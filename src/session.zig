@@ -207,6 +207,8 @@ fn authenticate(
     cfg: config.Config,
     session: c.ssh_session,
 ) !*const config.UserConfig {
+    const allowed_methods: c_int = @intCast(c.SSH_AUTH_METHOD_PASSWORD | c.SSH_AUTH_METHOD_PUBLICKEY);
+
     while (true) {
         const msg = c.ssh_message_get(session) orelse return error.LibsshFailure;
         defer c.ssh_message_free(msg);
@@ -216,7 +218,9 @@ fn authenticate(
             continue;
         }
 
-        if (c.ssh_message_subtype(msg) == c.SSH_AUTH_METHOD_PASSWORD) {
+        const subtype: c_uint = @intCast(c.ssh_message_subtype(msg));
+
+        if (subtype == c.SSH_AUTH_METHOD_PASSWORD) {
             const username_ptr = c.ssh_message_auth_user(msg);
             const password_ptr = c.ssh_message_auth_password(msg);
             if (username_ptr != null and password_ptr != null) {
@@ -234,11 +238,106 @@ fn authenticate(
                     audit.log(io, username, "auth.password", null, .denied, "unknown user");
                 }
             }
+        } else if (subtype == c.SSH_AUTH_METHOD_PUBLICKEY) {
+            const decision = handlePublicKeyMessage(io, cfg, msg);
+            switch (decision) {
+                .accepted => |user| return user,
+                .offered => continue,
+                .denied => {},
+            }
         }
 
-        _ = c.ssh_message_auth_set_methods(msg, @intCast(c.SSH_AUTH_METHOD_PASSWORD));
+        _ = c.ssh_message_auth_set_methods(msg, allowed_methods);
         _ = c.ssh_message_reply_default(msg);
     }
+}
+
+const PublicKeyDecision = union(enum) {
+    /// Signature verified and the key matches a configured key for the user.
+    /// Reply success was already sent; caller should return this user.
+    accepted: *const config.UserConfig,
+    /// Client offered an acceptable key (no signature yet). `pk_ok` was
+    /// already sent; caller should continue the loop and wait for the
+    /// follow-up signed message.
+    offered,
+    /// Anything else: unknown user, unmatched key, malformed offer, signature
+    /// failure. Caller should run the default-deny path.
+    denied,
+};
+
+fn handlePublicKeyMessage(
+    io: std.Io,
+    cfg: config.Config,
+    msg: c.ssh_message,
+) PublicKeyDecision {
+    const username_ptr = c.ssh_message_auth_user(msg);
+    if (username_ptr == null) return .denied;
+    const username = std.mem.span(username_ptr);
+
+    const presented = c.ssh_message_auth_pubkey(msg);
+    if (presented == null) {
+        audit.log(io, username, "auth.publickey", null, .denied, "no key in message");
+        return .denied;
+    }
+
+    const user = cfg.findUser(username) orelse {
+        audit.log(io, username, "auth.publickey", null, .denied, "unknown user");
+        return .denied;
+    };
+
+    if (!matchesAnyConfiguredKey(user, presented)) {
+        audit.log(io, username, "auth.publickey", null, .denied, "key not configured");
+        return .denied;
+    }
+
+    const state = c.ssh_message_auth_publickey_state(msg);
+    switch (state) {
+        c.SSH_PUBLICKEY_STATE_NONE => {
+            // Client is asking "would this key work?". Answer yes; libssh
+            // will then receive a signed follow-up that comes back with
+            // SSH_PUBLICKEY_STATE_VALID after libssh verifies the signature.
+            if (c.ssh_message_auth_reply_pk_ok_simple(msg) != c.SSH_OK) {
+                audit.log(io, username, "auth.publickey", null, .failed, "pk_ok reply failed");
+                return .denied;
+            }
+            return .offered;
+        },
+        c.SSH_PUBLICKEY_STATE_VALID => {
+            _ = c.ssh_message_auth_reply_success(msg, 0);
+            audit.log(io, username, "auth.publickey", null, .ok, user.keys[0].algorithm);
+            return .{ .accepted = user };
+        },
+        else => {
+            // SSH_PUBLICKEY_STATE_WRONG, SSH_PUBLICKEY_STATE_ERROR, anything else.
+            audit.log(io, username, "auth.publickey", null, .denied, "signature invalid");
+            return .denied;
+        },
+    }
+}
+
+fn matchesAnyConfiguredKey(user: *const config.UserConfig, presented: c.ssh_key) bool {
+    if (user.keys.len == 0) return false;
+    const presented_type = c.ssh_key_type(presented);
+
+    for (user.keys) |configured| {
+        const algo_z = std.heap.page_allocator.dupeZ(u8, configured.algorithm) catch return false;
+        defer std.heap.page_allocator.free(algo_z);
+        const blob_z = std.heap.page_allocator.dupeZ(u8, configured.blob) catch return false;
+        defer std.heap.page_allocator.free(blob_z);
+
+        const want_type = c.ssh_key_type_from_name(algo_z.ptr);
+        if (want_type != presented_type) continue;
+
+        var parsed: c.ssh_key = null;
+        const rc = c.ssh_pki_import_pubkey_base64(blob_z.ptr, want_type, &parsed);
+        if (rc != c.SSH_OK or parsed == null) continue;
+        defer c.ssh_key_free(parsed);
+
+        if (c.ssh_key_cmp(presented, parsed, c.SSH_KEY_CMP_PUBLIC) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn acceptSftpSubsystem(session: c.ssh_session) !c.ssh_channel {

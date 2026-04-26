@@ -9,4 +9,3 @@ user ally
   root /tmp/zift/ally
   allow /pending read write list mkdir remove rename
   allow /archive read list
-  deny *

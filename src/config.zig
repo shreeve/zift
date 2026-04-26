@@ -34,9 +34,23 @@ pub const ServerConfig = struct {
     log: LogTarget,
 };
 
+/// A public key authorized for a virtual user. Stored as the raw OpenSSH
+/// algorithm name and base64 blob from the config; libssh re-parses these
+/// into `ssh_key` values when matching a presented key at auth time.
+pub const PublicKey = struct {
+    /// One of "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+    /// "ecdsa-sha2-nistp521" (PLAN.md §8.4 accepted algorithms).
+    algorithm: []const u8,
+    /// Base64 blob (the second field of an OpenSSH public-key line).
+    blob: []const u8,
+};
+
 pub const UserConfig = struct {
     name: []const u8,
-    password_hash: []const u8,
+    /// Argon2id PHC string when password auth is provisioned, else null.
+    password_hash: ?[]const u8,
+    /// Public keys authorized for this user. May be empty.
+    keys: []const PublicKey,
     root: []const u8,
     rules: []const Rule,
 };
@@ -69,6 +83,7 @@ const ServerBuilder = struct {
 const UserBuilder = struct {
     name: []const u8,
     password_hash: ?[]const u8 = null,
+    keys: std.ArrayList(PublicKey) = .empty,
     root: ?[]const u8 = null,
     rules: std.ArrayList(Rule) = .empty,
 };
@@ -86,11 +101,12 @@ pub const Error = error{
     InvalidConfig,
     InvalidDuration,
     InvalidIndent,
+    InvalidKeyLine,
     InvalidPermission,
     InvalidUserName,
+    MissingCredentials,
     MissingHostKey,
     MissingListen,
-    MissingPassword,
     MissingRoot,
     MissingRulePattern,
     MissingRulePermissions,
@@ -104,7 +120,24 @@ pub const Error = error{
     PropertyOutsideSection,
     UnknownKey,
     UnknownSection,
+    UnsupportedKeyAlgorithm,
 };
+
+/// Public-key algorithms accepted in `key` lines, per PLAN.md §8.4.
+/// RSA and DSA are deliberately not on this list.
+const accepted_key_algorithms = [_][]const u8{
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+};
+
+fn isAcceptedKeyAlgorithm(algo: []const u8) bool {
+    for (accepted_key_algorithms) |accepted| {
+        if (std.mem.eql(u8, algo, accepted)) return true;
+    }
+    return false;
+}
 
 /// Accepted Argon2id parameter envelope per PLAN.md §8.4. Password property
 /// values whose embedded parameters fall outside this envelope are rejected
@@ -226,9 +259,13 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
 
     const final_users = try allocator.alloc(UserConfig, users.items.len);
     for (users.items, 0..) |*builder, i| {
+        if (builder.password_hash == null and builder.keys.items.len == 0) {
+            return error.MissingCredentials;
+        }
         final_users[i] = .{
             .name = builder.name,
-            .password_hash = builder.password_hash orelse return error.MissingPassword,
+            .password_hash = builder.password_hash,
+            .keys = try builder.keys.toOwnedSlice(allocator),
             .root = builder.root orelse return error.MissingRoot,
             .rules = try builder.rules.toOwnedSlice(allocator),
         };
@@ -278,6 +315,8 @@ fn parseUserProperty(
     if (std.mem.eql(u8, key, "password")) {
         try checkArgon2idPolicy(value, argon2id_policy);
         user.password_hash = try dupNonEmpty(allocator, value);
+    } else if (std.mem.eql(u8, key, "key")) {
+        try parseUserKey(allocator, user, value);
     } else if (std.mem.eql(u8, key, "root")) {
         user.root = try dupNonEmpty(allocator, value);
     } else if (std.mem.eql(u8, key, "allow")) {
@@ -287,6 +326,21 @@ fn parseUserProperty(
     } else {
         return error.UnknownKey;
     }
+}
+
+fn parseUserKey(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
+    var parts = std.mem.tokenizeAny(u8, value, " \t");
+    const algorithm = parts.next() orelse return error.InvalidKeyLine;
+    const blob = parts.next() orelse return error.InvalidKeyLine;
+    // Anything after the blob (the comment) is intentionally ignored.
+
+    if (!isAcceptedKeyAlgorithm(algorithm)) return error.UnsupportedKeyAlgorithm;
+    if (blob.len == 0) return error.InvalidKeyLine;
+
+    try user.keys.append(allocator, .{
+        .algorithm = try allocator.dupe(u8, algorithm),
+        .blob = try allocator.dupe(u8, blob),
+    });
 }
 
 fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
@@ -482,4 +536,58 @@ test "password accepted at envelope boundaries" {
         "user ally\n  password $argon2id$v=19$m=262144,t=8,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
+}
+
+test "key-only user accepted" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user runner\n  key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBLAH runner-1\n  root /tmp/a\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cfg.users.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.users[0].password_hash);
+    try std.testing.expectEqual(@as(usize, 1), cfg.users[0].keys.len);
+    try std.testing.expectEqualStrings("ssh-ed25519", cfg.users[0].keys[0].algorithm);
+    try std.testing.expectEqualStrings("AAAAC3NzaC1lZDI1NTE5AAAAIBLAH", cfg.users[0].keys[0].blob);
+}
+
+test "multiple keys per user accepted" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user runner\n" ++
+        "  key ssh-ed25519 AAAAC3aaaa primary\n" ++
+        "  key ecdsa-sha2-nistp256 AAAAE2bbbb backup\n" ++
+        "  root /tmp/a\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg.users[0].keys.len);
+    try std.testing.expectEqualStrings("ecdsa-sha2-nistp256", cfg.users[0].keys[1].algorithm);
+}
+
+test "rsa key rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user runner\n  key ssh-rsa AAAAB3NzaC1yc2EAAAA notallowed\n  root /tmp/a\n";
+    try std.testing.expectError(error.UnsupportedKeyAlgorithm, parse(std.testing.allocator, text));
+}
+
+test "dsa key rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user runner\n  key ssh-dss AAAAB3NzaC1kc3MAAAA legacy\n  root /tmp/a\n";
+    try std.testing.expectError(error.UnsupportedKeyAlgorithm, parse(std.testing.allocator, text));
+}
+
+test "key line missing blob rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user runner\n  key ssh-ed25519\n  root /tmp/a\n";
+    try std.testing.expectError(error.InvalidKeyLine, parse(std.testing.allocator, text));
+}
+
+test "user with neither password nor key rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user empty\n  root /tmp/a\n";
+    try std.testing.expectError(error.MissingCredentials, parse(std.testing.allocator, text));
 }

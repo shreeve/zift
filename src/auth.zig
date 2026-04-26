@@ -40,7 +40,8 @@ pub fn verifyPassword(
     user: *const config.UserConfig,
     password: []const u8,
 ) bool {
-    argon2.strVerify(user.password_hash, password, .{ .allocator = allocator }, io) catch return false;
+    const hash = user.password_hash orelse return false;
+    argon2.strVerify(hash, password, .{ .allocator = allocator }, io) catch return false;
     return true;
 }
 
@@ -79,10 +80,22 @@ test "hash and verify password" {
     const user: config.UserConfig = .{
         .name = "ally",
         .password_hash = hash,
+        .keys = &.{},
         .root = "/tmp",
         .rules = &.{},
     };
 
     try std.testing.expect(verifyPassword(std.testing.io, std.testing.allocator, &user, "correct horse"));
     try std.testing.expect(!verifyPassword(std.testing.io, std.testing.allocator, &user, "wrong horse"));
+}
+
+test "verifyPassword returns false when user has no password" {
+    const user: config.UserConfig = .{
+        .name = "key-only",
+        .password_hash = null,
+        .keys = &.{},
+        .root = "/tmp",
+        .rules = &.{},
+    };
+    try std.testing.expect(!verifyPassword(std.testing.io, std.testing.allocator, &user, "anything"));
 }
