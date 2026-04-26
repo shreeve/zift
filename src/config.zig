@@ -96,10 +96,73 @@ pub const Error = error{
     MissingRulePermissions,
     MissingServerSection,
     OutOfMemory,
+    PasswordHashNotArgon2id,
+    PasswordHashMalformed,
+    PasswordMemoryOutOfPolicy,
+    PasswordPassesOutOfPolicy,
+    PasswordParallelismOutOfPolicy,
     PropertyOutsideSection,
     UnknownKey,
     UnknownSection,
 };
+
+/// Accepted Argon2id parameter envelope per PLAN.md §8.4. Password property
+/// values whose embedded parameters fall outside this envelope are rejected
+/// at parse time so the unknown-user dummy hash (PLAN.md §8.4) can use a
+/// single upper-bound profile and still time-match every real user.
+pub const argon2id_policy = Argon2idPolicy{
+    .m_min = 65536, // 64 MiB
+    .m_max = 262144, // 256 MiB
+    .t_min = 2,
+    .t_max = 8,
+    .p_min = 1,
+    .p_max = 4,
+};
+
+pub const Argon2idPolicy = struct {
+    m_min: u32,
+    m_max: u32,
+    t_min: u32,
+    t_max: u32,
+    p_min: u32,
+    p_max: u32,
+};
+
+/// Validate a `password` property value: it must be an Argon2id PHC string
+/// whose embedded `m`, `t`, and `p` parameters fall inside the envelope.
+fn checkArgon2idPolicy(phc: []const u8, policy: Argon2idPolicy) Error!void {
+    const prefix = "$argon2id$";
+    if (!std.mem.startsWith(u8, phc, prefix)) return error.PasswordHashNotArgon2id;
+
+    var iter = std.mem.splitScalar(u8, phc, '$');
+    _ = iter.next(); // leading empty segment
+    _ = iter.next(); // "argon2id"
+    _ = iter.next() orelse return error.PasswordHashMalformed; // "v=19"
+    const params = iter.next() orelse return error.PasswordHashMalformed; // m=...,t=...,p=...
+    _ = iter.next() orelse return error.PasswordHashMalformed; // salt
+    _ = iter.next() orelse return error.PasswordHashMalformed; // hash
+
+    var m: ?u32 = null;
+    var t: ?u32 = null;
+    var p: ?u32 = null;
+    var pairs = std.mem.splitScalar(u8, params, ',');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return error.PasswordHashMalformed;
+        const k = pair[0..eq];
+        const v = std.fmt.parseUnsigned(u32, pair[eq + 1 ..], 10) catch return error.PasswordHashMalformed;
+        if (std.mem.eql(u8, k, "m")) m = v;
+        if (std.mem.eql(u8, k, "t")) t = v;
+        if (std.mem.eql(u8, k, "p")) p = v;
+    }
+
+    const m_val = m orelse return error.PasswordHashMalformed;
+    const t_val = t orelse return error.PasswordHashMalformed;
+    const p_val = p orelse return error.PasswordHashMalformed;
+
+    if (m_val < policy.m_min or m_val > policy.m_max) return error.PasswordMemoryOutOfPolicy;
+    if (t_val < policy.t_min or t_val > policy.t_max) return error.PasswordPassesOutOfPolicy;
+    if (p_val < policy.p_min or p_val > policy.p_max) return error.PasswordParallelismOutOfPolicy;
+}
 
 pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -213,6 +276,7 @@ fn parseUserProperty(
     value: []const u8,
 ) Error!void {
     if (std.mem.eql(u8, key, "password")) {
+        try checkArgon2idPolicy(value, argon2id_policy);
         user.password_hash = try dupNonEmpty(allocator, value);
     } else if (std.mem.eql(u8, key, "root")) {
         user.root = try dupNonEmpty(allocator, value);
@@ -345,22 +409,16 @@ test "parse valid config" {
     try std.testing.expect(ally.rules[0].permissions.contains(.write));
 }
 
+// Reused fixture for tests below: a syntactically valid PHC string with
+// parameters inside the policy envelope. The salt and hash bodies are not
+// real Argon2id outputs; the parser only validates structure, not crypto.
+const valid_test_phc = "$argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy";
+
 test "duplicate user is rejected" {
     const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/key
-        \\
-        \\user ally
-        \\  password hash
-        \\  root /tmp/a
-        \\
-        \\user ally
-        \\  password hash
-        \\  root /tmp/b
-        \\
-    ;
-
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n\n" ++
+        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/b\n";
     try std.testing.expectError(error.DuplicateUser, parse(std.testing.allocator, text));
 }
 
@@ -374,4 +432,54 @@ test "unknown keys are rejected" {
     ;
 
     try std.testing.expectError(error.UnknownKey, parse(std.testing.allocator, text));
+}
+
+test "password rejected when not argon2id" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $bcrypt$something\n  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordHashNotArgon2id, parse(std.testing.allocator, text));
+}
+
+test "password rejected when phc malformed" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $argon2id$broken\n  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordHashMalformed, parse(std.testing.allocator, text));
+}
+
+test "password rejected when memory below envelope" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $argon2id$v=19$m=4096,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordMemoryOutOfPolicy, parse(std.testing.allocator, text));
+}
+
+test "password rejected when memory above envelope" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $argon2id$v=19$m=524288,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordMemoryOutOfPolicy, parse(std.testing.allocator, text));
+}
+
+test "password rejected when passes below envelope" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $argon2id$v=19$m=65536,t=1,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordPassesOutOfPolicy, parse(std.testing.allocator, text));
+}
+
+test "password rejected when parallelism above envelope" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $argon2id$v=19$m=65536,t=3,p=8$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordParallelismOutOfPolicy, parse(std.testing.allocator, text));
+}
+
+test "password accepted at envelope boundaries" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $argon2id$v=19$m=262144,t=8,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
 }
