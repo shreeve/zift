@@ -1,0 +1,12 @@
+server
+  listen 127.0.0.1:2222
+  host-key /tmp/zift_host_ed25519
+  reload-interval 2s
+  log stderr
+
+user ally
+  password $argon2id$v=19$m=65536,t=3,p=4$example$replace-me
+  root /tmp/zift/ally
+  allow /pending read write list mkdir remove rename
+  allow /archive read list
+  deny *
