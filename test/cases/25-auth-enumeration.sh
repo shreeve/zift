@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# Test: auth attempts against known vs unknown users both produce denied
-#       audit lines (timing-safe dummy hash path exercised for unknown user)
-# Covers: PLAN §8.4 unknown-user timing parity
-# Oracle: audit log contains denied lines for both known-bad and unknown users
+# Test: known-bad-password and unknown-user attempts both produce a
+#       fully-formed `auth.password denied` audit line on the same path.
+#       This is the *audit-side* observable for the timing-safe dummy
+#       hash work — actual timing parity isn't asserted here because
+#       wall-clock measurements are unreliable in CI; the parity is
+#       enforced in `auth.zig` and exercised by the unit tests there.
+# Covers: PLAN §8.4 audit symmetry for known vs unknown users.
+# Oracle: a) both attempts produce a denied auth.password audit line;
+#         b) both lines carry the username the client offered; c) the
+#         unknown-user line carries the documented "unknown user" detail
+#         so operators can grep for enumeration probes.
 
 source "$(dirname "$0")/../lib/common.sh"
 
@@ -72,12 +79,27 @@ sleep 1
 stop_zift TERM
 wait "$ZIFT_PID" 2>/dev/null || true
 
-# Both attempts should produce auth.password denied lines.
-known_denied=$(grep -c '"user":"runner".*"auth.password".*"denied"' "$TEST_TMP/audit.jsonl" 2>/dev/null || echo 0)
-unknown_denied=$(grep -c '"user":"nonexistent".*"auth.password".*"denied"' "$TEST_TMP/audit.jsonl" 2>/dev/null || echo 0)
+# Both attempts produce auth.password denied lines. The audit JSON
+# field order is documented in audit.zig as event/user/operation/
+# result/.../ip — the regex relies on that order being stable.
+known_denied=$(grep -c '"user":"runner","operation":"auth.password","result":"denied"' "$TEST_TMP/audit.jsonl" 2>/dev/null || echo 0)
+unknown_denied=$(grep -c '"user":"nonexistent","operation":"auth.password","result":"denied"' "$TEST_TMP/audit.jsonl" 2>/dev/null || echo 0)
 
 [[ "$known_denied" -ge 1 ]] || fail "expected denied audit line for known user 'runner'"
 ok "known user bad-password produces denied audit line"
 
 [[ "$unknown_denied" -ge 1 ]] || fail "expected denied audit line for unknown user 'nonexistent'"
-ok "unknown user produces denied audit line (timing-safe dummy hash ran)"
+ok "unknown user produces denied audit line"
+
+# Cross-reference: only the unknown-user line should carry the
+# "unknown user" detail. This is the operator-facing signal that an
+# enumeration probe is happening; without it, the symmetry of the
+# audit lines would make probes invisible.
+if grep -q '"user":"nonexistent","operation":"auth.password","result":"denied","detail":"unknown user"' "$TEST_TMP/audit.jsonl"; then
+    ok "unknown-user audit line carries 'unknown user' detail"
+else
+    fail "expected 'unknown user' detail on unknown-user audit line"
+fi
+if grep -q '"user":"runner".*"detail":"unknown user"' "$TEST_TMP/audit.jsonl"; then
+    fail "known user line should NOT carry 'unknown user' detail"
+fi
