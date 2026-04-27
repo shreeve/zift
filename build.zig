@@ -42,9 +42,17 @@ fn buildLinkage(
     // statically-linked binary on every supported target. mbedTLS is
     // also notably smaller (~600 KB vs OpenSSL's ~3 MB) — fine for
     // SFTP, which uses a small subset of crypto primitives.
+    // `threading = true` defines `MBEDTLS_THREADING_PTHREAD` in the
+    // mbedTLS build, which makes libssh's `crypto_thread_init`
+    // (src/threads/mbedtls.c) accept the pthread callback set we
+    // install via `HAVE_PTHREAD = true` below. Without it, libssh
+    // returns SSH_ERROR from `ssh_threads_init` because the only
+    // accepted thread-callback type when mbedTLS isn't threaded
+    // is "threads_noop".
     const mbedtls_dep = b.dependency("mbedtls", .{
         .target = target,
         .optimize = optimize,
+        .threading = true,
     });
     const mbedtls_lib = mbedtls_dep.artifact("mbedtls");
 
@@ -201,14 +209,20 @@ fn buildLibssh(
         .HAVE_LIBGCRYPT = false,
         .HAVE_LIBMBEDCRYPTO = true,
 
-        // Threading. mbedTLS's Zig-built variant has a known issue with
-        // libssh's pthread integration; disabling HAVE_PTHREAD here makes
-        // libssh use its `noop` threading shim. SAFE FOR ZIFT because
-        // every libssh session is owned by exactly one OS thread (our
-        // `sessionThread` worker) — no concurrent calls into a single
-        // ssh_session. This matches OpenSSH's per-connection-fork
-        // model.
-        .HAVE_PTHREAD = false,
+        // Threading. Zift IS multi-threaded — one OS thread per
+        // accepted SFTP session. While each `ssh_session` itself is
+        // owned by exactly one worker, libssh has process-global
+        // state (one-time crypto init, allocator hooks, callbacks)
+        // that would race without the locks `threads/pthread.c`
+        // installs at `ssh_init` time. The previous `noop` shim
+        // worked in practice but only because most of libssh's
+        // global init happens before workers start; an attacker who
+        // could trigger reload-during-handshake could in theory
+        // race the global state. `HAVE_PTHREAD = true` makes the
+        // safety property structural rather than incidental.
+        // pthread is part of glibc/musl/Apple libc, so static
+        // builds get it free without a separate `-lpthread`.
+        .HAVE_PTHREAD = true,
         .HAVE_CMOCKA = false,
 
         // Compiler attribute support. Zig's clang frontend supports
@@ -257,6 +271,15 @@ fn buildLibssh(
         }),
     });
     lib.root_module.addCMacro("LIBSSH_STATIC", "1");
+    // Match the mbedTLS threading config we set on the mbedtls
+    // dependency above. `mbedtls/threading.h` gates type
+    // declarations on `MBEDTLS_THREADING_C` and the pthread-mode
+    // `mbedtls_threading_xxx` functions on `MBEDTLS_THREADING_PTHREAD`.
+    // libssh's `src/threads/mbedtls.c` includes that header; without
+    // these macros visible here too, libssh sees the no-threading
+    // shape of the API and `ssh_threads_init` returns SSH_ERROR.
+    lib.root_module.addCMacro("MBEDTLS_THREADING_C", "");
+    lib.root_module.addCMacro("MBEDTLS_THREADING_PTHREAD", "");
     lib.root_module.addConfigHeader(version_header);
     lib.root_module.addConfigHeader(config_header);
     lib.root_module.addIncludePath(src.path("include"));
@@ -334,12 +357,13 @@ fn buildLibssh(
         },
     });
 
-    // Threading shim. We disabled `HAVE_PTHREAD` (see config above), so
-    // we only need the noop shim — every libssh session is single-
-    // threaded from our worker's perspective.
+    // Threading shim. With `HAVE_PTHREAD = true` (see config above),
+    // libssh's `threads/pthread.c` provides the mutex/cond locks
+    // around process-global state. Required for safe use from
+    // multiple worker threads.
     lib.root_module.addCSourceFiles(.{
         .root = src.path("src"),
-        .files = &.{"threads/noop.c"},
+        .files = &.{"threads/pthread.c"},
     });
 
     // mbedTLS crypto backend. Includes ed25519 from libssh's external/
