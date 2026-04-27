@@ -752,7 +752,11 @@ const SftpState = struct {
     fn handleStat(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         if (policy.check(self.user, .stat, path.value) == .deny) {
-            self.auditDenied("stat", path.value);
+            // PLAN §8.5: emit audit AFTER replying. `defer` guarantees
+            // the audit fires once the reply syscall returns, so a slow
+            // audit destination (file on a hung NFS mount) cannot block
+            // the client's status reply.
+            defer self.auditDenied("stat", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
@@ -770,7 +774,7 @@ const SftpState = struct {
     fn handleOpendir(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         if (policy.check(self.user, .readdir, path.value) == .deny) {
-            self.auditDenied("opendir", path.value);
+            defer self.auditDenied("opendir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
@@ -780,16 +784,16 @@ const SftpState = struct {
         defer self.allocator.free(real);
 
         const dir = std.Io.Dir.openDirAbsolute(self.io, real, .{ .iterate = true }) catch {
-            self.auditFailed("opendir", path.value, "open dir failed");
+            defer self.auditFailed("opendir", path.value, "open dir failed");
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open dir failed");
         };
         self.vfs.verifyDir(self.io, dir) catch {
             dir.close(self.io);
-            self.auditDenied("opendir", path.value);
+            defer self.auditDenied("opendir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         };
         const id = try self.addDirHandle(dir);
-        self.auditOk("opendir", path.value, "");
+        defer self.auditOk("opendir", path.value, "");
         try replyHandle(self.channel, request_id, id);
     }
 
@@ -840,11 +844,11 @@ const SftpState = struct {
 
         // Both policies must allow the bits the client requested. PLAN §6.3.
         if (want_write and policy.check(self.user, .open_write, path.value) == .deny) {
-            self.auditDenied("open_write", path.value);
+            defer self.auditDenied("open_write", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         if (want_read and policy.check(self.user, .open_read, path.value) == .deny) {
-            self.auditDenied("open_read", path.value);
+            defer self.auditDenied("open_read", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
@@ -862,8 +866,10 @@ const SftpState = struct {
         // OS could follow back outside the jail. PLAN §8.3.
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
             const status = parentErrorStatus(err);
-            if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied(op_label, path.value)
-            else self.auditFailed(op_label, path.value, @errorName(err));
+            defer {
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied(op_label, path.value)
+                else self.auditFailed(op_label, path.value, @errorName(err));
+            }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer parent.deinit(self.io, self.allocator);
@@ -899,25 +905,25 @@ const SftpState = struct {
                     .truncate = false,
                     .exclusive = true,
                 }) catch {
-                    self.auditFailed(op_label, path.value, "create failed");
+                    defer self.auditFailed(op_label, path.value, "create failed");
                     return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
                 self.vfs.verifyFile(self.io, created) catch {
                     created.close(self.io);
-                    self.auditDenied(op_label, path.value);
+                    defer self.auditDenied(op_label, path.value);
                     return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
                 };
                 const id = try self.addFileHandle(created, want_read, want_write);
-                self.auditOk(op_label, path.value, "");
+                defer self.auditOk(op_label, path.value, "");
                 return replyHandle(self.channel, request_id, id);
             },
             error.SymLinkLoop => {
                 // Final component IS a symlink. Refuse outright.
-                self.auditDenied(op_label, path.value);
+                defer self.auditDenied(op_label, path.value);
                 return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
             },
             else => {
-                self.auditFailed(op_label, path.value, @errorName(err));
+                defer self.auditFailed(op_label, path.value, @errorName(err));
                 return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
             },
         };
@@ -933,7 +939,7 @@ const SftpState = struct {
         // outside the jail before any state-changing operation runs.
         self.vfs.verifyFile(self.io, file) catch {
             file.close(self.io);
-            self.auditDenied(op_label, path.value);
+            defer self.auditDenied(op_label, path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         };
 
@@ -941,13 +947,13 @@ const SftpState = struct {
         if (want_trunc and want_write) {
             file.setLength(self.io, 0) catch {
                 file.close(self.io);
-                self.auditFailed(op_label, path.value, "truncate failed");
+                defer self.auditFailed(op_label, path.value, "truncate failed");
                 return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "truncate failed");
             };
         }
 
         const id = try self.addFileHandle(file, want_read, want_write);
-        self.auditOk(op_label, path.value, "");
+        defer self.auditOk(op_label, path.value, "");
         try replyHandle(self.channel, request_id, id);
     }
 
@@ -964,7 +970,7 @@ const SftpState = struct {
         // this only at OPEN time would let a write-only-permitted client
         // exfiltrate via the same handle they wrote to.
         if (!handle.can_read) {
-            self.auditDenied("read", null);
+            defer self.auditDenied("read", null);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
@@ -988,7 +994,7 @@ const SftpState = struct {
 
         // Per PLAN §6.3, `write` permission gates SSH_FXP_WRITE.
         if (!handle.can_write) {
-            self.auditDenied("write", null);
+            defer self.auditDenied("write", null);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
@@ -1014,66 +1020,72 @@ const SftpState = struct {
     fn handleMkdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         if (policy.check(self.user, .mkdir, path.value) == .deny) {
-            self.auditDenied("mkdir", path.value);
+            defer self.auditDenied("mkdir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
             const status = parentErrorStatus(err);
-            if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("mkdir", path.value)
-            else self.auditFailed("mkdir", path.value, @errorName(err));
+            defer {
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("mkdir", path.value)
+                else self.auditFailed("mkdir", path.value, @errorName(err));
+            }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer parent.deinit(self.io, self.allocator);
 
         parent.parent.createDir(self.io, parent.base, .default_dir) catch {
-            self.auditFailed("mkdir", path.value, "createDir failed");
+            defer self.auditFailed("mkdir", path.value, "createDir failed");
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
         };
-        self.auditOk("mkdir", path.value, "");
+        defer self.auditOk("mkdir", path.value, "");
         try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
     fn handleRemove(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         if (policy.check(self.user, .remove, path.value) == .deny) {
-            self.auditDenied("remove", path.value);
+            defer self.auditDenied("remove", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
             const status = parentErrorStatus(err);
-            if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("remove", path.value)
-            else self.auditFailed("remove", path.value, @errorName(err));
+            defer {
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("remove", path.value)
+                else self.auditFailed("remove", path.value, @errorName(err));
+            }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer parent.deinit(self.io, self.allocator);
 
         parent.parent.deleteFile(self.io, parent.base) catch {
-            self.auditFailed("remove", path.value, "deleteFile failed");
+            defer self.auditFailed("remove", path.value, "deleteFile failed");
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "remove failed");
         };
-        self.auditOk("remove", path.value, "");
+        defer self.auditOk("remove", path.value, "");
         try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
     fn handleRmdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         if (policy.check(self.user, .rmdir, path.value) == .deny) {
-            self.auditDenied("rmdir", path.value);
+            defer self.auditDenied("rmdir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
             const status = parentErrorStatus(err);
-            if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rmdir", path.value)
-            else self.auditFailed("rmdir", path.value, @errorName(err));
+            defer {
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rmdir", path.value)
+                else self.auditFailed("rmdir", path.value, @errorName(err));
+            }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer parent.deinit(self.io, self.allocator);
 
         parent.parent.deleteDir(self.io, parent.base) catch {
-            self.auditFailed("rmdir", path.value, "deleteDir failed");
+            defer self.auditFailed("rmdir", path.value, "deleteDir failed");
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rmdir failed");
         };
-        self.auditOk("rmdir", path.value, "");
+        defer self.auditOk("rmdir", path.value, "");
         try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
@@ -1081,29 +1093,33 @@ const SftpState = struct {
         const from = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad source");
         const to = parseString(from.rest) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad destination");
         if (policy.checkRename(self.user, from.value, to.value) == .deny) {
-            self.auditDenied("rename", from.value);
+            defer self.auditDenied("rename", from.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         var from_parent = self.vfs.openVerifiedParent(self.io, self.allocator, from.value) catch |err| {
             const status = parentErrorStatus(err);
-            if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", from.value)
-            else self.auditFailed("rename", from.value, @errorName(err));
+            defer {
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", from.value)
+                else self.auditFailed("rename", from.value, @errorName(err));
+            }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer from_parent.deinit(self.io, self.allocator);
         var to_parent = self.vfs.openVerifiedParent(self.io, self.allocator, to.value) catch |err| {
             const status = parentErrorStatus(err);
-            if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", to.value)
-            else self.auditFailed("rename", to.value, @errorName(err));
+            defer {
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", to.value)
+                else self.auditFailed("rename", to.value, @errorName(err));
+            }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer to_parent.deinit(self.io, self.allocator);
 
         std.Io.Dir.rename(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch {
-            self.auditFailed("rename", from.value, "rename failed");
+            defer self.auditFailed("rename", from.value, "rename failed");
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename failed");
         };
-        self.auditOk("rename", from.value, to.value);
+        defer self.auditOk("rename", from.value, to.value);
         try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
