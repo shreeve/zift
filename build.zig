@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 /// this via `-Dversion=...` extracted from the pushed git tag, so the
 /// shipped artifact name matches the tag exactly. Local `zig build release`
 /// invocations without `-Dversion=...` use this value as a stable fallback.
-const default_version = "0.2.1";
+const default_version = "0.2.2";
 
 /// libssh version we vendor. Must match the tag in `build.zig.zon`'s
 /// `libssh_source` URL. Tracked here in source rather than parsed at
@@ -108,6 +108,47 @@ fn buildLibssh(
     zlib_lib: *std.Build.Step.Compile,
 ) *std.Build.Step.Compile {
     const src = b.dependency("libssh_source", .{});
+
+    // Reproducible-build flag for libssh's C compilation. Any time
+    // libssh's source uses `__FILE__` (assert macros, `SSH_LOG`,
+    // some error paths) the C preprocessor bakes the absolute path
+    // of the .c file into the binary's `.rodata`. That path is
+    // build-host-specific:
+    //
+    //   local Mac : /Users/shreeve/Data/Code/zift/zig-pkg/<hash>/src/foo.c
+    //   GitHub CI : /home/runner/work/zift/zift/zig-pkg/<hash>/src/foo.c
+    //
+    // so two builds of the SAME source tree produce different
+    // binaries (a 16-byte rodata delta from one path string,
+    // cascading through all section offsets). `-ffile-prefix-map`
+    // remaps the source-root prefix to a fixed string at compile
+    // time, making the embedded `__FILE__` independent of where the
+    // source sits on disk. Local cross-compile and CI builds then
+    // produce byte-identical binaries (verified against v0.2.1).
+    //
+    // We point the remap at our own pinned libssh version string so
+    // the rewritten `__FILE__` is still informative if it shows up
+    // in a real error message: `/libssh-0.11.3/src/packet_crypt.c`
+    // tells an operator both the library and the file. Just stripping
+    // the path prefix entirely would lose that context.
+    const libssh_src_path = src.path("").getPath3(b, null);
+    const libssh_src_abs = b.fmt("{s}/{s}", .{
+        libssh_src_path.root_dir.path orelse ".",
+        libssh_src_path.sub_path,
+    });
+    // `-ffile-prefix-map=OLD=NEW` rewrites paths whose prefix matches
+    // OLD by literal substitution. clang's substitution doesn't add
+    // its own separator. Note: `LazyPath.getPath3` returns a path
+    // that ALREADY ends with `/` for a directory dep, so we don't
+    // append one to OLD (doing so produced `<hash>//` which never
+    // matched the single-slash `<hash>/src/file.c` in `__FILE__`).
+    // We DO add `/` to NEW so the rewritten path reads cleanly:
+    // `/libssh-0.11.3/src/packet_crypt.c` (vs `/libssh-0.11.3src/...`).
+    const libssh_remap = b.fmt(
+        "-ffile-prefix-map={s}=/libssh-{d}.{d}.{d}/",
+        .{ libssh_src_abs, libssh_major, libssh_minor, libssh_patch },
+    );
+    const libssh_cflags: []const []const u8 = &.{libssh_remap};
 
     const is_unix = target.result.os.tag == .linux or target.result.os.tag == .macos;
     const is_linux = target.result.os.tag == .linux;
@@ -355,6 +396,7 @@ fn buildLibssh(
             "token.c",
             "pki_ed25519_common.c",
         },
+        .flags = libssh_cflags,
     });
 
     // Threading shim. With `HAVE_PTHREAD = true` (see config above),
@@ -364,6 +406,7 @@ fn buildLibssh(
     lib.root_module.addCSourceFiles(.{
         .root = src.path("src"),
         .files = &.{"threads/pthread.c"},
+        .flags = libssh_cflags,
     });
 
     // mbedTLS crypto backend. Includes ed25519 from libssh's external/
@@ -388,6 +431,7 @@ fn buildLibssh(
             "external/poly1305.c",
             "chachapoly.c",
         },
+        .flags = libssh_cflags,
     });
 
     // SFTP wire protocol + server.
@@ -399,6 +443,7 @@ fn buildLibssh(
             "sftp_aio.c",
             "sftpserver.c",
         },
+        .flags = libssh_cflags,
     });
 
     // SSH server side (bind, accept, message dispatch).
@@ -409,18 +454,21 @@ fn buildLibssh(
             "bind.c",
             "bind_config.c",
         },
+        .flags = libssh_cflags,
     });
 
     // DH group exchange (key-exchange algorithm family).
     lib.root_module.addCSourceFiles(.{
         .root = src.path("src"),
         .files = &.{"dh-gex.c"},
+        .flags = libssh_cflags,
     });
 
     // Curve25519 reference implementation.
     lib.root_module.addCSourceFiles(.{
         .root = src.path("src"),
         .files = &.{"external/curve25519_ref.c"},
+        .flags = libssh_cflags,
     });
 
     return lib;
