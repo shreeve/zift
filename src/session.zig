@@ -1571,7 +1571,28 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
             slice_ms,
         );
         if (n == c.SSH_ERROR) return error.LibsshFailure;
-        if (n == 0) return error.ChannelEof; // clean half-close from peer
+        if (n == 0) {
+            // `ssh_channel_read_timeout` returns 0 either (a) genuinely
+            // — the peer sent SSH_MSG_CHANNEL_EOF — or (b) spuriously
+            // because libssh 0.10.x's internal state thinks `remote_eof`
+            // is set when it isn't. (b) is observable when we mix the
+            // message API for channel-open/subsystem with the channel
+            // API for I/O after `env` requests have flowed through
+            // ssh_message_reply_default. Cross-check via ssh_channel_is_eof:
+            // if it reports the channel is NOT actually EOF, treat the
+            // bogus 0 as a transient and try again. The idle-timeout
+            // path still bounds the max wait.
+            if (c.ssh_channel_is_eof(state.channel) == 0) {
+                if (state.idle_timeout_ms != 0) {
+                    const elapsed: i64 = nowMs() - state.last_activity_ms;
+                    if (elapsed >= @as(i64, @intCast(state.idle_timeout_ms))) {
+                        return error.IdleTimeout;
+                    }
+                }
+                continue;
+            }
+            return error.ChannelEof;
+        }
         if (n == c.SSH_AGAIN) {
             if (state.idle_timeout_ms != 0) {
                 const elapsed: i64 = nowMs() - state.last_activity_ms;
