@@ -220,6 +220,7 @@ pub const Error = error{
     DuplicateServerSection,
     DuplicateUser,
     EmptyUserName,
+    InlineComment,
     InvalidConfig,
     InvalidDuration,
     InvalidIndent,
@@ -253,6 +254,69 @@ pub const Error = error{
 /// pathological inputs before we say no.
 pub const max_username_bytes: usize = 64;
 pub const max_keyline_bytes: usize = 8192;
+
+/// Diagnostic context captured by `parse` on any error. Callers (zift
+/// validate, zift serve startup, runtime reload) read `line`,
+/// `section_kind`, `userName()`, and `key()` after a `catch` to emit a
+/// precise stderr diagnostic — `zift: <file>:<line>: <reason>` —
+/// rather than the raw error name. PLAN §6.2 / §7.3 require errors
+/// that identify file, line, section/user, and key.
+///
+/// Strings are stored in fixed inline buffers (sized at PLAN §7.6
+/// limits) so the diag survives the arena's `deinit` on the error
+/// path. A `?[]const u8` here would dangle once the parser's arena is
+/// torn down.
+pub const ParseDiag = struct {
+    line: u32 = 0,
+    section_kind: ?Section = null,
+    user_name_buf: [max_username_bytes + 1]u8 = [_]u8{0} ** (max_username_bytes + 1),
+    user_name_len: usize = 0,
+    key_buf: [64]u8 = [_]u8{0} ** 64,
+    key_len: usize = 0,
+
+    pub fn userName(self: *const ParseDiag) ?[]const u8 {
+        if (self.user_name_len == 0) return null;
+        return self.user_name_buf[0..self.user_name_len];
+    }
+
+    pub fn keyName(self: *const ParseDiag) ?[]const u8 {
+        if (self.key_len == 0) return null;
+        return self.key_buf[0..self.key_len];
+    }
+
+    fn setUserName(self: *ParseDiag, name: []const u8) void {
+        const n = @min(name.len, self.user_name_buf.len);
+        @memcpy(self.user_name_buf[0..n], name[0..n]);
+        self.user_name_len = n;
+    }
+
+    fn setKey(self: *ParseDiag, key: []const u8) void {
+        const n = @min(key.len, self.key_buf.len);
+        @memcpy(self.key_buf[0..n], key[0..n]);
+        self.key_len = n;
+    }
+
+    /// Format the captured context plus an `@errorName` suffix into
+    /// `writer`. Caller already has `<file>:` prefix; we add the rest.
+    pub fn format(self: *const ParseDiag, err: anyerror, writer: *std.Io.Writer) !void {
+        if (self.line != 0) {
+            try writer.print("line {d}: ", .{self.line});
+        }
+        if (self.section_kind) |kind| {
+            switch (kind) {
+                .server => try writer.writeAll("[server] "),
+                .user => if (self.userName()) |name| {
+                    try writer.print("[user {s}] ", .{name});
+                } else {
+                    try writer.writeAll("[user] ");
+                },
+                .none => {},
+            }
+        }
+        if (self.keyName()) |k| try writer.print("'{s}': ", .{k});
+        try writer.writeAll(@errorName(err));
+    }
+};
 
 /// Public-key algorithms accepted in `key` lines, per PLAN.md §8.4.
 /// RSA and DSA are deliberately not on this list.
@@ -329,6 +393,17 @@ fn checkArgon2idPolicy(phc: []const u8, policy: Argon2idPolicy) Error!void {
 }
 
 pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
+    return parseWithDiag(gpa, text, null);
+}
+
+/// Same as `parse` but also populates `diag` (when non-null) with the
+/// line/section/user context of any failure. Callers use this when
+/// they want operator-facing diagnostics with file:line precision.
+pub fn parseWithDiag(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    diag: ?*ParseDiag,
+) Error!Config {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const allocator = arena.allocator();
@@ -340,12 +415,41 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
     var section: Section = .none;
     var current_user: ?*UserBuilder = null;
 
+    // Mutable trackers updated as we walk; `errdefer` snapshots them
+    // into `diag` on any error path so callers see the location of
+    // the failing line, the section it's in, and which user was
+    // active (if applicable). The diag's string buffers are inline
+    // so they survive the arena's `deinit` that runs on this error
+    // path (LIFO errdefer order — both run, but slices into the
+    // arena would dangle by the time the caller reads them).
+    var line_no: u32 = 0;
+    var key_for_diag: ?[]const u8 = null;
+    errdefer {
+        if (diag) |d| {
+            d.line = line_no;
+            d.section_kind = section;
+            if (current_user) |u| d.setUserName(u.name);
+            if (key_for_diag) |k| d.setKey(k);
+        }
+    }
+
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
+        line_no += 1;
+        key_for_diag = null;
+
         const no_cr = std.mem.trimEnd(u8, raw, "\r");
-        const without_comment = stripComment(no_cr);
-        const line = std.mem.trim(u8, without_comment, " \t");
+        // PLAN §6.2: only whole-line comments are recognized. A line
+        // whose first non-whitespace character is `#` is treated as a
+        // comment and skipped; a `#` after a value is a syntax error,
+        // not a comment delimiter.
+        const trimmed_for_comment_check = std.mem.trimStart(u8, no_cr, " \t");
+        if (trimmed_for_comment_check.len > 0 and trimmed_for_comment_check[0] == '#') {
+            continue;
+        }
+        const line = std.mem.trim(u8, no_cr, " \t");
         if (line.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, line, '#') != null) return error.InlineComment;
 
         const indent = countIndent(no_cr);
         if (indent == 0) {
@@ -377,6 +481,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
         if (indent < 1) return error.InvalidIndent;
 
         const key, const value = splitKeyValue(line) orelse return error.InvalidConfig;
+        key_for_diag = key;
         switch (section) {
             .none => return error.PropertyOutsideSection,
             .server => try parseServerProperty(allocator, &server, key, value),
@@ -537,6 +642,16 @@ fn parsePermission(token: []const u8) ?Permission {
 
 fn parseDurationMs(value: []const u8) Error!u64 {
     if (value.len == 0) return error.InvalidDuration;
+
+    // Bare `0` is the documented sentinel for "disabled" (idle-timeout,
+    // reload-interval) and means the same thing in any unit — special-
+    // cased here so operators don't have to write `0s`.
+    if (std.mem.eql(u8, value, "0")) return 0;
+
+    // PLAN §6.2: any non-zero duration requires a unit suffix
+    // (`ms`, `s`, `m`, `h`). A bare number is ambiguous (operators
+    // expect seconds; the implementation used to treat it as
+    // milliseconds) so we reject it rather than guess.
     if (std.mem.endsWith(u8, value, "ms")) {
         return std.fmt.parseUnsigned(u64, value[0 .. value.len - 2], 10) catch error.InvalidDuration;
     }
@@ -544,17 +659,20 @@ fn parseDurationMs(value: []const u8) Error!u64 {
         const seconds = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
         return seconds * 1000;
     }
-    return std.fmt.parseUnsigned(u64, value, 10) catch error.InvalidDuration;
+    if (std.mem.endsWith(u8, value, "m")) {
+        const minutes = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
+        return minutes * 60 * 1000;
+    }
+    if (std.mem.endsWith(u8, value, "h")) {
+        const hours = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
+        return hours * 60 * 60 * 1000;
+    }
+    return error.InvalidDuration;
 }
 
 fn dupNonEmpty(allocator: std.mem.Allocator, value: []const u8) Error![]const u8 {
     if (value.len == 0) return error.InvalidConfig;
     return allocator.dupe(u8, value);
-}
-
-fn stripComment(line: []const u8) []const u8 {
-    const index = std.mem.indexOfScalar(u8, line, '#') orelse return line;
-    return line[0..index];
 }
 
 fn countIndent(line: []const u8) usize {

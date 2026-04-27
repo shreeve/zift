@@ -85,12 +85,16 @@ fn validate(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
     };
     defer gpa.free(contents);
 
-    var cfg = config.parse(gpa, contents) catch |err| {
-        try stderr.writeStreamingAll(io, "zift validate: ");
-        try stderr.writeStreamingAll(io, path);
-        try stderr.writeStreamingAll(io, ": ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
+    var diag: config.ParseDiag = .{};
+    var cfg = config.parseWithDiag(gpa, contents, &diag) catch |err| {
+        var msg_buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&msg_buf);
+        w.writeAll("zift validate: ") catch {};
+        w.writeAll(path) catch {};
+        w.writeAll(": ") catch {};
+        diag.format(err, &w) catch {};
+        w.writeAll("\n") catch {};
+        try stderr.writeStreamingAll(io, w.buffered());
         return 1;
     };
     defer cfg.deinit();
@@ -127,9 +131,25 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     signals.install();
 
     const stdout = std.Io.File.stdout();
+    const stderr = std.Io.File.stderr();
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 20));
     defer gpa.free(contents);
-    var cfg = try config.parse(gpa, contents);
+
+    // Use parseWithDiag so a config syntax error emits a structured
+    // `zift: <file>:line N: <reason>` line instead of just an error
+    // name. PLAN §6.2 expects line-level diagnostics on startup.
+    var diag: config.ParseDiag = .{};
+    var cfg = config.parseWithDiag(gpa, contents, &diag) catch |err| {
+        var msg_buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&msg_buf);
+        w.writeAll("zift: ") catch {};
+        w.writeAll(args[2]) catch {};
+        w.writeAll(": ") catch {};
+        diag.format(err, &w) catch {};
+        w.writeAll("\n") catch {};
+        try stderr.writeStreamingAll(io, w.buffered());
+        return err;
+    };
 
     // Refuse to start serving until the live-filesystem invariants
     // hold (PLAN.md §6.2). Diagnostics already written to stderr.

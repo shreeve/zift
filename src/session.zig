@@ -318,10 +318,16 @@ const ActiveConfig = struct {
         };
         defer self.allocator.free(contents);
 
-        var next_config = config.parse(self.allocator, contents) catch |err| {
-            try stderr.writeStreamingAll(self.io, "zift: config reload rejected: ");
-            try stderr.writeStreamingAll(self.io, @errorName(err));
-            try stderr.writeStreamingAll(self.io, "\n");
+        var diag: config.ParseDiag = .{};
+        var next_config = config.parseWithDiag(self.allocator, contents, &diag) catch |err| {
+            var msg_buf: [512]u8 = undefined;
+            var w = std.Io.Writer.fixed(&msg_buf);
+            w.writeAll("zift: config reload rejected: ") catch {};
+            w.writeAll(path) catch {};
+            w.writeAll(": ") catch {};
+            diag.format(err, &w) catch {};
+            w.writeAll("\n") catch {};
+            try stderr.writeStreamingAll(self.io, w.buffered());
             return;
         };
         errdefer next_config.deinit();
