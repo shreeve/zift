@@ -13,6 +13,12 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// PLAN §7.6: maximum SFTP packet size is 256 KiB. Frames that declare
+/// a larger length on the wire are treated as malformed and the session
+/// is torn down (we cannot reply `BAD_MESSAGE` for the packet itself
+/// because the request_id lives inside the body we refuse to read).
+const sftp_max_packet_bytes: usize = 256 * 1024;
+
 /// Monotonic-clock millisecond reading. Used for idle-timeout deadlines
 /// and graceful-shutdown drain timing. The Linux/macOS `CLOCK_MONOTONIC`
 /// is unaffected by wall-clock changes.
@@ -634,9 +640,15 @@ fn runSftp(
     };
     defer state.deinit();
 
-    var payload_buf: [8192]u8 = undefined;
+    // PLAN §7.6: maximum SFTP packet size is 256 KiB. Allocate on the
+    // heap so we don't push the worker thread stack past Zig's default
+    // (8 MB on Darwin, 8 MB on glibc). One allocation per session, freed
+    // at session exit.
+    const payload_buf = try allocator.alloc(u8, sftp_max_packet_bytes);
+    defer allocator.free(payload_buf);
+
     const ip_str = peer_ip orelse "";
-    const first_payload = readPacketTimed(&state, &payload_buf) catch |err| switch (err) {
+    const first_payload = readPacketTimed(&state, payload_buf) catch |err| switch (err) {
         error.IdleTimeout => {
             audit.log(io, user.name, "idle.timeout", null, .ok, "", ip_str);
             return;
@@ -648,7 +660,7 @@ fn runSftp(
     state.last_activity_ms = nowMs();
 
     while (true) {
-        const payload = readPacketTimed(&state, &payload_buf) catch |err| switch (err) {
+        const payload = readPacketTimed(&state, payload_buf) catch |err| switch (err) {
             error.IdleTimeout => {
                 audit.log(io, user.name, "idle.timeout", null, .ok, "", ip_str);
                 return;
@@ -663,6 +675,7 @@ fn runSftp(
         switch (msg_type) {
             c.SSH_FXP_REALPATH => try state.handleRealpath(request_id, payload[5..]),
             c.SSH_FXP_STAT, c.SSH_FXP_LSTAT => try state.handleStat(request_id, payload[5..]),
+            c.SSH_FXP_FSTAT => try state.handleFstat(request_id, payload[5..]),
             c.SSH_FXP_OPENDIR => try state.handleOpendir(request_id, payload[5..]),
             c.SSH_FXP_READDIR => try state.handleReaddir(request_id, payload[5..]),
             c.SSH_FXP_OPEN => try state.handleOpen(request_id, payload[5..]),
@@ -673,7 +686,23 @@ fn runSftp(
             c.SSH_FXP_REMOVE => try state.handleRemove(request_id, payload[5..]),
             c.SSH_FXP_RMDIR => try state.handleRmdir(request_id, payload[5..]),
             c.SSH_FXP_RENAME => try state.handleRename(request_id, payload[5..]),
-            else => try replyStatus(channel, request_id, c.SSH_FX_FAILURE, "unsupported"),
+            // PLAN §7.6 explicitly lists these as rejected with
+            // SSH_FX_OP_UNSUPPORTED. Clients (rsync, scp -p, paramiko's
+            // chmod/symlink/readlink) probe these; the right reply
+            // surfaces "this op isn't supported" — typically translated
+            // to errno.ENOSYS by the client — rather than the generic
+            // FAILURE that means "I tried and broke."
+            c.SSH_FXP_SETSTAT,
+            c.SSH_FXP_FSETSTAT,
+            c.SSH_FXP_READLINK,
+            c.SSH_FXP_SYMLINK,
+            c.SSH_FXP_EXTENDED,
+            => try replyStatus(channel, request_id, c.SSH_FX_OP_UNSUPPORTED, "unsupported"),
+            // Truly unknown opcode. Same answer per PLAN §7.6 — the
+            // session continues; we only disconnect on persistent
+            // malformed traffic, which the read-side enforces by
+            // rejecting oversize frames before parsing.
+            else => try replyStatus(channel, request_id, c.SSH_FX_OP_UNSUPPORTED, "unsupported"),
         }
     }
 }
@@ -747,6 +776,23 @@ const SftpState = struct {
         defer self.allocator.free(normalized);
 
         try replyName(self.channel, request_id, normalized);
+    }
+
+    /// SSH_FXP_FSTAT — stat-by-handle (PLAN §7.6 "Inherits the open's
+    /// permission"). The client opened the file via SSH_FXP_OPEN, which
+    /// already ran `.open_read`/`.open_write` policy and stamped per-
+    /// handle access bits, so FSTAT itself does not consult policy
+    /// again — it just reports the underlying fd's stat. This matches
+    /// OpenSSH's sftp-server.
+    fn handleFstat(self: *SftpState, request_id: u32, payload: []const u8) !void {
+        const id = parseHandleId(payload) catch
+            return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
+        const handle = self.findHandle(id, .file) orelse
+            return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+
+        const file_stat = handle.file.?.stat(self.io) catch
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "fstat failed");
+        try replyAttrs(self.channel, request_id, file_stat);
     }
 
     fn handleStat(self: *SftpState, request_id: u32, payload: []const u8) !void {
