@@ -130,7 +130,6 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     // Install operational signal handlers before any worker threads exist.
     signals.install();
 
-    const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 20));
     defer gpa.free(contents);
@@ -165,22 +164,27 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     try audit.initGlobal(gpa, cfg.server.log);
     defer audit.deinitGlobal(gpa);
 
-    try stdout.writeStreamingAll(io, "zift: libssh initialized\n");
-    try stdout.writeStreamingAll(io, "zift: config path: ");
-    try stdout.writeStreamingAll(io, args[2]);
-    try stdout.writeStreamingAll(io, "\n");
-    try stdout.writeStreamingAll(io, "zift: listen: ");
-    try stdout.writeStreamingAll(io, cfg.server.listen);
-    try stdout.writeStreamingAll(io, "\n");
+    // Operational status goes to stderr (PLAN §7.4); stdout is
+    // reserved for things a script genuinely consumes (the PHC string
+    // from `zift hash-password`, the `version` output).
+    try stderr.writeStreamingAll(io, "zift: libssh initialized\n");
+    try stderr.writeStreamingAll(io, "zift: config path: ");
+    try stderr.writeStreamingAll(io, args[2]);
+    try stderr.writeStreamingAll(io, "\n");
+    try stderr.writeStreamingAll(io, "zift: listen: ");
+    try stderr.writeStreamingAll(io, cfg.server.listen);
+    try stderr.writeStreamingAll(io, "\n");
     try session.run(io, gpa, args[2], cfg);
 }
 
 fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !void {
+    // Pipeline-friendly: read the password from stdin, write the PHC
+    // string + newline to stdout, no prompt or framing of any kind.
+    // PLAN §11.3: `zift hash-password` should be cleanly scriptable
+    // ("printf '%s\n' "$pw" | zift hash-password" rather than
+    // requiring expect-style interaction).
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
-    const stderr = std.Io.File.stderr();
-
-    try stderr.writeStreamingAll(io, "password: ");
 
     var reader_buffer: [256]u8 = undefined;
     var reader = stdin.readerStreaming(io, &reader_buffer);

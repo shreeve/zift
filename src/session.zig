@@ -119,10 +119,12 @@ pub fn run(
         .revents = 0,
     }};
 
-    const stdout = std.Io.File.stdout();
-    try stdout.writeStreamingAll(io, "zift: listening on ");
-    try stdout.writeStreamingAll(io, active.current.config.server.listen);
-    try stdout.writeStreamingAll(io, "\n");
+    // PLAN §7.4: human-readable status goes to stderr; stdout is
+    // reserved for things scripts genuinely consume.
+    const status = std.Io.File.stderr();
+    try status.writeStreamingAll(io, "zift: listening on ");
+    try status.writeStreamingAll(io, active.current.config.server.listen);
+    try status.writeStreamingAll(io, "\n");
 
     // Mtime-based reload polling: PLAN §7.3 says the polling interval
     // is `reload-interval` (default 2 s); `0` disables runtime mtime
@@ -167,7 +169,7 @@ pub fn run(
         if (signals.active_sessions.load(.acquire) >= max) {
             var ip_buf: [64]u8 = undefined;
             const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
-            audit.log(io, null, "accept", null, .denied, "max-connections reached", peer_ip);
+            audit.log(io, null, "accept.rejected", null, .denied, "max-connections reached", peer_ip);
             c.ssh_disconnect(session);
             c.ssh_free(session);
             continue :accept_loop;
@@ -209,6 +211,12 @@ pub fn run(
     // rely on kernel reap at process exit (PLAN §7.1).
     const stderr = std.Io.File.stderr();
     try stderr.writeStreamingAll(io, "zift: shutdown signal received, draining sessions\n");
+
+    // PLAN §7.1: close the listening socket FIRST so no fresh TCP
+    // connections land during the grace window. The `defer
+    // ssh_bind_free` at function entry still tears down libssh's bind
+    // state on return; this just unbinds the port immediately.
+    _ = std.c.close(bind_fd);
 
     const grace_ms: i64 = @intCast(active.current.config.server.shutdown_grace_ms);
     const drain_deadline = nowMs() + grace_ms;
@@ -606,10 +614,10 @@ fn handlePublicKeyMessage(
         return .denied;
     }
 
-    if (!matchesAnyConfiguredKey(user, presented)) {
+    const matched_idx = matchesAnyConfiguredKey(user, presented) orelse {
         audit.log(io, username, "auth.publickey", null, .denied, "key not configured", ip_str);
         return .denied;
-    }
+    };
 
     const state = c.ssh_message_auth_publickey_state(msg);
     switch (state) {
@@ -625,7 +633,10 @@ fn handlePublicKeyMessage(
         },
         c.SSH_PUBLICKEY_STATE_VALID => {
             _ = c.ssh_message_auth_reply_success(msg, 0);
-            audit.log(io, username, "auth.publickey", null, .ok, user.keys[0].algorithm, ip_str);
+            // Audit the algorithm of the *matched* key, not always
+            // keys[0]: a user with multiple configured keys would
+            // otherwise look like every login used the first key.
+            audit.log(io, username, "auth.publickey", null, .ok, user.keys[matched_idx].algorithm, ip_str);
             return .{ .accepted = user };
         },
         else => {
@@ -636,14 +647,18 @@ fn handlePublicKeyMessage(
     }
 }
 
-fn matchesAnyConfiguredKey(user: *const config.UserConfig, presented: c.ssh_key) bool {
-    if (user.keys.len == 0) return false;
+/// Return the index of the first configured key that matches the
+/// presented key, or `null` if none match. Returning the index lets
+/// the audit log identify which configured key the client used —
+/// `user.keys[0]` would lie for users with multiple keys.
+fn matchesAnyConfiguredKey(user: *const config.UserConfig, presented: c.ssh_key) ?usize {
+    if (user.keys.len == 0) return null;
     const presented_type = c.ssh_key_type(presented);
 
-    for (user.keys) |configured| {
-        const algo_z = std.heap.page_allocator.dupeZ(u8, configured.algorithm) catch return false;
+    for (user.keys, 0..) |configured, i| {
+        const algo_z = std.heap.page_allocator.dupeZ(u8, configured.algorithm) catch return null;
         defer std.heap.page_allocator.free(algo_z);
-        const blob_z = std.heap.page_allocator.dupeZ(u8, configured.blob) catch return false;
+        const blob_z = std.heap.page_allocator.dupeZ(u8, configured.blob) catch return null;
         defer std.heap.page_allocator.free(blob_z);
 
         const want_type = c.ssh_key_type_from_name(algo_z.ptr);
@@ -655,10 +670,10 @@ fn matchesAnyConfiguredKey(user: *const config.UserConfig, presented: c.ssh_key)
         defer c.ssh_key_free(parsed);
 
         if (c.ssh_key_cmp(presented, parsed, c.SSH_KEY_CMP_PUBLIC) == 0) {
-            return true;
+            return i;
         }
     }
-    return false;
+    return null;
 }
 
 /// Hardcoded dummy Ed25519 public-key blob (an existing public key —

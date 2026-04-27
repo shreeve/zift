@@ -49,7 +49,7 @@ wait_bg
 
 # Two should have authed successfully; one should have been refused.
 auth_count=$(grep -c '"operation":"auth.password","result":"ok"' "$ZIFT_LOG" || true)
-deny_count=$(grep -c '"operation":"accept","result":"denied"' "$ZIFT_LOG" || true)
+deny_count=$(grep -c '"operation":"accept.rejected","result":"denied"' "$ZIFT_LOG" || true)
 
 [[ "$auth_count" == "2" ]] || fail "expected 2 successful auths, got $auth_count"
 ok "two sessions admitted"
