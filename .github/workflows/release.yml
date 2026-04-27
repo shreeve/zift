@@ -11,17 +11,23 @@ name: Release
 # (see deploy/DEPLOY.md). A traditional GPG flow can be added later
 # as additive without disturbing this one.
 #
-# Coverage today:
-#   ubuntu-latest  -> Linux x86_64  (dynamic libssh from apt)
-#   macos-latest   -> macOS aarch64 (dynamic libssh from Homebrew)
+# Coverage (v0.2.0+):
+#   - x86_64-linux-musl  : ubuntu-latest, fully static (zero DT_NEEDED)
+#   - aarch64-linux-musl : ubuntu-latest, fully static (zero DT_NEEDED)
+#   - aarch64-macos      : macos-latest,  libSystem-only
+#   - x86_64-macos       : macos-latest,  libSystem-only
 #
-# Coverage gaps (tracked in TODOS.md as the rest of PLAN §13):
-#   - Linux aarch64 + macOS x86_64: needs cross-build via vendored
-#     libssh + libcrypto so we don't depend on a per-target sysroot.
-#   - Static linking: same blocker — once libssh is vendored, the
-#     `verify-release.sh` allowlist tightens to "zero NEEDED" on
-#     Linux and "libSystem only" on macOS, and the binaries become
-#     drop-in for any host.
+# Each runner cross-compiles to both targets it owns. Zig's cross-
+# compile means a single ubuntu-latest can produce x86_64-linux-musl
+# AND aarch64-linux-musl; same for macos-latest.
+#
+# `linux-musl` (NOT plain `linux`) is mandatory on Linux: a plain
+# `-Dtarget=x86_64-linux` build defaults to dynamic glibc (because
+# native Linux hosts have glibc available), producing a binary with
+# `DT_NEEDED libc.so.6` that won't run on Alpine, distroless, or any
+# host with a different glibc minor version. `linux-musl` forces the
+# musl libc + static link path, giving us a binary that runs on any
+# Linux 3.x+ kernel regardless of distro.
 #
 # Verification by partners:
 #   gh release download vX.Y.Z --pattern 'zift-*' --pattern 'SHA256SUMS*'
@@ -49,7 +55,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            targets: 'x86_64-linux-musl aarch64-linux-musl'
+          - os: macos-latest
+            targets: 'aarch64-macos x86_64-macos'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -83,20 +93,29 @@ jobs:
       # build.zig.zon. Hermetic build, reproducible from a clean
       # checkout on any host with Zig 0.16.0 installed.
 
-      - name: Build release artifact
-        run: zig build release -Dversion=${{ steps.version.outputs.version }}
+      - name: Build release artifacts
+        env:
+          TARGETS: ${{ matrix.targets }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # One `zig build release` per target. build.zig writes
+          # `zig-out/release/zift-{version}-{target}` and
+          # `SHA256SUMS-{target}` so successive cross-compiles in the
+          # same workspace don't clobber each other. The publish job
+          # aggregates all SHA256SUMS-* into one canonical manifest.
+          set -euo pipefail
+          for tgt in $TARGETS; do
+            echo "::group::Building zift-${VERSION}-${tgt}"
+            zig build release -Dversion="$VERSION" -Dtarget="$tgt"
+            echo "::endgroup::"
+          done
 
-      - name: Show artifact + checksum
+      - name: Show artifacts + checksums
         run: |
           ls -la zig-out/release/
-          # Per-target SHA256SUMS-{target} files (build.zig writes one
-          # per `-Dtarget=...` invocation to avoid clobbering the file
-          # when multi-target builds run in the same workspace). The
-          # publish job aggregates all of them into one canonical
-          # SHA256SUMS via `cat dist/release-*/SHA256SUMS*`.
           cat zig-out/release/SHA256SUMS-*
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           # Per-runner artifact name. The publish job picks both up

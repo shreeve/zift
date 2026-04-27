@@ -82,7 +82,12 @@ case "$kind" in
         # speaks ELF too, so this command also works on a macOS host
         # inspecting a cross-compiled Linux binary.
         deps=$(objdump -p "$artifact" 2>/dev/null | awk '/NEEDED/ {print $2}' | sort -u)
-        allowed_re="$LINUX_ALLOWED"
+        # Wrap the allowlist in `^(...)$` so empty `LINUX_ALLOWED='' `
+        # produces `^()$` (matches only the empty line) rather than
+        # the empty regex (which `grep -Ev ""` interprets as "match
+        # every line", silently filtering out everything and reporting
+        # OK on a binary with real DT_NEEDED entries).
+        allowed_re="^(${LINUX_ALLOWED})\$"
         kind_label="DT_NEEDED (ELF)"
         ;;
     macho)
@@ -91,6 +96,8 @@ case "$kind" in
         # `otool`). We call `otool` directly and let the build fail with
         # a clear "command not found" if the host lacks it.
         deps=$(otool -L "$artifact" 2>/dev/null | tail -n +2 | awk '{print $1}' | sort -u)
+        # The MACOS_ALLOWED regex is already anchored with `^(...)$`;
+        # use it directly.
         allowed_re="$MACOS_ALLOWED"
         kind_label="LC_LOAD_DYLIB (Mach-O)"
         ;;
