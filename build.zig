@@ -158,7 +158,23 @@ pub fn build(b: *std.Build) void {
     ));
     checksum_cmd.step.dependOn(&install_release.step);
 
+    // Verify the release artifact's runtime dependency surface against
+    // a known allowlist. Today's allowlist accepts the small set of
+    // dynamic deps the build legitimately produces (libssh + libc on
+    // Linux, libssh + libSystem on macOS). When static linking lands
+    // (vendored libssh + libcrypto via build.zig.zon), `verify-release.sh`
+    // gets a one-line allowlist tightening that turns this into the
+    // literal "zero NEEDED" check PLAN §13 promises for Linux. The
+    // script itself dispatches on ELF vs Mach-O magic so it works on
+    // any host inspecting any target binary.
+    const verify_cmd = b.addSystemCommand(&.{
+        "build/verify-release.sh",
+        b.fmt("zig-out/release/{s}", .{artifact_name}),
+    });
+    verify_cmd.step.dependOn(&install_release.step);
+
     const release_step = b.step("release", "Build a versioned release binary into zig-out/release/");
     release_step.dependOn(&install_release.step);
     release_step.dependOn(&checksum_cmd.step);
+    release_step.dependOn(&verify_cmd.step);
 }
