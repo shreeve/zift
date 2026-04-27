@@ -67,7 +67,10 @@ jobs:
             | sort -u)
           echo "$needed" | sed 's/^/  /'
 
-          allowed='libssh\.so\.4|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1|ld-linux-(x86-64|aarch64)\.so\.[12]'
+          # The dynamic loader (`ld-linux-*.so.2`) is the binary's
+          # `PT_INTERP` entry, not a `DT_NEEDED`, so it does not appear
+          # in the awk filter above and is intentionally absent here.
+          allowed='libssh\.so\.4|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1'
           unexpected=$(echo "$needed" | grep -Ev "^(${allowed})$" || true)
           if [ -n "$unexpected" ]; then
             echo
@@ -89,14 +92,30 @@ jobs:
           # and silently leaves the directive at its compile-time
           # default — a stealth weakening of the unit's hardening).
           #
-          # We feed it the deploy template directly. Any error or
-          # warning fails the build.
-          sudo apt-get install -y systemd
-          out=$(systemd-analyze verify deploy/zift.service 2>&1) || true
-          echo "$out"
-          if echo "$out" | grep -qE 'Failed to parse|Unknown lvalue|inline comment'; then
-            echo
-            echo "FAIL: systemd-analyze verify rejected directives in deploy/zift.service"
+          # We fail on:
+          #   - any non-zero exit code from `systemd-analyze verify`
+          #   - any output at all on stdout/stderr
+          # systemd is preinstalled on ubuntu-latest images, so the
+          # tool is already on $PATH. The fall-through install is a
+          # safety net for runners that drop it.
+          command -v systemd-analyze >/dev/null \
+            || sudo apt-get install -y --no-install-recommends systemd
+
+          # `systemd-analyze verify` walks the unit's [Install] deps,
+          # which expects the unit to live under a system path. Drop
+          # a copy in /tmp and point at it from there so dependency
+          # resolution succeeds without polluting /etc.
+          install -m 0644 deploy/zift.service /tmp/zift.service
+
+          set +e
+          out=$(systemd-analyze verify /tmp/zift.service 2>&1)
+          rc=$?
+          set -e
+
+          if [ "$rc" -ne 0 ] || [ -n "$out" ]; then
+            echo "FAIL: systemd-analyze verify reported issues:"
+            echo "$out" | sed 's/^/  /'
+            echo "  exit code: $rc"
             exit 1
           fi
           echo "systemd-analyze verify clean."
