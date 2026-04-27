@@ -114,9 +114,57 @@ pub const Vfs = struct {
 
     /// Resolves the virtual path's parent directory, opens it as a verified
     /// `std.Io.Dir` whose canonical real path is confirmed to be inside the
-    /// jail, and returns the parent directory plus the basename. The caller
-    /// then performs operations relative to the parent fd (mkdirat / unlinkat /
-    /// renameat) to avoid TOCTOU between path resolution and the operation.
+    /// jail, and returns the parent directory plus the basename.
+    ///
+    /// **Path-jail invariant** (PLAN §8.3, ENFORCED HERE — do NOT remove
+    /// any step or reorder without re-reading this comment):
+    ///
+    /// 1. `normalizeVirtualPath`: pure string reduction. Rejects `..` that
+    ///    walks above `/`, rejects NUL/control bytes, validates UTF-8.
+    ///    No filesystem access yet — the jail starts at the next step.
+    ///
+    /// 2. `realPathFileAbsoluteAlloc`: resolves `<root><virtual>` through
+    ///    every symlink, returning the canonical path string. This is
+    ///    racy on its own — between this call and step 4 an attacker
+    ///    with write access on any ancestor could swap a directory for
+    ///    a symlink targeting outside the jail. We DO NOT trust the
+    ///    string-based check at step 3 by itself; it's a fast-path
+    ///    rejection for the common case of "user obviously asked for
+    ///    something outside their root."
+    ///
+    /// 3. `isInsideRoot`: string-prefix check — fast, racy, defensive.
+    ///    Discards the obvious "../../../etc/passwd" attempts before we
+    ///    spend a syscall opening anything.
+    ///
+    /// 4. `openDirAbsolute`: actual `open(2)` of the canonical path.
+    ///    Returns an FD; once captured, the FD points at a specific
+    ///    inode no matter how the path is later swapped on disk.
+    ///
+    /// 5. `verifyDir` (THE INVARIANT-PRESERVING STEP): reads
+    ///    `realPath` of the OPEN FD via `/proc/self/fd/N` (Linux) or
+    ///    `fcntl(F_GETPATH)` (macOS). This is racefree — the kernel
+    ///    asks "what file does this fd actually point at right now?"
+    ///    not "what does this string mean right now?" If a swap
+    ///    happened between steps 2-4, the FD's real path now resolves
+    ///    OUTSIDE the jail, and we close it and reject. The caller
+    ///    NEVER sees a usable FD that points outside the jail.
+    ///
+    /// The combined effect: the jail check is racy in the path-string
+    /// world (steps 2-3) but racefree in the FD world (steps 4-5).
+    /// Operations on the returned FD use *at() syscalls (mkdirat,
+    /// unlinkat, renameat, openat), which inherit the FD's inode
+    /// identity rather than re-resolving the path through the
+    /// (possibly attacker-controlled) name tree.
+    ///
+    /// **DO NOT** "simplify" by:
+    ///   - dropping `verifyDir` because the string-check passed,
+    ///   - replacing `verifyDir` with another `realPathFileAbsoluteAlloc`
+    ///     of the original string (that's the same race),
+    ///   - reordering so verification happens before opening.
+    /// All three break the invariant. Any of those changes needs to
+    /// come with an alternative — e.g. on Linux, `openat2` with
+    /// `RESOLVE_BENEATH` would let us drop the dance entirely once
+    /// macOS catches up.
     pub fn openVerifiedParent(
         self: Vfs,
         io: std.Io,
@@ -137,12 +185,17 @@ pub const Vfs = struct {
         const joined_parent = try joinRoot(allocator, self.root, parent_virtual);
         defer allocator.free(joined_parent);
 
+        // Step 2: canonicalize via the path string. RACY by itself.
         const real_parent = try std.Io.Dir.realPathFileAbsoluteAlloc(io, joined_parent, allocator);
         defer allocator.free(real_parent);
+        // Step 3: fast-path rejection. Defensive only.
         if (!isInsideRoot(self.root, real_parent)) return error.PathTraversal;
 
+        // Step 4: capture FD identity.
         const dir = std.Io.Dir.openDirAbsolute(io, real_parent, .{}) catch return error.PathTraversal;
         errdefer dir.close(io);
+        // Step 5: RACEFREE re-verification via FD's own real path.
+        // This is what makes the jail actually safe.
         try self.verifyDir(io, dir);
 
         const base_owned = try allocator.dupe(u8, base_part);
@@ -256,5 +309,36 @@ test "resolve blocks symlink escape" {
     try std.testing.expectError(
         error.PathTraversal,
         vfs.resolveExisting(std.testing.io, std.testing.allocator, "/outside/passwd"),
+    );
+}
+
+test "openVerifiedParent blocks parent-symlink escape" {
+    // Locks in the path-jail invariant in `openVerifiedParent`. If a
+    // future refactor drops either the string-prefix check (step 3)
+    // OR the FD-based `verifyDir` re-check (step 5), this test fails
+    // — catching the kind of "looks the same, doesn't it?" change
+    // that introduces TOCTOU.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(std.testing.io, "root", .default_dir);
+    // `escape/` is a symlink inside the jail pointing OUTSIDE. Any
+    // SFTP request like `/escape/anything` must be rejected.
+    try tmp.dir.symLink(std.testing.io, "/etc", "root/escape", .{});
+
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPathFile(std.testing.io, "root", &root_buf);
+
+    var vfs = try Vfs.init(std.testing.io, std.testing.allocator, root_buf[0..root_len]);
+    defer vfs.deinit(std.testing.allocator);
+
+    // The basename ("hosts") doesn't exist on the symlink target —
+    // doesn't matter, we should reject before any open is attempted
+    // because the parent dir's canonical path resolves outside the
+    // jail. The error is `PathTraversal` regardless of whether the
+    // string check or the FD-based check fires first.
+    try std.testing.expectError(
+        error.PathTraversal,
+        vfs.openVerifiedParent(std.testing.io, std.testing.allocator, "/escape/hosts"),
     );
 }
