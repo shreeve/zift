@@ -20,6 +20,17 @@ pub const Error = error{
 /// because the request_id lives inside the body we refuse to read).
 const sftp_max_packet_bytes: usize = 256 * 1024;
 
+/// Maximum number of simultaneously-open file/dir handles per SFTP
+/// session. Without a cap the client can pipeline OPEN/OPENDIR
+/// requests forever, leaking ~200 bytes of `Handle` state apiece
+/// until idle-timeout fires — a slow but reliable per-session memory
+/// DoS that bypasses `max-connections` (each connection drives its
+/// own footprint up). 256 is comfortably above any well-behaved
+/// client's working set (`scp -r`, `rsync` over SFTP, paramiko
+/// recursive walkers all stay well under 32) but bounds total
+/// handle memory at ~50 KiB per session under attack.
+const max_handles_per_session: usize = 256;
+
 /// Monotonic-clock millisecond reading. Used for idle-timeout deadlines
 /// and graceful-shutdown drain timing. The Linux/macOS `CLOCK_MONOTONIC`
 /// is unaffected by wall-clock changes.
@@ -1202,6 +1213,15 @@ const SftpState = struct {
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
+        // Per-session handle cap (PLAN §8.4 DoS hardening). Check
+        // BEFORE opening the dir so we don't have to clean up an FD on
+        // the cap-exceeded path. Single-threaded per session, so no
+        // TOCTOU between this check and the matching `addDirHandle`.
+        if (self.handles.items.len >= max_handles_per_session) {
+            defer self.auditFailed("opendir", path.value, "handle limit reached");
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "too many open handles");
+        }
+
         const real = self.vfs.resolveExisting(self.io, self.allocator, path.value) catch {
             return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
         };
@@ -1328,6 +1348,14 @@ const SftpState = struct {
         }
 
         const op_label: []const u8 = if (want_write) "open_write" else "open_read";
+
+        // Per-session handle cap (PLAN §8.4 DoS hardening). Same
+        // pre-check as `handleOpendir` — refuse before opening so
+        // we never have to clean up an FD on the cap-exceeded path.
+        if (self.handles.items.len >= max_handles_per_session) {
+            defer self.auditFailed(op_label, path.value, "handle limit reached");
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "too many open handles");
+        }
 
         const want_creat = (flags & @as(u32, @intCast(c.SSH_FXF_CREAT))) != 0;
         const want_excl = (flags & @as(u32, @intCast(c.SSH_FXF_EXCL))) != 0;
@@ -1494,11 +1522,19 @@ const SftpState = struct {
 
     fn handleClose(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const id = parseHandleId(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
-        for (self.handles.items) |*handle| {
-            if (handle.id == id) {
-                self.closeHandle(handle);
-                handle.kind = .file;
-                handle.id = 0;
+        // Walk by index (not pointer) so we can `swapRemove` the slot
+        // when we find it. swapRemove keeps the array dense — closed
+        // handles free their slot, so a long-running session that
+        // opens-and-closes 10000 files still uses bounded memory and
+        // can keep opening up to the per-session cap. v0.1.x marked
+        // closed slots `id=0, kind=.file` and left them in the array,
+        // which broke the new handle cap (every closed slot still
+        // counted toward `handles.items.len`).
+        var i: usize = 0;
+        while (i < self.handles.items.len) : (i += 1) {
+            if (self.handles.items[i].id == id) {
+                self.closeHandle(&self.handles.items[i]);
+                _ = self.handles.swapRemove(i);
                 return replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
             }
         }
