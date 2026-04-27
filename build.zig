@@ -545,10 +545,11 @@ pub fn build(b: *std.Build) void {
 
     // ----- `zig build release` (PLAN §13) -----------------------------------
     //
-    // Produces `zig-out/release/zift-{version}-{target}` plus a
-    // `SHA256SUMS` line. Always linked ReleaseSafe regardless of the
-    // global `-Doptimize=...` so production binaries get the same
-    // safety checks integration tests run against.
+    // Produces `./release/zift-{version}-{target}` plus a per-target
+    // `SHA256SUMS-{target}` line. Always linked ReleaseSafe
+    // regardless of the global `-Doptimize=...` so production
+    // binaries get the same safety checks integration tests run
+    // against.
     //
     // Dev/test/release all use the SAME vendored libssh + mbedTLS +
     // zlib (the shared `buildLinkage` helper). No partner ever needs
@@ -573,8 +574,14 @@ pub fn build(b: *std.Build) void {
     release_exe.root_module.linkLibrary(release.libssh_lib);
 
     const artifact_name = b.fmt("zift-{s}-{s}", .{ zift_version, target_triple });
+    // `dest_dir = "../release"` resolves through the install prefix
+    // (`zig-out`) up one level into the project root, so release
+    // artifacts land at `<project>/release/...`. Same trick as the
+    // dev binary's `../bin` install — keeps the `zig-out/` dance out
+    // of the project root entirely. The CI release workflow uploads
+    // straight from this path.
     const install_release = b.addInstallArtifact(release_exe, .{
-        .dest_dir = .{ .override = .{ .custom = "release" } },
+        .dest_dir = .{ .override = .{ .custom = "../release" } },
         .dest_sub_path = artifact_name,
     });
 
@@ -588,18 +595,18 @@ pub fn build(b: *std.Build) void {
     // SHA256SUMS at publish time before signing.
     const checksum_cmd = b.addSystemCommand(&.{ "sh", "-c" });
     checksum_cmd.addArg(b.fmt(
-        "cd zig-out/release && shasum -a 256 '{s}' > 'SHA256SUMS-{s}' && cat 'SHA256SUMS-{s}'",
+        "cd release && shasum -a 256 '{s}' > 'SHA256SUMS-{s}' && cat 'SHA256SUMS-{s}'",
         .{ artifact_name, target_triple, target_triple },
     ));
     checksum_cmd.step.dependOn(&install_release.step);
 
     const verify_cmd = b.addSystemCommand(&.{
         "build/verify-release.sh",
-        b.fmt("zig-out/release/{s}", .{artifact_name}),
+        b.fmt("release/{s}", .{artifact_name}),
     });
     verify_cmd.step.dependOn(&install_release.step);
 
-    const release_step = b.step("release", "Build a versioned, fully-static release binary into zig-out/release/");
+    const release_step = b.step("release", "Build a versioned, fully-static release binary into ./release/");
     release_step.dependOn(&install_release.step);
     release_step.dependOn(&checksum_cmd.step);
     release_step.dependOn(&verify_cmd.step);

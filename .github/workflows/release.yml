@@ -99,7 +99,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           # One `zig build release` per target. build.zig writes
-          # `zig-out/release/zift-{version}-{target}` and
+          # `release/zift-{version}-{target}` and
           # `SHA256SUMS-{target}` so successive cross-compiles in the
           # same workspace don't clobber each other. The publish job
           # aggregates all SHA256SUMS-* into one canonical manifest.
@@ -112,8 +112,8 @@ jobs:
 
       - name: Show artifacts + checksums
         run: |
-          ls -la zig-out/release/
-          cat zig-out/release/SHA256SUMS-*
+          ls -la release/
+          cat release/SHA256SUMS-*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -121,7 +121,7 @@ jobs:
           # Per-runner artifact name. The publish job picks both up
           # via `dist/release-*` glob to build the unified manifest.
           name: release-${{ matrix.os }}
-          path: zig-out/release/
+          path: release/
           if-no-files-found: error
 
   publish:
