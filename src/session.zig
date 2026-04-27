@@ -124,21 +124,36 @@ pub fn run(
     try stdout.writeStreamingAll(io, active.current.config.server.listen);
     try stdout.writeStreamingAll(io, "\n");
 
+    // Mtime-based reload polling: PLAN §7.3 says the polling interval
+    // is `reload-interval` (default 2 s); `0` disables runtime mtime
+    // polling entirely (SIGHUP still works). We track a next-deadline
+    // in monotonic-ms and only call `reloadIfChanged` when it's hit,
+    // independent of how busy the accept fd is.
+    var next_reload_ms: i64 = nowMs() +
+        @as(i64, @intCast(active.current.config.server.reload_interval_ms));
+
     accept_loop: while (true) {
         if (signals.shutdown_requested.load(.acquire)) break :accept_loop;
 
         // SIGHUP forces a reload regardless of mtime (PLAN §7.2).
         if (signals.reload_requested.swap(false, .acq_rel)) {
             active.forceReload(config_path, &config_mtime);
+            next_reload_ms = nowMs() +
+                @as(i64, @intCast(active.current.config.server.reload_interval_ms));
+        }
+
+        // mtime watcher fires only on a per-config-interval cadence.
+        // `reload_interval_ms == 0` disables it (PLAN §7.3); only
+        // SIGHUP can re-read the file in that mode.
+        const reload_interval = active.current.config.server.reload_interval_ms;
+        if (reload_interval > 0 and nowMs() >= next_reload_ms) {
+            try active.reloadIfChanged(config_path, &config_mtime);
+            next_reload_ms = nowMs() +
+                @as(i64, @intCast(active.current.config.server.reload_interval_ms));
         }
 
         const ready = std.posix.poll(&pfd, 1000) catch continue :accept_loop;
-        if (ready == 0) {
-            // Idle tick: piggyback the mtime watcher here so reload remains
-            // a same-thread, lock-protected operation.
-            try active.reloadIfChanged(config_path, &config_mtime);
-            continue :accept_loop;
-        }
+        if (ready == 0) continue :accept_loop;
 
         const session = c.ssh_new() orelse return error.LibsshFailure;
         const accept_rc = c.ssh_bind_accept(bind, session);
@@ -147,8 +162,6 @@ pub fn run(
             c.ssh_free(session);
             continue :accept_loop;
         }
-
-        try active.reloadIfChanged(config_path, &config_mtime);
 
         const max = active.current.config.server.max_connections;
         if (signals.active_sessions.load(.acquire) >= max) {
@@ -270,6 +283,10 @@ const ActiveConfig = struct {
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
     current: *ConfigRef,
+    /// Tracks the warned-state for repeated stat failures on the
+    /// config file. Set on first failure (warning emitted), cleared
+    /// when the file becomes readable again. PLAN §7.3.
+    stat_warned: bool = false,
 
     fn acquire(self: *ActiveConfig) *ConfigRef {
         self.mutex.lockUncancelable(self.io);
@@ -286,8 +303,33 @@ const ActiveConfig = struct {
         path: []const u8,
         known_mtime: *std.Io.Timestamp,
     ) !void {
-        const mtime = currentConfigMtime(self.io, path) catch return;
-        if (mtime.nanoseconds == known_mtime.nanoseconds) return;
+        const mtime = currentConfigMtime(self.io, path) catch |err| {
+            // PLAN §7.3: a deleted or unreadable config logs a single
+            // warning and keeps the previous config running. Repeated
+            // failures are suppressed until the file becomes readable
+            // again, then we log the recovery.
+            if (!self.stat_warned) {
+                const stderr = std.Io.File.stderr();
+                stderr.writeStreamingAll(self.io, "zift: cannot stat config file: ") catch {};
+                stderr.writeStreamingAll(self.io, path) catch {};
+                stderr.writeStreamingAll(self.io, ": ") catch {};
+                stderr.writeStreamingAll(self.io, @errorName(err)) catch {};
+                stderr.writeStreamingAll(self.io, " (keeping previous config)\n") catch {};
+                self.stat_warned = true;
+            }
+            return;
+        };
+
+        if (self.stat_warned) {
+            const stderr = std.Io.File.stderr();
+            stderr.writeStreamingAll(self.io, "zift: config file readable again\n") catch {};
+            self.stat_warned = false;
+        }
+
+        // PLAN §7.3: reload triggers only when mtime moves forward.
+        // Atomic-deploy patterns that preserve or rewind mtime rely on
+        // SIGHUP (which uses `forceReload` and skips this check).
+        if (mtime.nanoseconds <= known_mtime.nanoseconds) return;
         try self.applyReload(path, mtime, known_mtime);
     }
 
