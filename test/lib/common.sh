@@ -128,18 +128,26 @@ sftp_password() {
     cmd_file="$TEST_TMP/sftp-cmds-$$.exp"
     {
         echo 'set timeout 30'
+        # The password is read from the environment so a value containing
+        # Tcl-special characters (`"`, `$`, `[`, `]`, `\`) is data, not
+        # script. Interpolating directly into a `send "..."` string is
+        # unsafe — see the test/lib note in PLAN §11.5.
+        echo 'set password $env(ZIFT_TEST_PASSWORD)'
         printf 'spawn sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 -P %s %s@127.0.0.1\n' \
             "$TEST_PORT" "$user"
         echo 'expect "password:"'
-        echo "send \"$pass\r\""
+        echo 'send -- "$password\r"'
         echo 'expect "sftp>"'
         for cmd in "${commands[@]}"; do
-            printf 'send %s\nexpect "sftp>"\n' "\"$cmd\r\""
+            # Commands are still interpolated; tests pass known-safe
+            # values. If we ever need to script hostile commands, route
+            # them through env vars too.
+            printf 'send -- %s\nexpect "sftp>"\n' "\"$cmd\r\""
         done
-        echo 'send "bye\r"'
+        echo 'send -- "bye\r"'
         echo 'expect eof'
     } > "$cmd_file"
-    expect -f "$cmd_file"
+    ZIFT_TEST_PASSWORD="$pass" expect -f "$cmd_file"
 }
 
 ok() {

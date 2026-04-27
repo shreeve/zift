@@ -47,12 +47,36 @@ jobs:
       - name: Verify binary exists
         run: test -f zig-out/bin/zift
 
-      - name: Check dynamic dependencies
+      - name: Check dynamic dependencies (allowlist assertion)
         run: |
           echo "=== Dynamic dependencies ==="
-          ldd zig-out/bin/zift || true
+          ldd zig-out/bin/zift
           echo "=== Binary size ==="
           ls -lh zig-out/bin/zift
+
+          # Allowlist for an ubuntu-latest ReleaseSafe build linked
+          # against apt's libssh-dev. Anything outside this set is a
+          # build-system regression we want CI to surface immediately
+          # (e.g. a new Zig stdlib that pulled in something we did not
+          # intend to ship dynamically). The list intentionally omits
+          # `linux-vdso.so.1` and the loader (`/lib64/ld-linux-*`)
+          # because those are not `=> /path` resolutions in `ldd`.
+          allowed='libssh\.so\.4|libcrypto\.so\.3|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1|libz\.so\.1|libssl\.so\.3'
+          unexpected=$(ldd zig-out/bin/zift \
+            | awk '/=>/ {print $1}' \
+            | sort -u \
+            | grep -Ev "^(${allowed})$" || true)
+          if [ -n "$unexpected" ]; then
+            echo
+            echo "FAIL: dynamic dependencies outside the allowlist:"
+            echo "$unexpected" | sed 's/^/  /'
+            echo
+            echo "Either the binary picked up a new system library (build"
+            echo "regression) or the allowlist needs updating to match a"
+            echo "deliberate change in our dependency surface."
+            exit 1
+          fi
+          echo "All dynamic deps are on the allowlist."
 
       - name: Smoke test (version)
         run: zig-out/bin/zift version

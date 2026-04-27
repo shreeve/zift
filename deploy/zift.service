@@ -14,21 +14,63 @@ ExecStart=/usr/local/bin/zift serve /etc/zift/zift.conf
 Restart=on-failure
 RestartSec=5
 
-# Hardening: restrict the process to the minimum it needs.
+# Hardening: restrict the process to the minimum it needs. The set
+# below is the union of well-tested directives that work for a long-
+# running TCP daemon doing libssh + filesystem I/O. Each directive
+# restricts a specific kernel surface; together they cover privilege,
+# namespace, kernel-config, IPC, address-family, syscall, capability,
+# and /dev visibility.
+
+# Privilege & namespace fences.
 NoNewPrivileges=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+# Filesystem visibility.
 PrivateTmp=true
+PrivateDevices=true        # only /dev/null, /dev/zero, /dev/{u}random etc.
 ProtectSystem=strict
 ProtectHome=true
+ProtectProc=invisible      # /proc shows only this service's PIDs
+ProcSubset=pid             # hide /proc/<pid>/{net,sys,...} except pid metadata
+
+# Kernel-config surface.
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectControlGroups=true
-RestrictNamespaces=true
-RestrictRealtime=true
-RestrictSUIDSGID=true
-LockPersonality=true
+ProtectClock=true
+ProtectHostname=true
+
+# Memory & exec.
 MemoryDenyWriteExecute=true
-RemoveIPC=true
+
+# Capabilities. Zift runs as `zift:zift` and never needs root caps.
+# An empty bounding set is the strongest possible filter.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Address families. Zift speaks SFTP over TCP only — IPv4 and IPv6.
+# AF_UNIX is not used (no local-socket protocol). AF_NETLINK is not
+# used (no kernel-event subscription). Refusing them removes the
+# corresponding kernel parsers from the attack surface.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# System-call surface. `@system-service` is systemd's curated baseline
+# for ordinary daemons; the additional `~@privileged ~@resources`
+# subtractions block setuid/setgid/setpgid/sched_setaffinity/etc.
+# that Zift never invokes. `SystemCallArchitectures=native` blocks
+# the 32-bit syscall ABI on x86_64 hosts (a frequent confused-deputy
+# vector).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged ~@resources
+SystemCallArchitectures=native
+
+# Kernel keyring. Zift does not use the keyring; isolate it.
+KeyringMode=private
 
 # Only the partner roots, the config, and the audit log need to be writable.
 # Adjust these paths to match your layout.
