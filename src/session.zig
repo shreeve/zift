@@ -450,6 +450,26 @@ fn sessionThread(args: *SessionArgs) void {
             logLibsshError(io, @errorName(err), ssh_session) catch {};
         };
         registered = true;
+
+        // TCP_NODELAY — disable Nagle's algorithm on this connection.
+        // SFTP is a tight request/response protocol with many small
+        // packets per command (4-6 round trips for a single `ls`).
+        // Without TCP_NODELAY, the kernel may batch our 4-byte length
+        // prefix with the SFTP payload that immediately follows it,
+        // adding ~40ms of TCP delayed-ACK latency PER round trip.
+        // Across 4 round trips that's up to ~160ms of avoidable lag
+        // on every interactive command. Every modern SSH/HTTP server
+        // sets this; we should too.
+        const flag: c_int = 1;
+        const ipproto_tcp: c_int = 6; // IPPROTO_TCP — same on Linux + macOS
+        const tcp_nodelay: c_int = 1; // TCP_NODELAY    — same on Linux + macOS
+        _ = std.c.setsockopt(
+            session_fd,
+            ipproto_tcp,
+            tcp_nodelay,
+            @ptrCast(&flag),
+            @sizeOf(c_int),
+        );
     }
 
     // PLAN §8.4: the pre-auth slot is owned by `sessionThread` until
@@ -1560,7 +1580,18 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
     //   == 0         end-of-file
     //   SSH_AGAIN    timeout elapsed without data
     //   SSH_ERROR    transport / channel failure
-    const slice_ms: c_int = 1000;
+    //
+    // Slice = 200ms. Two competing concerns:
+    //   - SHORTER  reduces worst-case lag in the libssh-spurious-EOF
+    //              retry path (where we re-poll after `is_eof == 0`)
+    //              and improves responsiveness of the idle-deadline
+    //              check.
+    //   - LONGER   reduces wakeups per session (lower CPU when many
+    //              concurrent sessions are mostly idle).
+    // 200ms strikes the balance: 5 wakeups/sec/session is cheap, and
+    // lag from a single spurious-EOF retry is bounded to ~200ms (one
+    // perceptible "beat" rather than the previous 1-second stall).
+    const slice_ms: c_int = 200;
     var offset: usize = 0;
     while (offset < out.len) {
         const n = c.ssh_channel_read_timeout(
