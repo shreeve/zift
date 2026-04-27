@@ -56,21 +56,52 @@ pub fn verifyLogin(
         return verifyPassword(io, allocator, user, password);
     }
 
-    // Unknown user. Run a real Argon2id verification against a dummy hash
-    // produced with upper-bound envelope parameters so the latency of an
-    // unknown-user attempt matches or exceeds the slowest real user's
-    // verification. PLAN.md §8.4. The hash is recomputed on each unknown
-    // attempt; this is intentional — the work itself is the security
-    // property. `max-connections` (PLAN.md §6.2) bounds the worst-case
-    // concurrent memory cost of an auth-storm.
-    var dummy_buf: [256]u8 = undefined;
-    const dummy_hash = argon2.strHash("zift-dummy-password", .{
+    // Unknown user. Run a real Argon2id verification against a cached
+    // dummy hash so the latency of an unknown-user attempt matches the
+    // slowest real user's verification. PLAN.md §8.4. The hash itself
+    // is computed once at first use and reused for every subsequent
+    // unknown-user attempt; the *verification* work is the security
+    // property, and that runs on every call. `max-connections`
+    // (PLAN.md §6.2) bounds the worst-case concurrent memory cost of
+    // an auth-storm.
+    const dummy = ensureDummyHash(io, allocator) orelse return false;
+    argon2.strVerify(dummy, password, .{ .allocator = allocator }, io) catch {};
+    return false;
+}
+
+// ----- cached dummy hash --------------------------------------------------
+//
+// A dummy Argon2id PHC string used to give unknown-user auth attempts the
+// same latency as a real user's `strVerify`. Computed once at first use,
+// then read by every subsequent unknown-user verifyLogin / pubkey-fallback
+// call. Lazy init under a mutex; the produced PHC string lives in a
+// process-static buffer for the lifetime of the program.
+
+var dummy_buf: [256]u8 = undefined;
+var dummy_ready: std.atomic.Value(bool) = .init(false);
+var dummy_mutex: std.Io.Mutex = .init;
+var dummy_slice: []const u8 = &.{};
+
+pub fn ensureDummyHash(io: std.Io, allocator: std.mem.Allocator) ?[]const u8 {
+    // Fast path: already initialized.
+    if (dummy_ready.load(.acquire)) return dummy_slice;
+
+    dummy_mutex.lockUncancelable(io);
+    defer dummy_mutex.unlock(io);
+
+    // Re-check under the lock: another thread may have initialized
+    // while we were waiting.
+    if (dummy_ready.load(.acquire)) return dummy_slice;
+
+    const computed = argon2.strHash("zift-dummy-password", .{
         .allocator = allocator,
         .params = dummy_params,
         .mode = .argon2id,
-    }, &dummy_buf, io) catch return false;
-    argon2.strVerify(dummy_hash, password, .{ .allocator = allocator }, io) catch {};
-    return false;
+    }, &dummy_buf, io) catch return null;
+
+    dummy_slice = computed;
+    dummy_ready.store(true, .release);
+    return dummy_slice;
 }
 
 test "hash and verify password" {

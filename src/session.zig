@@ -448,6 +448,14 @@ fn authenticate(
 ) !*const config.UserConfig {
     const allowed_methods: c_int = @intCast(c.SSH_AUTH_METHOD_PASSWORD | c.SSH_AUTH_METHOD_PUBLICKEY);
 
+    // PLAN §8.4 implies a finite ceiling on auth attempts per session.
+    // 6 matches OpenSSH's `MaxAuthTries` default. Successes return
+    // early; pubkey "offered" (probing) does not count because libssh
+    // gives us a `pk_ok` follow-up where the real signature verify
+    // happens. Only a `denied` outcome consumes an attempt.
+    const max_auth_attempts: u32 = 6;
+    var failed_attempts: u32 = 0;
+
     while (true) {
         const msg = c.ssh_message_get(session) orelse return error.LibsshFailure;
         defer c.ssh_message_free(msg);
@@ -484,6 +492,15 @@ fn authenticate(
                 .offered => continue,
                 .denied => {},
             }
+        }
+
+        // Reaching here means this attempt failed (or the message
+        // wasn't a recognized auth method). Count it; disconnect when
+        // the ceiling is hit.
+        failed_attempts += 1;
+        if (failed_attempts >= max_auth_attempts) {
+            audit.log(io, null, "auth.too_many_attempts", null, .denied, "", peer_ip orelse "");
+            return error.LibsshFailure;
         }
 
         _ = c.ssh_message_auth_set_methods(msg, allowed_methods);
@@ -523,9 +540,23 @@ fn handlePublicKeyMessage(
     }
 
     const user = cfg.findUser(username) orelse {
+        // Unknown user. Run dummy key-import + compare so the timing
+        // matches what a known-user-but-wrong-key attempt would take.
+        // Without this, an attacker can probe valid usernames by
+        // measuring the response time difference. PLAN §8.4: failed
+        // authentication does not reveal whether the username exists.
+        _ = matchAgainstDummyKey(presented);
         audit.log(io, username, "auth.publickey", null, .denied, "unknown user", ip_str);
         return .denied;
     };
+
+    if (user.keys.len == 0) {
+        // Known user, password-only. Same dummy work so the timing
+        // discriminator (does this user accept keys?) is also masked.
+        _ = matchAgainstDummyKey(presented);
+        audit.log(io, username, "auth.publickey", null, .denied, "no keys configured", ip_str);
+        return .denied;
+    }
 
     if (!matchesAnyConfiguredKey(user, presented)) {
         audit.log(io, username, "auth.publickey", null, .denied, "key not configured", ip_str);
@@ -579,6 +610,36 @@ fn matchesAnyConfiguredKey(user: *const config.UserConfig, presented: c.ssh_key)
             return true;
         }
     }
+    return false;
+}
+
+/// Hardcoded dummy Ed25519 public-key blob (an existing public key —
+/// the matching private key is intentionally not stored anywhere; we
+/// only ever compare against this, never accept a signature from it).
+/// Used to give unknown-user / no-keys-configured pubkey attempts the
+/// same import-and-compare timing as a real lookup, so an attacker
+/// cannot probe valid usernames by measuring response time. PLAN §8.4.
+const dummy_pubkey_algorithm = "ssh-ed25519";
+const dummy_pubkey_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIIH9hN3OvKbo/u+wsxJjPXpOAFn4mP+/p1bbyT2bF50K";
+
+/// Run the same import-and-compare work matchesAnyConfiguredKey does
+/// for a real configured key, but against a dummy that will never
+/// match. Always returns `false`. The point is the *cost* — masking
+/// the timing channel between "this user exists / has keys" and "this
+/// user does not."
+fn matchAgainstDummyKey(presented: c.ssh_key) bool {
+    const algo_z = std.heap.page_allocator.dupeZ(u8, dummy_pubkey_algorithm) catch return false;
+    defer std.heap.page_allocator.free(algo_z);
+    const blob_z = std.heap.page_allocator.dupeZ(u8, dummy_pubkey_blob) catch return false;
+    defer std.heap.page_allocator.free(blob_z);
+
+    const want_type = c.ssh_key_type_from_name(algo_z.ptr);
+    var parsed: c.ssh_key = null;
+    const rc = c.ssh_pki_import_pubkey_base64(blob_z.ptr, want_type, &parsed);
+    if (rc != c.SSH_OK or parsed == null) return false;
+    defer c.ssh_key_free(parsed);
+
+    _ = c.ssh_key_cmp(presented, parsed, c.SSH_KEY_CMP_PUBLIC);
     return false;
 }
 
