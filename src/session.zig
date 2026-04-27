@@ -702,42 +702,104 @@ const SftpState = struct {
 
         const op_label: []const u8 = if (want_write) "open_write" else "open_read";
 
-        if (want_write) {
-            const real = try self.vfs.resolveForCreate(self.io, self.allocator, path.value);
-            defer self.allocator.free(real);
-            const file = std.Io.Dir.cwd().createFile(self.io, real, .{
-                .read = want_read,
-                .truncate = (flags & @as(u32, @intCast(c.SSH_FXF_TRUNC))) != 0,
-            }) catch {
-                self.auditFailed(op_label, path.value, "create failed");
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
-            };
-            self.vfs.verifyFile(self.io, file) catch {
-                file.close(self.io);
+        const want_creat = (flags & @as(u32, @intCast(c.SSH_FXF_CREAT))) != 0;
+        const want_excl = (flags & @as(u32, @intCast(c.SSH_FXF_EXCL))) != 0;
+        const want_trunc = (flags & @as(u32, @intCast(c.SSH_FXF_TRUNC))) != 0;
+
+        // Resolve the parent directory through `openVerifiedParent`,
+        // which canonicalizes through any symlinks in the parent path
+        // and verifies the result is inside the user's jail. From here
+        // on we operate exclusively on `parent.parent` (an FD) plus
+        // the basename string — never on a real-path string that the
+        // OS could follow back outside the jail. PLAN §8.3.
+        var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
+            const status = parentErrorStatus(err);
+            if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied(op_label, path.value)
+            else self.auditFailed(op_label, path.value, @errorName(err));
+            return replyStatus(self.channel, request_id, status, "denied or not found");
+        };
+        defer parent.deinit(self.io, self.allocator);
+
+        const open_mode: std.Io.Dir.OpenFileOptions.Mode = blk: {
+            if (want_write and want_read) break :blk .read_write;
+            if (want_write) break :blk .write_only;
+            break :blk .read_only;
+        };
+
+        // First open the existing basename with O_NOFOLLOW. A symlink at
+        // the final component is rejected unconditionally — the spec
+        // invariant is that an SFTP operation never affects state outside
+        // the jail, and following a symlink at the basename would let
+        // the kernel reach files we never validated.
+        var file = parent.parent.openFile(self.io, parent.base, .{
+            .mode = open_mode,
+            .follow_symlinks = false,
+            .allow_directory = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (!want_creat or !want_write) {
+                    return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+                }
+                // Race-free create at the verified parent. `exclusive=true`
+                // ensures we don't blindly clobber a file (or symlink) that
+                // appeared between our no-follow probe and this createFile.
+                // Truncation is deferred until after verifyFile so a
+                // hypothetical kernel quirk that defeated O_NOFOLLOW in the
+                // probe still can't truncate an outside-jail target.
+                const created = parent.parent.createFile(self.io, parent.base, .{
+                    .read = want_read,
+                    .truncate = false,
+                    .exclusive = true,
+                }) catch {
+                    self.auditFailed(op_label, path.value, "create failed");
+                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                };
+                self.vfs.verifyFile(self.io, created) catch {
+                    created.close(self.io);
+                    self.auditDenied(op_label, path.value);
+                    return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+                };
+                const id = try self.addFileHandle(created, want_read, want_write);
+                self.auditOk(op_label, path.value, "");
+                return replyHandle(self.channel, request_id, id);
+            },
+            error.SymLinkLoop => {
+                // Final component IS a symlink. Refuse outright.
                 self.auditDenied(op_label, path.value);
                 return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
-            };
-            const id = try self.addFileHandle(file, want_read, want_write);
-            self.auditOk(op_label, path.value, "");
-            return replyHandle(self.channel, request_id, id);
+            },
+            else => {
+                self.auditFailed(op_label, path.value, @errorName(err));
+                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+            },
+        };
+
+        // EXCL means "create exclusively". The file existed → fail.
+        if (want_creat and want_excl) {
+            file.close(self.io);
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "exists");
         }
 
-        // Pure read open.
-        const real = self.vfs.resolveExisting(self.io, self.allocator, path.value) catch {
-            return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
-        };
-        defer self.allocator.free(real);
-        const file = std.Io.Dir.cwd().openFile(self.io, real, .{ .mode = .read_only, .allow_directory = false }) catch {
-            self.auditFailed("open_read", path.value, "open failed");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
-        };
+        // Belt-and-suspenders FD verification. If the platform's
+        // O_NOFOLLOW had any quirk, this catches a fd that resolves
+        // outside the jail before any state-changing operation runs.
         self.vfs.verifyFile(self.io, file) catch {
             file.close(self.io);
-            self.auditDenied("open_read", path.value);
+            self.auditDenied(op_label, path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         };
-        const id = try self.addFileHandle(file, true, false);
-        self.auditOk("open_read", path.value, "");
+
+        // Truncation only after the FD is proven inside the jail.
+        if (want_trunc and want_write) {
+            file.setLength(self.io, 0) catch {
+                file.close(self.io);
+                self.auditFailed(op_label, path.value, "truncate failed");
+                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "truncate failed");
+            };
+        }
+
+        const id = try self.addFileHandle(file, want_read, want_write);
+        self.auditOk(op_label, path.value, "");
         try replyHandle(self.channel, request_id, id);
     }
 
