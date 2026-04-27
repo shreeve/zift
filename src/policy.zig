@@ -61,9 +61,15 @@ fn permissionFor(operation: Operation) config.Permission {
 ///   `/pending`, `/pending/inbox`, `/pending/inbox/file.csv`, but
 ///   never `/pendingfoo`. The root pattern `/` matches every path
 ///   that begins with `/`.
-/// - Patterns containing `*` or `?` are globs. `*` matches any
-///   sequence of characters not including `/`; `?` matches any single
-///   character that is not `/`.
+/// - Patterns containing `*` or `?` are globs. Three wildcards:
+///     `*`   — any sequence not including `/` (single component).
+///     `?`   — exactly one character that is not `/`.
+///     `**`  — any sequence INCLUDING `/` (cross-component). Runs of
+///             three or more `*` collapse to one `**`. So
+///             `deny **.exe` correctly denies `foo.exe`, `dir/foo.exe`,
+///             and `dir/sub/foo.exe` alike. `/inbox/**` matches all
+///             contents of `/inbox` at any depth, but NOT `/inbox`
+///             itself (matching gitignore convention).
 pub fn globMatch(pattern: []const u8, value: []const u8) bool {
     if (std.mem.indexOfAny(u8, pattern, "*?") == null) {
         return literalPrefixMatch(pattern, value);
@@ -83,6 +89,52 @@ fn literalPrefixMatch(pattern: []const u8, value: []const u8) bool {
 
 fn globMatchInner(pattern: []const u8, value: []const u8) bool {
     if (pattern.len == 0) return value.len == 0;
+
+    // `**/` — gitignore-style "zero or more path segments". Allows
+    // `/foo/**/bar` to match `/foo/bar` (zero intermediates),
+    // `/foo/x/bar` (one), `/foo/x/y/bar` (two), etc. Without this
+    // special case the literal `/` in the pattern after `**` would
+    // require at least one segment between the two slashes — the
+    // surprise behavior the live demo surfaced.
+    //
+    // Detection: pattern starts with two or more `*` followed by `/`.
+    // We collapse the run of `*` and then split on the trailing slash.
+    // The wildcard then matches either:
+    //   (a) zero segments — `pattern[after_slash..]` runs against `value`
+    //       directly, as if `**/` weren't there.
+    //   (b) one or more segments — try every `/` position in `value`
+    //       as the boundary.
+    if (pattern.len >= 3 and pattern[0] == '*' and pattern[1] == '*') {
+        var star_end: usize = 2;
+        while (star_end < pattern.len and pattern[star_end] == '*') star_end += 1;
+        if (star_end < pattern.len and pattern[star_end] == '/') {
+            const rest = pattern[star_end + 1 ..];
+            if (globMatchInner(rest, value)) return true; // (a)
+            var i: usize = 0;
+            while (i < value.len) : (i += 1) {
+                if (value[i] == '/' and globMatchInner(rest, value[i + 1 ..])) return true; // (b)
+            }
+            return false;
+        }
+        // Fall through to the general `**` case (e.g. `**.exe`).
+    }
+
+    // General `**` — two or more consecutive `*` not followed by `/`.
+    // Matches any sequence of characters INCLUDING `/`. We collapse
+    // runs of three or more `*` to a single cross-slash wildcard so
+    // `***...*` doesn't blow up the recursion in the pathological
+    // pattern case.
+    if (pattern.len >= 2 and pattern[0] == '*' and pattern[1] == '*') {
+        var rest_idx: usize = 2;
+        while (rest_idx < pattern.len and pattern[rest_idx] == '*') rest_idx += 1;
+        const rest = pattern[rest_idx..];
+
+        var i: usize = 0;
+        while (i <= value.len) : (i += 1) {
+            if (globMatchInner(rest, value[i..])) return true;
+        }
+        return false;
+    }
 
     if (pattern[0] == '*') {
         // `*` does not cross path boundaries (PLAN §6.3).
@@ -205,4 +257,73 @@ test "star does not cross path boundary" {
     try std.testing.expect(!globMatch("*.exe", "/tool.exe"));
     try std.testing.expect(globMatch("/pending/*.tmp", "/pending/foo.tmp"));
     try std.testing.expect(!globMatch("/pending/*.tmp", "/pending/sub/foo.tmp"));
+}
+
+test "double-star crosses path boundary" {
+    // `**.exe` matches any `.exe` at any depth.
+    try std.testing.expect(globMatch("**.exe", "tool.exe"));
+    try std.testing.expect(globMatch("**.exe", "/tool.exe"));
+    try std.testing.expect(globMatch("**.exe", "/dir/tool.exe"));
+    try std.testing.expect(globMatch("**.exe", "/a/b/c/tool.exe"));
+    try std.testing.expect(!globMatch("**.exe", "tool.txt"));
+    try std.testing.expect(!globMatch("**.exe", "/dir/tool.txt"));
+
+    // `/inbox/**` matches every path strictly under `/inbox/`.
+    try std.testing.expect(globMatch("/inbox/**", "/inbox/file.csv"));
+    try std.testing.expect(globMatch("/inbox/**", "/inbox/sub/file.csv"));
+    try std.testing.expect(globMatch("/inbox/**", "/inbox/a/b/c/file.csv"));
+
+    // gitignore convention: `/inbox/**` does NOT match `/inbox` itself
+    // (no character available for `**` to consume after the trailing
+    // `/`). Operators that want to deny the dir too write
+    // `deny /inbox` separately.
+    try std.testing.expect(!globMatch("/inbox/**", "/inbox"));
+    try std.testing.expect(!globMatch("/inbox/**", "/outbox/file.csv"));
+
+    // `/foo/**/bar` — `bar` under any subtree of `/foo/`.
+    try std.testing.expect(globMatch("/foo/**/bar", "/foo/bar"));
+    try std.testing.expect(globMatch("/foo/**/bar", "/foo/x/bar"));
+    try std.testing.expect(globMatch("/foo/**/bar", "/foo/x/y/z/bar"));
+    try std.testing.expect(!globMatch("/foo/**/bar", "/foo/baz"));
+
+    // Three or more `*` collapse to `**` (no recursive blowup, no
+    // semantic surprise).
+    try std.testing.expect(globMatch("***.exe", "/dir/tool.exe"));
+    try std.testing.expect(globMatch("****", "/anything/at/all"));
+
+    // `**` alone matches anything (including the empty string).
+    try std.testing.expect(globMatch("**", ""));
+    try std.testing.expect(globMatch("**", "anything"));
+    try std.testing.expect(globMatch("**", "/with/slashes/in/it"));
+}
+
+test "deny **.exe denies recursively" {
+    // The `*.exe` footgun the live demo surfaced: with single-star
+    // semantics, `deny *.exe` only matches `.exe` files in the
+    // current directory level. `deny **.exe` does the right thing.
+    var rules = [_]config.Rule{
+        .{
+            .effect = .allow,
+            .pattern = "/",
+            .permissions = config.PermissionSet.initFull(),
+        },
+        .{
+            .effect = .deny,
+            .pattern = "**.exe",
+            .permissions = config.PermissionSet.initFull(),
+        },
+    };
+    const user: config.UserConfig = .{
+        .name = "ally",
+        .password_hash = "hash",
+        .keys = &.{},
+        .root = "/tmp",
+        .rules = &rules,
+    };
+
+    try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/tool.exe"));
+    try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/sub/tool.exe"));
+    try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/a/b/c/tool.exe"));
+    try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/tool.txt"));
+    try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/sub/dir/tool.txt"));
 }

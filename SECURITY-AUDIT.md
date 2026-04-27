@@ -150,11 +150,19 @@ documented trade-off), or **FINDING** (actionable issue with recommended fix).
 - **OK**: `literalPrefixMatch` checks at path-component boundaries.
   `/pending` does not match `/pendingfoo`.
 - **OK**: Glob `*` does not cross `/` boundaries. `?` does not match `/`.
+- **OK**: Glob `**` DOES cross `/` boundaries (gitignore convention).
+  `**.exe` matches `.exe` files at any depth; `/inbox/**` matches every
+  path strictly under `/inbox/`; `/foo/**/bar` matches `bar` under any
+  subtree of `/foo/` including the zero-intermediate-segment case.
+  Runs of three or more `*` collapse to one `**` so a hostile pattern
+  can't blow up the matcher's recursion.
 - **OK**: `checkRename` evaluates policy on both source and destination paths.
-- **CAVEAT**: Glob matching is recursive. A pathological pattern like
-  `*****...` against a long path could be expensive, but the 4096-byte path
-  limit and the restricted pattern syntax (`*` and `?` only, no `**`) bound
-  the practical cost.
+- **CAVEAT**: Glob matching is recursive. With `**` admitted, a
+  deliberately-crafted pattern like `**X**X**X...` against a long path
+  could backtrack exponentially. In Zift's threat model patterns are
+  operator-controlled (config file, root-owned), not attacker-supplied,
+  so the practical cost is whatever the operator types. The 4096-byte
+  path cap and config line-length cap bound the absolute worst case.
 
 ---
 

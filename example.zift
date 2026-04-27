@@ -12,3 +12,8 @@ user ally
   root /tmp/zift/ally
   allow /pending read write list mkdir remove rename
   allow /archive read list
+  # `**` crosses path boundaries (gitignore-style); `*` does not.
+  # `**.exe` denies executables anywhere under the partner root;
+  # `**/.ssh/**` denies anything inside a `.ssh` dir at any depth.
+  deny **.exe
+  deny **/.ssh/**

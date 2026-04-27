@@ -111,7 +111,8 @@ user acme
   root /zfs/sftp/acme
   allow /inbox read write list mkdir
   allow /outbox read list
-  deny *.exe .ssh/*
+  deny **.exe
+  deny **/.ssh/**
 EOF
 sudo chown root:zift /etc/zift/zift.conf
 sudo chmod 0640 /etc/zift/zift.conf
