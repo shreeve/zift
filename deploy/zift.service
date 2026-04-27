@@ -1,0 +1,49 @@
+[Unit]
+Description=Zift SFTP Server
+Documentation=https://github.com/shreeve/zift
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zift
+Group=zift
+
+ExecStart=/usr/local/bin/zift serve /etc/zift/zift.conf
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening: restrict the process to the minimum it needs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+
+# Only the partner roots, the config, and the audit log need to be writable.
+# Adjust these paths to match your layout.
+ReadWritePaths=/zfs/sftp /var/log/zift
+
+# The host key and config are read-only after startup.
+ReadOnlyPaths=/etc/zift
+
+# Resource limits: bound Argon2id memory pressure from auth storms.
+# max-connections * worst-case-Argon2id-memory (256 MiB) = 32 GiB for 128 conns.
+# Tune to your host's capacity.
+LimitNOFILE=4096
+MemoryMax=4G
+
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
