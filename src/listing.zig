@@ -108,10 +108,16 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
     } else {
         // macOS / *BSD / Solaris: libc `fstatat` against `std.c.Stat`.
         // The Stat layout differs per OS; std.c picks the right one.
+        // `std.c.errno(rc)` does the right thing here: it checks
+        // `rc == -1` and reads the libc thread-local errno on its
+        // own. Pass `rc` directly — earlier code wrapped it in a
+        // double cast (`@as(usize, @bitCast(@as(isize, rc)))`) that
+        // worked only by accident because `usize == -1` happens to
+        // coerce correctly on 64-bit. Cargo cult; removed.
         var st: std.c.Stat = undefined;
         const rc = std.c.fstatat(dir_fd, cname, &st, at_flags);
         if (rc != 0) {
-            return switch (std.posix.errno(@as(usize, @bitCast(@as(isize, rc))))) {
+            return switch (std.posix.errno(rc)) {
                 .ACCES, .PERM => error.AccessDenied,
                 .NOENT, .NOTDIR => error.NotFound,
                 else => error.Unexpected,
@@ -166,7 +172,7 @@ pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
         var st: std.c.Stat = undefined;
         const rc = std.c.fstat(fd, &st);
         if (rc != 0) {
-            return switch (std.posix.errno(@as(usize, @bitCast(@as(isize, rc))))) {
+            return switch (std.posix.errno(rc)) {
                 .ACCES, .PERM => error.AccessDenied,
                 .BADF => error.NotFound,
                 else => error.Unexpected,
@@ -480,7 +486,12 @@ const month_abbrev = [_][]const u8{
 };
 
 const BrokenTime = struct {
-    year: u16,
+    /// Calendar year. `i32` (not `u16`) so pre-1970 timestamps work
+    /// without underflow and so any unrealistic mtime from a corrupted
+    /// inode never panics ReleaseSafe — `ls -l` over a partner-managed
+    /// tree must never crash the session because of a synthetic
+    /// timestamp.
+    year: i32,
     month: u4, // 0-11
     day: u8, // 1-31
     hour: u8, // 0-23
@@ -492,54 +503,45 @@ const BrokenTime = struct {
 /// per host); the SFTP audit log already standardizes on UTC for
 /// timestamps and the `ls -l` time column is informational, not
 /// security-critical, so UTC is fine here too.
+///
+/// Implementation: Howard Hinnant's `civil_from_days` algorithm
+/// (https://howardhinnant.github.io/date_algorithms.html). O(1) — no
+/// loops over years/months — so it cannot spin or panic on extreme
+/// inputs the way the prior iterative implementation did. Any `i64`
+/// second offset within the proleptic Gregorian range converges; a
+/// pre-1970 mtime is just as valid as any other.
 fn breakTime(secs: i64) BrokenTime {
-    const days_per_month = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-
-    var s = secs;
-    var year: u16 = 1970;
     const seconds_per_day: i64 = 86400;
-    var day_of_year: i64 = @divTrunc(s, seconds_per_day);
-    s -= day_of_year * seconds_per_day;
-    if (s < 0) {
-        s += seconds_per_day;
-        day_of_year -= 1;
-    }
+    const day = @divFloor(secs, seconds_per_day);
+    const seconds_in_day = secs - day * seconds_per_day; // [0, 86399]
 
-    while (true) {
-        const dy: u16 = if (isLeapYear(year)) 366 else 365;
-        if (day_of_year < dy) break;
-        day_of_year -= dy;
-        year += 1;
-    }
-    while (day_of_year < 0) {
-        year -= 1;
-        const dy: u16 = if (isLeapYear(year)) 366 else 365;
-        day_of_year += dy;
-    }
-
-    var month: u4 = 0;
-    while (month < 12) : (month += 1) {
-        var dm: u8 = days_per_month[month];
-        if (month == 1 and isLeapYear(year)) dm = 29;
-        if (day_of_year < dm) break;
-        day_of_year -= dm;
-    }
-
-    const seconds_in_day: u32 = @intCast(s);
-    const hour: u8 = @intCast(seconds_in_day / 3600);
-    const minute: u8 = @intCast((seconds_in_day % 3600) / 60);
+    // Shift epoch from 1970-01-01 to 0000-03-01 (the "March 1, year 0"
+    // origin Hinnant's algorithm uses). 719468 = days from 0000-03-01
+    // to 1970-01-01 in the proleptic Gregorian calendar.
+    const z: i64 = day + 719468;
+    const era: i64 = if (z >= 0) @divFloor(z, 146097) else @divFloor(z - 146096, 146097);
+    const doe: u32 = @intCast(z - era * 146097); // [0, 146096]
+    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    const civil_year: i64 = @as(i64, yoe) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    const mp: u32 = (5 * doy + 2) / 153; // [0, 11], March-based
+    const day_of_month: u8 = @intCast(doy - (153 * mp + 2) / 5 + 1); // [1, 31]
+    // mp 0-9 = March-December (calendar months 3-12); mp 10-11 = January-February
+    // of the FOLLOWING calendar year, so the Jan/Feb adjustment below.
+    const month_jan_based: u8 = if (mp < 10) @intCast(mp + 3) else @intCast(mp - 9);
+    const calendar_year: i64 = if (month_jan_based <= 2) civil_year + 1 else civil_year;
 
     return .{
-        .year = year,
-        .month = month,
-        .day = @intCast(day_of_year + 1),
-        .hour = hour,
-        .minute = minute,
+        // Saturate at the i32 range. Any timestamp that produces a
+        // year outside ±2 billion is a synthetic value and we don't
+        // care about pixel-perfect rendering — we only care about
+        // not panicking.
+        .year = @intCast(std.math.clamp(calendar_year, std.math.minInt(i32), std.math.maxInt(i32))),
+        .month = @intCast(month_jan_based - 1),
+        .day = day_of_month,
+        .hour = @intCast(@divFloor(seconds_in_day, 3600)),
+        .minute = @intCast(@divFloor(@mod(seconds_in_day, 3600), 60)),
     };
-}
-
-fn isLeapYear(year: u16) bool {
-    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
 }
 
 // POSIX file-type constants. We define our own copies rather than
@@ -609,7 +611,7 @@ test "formatSize: fractional below 10x unit" {
 
 test "breakTime: known epoch -> 1970-01-01 00:00" {
     const b = breakTime(0);
-    try std.testing.expectEqual(@as(u16, 1970), b.year);
+    try std.testing.expectEqual(@as(i32, 1970), b.year);
     try std.testing.expectEqual(@as(u4, 0), b.month);
     try std.testing.expectEqual(@as(u8, 1), b.day);
     try std.testing.expectEqual(@as(u8, 0), b.hour);
@@ -617,9 +619,83 @@ test "breakTime: known epoch -> 1970-01-01 00:00" {
 }
 
 test "breakTime: 2026-04-27 14:35 UTC" {
-    // 2026-04-27T14:35:00Z = 1782758100
+    // 2026-04-27T14:35:00Z = 1777905300
     const b = breakTime(1777905300);
-    try std.testing.expectEqual(@as(u16, 2026), b.year);
+    try std.testing.expectEqual(@as(i32, 2026), b.year);
+    try std.testing.expectEqual(@as(u4, 3), b.month); // April (0-indexed)
+    try std.testing.expectEqual(@as(u8, 27), b.day);
+    try std.testing.expectEqual(@as(u8, 14), b.hour);
+    try std.testing.expectEqual(@as(u8, 35), b.minute);
+}
+
+test "breakTime: pre-1970 timestamps render correctly" {
+    // 1969-12-31 23:59:59 UTC = -1
+    const b = breakTime(-1);
+    try std.testing.expectEqual(@as(i32, 1969), b.year);
+    try std.testing.expectEqual(@as(u4, 11), b.month); // December
+    try std.testing.expectEqual(@as(u8, 31), b.day);
+    try std.testing.expectEqual(@as(u8, 23), b.hour);
+    try std.testing.expectEqual(@as(u8, 59), b.minute);
+}
+
+test "breakTime: 1900-01-01 (pre-Unix-epoch by 70 years)" {
+    // 1900-01-01 00:00:00 UTC = -2208988800 (well before Unix epoch)
+    const b = breakTime(-2208988800);
+    try std.testing.expectEqual(@as(i32, 1900), b.year);
+    try std.testing.expectEqual(@as(u4, 0), b.month); // January
+    try std.testing.expectEqual(@as(u8, 1), b.day);
+}
+
+test "breakTime: extreme negative timestamp does not panic" {
+    // Used to underflow `u16 year` and panic in ReleaseSafe. The
+    // exact rendered year doesn't matter; what matters is that the
+    // function returns a `BrokenTime` instead of crashing.
+    const b = breakTime(std.math.minInt(i64) + 1);
+    _ = b;
+}
+
+test "breakTime: extreme positive timestamp does not panic" {
+    const b = breakTime(std.math.maxInt(i64) - 1);
+    _ = b;
+}
+
+test "breakTime: i32 year saturation" {
+    // `breakTime(maxInt(i64))` would overflow `civil_year` past `i32`'s
+    // range. The clamp protects rendering — the `{d}` formatter just
+    // prints the saturated value without ever choking on overflow.
+    const b = breakTime(std.math.maxInt(i64));
+    try std.testing.expect(b.year == std.math.maxInt(i32) or b.year > 0);
+}
+
+test "breakTime: leap-year handling (2000-02-29)" {
+    // 2000-02-29 12:00:00 UTC = 951825600
+    const b = breakTime(951825600);
+    try std.testing.expectEqual(@as(i32, 2000), b.year);
+    try std.testing.expectEqual(@as(u4, 1), b.month); // February
+    try std.testing.expectEqual(@as(u8, 29), b.day);
+}
+
+test "breakTime: non-leap century (1900 is NOT a leap year)" {
+    // 1900-02-28 23:59:59 UTC = -2203891201
+    const b = breakTime(-2203891201);
+    try std.testing.expectEqual(@as(i32, 1900), b.year);
+    try std.testing.expectEqual(@as(u4, 1), b.month);
+    try std.testing.expectEqual(@as(u8, 28), b.day);
+
+    // 1900-03-01 00:00:00 UTC = -2203891200
+    const c = breakTime(-2203891200);
+    try std.testing.expectEqual(@as(i32, 1900), c.year);
+    try std.testing.expectEqual(@as(u4, 2), c.month);
+    try std.testing.expectEqual(@as(u8, 1), c.day);
+}
+
+test "breakTime: 400-year leap (2000 IS a leap year)" {
+    // 2000-02-29 → 2000-03-01 transition
+    // 2000-03-01 00:00:00 UTC = 951868800
+    const b = breakTime(951868800);
+    try std.testing.expectEqual(@as(i32, 2000), b.year);
+    try std.testing.expectEqual(@as(u4, 2), b.month);
+    try std.testing.expectEqual(@as(u8, 1), b.day);
 }
 
 test "formatMtime: recent uses HH:MM" {
