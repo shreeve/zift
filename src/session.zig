@@ -753,6 +753,22 @@ const SftpState = struct {
         self.handles.deinit(self.allocator);
     }
 
+    /// Validate a freshly-parsed client path against PLAN §7.6 (length)
+    /// and §8.3 (byte set + UTF-8). On failure: send `SSH_FX_BAD_MESSAGE`
+    /// and return `false` so the caller short-circuits the rest of the
+    /// handler. `true` means the path passed all early-gate checks and
+    /// is safe to feed into policy + audit + filesystem resolution.
+    /// Returning a bool (rather than an error) keeps the malformed-path
+    /// case out of `runSftp`'s session-fatal error path — only THIS
+    /// request fails; the session continues per PLAN §7.6.
+    fn ensureValidPath(self: *SftpState, request_id: u32, value: []const u8) !bool {
+        vfs_mod.Vfs.validateVirtualPath(value) catch {
+            try replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+            return false;
+        };
+        return true;
+    }
+
     fn auditOk(self: *SftpState, op: []const u8, vpath: ?[]const u8, detail: []const u8) void {
         audit.log(self.io, self.user.name, op, vpath, .ok, detail, self.peer_ip orelse "");
     }
@@ -797,6 +813,7 @@ const SftpState = struct {
 
     fn handleStat(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        if (!try self.ensureValidPath(request_id, path.value)) return;
         if (policy.check(self.user, .stat, path.value) == .deny) {
             // PLAN §8.5: emit audit AFTER replying. `defer` guarantees
             // the audit fires once the reply syscall returns, so a slow
@@ -819,6 +836,7 @@ const SftpState = struct {
 
     fn handleOpendir(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        if (!try self.ensureValidPath(request_id, path.value)) return;
         if (policy.check(self.user, .readdir, path.value) == .deny) {
             defer self.auditDenied("opendir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
@@ -872,6 +890,7 @@ const SftpState = struct {
     fn handleOpen(self: *SftpState, request_id: u32, payload: []const u8) !void {
         var cursor = payload;
         const path = parseString(cursor) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        if (!try self.ensureValidPath(request_id, path.value)) return;
         cursor = path.rest;
         if (cursor.len < 4) return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad flags");
         const flags = readU32(cursor[0..4]);
@@ -1065,6 +1084,7 @@ const SftpState = struct {
 
     fn handleMkdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        if (!try self.ensureValidPath(request_id, path.value)) return;
         if (policy.check(self.user, .mkdir, path.value) == .deny) {
             defer self.auditDenied("mkdir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
@@ -1089,6 +1109,7 @@ const SftpState = struct {
 
     fn handleRemove(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        if (!try self.ensureValidPath(request_id, path.value)) return;
         if (policy.check(self.user, .remove, path.value) == .deny) {
             defer self.auditDenied("remove", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
@@ -1113,6 +1134,7 @@ const SftpState = struct {
 
     fn handleRmdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        if (!try self.ensureValidPath(request_id, path.value)) return;
         if (policy.check(self.user, .rmdir, path.value) == .deny) {
             defer self.auditDenied("rmdir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
@@ -1138,6 +1160,8 @@ const SftpState = struct {
     fn handleRename(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const from = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad source");
         const to = parseString(from.rest) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad destination");
+        if (!try self.ensureValidPath(request_id, from.value)) return;
+        if (!try self.ensureValidPath(request_id, to.value)) return;
         if (policy.checkRename(self.user, from.value, to.value) == .deny) {
             defer self.auditDenied("rename", from.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");

@@ -5,8 +5,15 @@ pub const Error = error{
     InvalidPath,
     NotAbsoluteRoot,
     OutOfMemory,
+    PathTooLong,
     PathTraversal,
 } || std.Io.Dir.RealPathFileAllocError;
+
+/// PLAN §7.6: maximum virtual path length is 4096 bytes. Applies to
+/// the raw client-supplied path before normalization; a path longer
+/// than this is rejected before we allocate any per-component
+/// storage.
+pub const max_virtual_path_bytes: usize = 4096;
 
 pub const Vfs = struct {
     root: [:0]const u8,
@@ -75,6 +82,20 @@ pub const Vfs = struct {
         return normalizeVirtualPath(allocator, virtual_path);
     }
 
+    /// Allocation-free validation of a client-supplied virtual path
+    /// against PLAN §7.6 (length) and §8.3 (byte set + UTF-8). SFTP
+    /// handlers call this immediately after `parseString`, before
+    /// policy and audit, so an invalid-UTF-8 path never reaches the
+    /// JSON audit encoder and the right `SSH_FX_BAD_MESSAGE` status
+    /// surfaces to the client.
+    pub fn validateVirtualPath(virtual_path: []const u8) Error!void {
+        if (virtual_path.len > max_virtual_path_bytes) return error.PathTooLong;
+        for (virtual_path) |b| {
+            if (b == 0 or b < 0x20 or b == 0x7F) return error.InvalidPath;
+        }
+        if (!std.unicode.utf8ValidateSlice(virtual_path)) return error.InvalidPath;
+    }
+
     pub fn containsRealPath(self: Vfs, real_path: []const u8) bool {
         return isInsideRoot(self.root, real_path);
     }
@@ -141,7 +162,16 @@ pub const ParentResolution = struct {
 };
 
 fn normalizeVirtualPath(allocator: std.mem.Allocator, virtual_path: []const u8) Error![]u8 {
-    if (std.mem.indexOfScalar(u8, virtual_path, 0) != null) return error.InvalidPath;
+    // PLAN §7.6 max length, §8.3 byte-set restrictions.
+    if (virtual_path.len > max_virtual_path_bytes) return error.PathTooLong;
+    for (virtual_path) |b| {
+        // PLAN §8.3 step 2: reject NUL, all C0 control bytes, and DEL.
+        // The space-character (0x20) and printable ASCII are allowed;
+        // everything below 0x20 is forbidden including TAB / CR / LF
+        // since they're never legitimate inside a single SFTP path.
+        if (b == 0 or b < 0x20 or b == 0x7F) return error.InvalidPath;
+    }
+    if (!std.unicode.utf8ValidateSlice(virtual_path)) return error.InvalidPath;
 
     var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(allocator);

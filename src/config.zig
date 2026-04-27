@@ -226,6 +226,8 @@ pub const Error = error{
     InvalidKeyLine,
     InvalidPermission,
     InvalidUserName,
+    KeyLineTooLong,
+    UsernameTooLong,
     MissingCredentials,
     MissingHostKey,
     MissingListen,
@@ -244,6 +246,13 @@ pub const Error = error{
     UnknownSection,
     UnsupportedKeyAlgorithm,
 };
+
+/// PLAN §7.6 fixed implementation limits. Reject at parse time so a
+/// malformed config never reaches runtime; reject during request
+/// dispatch (path) so a malicious peer cannot spend server CPU on
+/// pathological inputs before we say no.
+pub const max_username_bytes: usize = 64;
+pub const max_keyline_bytes: usize = 8192;
 
 /// Public-key algorithms accepted in `key` lines, per PLAN.md §8.4.
 /// RSA and DSA are deliberately not on this list.
@@ -351,6 +360,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
             if (std.mem.startsWith(u8, line, "user ")) {
                 const name = std.mem.trim(u8, line["user ".len..], " \t");
                 if (name.len == 0) return error.EmptyUserName;
+                if (name.len > max_username_bytes) return error.UsernameTooLong;
                 if (!validUserName(name)) return error.InvalidUserName;
                 if (findUserBuilder(users.items, name) != null) return error.DuplicateUser;
 
@@ -466,6 +476,11 @@ fn parseUserProperty(
 }
 
 fn parseUserKey(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
+    // PLAN §7.6: maximum public-key line length is 8192 bytes. Reject
+    // before tokenizing so we don't allocate per-token storage for an
+    // attacker-supplied huge value.
+    if (value.len > max_keyline_bytes) return error.KeyLineTooLong;
+
     var parts = std.mem.tokenizeAny(u8, value, " \t");
     const algorithm = parts.next() orelse return error.InvalidKeyLine;
     const blob = parts.next() orelse return error.InvalidKeyLine;
