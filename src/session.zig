@@ -843,17 +843,31 @@ fn runSftp(
                 audit.log(io, user.name, "idle.timeout", null, .ok, "", ip_str);
                 return;
             },
+            error.ChannelEof => {
+                // Clean half-close: client sent SSH_MSG_CHANNEL_EOF
+                // (the standard "I'm done writing" signal). Treat as
+                // a normal session exit. Result is `ok`; nothing's
+                // wrong on either side.
+                audit.log(io, user.name, "session.ended", null, .ok, "client closed channel", ip_str);
+                return;
+            },
+            error.LibsshFailure => {
+                // Real transport / libssh failure. Capture libssh's
+                // last-error string so an operator can see WHY the
+                // wire dropped — "Socket error: disconnected", "Read
+                // (socket)…", whatever the underlying issue is. The
+                // detail field is bounded by audit.zig's truncation
+                // so a runaway error string can't blow the line cap.
+                var detail_buf: [256]u8 = undefined;
+                var w = std.Io.Writer.fixed(&detail_buf);
+                w.writeAll("LibsshFailure: ") catch {};
+                const lib_err = c.ssh_get_error(@as(?*anyopaque, @ptrCast(state.channel)));
+                if (lib_err != null) w.writeAll(std.mem.span(lib_err)) catch {};
+                audit.log(io, user.name, "session.ended", null, .failed, w.buffered(), ip_str);
+                return;
+            },
             else => |e| {
-                // Either the client closed the channel cleanly (EOF
-                // on `ssh_channel_read_timeout` returning 0) or a
-                // real transport / libssh failure. Either way the
-                // session is over, but a SILENT exit here means a
-                // session that drops unexpectedly leaves no audit
-                // breadcrumb at all — operators can't distinguish
-                // "client said bye" from "wire got reset" from "a
-                // bug in our packet read." Always emit one line so
-                // the close has a reason on it.
-                audit.log(io, user.name, "session.ended", null, .ok, @errorName(e), ip_str);
+                audit.log(io, user.name, "session.ended", null, .failed, @errorName(e), ip_str);
                 return;
             },
         };
@@ -1558,7 +1572,7 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
             slice_ms,
         );
         if (n == c.SSH_ERROR) return error.LibsshFailure;
-        if (n == 0) return error.LibsshFailure; // EOF
+        if (n == 0) return error.ChannelEof; // clean half-close from peer
         if (n == c.SSH_AGAIN) {
             if (state.idle_timeout_ms != 0) {
                 const elapsed: i64 = nowMs() - state.last_activity_ms;
