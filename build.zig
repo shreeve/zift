@@ -506,7 +506,19 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
     exe.root_module.linkLibrary(dev.libssh_lib);
-    b.installArtifact(exe);
+
+    // Install the dev binary at `<project>/bin/zift` rather than the
+    // default `zig-out/bin/zift`. `dest_dir = "../bin"` is relative to
+    // the install prefix (`zig-out`), so it resolves to the project
+    // root's `bin/`. Operationally this means `zig build && bin/zift`
+    // works without `cd zig-out/bin/...` ceremony, and the binary
+    // sits next to the source tree where editors and tools find it.
+    // Release artifacts still go to `zig-out/release/` (see the
+    // `release` step below) — only the local dev binary moves.
+    const install_exe = b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .{ .custom = "../bin" } },
+    });
+    b.getInstallStep().dependOn(&install_exe.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

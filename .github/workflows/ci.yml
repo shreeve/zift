@@ -45,14 +45,14 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe
 
       - name: Verify binary exists
-        run: test -f zig-out/bin/zift
+        run: test -f bin/zift
 
       - name: Check direct dynamic dependencies (NEEDED allowlist)
         run: |
           echo "=== Full dynamic resolution (informational) ==="
-          ldd zig-out/bin/zift || true
+          ldd bin/zift || true
           echo "=== Binary size ==="
-          ls -lh zig-out/bin/zift
+          ls -lh bin/zift
 
           # Assert the *direct* NEEDED entries on the binary, not the
           # full transitive resolution that `ldd` reports. libssh on
@@ -62,7 +62,7 @@ jobs:
           # upgrades. What we genuinely control is what *our* binary
           # has in its DT_NEEDED entries, which is short and stable.
           echo "=== Direct NEEDED entries ==="
-          needed=$(objdump -p zig-out/bin/zift \
+          needed=$(objdump -p bin/zift \
             | awk '/NEEDED/ {print $2}' \
             | sort -u)
           echo "$needed" | sed 's/^/  /'
@@ -136,13 +136,13 @@ jobs:
           echo "systemd-analyze verify clean."
 
       - name: Smoke test (version)
-        run: zig-out/bin/zift version
+        run: bin/zift version
 
       - name: Smoke test (validate)
         run: |
           ssh-keygen -t ed25519 -f /tmp/ci_host_ed25519 -N "" -q
           mkdir -p /tmp/ci_root
-          printf '%s\n' 'testpw' | zig-out/bin/zift hash-password > /tmp/ci_hash.txt
+          printf '%s\n' 'testpw' | bin/zift hash-password > /tmp/ci_hash.txt
           HASH=$(cat /tmp/ci_hash.txt)
           cat > /tmp/ci.zift <<EOF
           server
@@ -155,13 +155,13 @@ jobs:
             root /tmp/ci_root
             allow / read list
           EOF
-          zig-out/bin/zift validate /tmp/ci.zift
+          bin/zift validate /tmp/ci.zift
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: zift-linux-amd64-release-safe
-          path: zig-out/bin/zift
+          path: bin/zift
 
   integration-tests:
     name: Integration tests
@@ -174,10 +174,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: zift-linux-amd64-release-safe
-          path: zig-out/bin
+          path: bin
 
       - name: Make binary executable
-        run: chmod +x zig-out/bin/zift
+        run: chmod +x bin/zift
 
       - name: Install test dependencies
         run: |
@@ -188,7 +188,7 @@ jobs:
 
       - name: Run integration tests
         run: |
-          export PATH="$PWD/zig-out/bin:$PATH"
+          export PATH="$PWD/bin:$PATH"
           bash test/run.sh
 
   fuzz-short:

@@ -56,7 +56,7 @@ fi
 echo "==> building zift"
 ( cd "$ROOT" && zig build ) >/dev/null
 
-ZIFT_BIN="$ROOT/zig-out/bin/zift"
+ZIFT_BIN="$ROOT/bin/zift"
 [[ -x "$ZIFT_BIN" ]] || { echo "missing $ZIFT_BIN"; exit 2; }
 
 # --- pick the case set -----------------------------------------------------
