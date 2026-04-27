@@ -287,13 +287,38 @@ fn handleSession(
 ) !void {
     defer c.ssh_free(session);
 
-    if (c.ssh_handle_key_exchange(session) != c.SSH_OK) return error.LibsshFailure;
+    // Apply the configured idle-timeout to all blocking libssh reads
+    // BEFORE the handshake. Without this, a TCP-only "client" that
+    // never speaks SSH pins a worker thread + a max-connections slot
+    // forever; PLAN §6.2 says the timeout applies across the session
+    // lifecycle, not just after auth completes.
+    setSessionTimeout(session, cfg.server.idle_timeout_ms);
+
+    if (c.ssh_handle_key_exchange(session) != c.SSH_OK) {
+        audit.log(io, null, "handshake.failed", null, .failed, "");
+        return error.LibsshFailure;
+    }
 
     const user = try authenticate(io, allocator, cfg, session);
     const channel = try acceptSftpSubsystem(session);
 
     try runSftp(io, allocator, channel, user, cfg.server.idle_timeout_ms);
     c.ssh_disconnect(session);
+}
+
+/// Configure the per-session blocking-read timeout. libssh stores this
+/// in `ssh_session.opts.timeout` and applies it to every blocking
+/// socket read (handshake, key-exchange, USERAUTH messages, channel
+/// open/subsystem). Once we hand off to `runSftp` the per-call
+/// `ssh_channel_read_timeout` takes precedence for the SFTP read loop.
+/// `idle_timeout_ms == 0` means PLAN §6.2's "disabled" mode: do not set
+/// a timeout, leave libssh's default in place.
+fn setSessionTimeout(session: c.ssh_session, idle_timeout_ms: u64) void {
+    if (idle_timeout_ms == 0) return;
+    const seconds: c_long = @intCast(idle_timeout_ms / 1000);
+    const usec: c_long = @intCast((idle_timeout_ms % 1000) * 1000);
+    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT, &seconds);
+    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT_USEC, &usec);
 }
 
 fn authenticate(
