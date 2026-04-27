@@ -823,15 +823,35 @@ const SftpState = struct {
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
-        const real = self.vfs.resolveExisting(self.io, self.allocator, path.value) catch {
-            return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
-        };
-        defer self.allocator.free(real);
+        // Special-case the root: openVerifiedParent rejects "/" because
+        // it has no parent inside the jail. STAT of root means stat the
+        // jail directory itself.
+        if (std.mem.eql(u8, path.value, "/") or std.mem.eql(u8, path.value, "")) {
+            const root_stat = std.Io.Dir.cwd().statFile(self.io, self.vfs.root, .{ .follow_symlinks = true }) catch {
+                return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+            };
+            return replyAttrs(self.channel, request_id, root_stat);
+        }
 
-        const stat = std.Io.Dir.cwd().statFile(self.io, real, .{}) catch {
-            return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+        // FD-based stat (PLAN §8.3 — no string-layer authorization
+        // artifacts). Resolve the parent through `openVerifiedParent`,
+        // which canonicalizes through any symlinks in the parent path
+        // and verifies the result is inside the jail. Then `statFile`
+        // against the parent FD with `follow_symlinks = false` so a
+        // symlink at the final component returns its own metadata
+        // (PLAN §7.6: "STAT and LSTAT behave identically. Zift does
+        // not expose dangling-symlink semantics distinct from stat.")
+        // — and crucially, never crosses out of the jail to read the
+        // target.
+        var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
+            const status = parentErrorStatus(err);
+            return replyStatus(self.channel, request_id, status, "denied or not found");
         };
-        try replyAttrs(self.channel, request_id, stat);
+        defer parent.deinit(self.io, self.allocator);
+
+        const file_stat = parent.parent.statFile(self.io, parent.base, .{ .follow_symlinks = false }) catch
+            return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+        try replyAttrs(self.channel, request_id, file_stat);
     }
 
     fn handleOpendir(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1280,7 +1300,24 @@ fn readPacketTimed(state: *SftpState, payload_buf: []u8) ![]u8 {
     var len_buf: [4]u8 = undefined;
     try readExactTimed(state, &len_buf);
     const len = readU32(&len_buf);
-    if (len > payload_buf.len) return error.LibsshFailure;
+
+    // PLAN §7.6: maximum SFTP packet size is 256 KiB. If the declared
+    // length exceeds that, reply `SSH_FX_BAD_MESSAGE` for the request
+    // (so the client gets a structured rejection it can log) and then
+    // tear down the session — we cannot resync because we'd have to
+    // drain `len` bytes of attacker-controlled traffic to find the
+    // next packet boundary.
+    if (len > payload_buf.len) {
+        var head: [5]u8 = undefined;
+        // Best-effort: try to read msg_type + request_id so we can
+        // reference the original request in our reply. If even that
+        // fails, just disconnect — the client violated the protocol.
+        readExactTimed(state, &head) catch return error.LibsshFailure;
+        const request_id = readU32(head[1..5]);
+        replyStatus(state.channel, request_id, c.SSH_FX_BAD_MESSAGE, "packet too large") catch {};
+        return error.LibsshFailure;
+    }
+
     const payload = payload_buf[0..len];
     try readExactTimed(state, payload);
     return payload;
