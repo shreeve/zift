@@ -130,19 +130,12 @@ pub fn validateSemantic(
 ) SemanticError!void {
     const stderr = std.Io.File.stderr();
 
-    // 1. Host-key file must exist and be readable.
-    _ = std.Io.Dir.cwd().statFile(io, cfg.server.host_key, .{}) catch {
-        stderr.writeStreamingAll(io, "zift: host-key unreadable: ") catch {};
-        stderr.writeStreamingAll(io, cfg.server.host_key) catch {};
-        stderr.writeStreamingAll(io, "\n") catch {};
-        return error.HostKeyUnreadable;
-    };
-
-    // 1a. The pre-auth cap, if configured, must be ≤ the total cap.
-    // A pre-auth cap LARGER than the total cap can't ever fire (the
-    // total cap rejects first), and silently letting it slide hides
-    // an operator misconfiguration that probably should be a typo
-    // for `max-connections` instead.
+    // 1. Pure-numeric checks first: a config that has them wrong
+    // shouldn't even try to stat the filesystem. The pre-auth cap,
+    // if configured, must be ≤ the total cap. A pre-auth cap LARGER
+    // than the total cap can't ever fire (the total cap rejects
+    // first) and silently letting it slide hides an operator misconfig
+    // that's more likely a typo for `max-connections` than intent.
     if (cfg.server.max_unauth_connections != 0 and
         cfg.server.max_unauth_connections > cfg.server.max_connections)
     {
@@ -156,6 +149,14 @@ pub fn validateSemantic(
         stderr.writeStreamingAll(io, ")\n") catch {};
         return error.UnauthCapExceedsTotal;
     }
+
+    // 2. Host-key file must exist and be readable.
+    _ = std.Io.Dir.cwd().statFile(io, cfg.server.host_key, .{}) catch {
+        stderr.writeStreamingAll(io, "zift: host-key unreadable: ") catch {};
+        stderr.writeStreamingAll(io, cfg.server.host_key) catch {};
+        stderr.writeStreamingAll(io, "\n") catch {};
+        return error.HostKeyUnreadable;
+    };
 
     // 2. Each user root must exist, be a directory, and canonicalize
     // through symlinks. We canonicalize via realPath so the overlap
@@ -1000,6 +1001,9 @@ test "server defaults applied when properties omitted" {
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u64, 300_000), cfg.server.idle_timeout_ms);
     try std.testing.expectEqual(@as(u32, 128), cfg.server.max_connections);
+    // Pre-auth cap defaults to 0 = no separate cap (preserves the
+    // behavior operators see when they don't tune this knob).
+    try std.testing.expectEqual(@as(u32, 0), cfg.server.max_unauth_connections);
 }
 
 test "idle-timeout and max-connections parse" {
@@ -1010,3 +1014,46 @@ test "idle-timeout and max-connections parse" {
     try std.testing.expectEqual(@as(u64, 30_000), cfg.server.idle_timeout_ms);
     try std.testing.expectEqual(@as(u32, 64), cfg.server.max_connections);
 }
+
+test "max-unauth-connections parses as a non-negative integer" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n" ++
+        "  max-connections 64\n  max-unauth-connections 16\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 64), cfg.server.max_connections);
+    try std.testing.expectEqual(@as(u32, 16), cfg.server.max_unauth_connections);
+}
+
+test "max-unauth-connections equal to max-connections is accepted" {
+    // The semantic check rejects `>`, not `==` — equal is harmless
+    // because the unauth cap can never fire ahead of the global cap
+    // but its accounting is still useful for observability.
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n" ++
+        "  max-connections 32\n  max-unauth-connections 32\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 32), cfg.server.max_unauth_connections);
+}
+
+test "max-unauth-connections of 0 keeps the no-separate-cap default" {
+    // Operators may set `0` explicitly to document the choice. The
+    // semantic check accepts it the same way it accepts the absence
+    // of the directive.
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n" ++
+        "  max-connections 64\n  max-unauth-connections 0\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 0), cfg.server.max_unauth_connections);
+}
+
+// Note on coverage: the SEMANTIC rejection of
+// `max-unauth-connections > max-connections` requires an `io` instance
+// to satisfy `validateSemantic`'s signature. Constructing a real
+// `std.Io` from a unit test is awkward (it's normally provided by
+// `std.process.Init` to `main`). The integration suite covers this
+// case via `test/cases/30-unauth-cap.sh` (which exercises the live
+// runtime) and via the `validate` CLI in 13-validate-semantic-style
+// scenarios that an operator would actually run.
