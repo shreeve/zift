@@ -111,17 +111,38 @@ _(Homebrew paths gated to macOS, fuzz targets added, CI workflow added: see DONE
 
 ---
 
-## P3 — Nits
-
-- [ ] **`read`/`write` SFTP messages are not individually audited.** PLAN §8.5 reads as "every privileged operation"; we treat OPEN as the privileged step (audit happens there) and consider subsequent read/write within an authorized handle non-privileged. If we change our mind, audit at `READ`/`WRITE` would log-storm normal transfers; pre-decision is intentional. **Disputed by GPT-5.5; we'd document this explicitly in PLAN rather than start auditing every chunk.**
-- [ ] **`REALPATH`, `STAT`, `LSTAT`, `READDIR` aren't audited.** Same reasoning as above — these don't mutate state and don't reveal content. **Disputed by GPT-5.5; we'd audit only failures, not successes, if we audit at all.**
-- [ ] **`SA_RESTART` set on operational signal handlers.** GPT-5.5 flagged this; deliberately chosen because the accept loop polls with 1-second slices and we don't want to interrupt syscalls inside libssh. Documenting the choice rather than reverting it.
-- [ ] **`std.posix.sigaction` "return value ignored" claim.** In Zig 0.16 the function returns `void` and is `unreachable` on EINVAL — there is no return value to check. GPT-5.5 misread; no action needed.
-
----
-
 ## Disputed / Won't fix
 
-- **"Audit every READ/WRITE"** — see P3 entry. PLAN can be amended to say "OPEN audits the privilege; subsequent chunks aren't separately audited." We prefer that to log-storming.
-- **"Audit every REALPATH/STAT/LSTAT"** — same reasoning. Failures may be worth auditing if they're frequent enough to indicate probing; success isn't.
-- **"Build hardcodes /opt/homebrew is a blocker"** — only as a *release* concern. Development builds against system libssh are fine; the release pipeline will vendor.
+Items raised by peer review (GPT-5.5) that we deliberately do not accept,
+plus design choices we deliberately make. Documented here so a future
+reviewer doesn't re-litigate ground we've already walked.
+
+- **Audit every READ/WRITE chunk** — design choice (PLAN §8.5). OPEN
+  audits the privilege grant; subsequent read/write within an authorized
+  handle is not separately audited. Auditing every chunk would log-storm
+  normal transfers, drown the actual privilege events, and force operators
+  to write filters to recover signal. The chunk-level data is recoverable
+  from accounting (bytes per session) without per-chunk JSON. _GPT-5.5
+  disputed; we keep the decision._
+
+- **Audit every REALPATH / STAT / LSTAT / READDIR** — same reasoning as
+  above. These ops don't mutate state and don't expose content beyond
+  metadata the client already has authority to see (read+list policy
+  permission). If a deployment finds enumeration probes worth recording,
+  the right intervention is auditing the FAILURE path (denied stat in a
+  policy-restricted area), not the success path. _GPT-5.5 disputed; we
+  keep the decision._
+
+- **`SA_RESTART` on operational signal handlers** — deliberate choice.
+  The accept loop polls with 1-second slices, so signal latency is bounded
+  even when SA_RESTART blocks the signal from interrupting blocked
+  syscalls. The trade we don't want is signals interrupting `read(2)` /
+  `write(2)` calls inside libssh worker threads, where libssh's error
+  recovery is harder to reason about than just letting the next poll cycle
+  pick up the flag. _GPT-5.5 flagged this; we keep the choice and document
+  it here._
+
+- **`std.posix.sigaction` "return value ignored"** — non-issue. In Zig
+  0.16 the function returns `void` and is `unreachable` on EINVAL. There
+  is no return value to check. _GPT-5.5 misread the API; no action
+  needed._
