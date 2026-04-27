@@ -372,7 +372,7 @@ fn checkArgon2idPolicy(phc: []const u8, policy: Argon2idPolicy) Error!void {
     const hash_field = iter.next() orelse return error.PasswordHashMalformed;
     if (iter.next() != null) return error.PasswordHashMalformed;
     if (salt_field.len == 0 or hash_field.len == 0) return error.PasswordHashMalformed;
-    if (!isValidBase64(salt_field) or !isValidBase64(hash_field)) return error.PasswordHashMalformed;
+    if (!isValidPhcBase64(salt_field) or !isValidPhcBase64(hash_field)) return error.PasswordHashMalformed;
 
     var m: ?u32 = null;
     var t: ?u32 = null;
@@ -598,9 +598,10 @@ fn parseUserKey(allocator: std.mem.Allocator, user: *UserBuilder, value: []const
     if (blob.len == 0) return error.InvalidKeyLine;
 
     // PLAN §8.4: reject malformed key blobs at config load so a
-    // config-with-bad-key never goes live. A valid OpenSSH public-key
-    // blob is strict base64 (A-Z, a-z, 0-9, +, /, optional = padding).
-    if (!isValidBase64(blob)) return error.InvalidKeyLine;
+    // config-with-bad-key never goes live. OpenSSH public-key blobs
+    // are strict RFC 4648 standard base64 (with padding). The parser
+    // makes the same accept/reject decision libssh would.
+    if (!isValidStandardBase64(blob)) return error.InvalidKeyLine;
 
     try user.keys.append(allocator, .{
         .algorithm = try allocator.dupe(u8, algorithm),
@@ -608,15 +609,29 @@ fn parseUserKey(allocator: std.mem.Allocator, user: *UserBuilder, value: []const
     });
 }
 
-fn isValidBase64(data: []const u8) bool {
+/// Strict RFC 4648 standard base64 used for OpenSSH wire blobs:
+/// alphabet [A-Za-z0-9+/], length must be %4==0, padding is required
+/// where the byte count would otherwise leave 1 or 2 trailing chars.
+/// We round-trip through `std.base64.standard.Decoder` so the parser
+/// makes the same accept/reject decision libssh would.
+fn isValidStandardBase64(data: []const u8) bool {
+    if (data.len == 0 or data.len % 4 != 0) return false;
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(data) catch return false;
+    var buf: [8192]u8 = undefined;
+    if (decoded_len > buf.len) return false;
+    decoder.decode(buf[0..decoded_len], data) catch return false;
+    return true;
+}
+
+/// PHC base64: same alphabet as RFC 4648 standard, but no `=` padding
+/// is allowed and the length is therefore not required to be %4==0.
+/// PHC §B encodes 16-byte salts as 22 chars, 32-byte hashes as 43 chars,
+/// etc. — all with `len % 4 != 0` after the padding is stripped. Used
+/// for the `salt` and `hash` fields of an Argon2id PHC string.
+fn isValidPhcBase64(data: []const u8) bool {
     if (data.len == 0) return false;
-    var padding_started = false;
     for (data) |ch| {
-        if (ch == '=') {
-            padding_started = true;
-            continue;
-        }
-        if (padding_started) return false;
         const ok = (ch >= 'A' and ch <= 'Z') or
             (ch >= 'a' and ch <= 'z') or
             (ch >= '0' and ch <= '9') or
@@ -739,7 +754,7 @@ test "parse valid config" {
         \\  log stderr
         \\
         \\user ally
-        \\  password $argon2id$v=19$m=65536,t=3,p=4$example$hash
+        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
         \\  root /tmp/zift/ally
         \\  allow /pending read write list mkdir remove rename
         \\  allow /archive read list
@@ -834,30 +849,86 @@ test "password accepted at envelope boundaries" {
     defer cfg.deinit();
 }
 
+// Real-shape OpenSSH ed25519 wire blob: 32-byte length-prefixed
+// "ssh-ed25519" string + 32-byte length-prefixed key material.
+// 68 base64 chars = 51 bytes decoded.
+const valid_ed25519_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIPHj7SuD0g1xj0ZqLELSQ7Ux8RSjGlYBhVMxbfBhPXMd";
+
+// 96 base64 chars = 72 bytes decoded; long enough to look like an
+// ECDSA P-256 wire blob.
+const valid_ecdsa_blob =
+    "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPHj7SuD0g1xj0ZqLELSQ7Ux8RSjGlYBhVMxbfBhPXMd";
+
 test "key-only user accepted" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user runner\n  key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBLAH runner-1\n  root /tmp/a\n";
+        "user runner\n  key ssh-ed25519 " ++ valid_ed25519_blob ++ " runner-1\n  root /tmp/a\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqual(@as(usize, 1), cfg.users.len);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.users[0].password_hash);
     try std.testing.expectEqual(@as(usize, 1), cfg.users[0].keys.len);
     try std.testing.expectEqualStrings("ssh-ed25519", cfg.users[0].keys[0].algorithm);
-    try std.testing.expectEqualStrings("AAAAC3NzaC1lZDI1NTE5AAAAIBLAH", cfg.users[0].keys[0].blob);
+    try std.testing.expectEqualStrings(valid_ed25519_blob, cfg.users[0].keys[0].blob);
 }
 
 test "multiple keys per user accepted" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
         "user runner\n" ++
-        "  key ssh-ed25519 AAAAC3aaaa primary\n" ++
-        "  key ecdsa-sha2-nistp256 AAAAE2bbbb backup\n" ++
+        "  key ssh-ed25519 " ++ valid_ed25519_blob ++ " primary\n" ++
+        "  key ecdsa-sha2-nistp256 " ++ valid_ecdsa_blob ++ " backup\n" ++
         "  root /tmp/a\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqual(@as(usize, 2), cfg.users[0].keys.len);
     try std.testing.expectEqualStrings("ecdsa-sha2-nistp256", cfg.users[0].keys[1].algorithm);
+}
+
+test "key line with non-base64 blob rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user runner\n  key ssh-ed25519 not!valid!base64 oops\n  root /tmp/a\n";
+    try std.testing.expectError(error.InvalidKeyLine, parse(std.testing.allocator, text));
+}
+
+test "key line with bad base64 length rejected" {
+    // 29 chars — the previous lax validator let this through; strict
+    // base64 rejects because length is not a multiple of 4.
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user runner\n  key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBLAH oops\n  root /tmp/a\n";
+    try std.testing.expectError(error.InvalidKeyLine, parse(std.testing.allocator, text));
+}
+
+test "real argon2id phc accepted (PHC base64 has no padding)" {
+    // 22-char salt + 43-char hash — both `len % 4 != 0`, neither has
+    // `=` padding. RFC 9106 / PHC §B explicitly forbids padding so the
+    // strict OpenSSH-style validator must NOT be applied here.
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $argon2id$v=19$m=65536,t=3,p=1" ++
+        "$bSki6LMKgGqnScrLG0fo/2hpMLj8InvvY+irrZKEsS4" ++
+        "$0HMWjuvAdHzgT2+GA1DdgQL5fdDrC4X0GEezlPDjimQ\n" ++
+        "  root /tmp/a\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+}
+
+test "phc with `=` padding in salt rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $argon2id$v=19$m=65536,t=3,p=1$xxxx==xx$yyyyyyyyyyyy\n" ++
+        "  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordHashMalformed, parse(std.testing.allocator, text));
+}
+
+test "phc with non-alphabet char in hash rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password $argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyy!yyyyyyy\n" ++
+        "  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordHashMalformed, parse(std.testing.allocator, text));
 }
 
 test "rsa key rejected" {
