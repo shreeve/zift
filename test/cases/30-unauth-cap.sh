@@ -61,20 +61,33 @@ EOF
 
 start_zift
 
-# Helper: poll the audit log for a specific JSON pattern, up to N
-# attempts at 200ms intervals. Returns 0 when found, 1 on timeout.
+# Helper: poll the audit log for a specific (fixed-string) JSON
+# pattern, up to N attempts at 200ms intervals. Returns 0 when found,
+# 1 on timeout. `grep -F` so dots in operation names like
+# `accept.rejected` are treated as literal dots, not regex `any-char`.
 poll_audit() {
     local pattern="$1"
     local max_attempts="${2:-25}"  # 5 seconds default
     local i=0
     while [[ $i -lt $max_attempts ]]; do
-        if grep -q "$pattern" "$TEST_TMP/audit.jsonl" 2>/dev/null; then
+        if grep -Fq "$pattern" "$TEST_TMP/audit.jsonl" 2>/dev/null; then
             return 0
         fi
         sleep 0.2
         i=$((i + 1))
     done
     return 1
+}
+
+# Count occurrences of a fixed-string pattern in the audit log,
+# returning a single integer (never the multi-line "0\n0" the
+# `|| echo 0` idiom can produce when grep both prints "0" and
+# fails on no-match).
+count_audit() {
+    local pattern="$1"
+    local n
+    n=$(grep -Fc "$pattern" "$TEST_TMP/audit.jsonl" 2>/dev/null || true)
+    echo "${n:-0}"
 }
 
 # ============================================================
@@ -124,7 +137,7 @@ fi
 # Sanity: the global cap line should NOT appear (only 3 in flight,
 # global cap is 8). A buggy implementation that mis-attributes the
 # rejection to the global cap fails this check.
-if grep -q '"detail":"max-connections reached"' "$TEST_TMP/audit.jsonl"; then
+if grep -Fq '"detail":"max-connections reached"' "$TEST_TMP/audit.jsonl"; then
     fail "phase 1: rejection attributed to max-connections (should be max-unauth)"
 fi
 ok "phase 1: rejection correctly attributed to pre-auth cap, not global cap"
@@ -141,7 +154,7 @@ sleep 1  # ensure server-side teardowns finished and decremented
 # A fresh raw connection should now be ADMITTED (no rejection).
 # Snapshot the current rejection count so we can prove no NEW rejection
 # happens during this phase.
-rej_before=$(grep -c '"operation":"accept.rejected"' "$TEST_TMP/audit.jsonl" 2>/dev/null || echo 0)
+rej_before=$(count_audit '"operation":"accept.rejected"')
 
 "$PY" - <<EOF
 import socket, time
@@ -157,13 +170,12 @@ EOF
 # accept time"). 0.5s is enough to see an accept-time rejection if it
 # would have happened.
 sleep 0.5
-rej_after=$(grep -c '"operation":"accept.rejected"' "$TEST_TMP/audit.jsonl" 2>/dev/null || echo 0)
+rej_after=$(count_audit '"operation":"accept.rejected"')
 
 if [[ "$rej_before" == "$rej_after" ]]; then
     ok "phase 2: post-drop fresh connection accepted (unauth_sessions decremented)"
 else
     fail "phase 2: fresh connection rejected after stuck slots dropped — leak in unauth_sessions"
-    grep '"operation":"accept.rejected"' "$TEST_TMP/audit.jsonl" | tail -3 | sed 's/^/    /'
 fi
 
 # ============================================================
