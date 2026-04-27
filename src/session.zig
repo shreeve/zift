@@ -3,6 +3,7 @@ const c = @import("libssh");
 const audit = @import("audit.zig");
 const auth = @import("auth.zig");
 const config = @import("config.zig");
+const listing = @import("listing.zig");
 const policy = @import("policy.zig");
 const signals = @import("signals.zig");
 const vfs_mod = @import("vfs.zig");
@@ -26,6 +27,16 @@ fn nowMs() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
+}
+
+/// Wall-clock seconds since the Unix epoch — needed by the listing
+/// renderer to decide between `Mon DD HH:MM` (recent) and
+/// `Mon DD  YYYY` (old) for `ls -l` mtime formatting. Distinct from
+/// `nowMs()` which reads CLOCK_MONOTONIC for interval timing.
+fn nowUnixSecs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @as(i64, ts.sec);
 }
 
 /// Format the peer IP of `session`'s underlying TCP socket into `buf`.
@@ -1025,6 +1036,12 @@ const SftpState = struct {
     spurious_eof_count: u32 = 0,
     next_handle: u32 = 1,
     handles: std.ArrayList(Handle) = .empty,
+    /// Per-session cache for uid/gid -> name resolution used while
+    /// formatting `ls -l`-style longnames in directory listings.
+    /// Lives inside the state struct (no allocations) and shares
+    /// nothing across sessions — keeps cache poisoning between
+    /// concurrent partners impossible by construction.
+    name_resolver: listing.NameResolver = .{},
 
     fn deinit(self: *SftpState) void {
         for (self.handles.items) |*handle| {
@@ -1111,9 +1128,13 @@ const SftpState = struct {
         const handle = self.findHandle(id, .file) orelse
             return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
 
-        const file_stat = handle.file.?.stat(self.io) catch
+        // `listing.statFd` returns the same shape we use for READDIR
+        // (real mode, uid, gid, size, mtime), so STAT/FSTAT/READDIR
+        // are now consistent — partner gets the same fields whether
+        // they ask via "ls -la" or "stat <file>".
+        const info = listing.statFd(handle.file.?.handle) catch
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "fstat failed");
-        try replyAttrs(self.channel, request_id, file_stat);
+        try replyFullAttrs(self.channel, request_id, info);
     }
 
     fn handleStat(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1132,10 +1153,18 @@ const SftpState = struct {
         // it has no parent inside the jail. STAT of root means stat the
         // jail directory itself.
         if (std.mem.eql(u8, path.value, "/") or std.mem.eql(u8, path.value, "")) {
-            const root_stat = std.Io.Dir.cwd().statFile(self.io, self.vfs.root, .{ .follow_symlinks = true }) catch {
+            // STAT of "/" means stat the jail root itself. Open the
+            // root dir to get a stable fd, fstat it, then close.
+            // Going through an fd (rather than a path-string stat)
+            // matches PLAN §8.3 and gives us full uid/gid/mode for
+            // the listing renderer.
+            var root_dir = std.Io.Dir.cwd().openDir(self.io, self.vfs.root, .{ .iterate = false }) catch {
                 return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
             };
-            return replyAttrs(self.channel, request_id, root_stat);
+            defer root_dir.close(self.io);
+            const root_info = listing.statFd(root_dir.handle) catch
+                return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+            return replyFullAttrs(self.channel, request_id, root_info);
         }
 
         // FD-based stat (PLAN §8.3 — no string-layer authorization
@@ -1154,9 +1183,15 @@ const SftpState = struct {
         };
         defer parent.deinit(self.io, self.allocator);
 
-        const file_stat = parent.parent.statFile(self.io, parent.base, .{ .follow_symlinks = false }) catch
+        // `listing.statAt` against the verified parent FD (PLAN §8.3
+        // path-jail invariant) with `AT_SYMLINK_NOFOLLOW`. Returns
+        // the full POSIX shape — mode bits with file-type encoded,
+        // nlink, uid, gid, size, mtime — which `replyFullAttrs`
+        // hands to the client so it can render `ls -l` / `stat`
+        // output correctly.
+        const info = listing.statAt(parent.parent.handle, parent.base) catch
             return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
-        try replyAttrs(self.channel, request_id, file_stat);
+        try replyFullAttrs(self.channel, request_id, info);
     }
 
     fn handleOpendir(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1191,25 +1226,75 @@ const SftpState = struct {
         const handle = self.findHandle(id, .dir) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
         if (handle.dir_done) return replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof");
 
-        var names: [32]DirName = undefined;
+        // Batch up to `batch_size` entries per READDIR reply. Smaller
+        // than v0.1.x's 32 because we now carry per-entry longnames
+        // (~120 bytes apiece) plus full attrs (~28 bytes), and the
+        // wire-side packet buffer is 32 KiB. 16 × ~280 bytes ≈ 4.5
+        // KiB worst-case packet, well under the limit, and the round-
+        // trip cost of two READDIRs vs one is dominated by network
+        // RTT regardless of batch size.
+        const batch_size = 16;
+        var entries: [batch_size]DirEntry = undefined;
         var count: usize = 0;
-        while (count < names.len) {
+
+        const dir_fd = handle.dir.?.handle;
+        // Wall-clock seconds for the "recent vs old" heuristic in
+        // `formatLongname`. Captured once per READDIR call so all
+        // entries in this batch use a consistent reference point.
+        const now_secs: i64 = nowUnixSecs();
+
+        while (count < entries.len) {
             const entry = handle.dir_iter.?.next(self.io) catch {
                 return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read dir failed");
             } orelse {
                 handle.dir_done = true;
                 break;
             };
-            names[count] = .{
-                .name = try self.allocator.dupe(u8, entry.name),
-                .kind = entry.kind,
+
+            // `fstatat(dir_fd, name, AT_SYMLINK_NOFOLLOW)`. Stays inside
+            // the path-jail because `dir_fd` was opened through the
+            // verified-parent path and we never leave it. A symlink at
+            // `name` returns the symlink's own metadata rather than
+            // following it — so a partner can't trick us into reaching
+            // outside the jail just to render a listing.
+            const info = listing.statAt(dir_fd, entry.name) catch {
+                // An entry vanishing between readdir and statAt (race
+                // with another process unlinking it) is a normal
+                // filesystem condition. Skip rather than failing the
+                // whole READDIR — the next call sees the updated
+                // directory.
+                continue;
             };
+
+            // uid/gid → name. The resolver caches lookups and falls
+            // back to numeric on `getpwuid_r`/`getgrgid_r` failure.
+            // `numeric_*` is the fallback scratch when the cache is
+            // full or when libc returns no entry.
+            var numeric_user: [16]u8 = undefined;
+            var numeric_group: [16]u8 = undefined;
+            const user_name = self.name_resolver.user(info.uid, &numeric_user);
+            const group_name = self.name_resolver.group(info.gid, &numeric_group);
+
+            entries[count].name_len = entry.name.len;
+            const name_copy_len = @min(entry.name.len, entries[count].name_buf.len);
+            @memcpy(entries[count].name_buf[0..name_copy_len], entry.name[0..name_copy_len]);
+            entries[count].info = info;
+
+            const longname = listing.formatLongname(
+                &entries[count].longname_buf,
+                info,
+                user_name,
+                group_name,
+                entry.name[0..name_copy_len],
+                now_secs,
+            );
+            entries[count].longname_len = longname.len;
+
             count += 1;
         }
-        defer for (names[0..count]) |name| self.allocator.free(name.name);
 
         if (count == 0) return replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof");
-        try replyNames(self.channel, request_id, names[0..count]);
+        try replyNames(self.channel, request_id, entries[0..count]);
     }
 
     fn handleOpen(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1582,9 +1667,28 @@ const SftpState = struct {
     }
 };
 
-const DirName = struct {
-    name: []const u8,
-    kind: std.Io.File.Kind,
+/// One directory entry's worth of READDIR reply state. All buffers
+/// live inline so we can stack-allocate the batch — no per-entry
+/// heap traffic in the hot path.
+///
+/// `name_buf` holds the raw entry name (NAME_MAX = 255 bytes on
+/// Linux/macOS); `longname_buf` holds the formatted GNU-`ls`-style
+/// line we send as the SFTP `longname`. The 320-byte longname budget
+/// is `name_max + ~64` to fit the "permissions nlink owner group
+/// size mtime" header alongside the longest reasonable filename.
+const DirEntry = struct {
+    name_buf: [256]u8 = undefined,
+    name_len: usize = 0,
+    longname_buf: [320]u8 = undefined,
+    longname_len: usize = 0,
+    info: listing.EntryInfo = .{
+        .mode = 0,
+        .nlink = 0,
+        .uid = 0,
+        .gid = 0,
+        .size = 0,
+        .mtime_secs = 0,
+    },
 };
 
 fn parentErrorStatus(err: anyerror) c_int {
@@ -1743,16 +1847,20 @@ fn replyName(channel: c.ssh_channel, request_id: u32, name: []const u8) !void {
     try writePayload(channel, w.written());
 }
 
-fn replyNames(channel: c.ssh_channel, request_id: u32, names: []const DirName) !void {
-    var buf: [8192]u8 = undefined;
+fn replyNames(channel: c.ssh_channel, request_id: u32, entries: []const DirEntry) !void {
+    // 32 KiB per packet: 16 entries × ~(255 name + 320 longname + 28
+    // attrs + 12 length-prefix overhead) ≈ 9.8 KiB worst case, with
+    // room to spare for any future attr additions. Stack-allocated;
+    // the worker thread's stack is 8 MiB.
+    var buf: [32 * 1024]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_NAME));
     try w.putU32(request_id);
-    try w.putU32(@intCast(names.len));
-    for (names) |name| {
-        try w.string(name.name);
-        try w.string(name.name);
-        try writeBasicAttrs(&w, name.kind, 0);
+    try w.putU32(@intCast(entries.len));
+    for (entries) |entry| {
+        try w.string(entry.name_buf[0..@min(entry.name_len, entry.name_buf.len)]);
+        try w.string(entry.longname_buf[0..@min(entry.longname_len, entry.longname_buf.len)]);
+        try writeFullAttrs(&w, entry.info);
     }
     try writePayload(channel, w.written());
 }
@@ -1778,12 +1886,17 @@ fn replyDirAttrs(channel: c.ssh_channel, request_id: u32) !void {
     try writePayload(channel, w.written());
 }
 
-fn replyAttrs(channel: c.ssh_channel, request_id: u32, stat: std.Io.File.Stat) !void {
+fn replyFullAttrs(channel: c.ssh_channel, request_id: u32, info: listing.EntryInfo) !void {
+    // SFTP_FXP_ATTRS reply with the full attribute set (mode + uid +
+    // gid + size + atime/mtime). Used by STAT, LSTAT, and FSTAT — so
+    // a partner running `sftp> stat foo` and `sftp> ls -la` see the
+    // same fields, populated from the same `listing.statAt`-derived
+    // EntryInfo.
     var buf: [128]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_ATTRS));
     try w.putU32(request_id);
-    try writeBasicAttrs(&w, stat.kind, stat.size);
+    try writeFullAttrs(&w, info);
     try writePayload(channel, w.written());
 }
 
@@ -1812,9 +1925,17 @@ fn replyStatus(channel: c.ssh_channel, request_id: u32, status: c_int, message: 
 }
 
 fn writeDirAttrs(w: *PacketWriter) !void {
+    // Synthetic attrs for SFTP_NAME replies that only carry a path
+    // without an underlying inode (REALPATH against a virtual root).
+    // We claim "directory, mode 0755, size 0" — minimal but well-
+    // formed; the next STAT/READDIR fetches the real shape.
     try writeBasicAttrs(w, .directory, 0);
 }
 
+/// Synthetic attrs for callers who don't have an actual stat result —
+/// REALPATH replies and similar virtual paths. Only fills SIZE +
+/// PERMISSIONS with a plausible default. NEW code paths should prefer
+/// `writeFullAttrs` with a real `EntryInfo`.
 fn writeBasicAttrs(w: *PacketWriter, kind: std.Io.File.Kind, size: u64) !void {
     const mode: u32 = switch (kind) {
         .directory => @intCast(c.SSH_S_IFDIR | 0o755),
@@ -1823,6 +1944,44 @@ fn writeBasicAttrs(w: *PacketWriter, kind: std.Io.File.Kind, size: u64) !void {
     try w.putU32(@intCast(c.SSH_FILEXFER_ATTR_SIZE | c.SSH_FILEXFER_ATTR_PERMISSIONS));
     try w.putU64(size);
     try w.putU32(mode);
+}
+
+/// Emit an SFTP v3 file-attributes block populated from a real
+/// `listing.EntryInfo`. Includes:
+///
+///   - SIZE         : real byte size (0 for directories/specials)
+///   - UIDGID       : real uid + gid for `ls -l` rendering
+///   - PERMISSIONS  : real `st_mode` (file-type bits + permission
+///                    bits), so the client can render `drwxr-xr-x`
+///                    correctly for directories, symlinks, etc.
+///   - ACMODTIME    : atime + mtime as seconds since epoch
+///
+/// The flag word is the OR of the four `SSH_FILEXFER_ATTR_*` bits;
+/// each populated field follows in the spec-defined order.
+fn writeFullAttrs(w: *PacketWriter, info: listing.EntryInfo) !void {
+    const flags: u32 = @intCast(
+        c.SSH_FILEXFER_ATTR_SIZE |
+            c.SSH_FILEXFER_ATTR_UIDGID |
+            c.SSH_FILEXFER_ATTR_PERMISSIONS |
+            c.SSH_FILEXFER_ATTR_ACMODTIME,
+    );
+    try w.putU32(flags);
+    try w.putU64(info.size);
+    try w.putU32(info.uid);
+    try w.putU32(info.gid);
+    try w.putU32(info.mode);
+    // SFTP v3 stores acmodtime as 32-bit seconds. mtime_secs comes
+    // from statx/fstat as i64 to handle pre-1970 files correctly,
+    // but SFTP can only carry u32; clamp to the representable range
+    // (1970..2106) rather than truncate silently. Same for atime,
+    // which we don't track separately — we report mtime for both
+    // since SFTP clients use atime only as a fallback for dirs that
+    // don't track it.
+    const t32: u32 = if (info.mtime_secs < 0) 0
+        else if (info.mtime_secs > std.math.maxInt(u32)) std.math.maxInt(u32)
+        else @intCast(info.mtime_secs);
+    try w.putU32(t32);
+    try w.putU32(t32);
 }
 
 fn writePayload(channel: c.ssh_channel, payload: []const u8) !void {
