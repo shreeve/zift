@@ -146,15 +146,79 @@ server
 user ally
   password $argon2id$v=19$m=65536,t=3,p=1$...
   root /tmp/zift/ally
-  allow /pending read write list mkdir remove rename
-  allow /archive read list
   allow / read list
+  allow /pending read list add remove
+  allow /archive read list
   # `**` crosses path boundaries (gitignore-style); `*` does not.
   deny **.exe
   deny **/.ssh/**
 ```
 
+### Permission verbs
+
+The four-verb model covers every SFTP wire op a partner can perform:
+
+| Verb | Grants |
+|---|---|
+| `read` | download (SSH_FXP_READ), STAT/LSTAT |
+| `list` | readdir / OPENDIR / READDIR |
+| `add` | upload (SSH_FXP_WRITE) + mkdir + rename — symmetric with `remove` |
+| `remove` | unlink files + rmdir empty directories |
+
+The granular verbs `write`, `mkdir`, and `rename` are still accepted
+for fine-grained control (e.g. an immutable-receive workflow that
+allows uploads but forbids renames), but `add` is the recommended
+shorthand for the common "let them mutate this dir" case.
+
 Permissions are default-deny. `deny` rules override `allow` rules.
+
+#### `add`-without-`remove` and rename semantics
+
+`add` grants `rename`. There are two ways rename can be destructive:
+
+1. **Source-name removal.** Rename always moves the source name to
+   the destination. A partner with `add` (no `remove`) can still make
+   a file "disappear from its expected path" by renaming it to a
+   different name in the same dir. The inode lives on, but the path
+   the operator might be polling for is now empty. If you don't want
+   that, use the granular verbs (`write mkdir` instead of `add`) — they
+   include upload + directory creation but exclude rename.
+
+2. **Destination overwrite.** POSIX `rename(2)` atomically overwrites
+   an existing destination. Without a guard, an `add`-only partner
+   could destroy any existing entry by `rename src dest_to_destroy`.
+   Zift refuses this case: at rename time, if the destination exists
+   in any form (file, dir, symlink, socket, FIFO), the partner must
+   ALSO have `remove` permission on the destination path.
+
+Behavior summary:
+
+| Setup | rename can create new names? | rename can move existing names within scope? | rename can overwrite an existing destination? |
+|---|---|---|---|
+| `allow /pending write mkdir` (no `rename`, no `remove`) | yes (via upload + mkdir) | no | no |
+| `allow /pending add` (= write+mkdir+rename, no `remove`) | yes | yes | NO — refused at the destination |
+| `allow /pending add remove` | yes | yes | yes |
+
+The destination-overwrite guard uses a stat-then-rename sequence
+which has a small TOCTOU window — two concurrent partner sessions
+could in principle race the check. Closing that window hermetically
+requires `renameat2(RENAME_NOREPLACE)` on Linux or
+`renamex_np(RENAME_EXCL)` on macOS, which is tracked as a P2
+follow-up. For typical partner workflows (one session per partner,
+no pipelined adversarial renames) the portable check is sufficient.
+
+### Listing mode
+
+By default (`listing-mode virtual`, the v0.3.0+ default), `sftp> ls -la`
+shows partners their own virtual-user name, a fixed group of `sftp`,
+and policy-derived `rwx` bits — they see what they CAN DO, not who
+owns the file on the server's disk. The world triplet is always `---`
+(there's no third class of viewer in their jail). Setuid/setgid/sticky
+bits are stripped from the displayed mode.
+
+Add `listing-mode reality` to the `server` block if you want the
+on-disk owner/group/mode to pass through unchanged (rare; mostly
+useful for debugging).
 
 ## Production deployment
 

@@ -18,6 +18,83 @@ pub const Decision = enum {
     deny,
 };
 
+/// Compose a fictional `mode_t`-shaped value for `vpath` from this
+/// user's policy and the entry's real file kind. Used by the virtual
+/// listing renderer (`listing-mode virtual`, default in v0.3.0+) so
+/// `sftp> ls -la` shows a partner what they can actually DO with each
+/// entry rather than what's on disk.
+///
+/// The mapping has DIFFERENT semantics for files vs directories,
+/// because `w` means different things in those two worlds:
+///
+///   File-type bits        : preserved from the inode (`d` / `-` / `l` / ...)
+///   setuid/setgid/sticky  : ALWAYS off — operational, not partner-facing
+///
+///   For a FILE:
+///     r  = `read`   permission grants `SSH_FXP_OPEN(read)` / STAT
+///     w  = `write`  permission grants `SSH_FXP_OPEN(write)` —
+///          ability to overwrite the byte content. Note: removal is
+///          NOT counted toward the file's `w` bit; deletion is a
+///          property of the parent directory (you `unlink`-from-the-
+///          dir, not `unlink`-the-file).
+///     x  = always 0. SFTP doesn't execute files; the bit has no
+///          useful meaning to a partner.
+///
+///   For a DIRECTORY:
+///     r  = `read`   permission grants STAT/LSTAT
+///     w  = ANY mutation perm (`write` OR `mkdir` OR `rename` OR
+///          `remove`) — this directory's *contents* can change. A
+///          partner with rename-only or mkdir-only sees `w` even
+///          though they can't open files for write at this path.
+///     x  = `list`   permission grants `OPENDIR`/`READDIR` and
+///          traversal. (Following Unix convention: a dir with
+///          traverse-but-not-list is an obscurity, not a security
+///          property; we just couple them.)
+///
+///   Group triplet  : MIRRORS owner — the partner is the only
+///                    inhabitant of their jail, "group" doesn't model
+///                    anyone else.
+///   Other triplet  : ALWAYS `---` — there is no third class of
+///                    viewer in the jail, so showing world bits would
+///                    imply a reader who doesn't exist.
+pub fn policyDerivedMode(
+    user: *const config.UserConfig,
+    vpath: []const u8,
+    kind_bits: u32,
+) u32 {
+    const file_type = kind_bits & 0o170000;
+    const is_dir = file_type == 0o040000;
+
+    const can_read = check(user, .open_read, vpath) == .allow;
+
+    var owner: u32 = 0;
+    if (can_read) owner |= 0o4;
+
+    if (is_dir) {
+        // Dir: any of the four mutation ops contributes to `w`. Each
+        // op corresponds to a DIFFERENT verb in the config DSL
+        // (`write`, `mkdir`, `rename`, `remove`), so we must check
+        // them all — a partner with `mkdir` but not `write` still
+        // gets `w` because they CAN mutate this directory's contents.
+        const can_mutate = (check(user, .open_write, vpath) == .allow) or
+            (check(user, .mkdir, vpath) == .allow) or
+            (check(user, .rename, vpath) == .allow) or
+            (check(user, .remove, vpath) == .allow);
+        if (can_mutate) owner |= 0o2;
+        if (check(user, .readdir, vpath) == .allow) owner |= 0o1;
+    } else {
+        // File: `w` strictly means "can rewrite byte content"
+        // (= `write` permission, which gates `SSH_FXP_OPEN(write)`).
+        // Removal of the file is a property of the parent dir's
+        // policy, not this file's mode bits — exactly like Unix,
+        // where `rm somefile` consults the dir's `w` bit, not the
+        // file's.
+        if (check(user, .open_write, vpath) == .allow) owner |= 0o2;
+    }
+
+    return file_type | (owner << 6) | (owner << 3) | 0;
+}
+
 pub fn check(user: *const config.UserConfig, operation: Operation, virtual_path: []const u8) Decision {
     const needed = permissionFor(operation);
     var allowed = false;

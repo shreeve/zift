@@ -6,11 +6,26 @@ server
   max-connections 128
   max-unauth-connections 32
   log stderr
+  # `virtual` (default in v0.3.0+) shows the partner their own user
+  # name + a fixed group of "sftp" + policy-derived rwx bits. Set to
+  # `reality` if you want the on-disk owner/group/mode to leak through
+  # (rare; mostly useful for debugging).
+  listing-mode virtual
 
 user ally
   password $argon2id$v=19$m=65536,t=3,p=4$example$replace-me
   root /tmp/zift/ally
-  allow /pending read write list mkdir remove rename
+  # The four-verb model `(read | list | add | remove)` covers every
+  # SFTP wire op a partner can perform. `add` is shorthand for the
+  # union of write+mkdir+rename — granting all three together avoids
+  # the "I forgot to allow rename" surprise.
+  #
+  # Note: `add` grants rename, and POSIX rename atomically overwrites
+  # existing files. Zift's rename handler refuses overwrites when the
+  # partner lacks `remove` on the destination, so `add`-without-`remove`
+  # really means "create new names only" — see README for details.
+  allow / read list
+  allow /pending read list add remove
   allow /archive read list
   # `**` crosses path boundaries (gitignore-style); `*` does not.
   # `**.exe` denies executables anywhere under the partner root;

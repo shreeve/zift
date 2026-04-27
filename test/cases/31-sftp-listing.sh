@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Test: SFTP `ls -la`-style listing renders real attrs + a formatted
-# longname. Locks in the partner-facing user experience: the OpenSSH
-# sftp client's `?`-laden fallback for missing fields is replaced
-# with real mode bits, real nlink, real uid/gid (resolved to names),
-# real size (`-` for dirs, human-readable suffix for files), and a
-# `Mon DD HH:MM` mtime.
+# Test: SFTP `ls -la` rendering in the v0.3.0+ DEFAULT virtual mode —
+# partner sees their own virtual-user name, a fixed group of "sftp",
+# policy-derived rwx bits, and `---` in the world triplet. The on-disk
+# owner/group/mode never leak into the partner's view.
 #
-# Covers:  PLAN §7.6 READDIR + STAT attrs encoding, listing.zig
-#          longname formatter.
-# Oracle:  paramiko's SFTPAttributes.longname matches our format
-#          (mode 10ch + nlink + owner + group + size + mtime + name).
+# Covers:  PLAN §7.6 READDIR/STAT attrs encoding, src/listing.zig
+#          longname formatter, src/policy.zig policyDerivedMode,
+#          src/session.zig handleReaddir virtual-mode dispatch.
+# Oracle:  paramiko's SFTPAttributes.longname matches the
+#          virtual-mode promise (alice/sftp/policy-rwx/world=---).
 
 source "$(dirname "$0")/../lib/common.sh"
 
@@ -24,10 +23,13 @@ fi
 make_host_key
 hash=$(make_password_hash secret)
 
-mkdir -p "$TEST_TMP/data/pending"
+mkdir -p "$TEST_TMP/data/pending" "$TEST_TMP/data/archive"
 echo "hello world" > "$TEST_TMP/data/notes.txt"
 dd if=/dev/zero of="$TEST_TMP/data/large.bin" bs=1024 count=42 2>/dev/null
 
+# Use the new `add` verb on /pending (full r/w/list/add/remove).
+# /archive stays read-only. Top-level files are visible via `allow /
+# read list`.
 write_config <<EOF
 server
   listen 127.0.0.1:$TEST_PORT
@@ -38,95 +40,113 @@ user runner
   password $hash
   root $TEST_TMP/data
   allow / read list
-  allow /pending read write list
+  allow /pending read list add remove
+  allow /archive read list
 EOF
 
 start_zift
 
 "$PY" - <<EOF
-import paramiko, socket, sys, re
+import paramiko, socket, stat, sys
 
 sock = socket.create_connection(("127.0.0.1", $TEST_PORT), timeout=15)
 t = paramiko.Transport(sock)
 t.connect(username="runner", password="secret")
 sftp = paramiko.SFTPClient.from_transport(t)
 
-# --- 1. listdir_attr exposes both attrs and longname --------------------
 attrs_by_name = {a.filename: a for a in sftp.listdir_attr("/")}
-expected = {"notes.txt", "large.bin", "pending"}
-got = set(attrs_by_name.keys())
-assert expected <= got, f"missing entries: expected {expected}, got {got}"
-print("ok: listdir_attr returned all expected entries")
+print(f"entries seen: {sorted(attrs_by_name)}")
 
-# --- 2. attrs are populated (not the v0.1 hardcoded zeros) ---------------
+# --- 1. attrs basics ----------------------------------------------------
+expected = {"notes.txt", "large.bin", "pending", "archive"}
+assert expected <= set(attrs_by_name), f"missing: {expected - set(attrs_by_name)}"
+print("ok: all expected entries listed")
+
 notes = attrs_by_name["notes.txt"]
-assert notes.st_mode is not None and notes.st_mode != 0, \
-    f"notes.txt mode missing: {notes.st_mode!r}"
-assert notes.st_uid is not None, f"notes.txt uid missing"
-assert notes.st_gid is not None, f"notes.txt gid missing"
-assert notes.st_size == 12, f"notes.txt size wrong: {notes.st_size}"  # "hello world\n"
-assert notes.st_mtime is not None and notes.st_mtime > 0, \
-    f"notes.txt mtime missing: {notes.st_mtime!r}"
-print(f"ok: notes.txt attrs populated (mode=0o{notes.st_mode & 0o7777:o}, "
-      f"size={notes.st_size}, uid={notes.st_uid}, gid={notes.st_gid})")
+assert notes.st_size == 12, f"notes.txt size wrong: {notes.st_size}"
+assert notes.st_mtime and notes.st_mtime > 0, "mtime missing"
+print(f"ok: notes.txt size+mtime populated")
 
-pending = attrs_by_name["pending"]
-import stat
-assert stat.S_ISDIR(pending.st_mode), \
-    f"pending should be a dir, mode=0o{pending.st_mode:o}"
-print(f"ok: pending dir mode bits encode S_IFDIR")
+# --- 2. virtual-mode: uid/gid are zeroed in the wire attrs --------------
+# Server emits uid=0, gid=0 in virtual mode. The CLIENT may render
+# them differently depending on its passwd db, but the fields ARE
+# zero on the wire — confirming we never leaked the on-disk uid.
+assert notes.st_uid == 0, f"virtual-mode wire uid should be 0, got {notes.st_uid}"
+assert notes.st_gid == 0, f"virtual-mode wire gid should be 0, got {notes.st_gid}"
+print("ok: wire uid/gid zeroed (virtual mode)")
 
-# --- 3. longname is the GNU ls -la style line we constructed -----------
-# Format we promise:
-#   mode(10ch) nlink owner group size month day time-or-year name
-# A regex anchors only the parts we control: the mode prefix (d for
-# dir, - for regular file), the file/dir name at the end, and the
-# absence of a literal "?" (the openssh fallback indicator that v0.1
-# left in the gap when we sent no longname).
+# --- 3. longname owner column is the VIRTUAL user name, not the OS user
 notes_long = notes.longname
-assert notes_long is not None, "notes.txt has no longname"
-assert "?" not in notes_long, \
-    f"notes.txt longname contains '?' (server should provide all fields): {notes_long!r}"
-assert notes_long.startswith("-rw"), \
-    f"notes.txt longname should start with file-type '-rw...', got: {notes_long!r}"
-assert "notes.txt" in notes_long, \
-    f"notes.txt longname should end with filename, got: {notes_long!r}"
-print(f"ok: notes.txt longname: {notes_long!r}")
-
-pending_long = pending.longname
-assert "?" not in pending_long, \
-    f"pending longname contains '?': {pending_long!r}"
-assert pending_long.startswith("d"), \
-    f"pending longname should start with 'd' for directory, got: {pending_long!r}"
-# Directory size should render as "-", not the inode size (4096 etc.)
-# — explicit user request, see formatSize() in src/listing.zig.
-fields = pending_long.split()
-# fields layout: [mode, nlink, owner, group, size, month, day, time, name]
-assert fields[4] == "-", \
-    f"pending size column should be '-', got: {fields[4]!r} (full: {pending_long!r})"
-print(f"ok: pending longname: {pending_long!r} (size column = '-')")
-
-# --- 4. Large file size renders with K/M suffix --------------------------
-large = attrs_by_name["large.bin"]
-large_long = large.longname
-# 42 KiB → "42K" with our threshold rule
-assert "42K" in large_long, \
-    f"large.bin longname should contain '42K', got: {large_long!r}"
-print(f"ok: large.bin longname uses K suffix: {large_long!r}")
-
-# --- 5. Owner/group fields are NAMES (not numeric) for known accounts ---
-# Whoever ran zift owns the test dir. getpwuid_r should resolve their
-# uid to a name on any sane system. Numeric fallback is only OK if libc
-# cannot find the entry; we check the field is non-empty and matches
-# the running user's name.
-import os, pwd
-my_uid = os.geteuid()
-my_name = pwd.getpwuid(my_uid).pw_name
+assert notes_long, "notes.txt longname missing"
 fields = notes_long.split()
-owner_field = fields[2]
-assert owner_field == my_name, \
-    f"owner column should be {my_name!r} (resolved), got {owner_field!r}"
-print(f"ok: owner column resolved to name: {owner_field!r}")
+# Layout: mode(10) nlink owner group size mon day time-or-year name
+owner = fields[2]
+group = fields[3]
+assert owner == "runner", f"longname owner should be 'runner' (the virtual user), got {owner!r}"
+assert group == "sftp", f"longname group should be the fixed 'sftp', got {group!r}"
+print(f"ok: longname owner='runner' group='sftp'")
+# Note: a "real owner not in longname" check used to live here, but
+# it's redundant with the direct invariants above AND brittle when the
+# OS user happens to share the virtual user's name. Direct assertions
+# are sufficient.
+
+# --- 4. world triplet is always `---` -----------------------------------
+# Every entry, regardless of on-disk perms or what the partner can
+# actually do — there's no "third class" of viewer in the jail.
+for name, a in attrs_by_name.items():
+    long = a.longname
+    if not long:
+        continue
+    mode_str = long.split()[0]
+    # mode_str layout: <type><owner3><group3><other3>
+    # other3 is mode_str[7:10]
+    other_bits = mode_str[7:10]
+    assert other_bits == "---", \
+        f"{name}: world bits should be '---', got {other_bits!r} (full: {mode_str!r})"
+print("ok: every entry shows world bits as '---'")
+
+# --- 5. policy-derived owner bits ---------------------------------------
+# /pending has add+remove → directory mode bits should be rwx for owner.
+# /archive has only read+list → r-x.
+pending = attrs_by_name["pending"]
+pending_owner = pending.longname.split()[0][1:4]
+assert pending_owner == "rwx", f"/pending should show rwx (read+list+add+remove), got {pending_owner!r}"
+print(f"ok: /pending owner bits = rwx (allow read list add remove)")
+
+archive = attrs_by_name["archive"]
+archive_owner = archive.longname.split()[0][1:4]
+assert archive_owner == "r-x", f"/archive should show r-x (read+list, no mutation), got {archive_owner!r}"
+print(f"ok: /archive owner bits = r-x (allow read list, no add/remove)")
+
+# Top-level file: alice has `allow / read list` only. So a file at /
+# should show r-- (read but no write/remove).
+notes_owner = notes.longname.split()[0][1:4]
+assert notes_owner == "r--", f"/notes.txt should show r-- (read only at root), got {notes_owner!r}"
+print(f"ok: /notes.txt owner bits = r-- (read only at root)")
+
+# --- 6. group bits mirror owner bits ------------------------------------
+for name, a in attrs_by_name.items():
+    long = a.longname
+    if not long:
+        continue
+    mode_str = long.split()[0]
+    owner_bits = mode_str[1:4]
+    group_bits = mode_str[4:7]
+    assert owner_bits == group_bits, \
+        f"{name}: group bits {group_bits!r} should mirror owner bits {owner_bits!r} (full: {mode_str!r})"
+print("ok: group bits mirror owner bits everywhere")
+
+# --- 7. file-type bit preserved -----------------------------------------
+assert pending.longname.startswith("d"), f"pending should start with 'd': {pending.longname!r}"
+assert notes.longname.startswith("-"), f"notes.txt should start with '-': {notes.longname!r}"
+print("ok: file-type bits preserved (d for dirs, - for files)")
+
+# --- 8. dir size is `-`, file size is human-readable --------------------
+assert pending.longname.split()[4] == "-", \
+    f"directory size column should be '-', got: {pending.longname!r}"
+large = attrs_by_name["large.bin"]
+assert "42K" in large.longname, f"large.bin should show '42K': {large.longname!r}"
+print("ok: dir size = '-', file size uses K/M suffix")
 
 sftp.close()
 t.close()

@@ -539,7 +539,7 @@ fn handleSession(
 
     const channel = try acceptSftpSubsystem(session);
 
-    try runSftp(io, allocator, channel, user, cfg.server.idle_timeout_ms, peer_ip);
+    try runSftp(io, allocator, channel, user, cfg.server.idle_timeout_ms, cfg.server.listing_mode, peer_ip);
     c.ssh_disconnect(session);
 }
 
@@ -883,6 +883,7 @@ fn runSftp(
     channel: c.ssh_channel,
     user: *const config.UserConfig,
     idle_timeout_ms: u64,
+    listing_mode: config.ListingMode,
     peer_ip: ?[]const u8,
 ) !void {
     var jail = try vfs_mod.Vfs.init(io, allocator, user.root);
@@ -897,6 +898,7 @@ fn runSftp(
         .peer_ip = peer_ip,
         .vfs = jail,
         .idle_timeout_ms = idle_timeout_ms,
+        .listing_mode = listing_mode,
         .last_activity_ms = start_ms,
         .session_started_ms = start_ms,
     };
@@ -1003,6 +1005,14 @@ const Handle = struct {
     dir: ?std.Io.Dir = null,
     dir_iter: ?std.Io.Dir.Iterator = null,
     dir_done: bool = false,
+    /// Virtual path the dir was opened with (e.g., "/pending"). Stored
+    /// verbatim so the listing renderer can ask the policy "what can
+    /// this user do at <dir_vpath>/<entry_name>?" — necessary for
+    /// virtual-mode rendering, since the per-entry policy decision
+    /// depends on the path, not the inode. Borrowed pointer; the
+    /// path string itself is allocated in `addDirHandle` and freed
+    /// when the slot is `swapRemove`d in `closeHandle`.
+    dir_vpath: ?[]const u8 = null,
     file: ?std.Io.File = null,
     /// Whether SSH_FXP_READ is permitted against this handle. Set at
     /// OPEN time from the SFTP open flags + matching `.open_read` policy.
@@ -1052,7 +1062,15 @@ const SftpState = struct {
     /// Lives inside the state struct (no allocations) and shares
     /// nothing across sessions — keeps cache poisoning between
     /// concurrent partners impossible by construction.
+    /// Only consulted in `listing-mode reality`; in `virtual` mode
+    /// (the v0.3.0 default) we render the partner's own user name
+    /// and a fixed group of "sftp" without ever calling getpwuid_r.
     name_resolver: listing.NameResolver = .{},
+    /// `listing-mode` from the server config. `virtual` (default)
+    /// hides on-disk identities and renders policy-derived rwx;
+    /// `reality` shows the real uid/gid/mode for operators who
+    /// want the on-disk view.
+    listing_mode: config.ListingMode = .virtual,
 
     fn deinit(self: *SftpState) void {
         for (self.handles.items) |*handle| {
@@ -1102,6 +1120,49 @@ const SftpState = struct {
         return true;
     }
 
+    /// Translate a real `EntryInfo` (from fstatat/fstat) into what the
+    /// SFTP attrs reply will carry, honoring `listing_mode`.
+    ///
+    /// In `virtual` mode (default), uid+gid are zeroed and mode bits
+    /// are derived from the user's policy at `vpath`. In `reality`
+    /// mode, the inode's values pass through unchanged — including
+    /// setuid/setgid/sticky bits, since "reality" should be honest
+    /// about reality, not a cosmetically-censored half-truth.
+    ///
+    /// `vpath` may be null for `FSTAT` on a file handle (the partner
+    /// holds a handle, not a path). Without a vpath we can't ask the
+    /// policy what they can do at this exact entry. We fall back to
+    /// kind-correct conservative defaults: `rwx` for dirs, `rw-` for
+    /// files (no execute on files in our world). The partner already
+    /// passed an OPEN policy check to get the handle, so showing
+    /// permissive bits is consistent — they really can read/write
+    /// against this handle, modulo the per-handle access flags
+    /// (`can_read`/`can_write`) we tracked at OPEN time.
+    fn applyListingMode(self: *const SftpState, real: listing.EntryInfo, vpath: ?[]const u8) listing.EntryInfo {
+        switch (self.listing_mode) {
+            .reality => return real,
+            .virtual => {
+                var v = real;
+                v.uid = 0;
+                v.gid = 0;
+                if (vpath) |p| {
+                    v.mode = policy.policyDerivedMode(self.user, p, real.mode);
+                } else {
+                    const file_type = real.mode & 0o170000;
+                    const is_dir = file_type == 0o040000;
+                    // Dir: rwx (read + mutate + traverse) for owner+group.
+                    // File: rw- — no `x` because SFTP files are data,
+                    // not executables, and showing `x` would mislead
+                    // partners (and any client that switches behavior
+                    // based on the bit).
+                    const owner: u32 = if (is_dir) 0o7 else 0o6;
+                    v.mode = file_type | (owner << 6) | (owner << 3);
+                }
+                return v;
+            },
+        }
+    }
+
     fn auditOk(self: *SftpState, op: []const u8, vpath: ?[]const u8, detail: []const u8) void {
         audit.log(self.io, self.user.name, op, vpath, .ok, detail, self.peer_ip orelse "");
     }
@@ -1145,7 +1206,25 @@ const SftpState = struct {
         // they ask via "ls -la" or "stat <file>".
         const info = listing.statFd(handle.file.?.handle) catch
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "fstat failed");
-        try replyFullAttrs(self.channel, request_id, info);
+
+        // For virtual mode, FSTAT can't ask the policy what the
+        // partner can do here (no vpath available — the partner
+        // holds a handle, not a path), so the generic null-vpath
+        // fallback in `applyListingMode` would lie about a
+        // read-only handle by reporting `rw-`. Instead, derive the
+        // mode bits from the per-handle access flags we recorded at
+        // OPEN time: those ARE the truth about what's permitted on
+        // this fd, and they were already gated by policy when the
+        // handle was created.
+        var display = self.applyListingMode(info, null);
+        if (self.listing_mode == .virtual) {
+            const file_type = info.mode & 0o170000;
+            var owner: u32 = 0;
+            if (handle.can_read) owner |= 0o4;
+            if (handle.can_write) owner |= 0o2;
+            display.mode = file_type | (owner << 6) | (owner << 3);
+        }
+        try replyFullAttrs(self.channel, request_id, display);
     }
 
     fn handleStat(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1175,7 +1254,7 @@ const SftpState = struct {
             defer root_dir.close(self.io);
             const root_info = listing.statFd(root_dir.handle) catch
                 return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
-            return replyFullAttrs(self.channel, request_id, root_info);
+            return replyFullAttrs(self.channel, request_id, self.applyListingMode(root_info, "/"));
         }
 
         // FD-based stat (PLAN §8.3 — no string-layer authorization
@@ -1202,7 +1281,7 @@ const SftpState = struct {
         // output correctly.
         const info = listing.statAt(parent.parent.handle, parent.base) catch
             return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
-        try replyFullAttrs(self.channel, request_id, info);
+        try replyFullAttrs(self.channel, request_id, self.applyListingMode(info, path.value));
     }
 
     fn handleOpendir(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1236,7 +1315,7 @@ const SftpState = struct {
             defer self.auditDenied("opendir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         };
-        const id = try self.addDirHandle(dir);
+        const id = try self.addDirHandle(dir, path.value);
         defer self.auditOk("opendir", path.value, "");
         try replyHandle(self.channel, request_id, id);
     }
@@ -1263,6 +1342,20 @@ const SftpState = struct {
         // entries in this batch use a consistent reference point.
         const now_secs: i64 = nowUnixSecs();
 
+        // The dir_vpath invariant: every dir handle is created via
+        // `addDirHandle(dir, vpath)` which always sets `dir_vpath` to
+        // a heap-duped non-null string. If we observe a null here it
+        // means a future refactor broke the invariant — fail loud.
+        const dir_vpath = handle.dir_vpath orelse {
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "internal: dir handle missing vpath");
+        };
+
+        // Re-used across all entries in this batch. Sized to PATH_MAX
+        // because `<dir-vpath>/<entry-name>` could be up to that long
+        // in pathological cases. Hoisted out of the per-entry loop so
+        // we don't push 4 KiB onto the stack 16 times per READDIR.
+        var vpath_buf: [std.posix.PATH_MAX]u8 = undefined;
+
         while (count < entries.len) {
             const entry = handle.dir_iter.?.next(self.io) catch {
                 return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read dir failed");
@@ -1286,23 +1379,78 @@ const SftpState = struct {
                 continue;
             };
 
+            entries[count].name_len = entry.name.len;
+            const name_copy_len = @min(entry.name.len, entries[count].name_buf.len);
+            @memcpy(entries[count].name_buf[0..name_copy_len], entry.name[0..name_copy_len]);
+
+            // `display_info` is what we expose to the client. In
+            // `virtual` mode (the default since v0.3.0) we override
+            // owner/group/mode with policy-derived values so the
+            // partner sees themselves, not the OS user running zift.
+            // In `reality` mode we pass the real inode-derived info
+            // through unchanged. The size + mtime come from the real
+            // inode either way (they're operationally relevant and
+            // not host-identifying).
+            var display_info = info;
+
             // uid/gid → name. The resolver caches lookups and falls
             // back to numeric on `getpwuid_r`/`getgrgid_r` failure.
             // `numeric_*` is the fallback scratch when the cache is
             // full or when libc returns no entry.
             var numeric_user: [16]u8 = undefined;
             var numeric_group: [16]u8 = undefined;
-            const user_name = self.name_resolver.user(info.uid, &numeric_user);
-            const group_name = self.name_resolver.group(info.gid, &numeric_group);
+            var user_name: []const u8 = undefined;
+            var group_name: []const u8 = undefined;
 
-            entries[count].name_len = entry.name.len;
-            const name_copy_len = @min(entry.name.len, entries[count].name_buf.len);
-            @memcpy(entries[count].name_buf[0..name_copy_len], entry.name[0..name_copy_len]);
-            entries[count].info = info;
+            switch (self.listing_mode) {
+                .virtual => {
+                    // Construct the full virtual path of this entry:
+                    // `<dir-vpath>/<entry-name>`, the same shape
+                    // `policy.check` consumes for any other op against
+                    // this entry. We want the policy view to be
+                    // CONSISTENT — what the partner sees in `ls -la`
+                    // should match what the partner can actually do
+                    // when they later try to OPEN/REMOVE/etc. that
+                    // entry.
+                    //
+                    // Use `entry.name` (not the truncated
+                    // `name_copy_len`) for the policy lookup because
+                    // policy decisions must reflect the REAL filename
+                    // — truncating could match the wrong rule (e.g. a
+                    // 256-char name truncated to 255 chars might no
+                    // longer match a literal prefix).
+                    //
+                    // On overflow (vpath > PATH_MAX, vanishingly
+                    // unlikely after VFS validation but possible at
+                    // the end of legal VFS path lengths) we fall back
+                    // to the parent dir's vpath. This is INACCURATE:
+                    // a child-specific deny rule (`deny **.exe`) could
+                    // be lost. For now we accept the inaccuracy on
+                    // the display side rather than allocating a
+                    // fallback string at every entry. Tracked as a
+                    // P3 follow-up — if real partners ever hit this
+                    // path the fix is a heap allocation here.
+                    const sep: []const u8 = if (std.mem.endsWith(u8, dir_vpath, "/")) "" else "/";
+                    const vpath = std.fmt.bufPrint(&vpath_buf, "{s}{s}{s}", .{
+                        dir_vpath, sep, entry.name,
+                    }) catch dir_vpath;
+                    display_info.mode = policy.policyDerivedMode(self.user, vpath, info.mode);
+                    display_info.uid = 0;
+                    display_info.gid = 0;
+                    user_name = self.user.name;
+                    group_name = "sftp";
+                },
+                .reality => {
+                    user_name = self.name_resolver.user(info.uid, &numeric_user);
+                    group_name = self.name_resolver.group(info.gid, &numeric_group);
+                },
+            }
+
+            entries[count].info = display_info;
 
             const longname = listing.formatLongname(
                 &entries[count].longname_buf,
-                info,
+                display_info,
                 user_name,
                 group_name,
                 entry.name[0..name_copy_len],
@@ -1644,6 +1792,56 @@ const SftpState = struct {
         };
         defer to_parent.deinit(self.io, self.allocator);
 
+        // POSIX `rename(2)` ATOMICALLY OVERWRITES the destination if
+        // it exists — meaning a partner with `rename` permission can
+        // destroy any existing entry by `rename src dest`, even if
+        // they have NO `remove` permission. This breaks the v0.3.0
+        // compound-verb story (where `add` grants rename but NOT
+        // remove): without this guard, `add`-only access would
+        // silently grant equivalent-to-remove power via overwrite.
+        //
+        // Guard: `lstat` the destination via the verified parent FD,
+        // not `openFile` — a directory, symlink, FIFO, socket, or
+        // device entry at the destination would all be missed by
+        // openFile (which only succeeds on regular openable files)
+        // but is correctly detected as "exists" by lstat. If the
+        // destination exists in any form, require `.remove`
+        // permission on the destination path.
+        //
+        // Bounded TOCTOU: this stat-then-rename window is racy. Two
+        // SFTP sessions from the same partner (or two pipelined
+        // requests on one session) could exploit it: session A stats
+        // and finds dest absent, session B creates dest, session A
+        // proceeds with rename and overwrites B's entry. The race
+        // is closed hermetically only by Linux's `renameat2(...,
+        // RENAME_NOREPLACE)` and macOS's `renamex_np(...,
+        // RENAME_EXCL)`. We use the portable check today and accept
+        // the bounded race. Tracked as a P2 follow-up to switch to
+        // the platform-specific no-replace primitives.
+        const dest_exists = blk: {
+            _ = listing.statAt(to_parent.parent.handle, to_parent.base) catch |err| switch (err) {
+                error.NotFound => break :blk false,
+                else => {
+                    defer self.auditFailed("rename", to.value, "stat dest failed");
+                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "stat dest failed");
+                },
+            };
+            break :blk true;
+        };
+        if (dest_exists and policy.check(self.user, .remove, to.value) == .deny) {
+            // Audit against the DESTINATION path — that's where the
+            // policy denied us (overwrite requires `remove` on dest).
+            // Auditing the source would mislead operators reading
+            // logs into thinking the source rule was wrong.
+            defer self.auditDenied("rename", to.value);
+            return replyStatus(
+                self.channel,
+                request_id,
+                c.SSH_FX_PERMISSION_DENIED,
+                "rename would overwrite an existing entry; partner lacks remove on destination",
+            );
+        }
+
         std.Io.Dir.rename(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch {
             defer self.auditFailed("rename", from.value, "rename failed");
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename failed");
@@ -1652,13 +1850,27 @@ const SftpState = struct {
         try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
-    fn addDirHandle(self: *SftpState, dir: std.Io.Dir) !u32 {
+    fn addDirHandle(self: *SftpState, dir: std.Io.Dir, vpath: []const u8) !u32 {
+        // ON FAILURE we MUST close `dir` — the caller has already
+        // transferred ownership to us. Without this errdefer, an
+        // OOM (or any future failure path) at append time leaks
+        // both the heap allocation and the open dir-fd until the
+        // session ends. Same audit done for `addFileHandle`.
+        var dir_local = dir;
+        errdefer dir_local.close(self.io);
+
         const id = self.nextHandleId();
+        // dup the vpath so it survives the caller's `path` going out of
+        // scope (the parser hands us a slice into the SFTP packet
+        // buffer that gets reused on the next request).
+        const vpath_owned = try self.allocator.dupe(u8, vpath);
+        errdefer self.allocator.free(vpath_owned);
         try self.handles.append(self.allocator, .{
             .id = id,
             .kind = .dir,
-            .dir = dir,
-            .dir_iter = dir.iterate(),
+            .dir = dir_local,
+            .dir_iter = dir_local.iterate(),
+            .dir_vpath = vpath_owned,
         });
         return id;
     }
@@ -1670,11 +1882,18 @@ const SftpState = struct {
         can_write: bool,
         is_append: bool,
     ) !u32 {
+        // Same fd-leak guard as `addDirHandle`: the caller has
+        // transferred ownership of `file` to us, so an append failure
+        // (OOM, etc.) must close it. Without errdefer the fd would
+        // leak until session shutdown.
+        var file_local = file;
+        errdefer file_local.close(self.io);
+
         const id = self.nextHandleId();
         try self.handles.append(self.allocator, .{
             .id = id,
             .kind = .file,
-            .file = file,
+            .file = file_local,
             .can_read = can_read,
             .can_write = can_write,
             .is_append = is_append,
@@ -1698,8 +1917,10 @@ const SftpState = struct {
     fn closeHandle(self: *SftpState, handle: *Handle) void {
         if (handle.dir) |dir| dir.close(self.io);
         if (handle.file) |file| file.close(self.io);
+        if (handle.dir_vpath) |vp| self.allocator.free(vp);
         handle.dir = null;
         handle.file = null;
+        handle.dir_vpath = null;
     }
 };
 

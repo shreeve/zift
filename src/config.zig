@@ -67,6 +67,20 @@ pub const ServerConfig = struct {
     /// seconds rather than minutes.
     shutdown_grace_ms: u64,
     log: LogTarget,
+    /// How `sftp> ls -la` renders entries to the partner. `virtual`
+    /// (default in v0.3.0+) shows the partner's own virtual-user
+    /// name, a fixed group of `sftp`, policy-derived rwx bits in the
+    /// owner+group triplets, and `---` for world; setuid/setgid/sticky
+    /// bits are always cleared. `reality` is the v0.2.x behavior:
+    /// the inode's real owner, group, and mode pass through
+    /// unchanged — including any setuid/setgid/sticky bits. PLAN
+    /// §7.6 (default flipped between v0.2.x and v0.3.0).
+    listing_mode: ListingMode,
+};
+
+pub const ListingMode = enum {
+    virtual,
+    reality,
 };
 
 /// A public key authorized for a virtual user. Stored as the raw OpenSSH
@@ -251,6 +265,7 @@ const ServerBuilder = struct {
     max_unauth_connections: u32 = 0,
     shutdown_grace_ms: u64 = 30_000,
     log: ?LogTarget = null,
+    listing_mode: ListingMode = .virtual,
 };
 
 const UserBuilder = struct {
@@ -574,6 +589,7 @@ pub fn parseWithDiag(
             .max_unauth_connections = server.max_unauth_connections,
             .shutdown_grace_ms = server.shutdown_grace_ms,
             .log = server.log orelse .stderr,
+            .listing_mode = server.listing_mode,
         },
         .users = final_users,
     };
@@ -610,6 +626,14 @@ fn parseServerProperty(
             // time rather than discovered at first reload.
             if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
             server.log = .{ .file = try dupNonEmpty(allocator, value) };
+        }
+    } else if (std.mem.eql(u8, key, "listing-mode")) {
+        if (std.mem.eql(u8, value, "virtual")) {
+            server.listing_mode = .virtual;
+        } else if (std.mem.eql(u8, value, "reality")) {
+            server.listing_mode = .reality;
+        } else {
+            return error.InvalidConfig;
         }
     } else {
         return error.UnknownKey;
@@ -702,7 +726,23 @@ fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []con
     var permissions = PermissionSet.initEmpty();
     var saw_permission = false;
     while (parts.next()) |token| {
-        permissions.insert(parsePermission(token) orelse return error.InvalidPermission);
+        if (std.mem.eql(u8, token, "add")) {
+            // `add` is a compound verb that grants every "create-or-modify-
+            // by-name" operation: file upload, directory creation, and rename
+            // of either kind. Symmetric with `remove` (which already covers
+            // both file unlink AND rmdir via policy.permissionFor). So the
+            // four-verb model `(read | list | add | remove)` covers every
+            // SFTP wire op a partner can perform — fewer knobs, less room
+            // for "I forgot to grant rename" surprises. The granular
+            // verbs (`write`, `mkdir`, `rename`) remain valid for operators
+            // who genuinely need that distinction (e.g. an immutable-receive
+            // workflow that allows uploads but no renames).
+            permissions.insert(.write);
+            permissions.insert(.mkdir);
+            permissions.insert(.rename);
+        } else {
+            permissions.insert(parsePermission(token) orelse return error.InvalidPermission);
+        }
         saw_permission = true;
     }
     if (!saw_permission) return error.MissingRulePermissions;
@@ -826,6 +866,62 @@ test "parse valid config" {
     try std.testing.expectEqualStrings("/tmp/zift/ally", ally.root);
     try std.testing.expectEqual(@as(usize, 3), ally.rules.len);
     try std.testing.expect(ally.rules[0].permissions.contains(.write));
+}
+
+test "parse: 'add' verb expands to write+mkdir+rename" {
+    const text =
+        \\server
+        \\  listen 127.0.0.1:2222
+        \\  host-key /tmp/zift_host_ed25519
+        \\  log stderr
+        \\
+        \\user alice
+        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  root /tmp/zift/alice
+        \\  allow /pending read list add remove
+        \\
+    ;
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+
+    const alice = cfg.findUser("alice").?;
+    try std.testing.expectEqual(@as(usize, 1), alice.rules.len);
+    const rule = alice.rules[0];
+    try std.testing.expectEqualStrings("/pending", rule.pattern);
+    // `add` should have unfolded into the granular trio. `read | list |
+    // add | remove` ⇒ {read, list, write, mkdir, rename, remove}. If
+    // someone "simplifies" the parser to alias add↔write only, this
+    // test catches it (mkdir + rename would go missing).
+    try std.testing.expect(rule.permissions.contains(.read));
+    try std.testing.expect(rule.permissions.contains(.list));
+    try std.testing.expect(rule.permissions.contains(.write));
+    try std.testing.expect(rule.permissions.contains(.mkdir));
+    try std.testing.expect(rule.permissions.contains(.rename));
+    try std.testing.expect(rule.permissions.contains(.remove));
+}
+
+test "parse: 'add' alongside granular verbs is idempotent" {
+    // `add` + a granular verb that's already in `add`'s expansion should
+    // just OR cleanly — no error, no surprise.
+    const text =
+        \\server
+        \\  listen 127.0.0.1:2222
+        \\  host-key /tmp/zift_host_ed25519
+        \\  log stderr
+        \\
+        \\user alice
+        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  root /tmp/zift/alice
+        \\  allow /pending read list add write rename
+        \\
+    ;
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    const alice = cfg.findUser("alice").?;
+    const rule = alice.rules[0];
+    try std.testing.expect(rule.permissions.contains(.write));
+    try std.testing.expect(rule.permissions.contains(.mkdir));
+    try std.testing.expect(rule.permissions.contains(.rename));
 }
 
 // Reused fixture for tests below: a syntactically valid PHC string with
@@ -1110,6 +1206,7 @@ fn makeNumericTestConfig(args: NumericTestArgs) Config {
             .max_unauth_connections = args.max_unauth,
             .shutdown_grace_ms = 0,
             .log = .stderr,
+            .listing_mode = .virtual,
         },
         .users = &.{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
