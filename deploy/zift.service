@@ -30,12 +30,18 @@ RestrictSUIDSGID=true
 RemoveIPC=true
 
 # Filesystem visibility.
+# `PrivateDevices=true` exposes only /dev/null, /dev/zero, /dev/full,
+# /dev/random, /dev/urandom, /dev/tty — enough for libssh's RNG init
+# without exposing the rest of /dev.
+# `ProtectProc=invisible` makes /proc show only this service's PIDs.
+# `ProcSubset=pid` hides /proc/<pid>/{net,sys,...}, leaving only PID
+# metadata. Both directives require Linux 5.8+ / systemd 247+.
 PrivateTmp=true
-PrivateDevices=true        # only /dev/null, /dev/zero, /dev/{u}random etc.
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ProtectProc=invisible      # /proc shows only this service's PIDs
-ProcSubset=pid             # hide /proc/<pid>/{net,sys,...} except pid metadata
+ProtectProc=invisible
+ProcSubset=pid
 
 # Kernel-config surface.
 ProtectKernelTunables=true

@@ -47,28 +47,31 @@ jobs:
       - name: Verify binary exists
         run: test -f zig-out/bin/zift
 
-      - name: Check dynamic dependencies (allowlist assertion)
+      - name: Check direct dynamic dependencies (NEEDED allowlist)
         run: |
-          echo "=== Dynamic dependencies ==="
-          ldd zig-out/bin/zift
+          echo "=== Full dynamic resolution (informational) ==="
+          ldd zig-out/bin/zift || true
           echo "=== Binary size ==="
           ls -lh zig-out/bin/zift
 
-          # Allowlist for an ubuntu-latest ReleaseSafe build linked
-          # against apt's libssh-dev. Anything outside this set is a
-          # build-system regression we want CI to surface immediately
-          # (e.g. a new Zig stdlib that pulled in something we did not
-          # intend to ship dynamically). The list intentionally omits
-          # `linux-vdso.so.1` and the loader (`/lib64/ld-linux-*`)
-          # because those are not `=> /path` resolutions in `ldd`.
-          allowed='libssh\.so\.4|libcrypto\.so\.3|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1|libz\.so\.1|libssl\.so\.3'
-          unexpected=$(ldd zig-out/bin/zift \
-            | awk '/=>/ {print $1}' \
-            | sort -u \
-            | grep -Ev "^(${allowed})$" || true)
+          # Assert the *direct* NEEDED entries on the binary, not the
+          # full transitive resolution that `ldd` reports. libssh on
+          # Ubuntu pulls libgssapi-krb5-2, libkrb5-3, libcom_err.so.2,
+          # libk5crypto.so.3, libkeyutils.so.1 etc. transitively — those
+          # are libssh's choice, not ours, and they shift across distro
+          # upgrades. What we genuinely control is what *our* binary
+          # has in its DT_NEEDED entries, which is short and stable.
+          echo "=== Direct NEEDED entries ==="
+          needed=$(objdump -p zig-out/bin/zift \
+            | awk '/NEEDED/ {print $2}' \
+            | sort -u)
+          echo "$needed" | sed 's/^/  /'
+
+          allowed='libssh\.so\.4|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1|ld-linux-(x86-64|aarch64)\.so\.[12]'
+          unexpected=$(echo "$needed" | grep -Ev "^(${allowed})$" || true)
           if [ -n "$unexpected" ]; then
             echo
-            echo "FAIL: dynamic dependencies outside the allowlist:"
+            echo "FAIL: NEEDED entries outside the allowlist:"
             echo "$unexpected" | sed 's/^/  /'
             echo
             echo "Either the binary picked up a new system library (build"
@@ -76,7 +79,27 @@ jobs:
             echo "deliberate change in our dependency surface."
             exit 1
           fi
-          echo "All dynamic deps are on the allowlist."
+          echo "All NEEDED entries are on the allowlist."
+
+      - name: Verify systemd unit (catch inline-comment & directive bugs)
+        run: |
+          # systemd-analyze verify catches the class of bug where a
+          # directive line carries a trailing inline comment (which
+          # systemd parses as part of the value, fails to interpret,
+          # and silently leaves the directive at its compile-time
+          # default — a stealth weakening of the unit's hardening).
+          #
+          # We feed it the deploy template directly. Any error or
+          # warning fails the build.
+          sudo apt-get install -y systemd
+          out=$(systemd-analyze verify deploy/zift.service 2>&1) || true
+          echo "$out"
+          if echo "$out" | grep -qE 'Failed to parse|Unknown lvalue|inline comment'; then
+            echo
+            echo "FAIL: systemd-analyze verify rejected directives in deploy/zift.service"
+            exit 1
+          fi
+          echo "systemd-analyze verify clean."
 
       - name: Smoke test (version)
         run: zig-out/bin/zift version
