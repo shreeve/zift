@@ -365,10 +365,14 @@ fn checkArgon2idPolicy(phc: []const u8, policy: Argon2idPolicy) Error!void {
     var iter = std.mem.splitScalar(u8, phc, '$');
     _ = iter.next(); // leading empty segment
     _ = iter.next(); // "argon2id"
-    _ = iter.next() orelse return error.PasswordHashMalformed; // "v=19"
+    const version_field = iter.next() orelse return error.PasswordHashMalformed;
+    if (!std.mem.eql(u8, version_field, "v=19")) return error.PasswordHashMalformed;
     const params = iter.next() orelse return error.PasswordHashMalformed; // m=...,t=...,p=...
-    _ = iter.next() orelse return error.PasswordHashMalformed; // salt
-    _ = iter.next() orelse return error.PasswordHashMalformed; // hash
+    const salt_field = iter.next() orelse return error.PasswordHashMalformed;
+    const hash_field = iter.next() orelse return error.PasswordHashMalformed;
+    if (iter.next() != null) return error.PasswordHashMalformed;
+    if (salt_field.len == 0 or hash_field.len == 0) return error.PasswordHashMalformed;
+    if (!isValidBase64(salt_field) or !isValidBase64(hash_field)) return error.PasswordHashMalformed;
 
     var m: ?u32 = null;
     var t: ?u32 = null;
@@ -589,15 +593,37 @@ fn parseUserKey(allocator: std.mem.Allocator, user: *UserBuilder, value: []const
     var parts = std.mem.tokenizeAny(u8, value, " \t");
     const algorithm = parts.next() orelse return error.InvalidKeyLine;
     const blob = parts.next() orelse return error.InvalidKeyLine;
-    // Anything after the blob (the comment) is intentionally ignored.
 
     if (!isAcceptedKeyAlgorithm(algorithm)) return error.UnsupportedKeyAlgorithm;
     if (blob.len == 0) return error.InvalidKeyLine;
+
+    // PLAN §8.4: reject malformed key blobs at config load so a
+    // config-with-bad-key never goes live. A valid OpenSSH public-key
+    // blob is strict base64 (A-Z, a-z, 0-9, +, /, optional = padding).
+    if (!isValidBase64(blob)) return error.InvalidKeyLine;
 
     try user.keys.append(allocator, .{
         .algorithm = try allocator.dupe(u8, algorithm),
         .blob = try allocator.dupe(u8, blob),
     });
+}
+
+fn isValidBase64(data: []const u8) bool {
+    if (data.len == 0) return false;
+    var padding_started = false;
+    for (data) |ch| {
+        if (ch == '=') {
+            padding_started = true;
+            continue;
+        }
+        if (padding_started) return false;
+        const ok = (ch >= 'A' and ch <= 'Z') or
+            (ch >= 'a' and ch <= 'z') or
+            (ch >= '0' and ch <= '9') or
+            ch == '+' or ch == '/';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
