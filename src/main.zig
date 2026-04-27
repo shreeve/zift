@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("libssh");
 const build_options = @import("build_options");
+const audit = @import("audit.zig");
 const auth = @import("auth.zig");
 const config = @import("config.zig");
 const session = @import("session.zig");
@@ -136,6 +137,13 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
         cfg.deinit();
         return err;
     };
+
+    // Audit destination is determined by `server.log` (default stderr,
+    // or an absolute path that is opened O_APPEND and reopened on
+    // SIGUSR1). PLAN §7.4. Initialized AFTER semantic validation but
+    // BEFORE session.run starts spawning worker threads.
+    try audit.initGlobal(gpa, cfg.server.log);
+    defer audit.deinitGlobal(gpa);
 
     try stdout.writeStreamingAll(io, "zift: libssh initialized\n");
     try stdout.writeStreamingAll(io, "zift: config path: ");

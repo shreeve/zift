@@ -22,6 +22,53 @@ fn nowMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
 }
 
+/// Format the peer IP of `session`'s underlying TCP socket into `buf`.
+/// Returns a slice into `buf` on success, `null` on any error (no
+/// socket, getpeername fails, unknown family). The returned slice
+/// contains only the address — no port, no brackets — so the audit
+/// schema's `ip` field is consistent across IPv4/IPv6 and lookup-able
+/// by composition tools (fail2ban, awk, etc.).
+fn capturePeerIp(session: c.ssh_session, buf: []u8) ?[]const u8 {
+    const fd = c.ssh_get_fd(session);
+    if (fd < 0) return null;
+
+    var ss: std.posix.sockaddr.storage align(8) = undefined;
+    var ss_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    std.posix.getpeername(fd, @ptrCast(@alignCast(&ss)), &ss_len) catch return null;
+
+    const family = @as(*const std.posix.sockaddr, @ptrCast(@alignCast(&ss))).family;
+    switch (family) {
+        std.posix.AF.INET => {
+            const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&ss));
+            const bytes: [4]u8 = @bitCast(sa.addr);
+            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            }) catch null;
+        },
+        std.posix.AF.INET6 => {
+            const sa: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&ss));
+            return formatIPv6(&sa.addr, buf);
+        },
+        else => return null,
+    }
+}
+
+/// Minimal IPv6 address formatter. Produces colon-hex form without
+/// `::` zero-run compression — operationally fine for audit logs and
+/// keeps the helper allocation-free.
+fn formatIPv6(addr: *const [16]u8, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+        std.mem.readInt(u16, addr[0..2], .big),
+        std.mem.readInt(u16, addr[2..4], .big),
+        std.mem.readInt(u16, addr[4..6], .big),
+        std.mem.readInt(u16, addr[6..8], .big),
+        std.mem.readInt(u16, addr[8..10], .big),
+        std.mem.readInt(u16, addr[10..12], .big),
+        std.mem.readInt(u16, addr[12..14], .big),
+        std.mem.readInt(u16, addr[14..16], .big),
+    }) catch null;
+}
+
 pub fn run(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -99,7 +146,9 @@ pub fn run(
 
         const max = active.current.config.server.max_connections;
         if (signals.active_sessions.load(.acquire) >= max) {
-            audit.log(io, null, "accept", null, .denied, "max-connections reached");
+            var ip_buf: [64]u8 = undefined;
+            const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
+            audit.log(io, null, "accept", null, .denied, "max-connections reached", peer_ip);
             c.ssh_disconnect(session);
             c.ssh_free(session);
             continue :accept_loop;
@@ -342,6 +391,14 @@ fn handleSession(
 ) !void {
     defer c.ssh_free(session);
 
+    // Capture peer IP at session start so every audit line emitted by
+    // this session — accept-time, handshake, auth, SFTP ops — carries
+    // it. Lifetime of `peer_ip` is the stack frame of handleSession,
+    // and every callee runs synchronously from here, so pointing into
+    // `ip_buf` is safe.
+    var ip_buf: [64]u8 = undefined;
+    const peer_ip: ?[]const u8 = capturePeerIp(session, &ip_buf);
+
     // Apply the configured idle-timeout to all blocking libssh reads
     // BEFORE the handshake. Without this, a TCP-only "client" that
     // never speaks SSH pins a worker thread + a max-connections slot
@@ -350,14 +407,14 @@ fn handleSession(
     setSessionTimeout(session, cfg.server.idle_timeout_ms);
 
     if (c.ssh_handle_key_exchange(session) != c.SSH_OK) {
-        audit.log(io, null, "handshake.failed", null, .failed, "");
+        audit.log(io, null, "handshake.failed", null, .failed, "", peer_ip orelse "");
         return error.LibsshFailure;
     }
 
-    const user = try authenticate(io, allocator, cfg, session);
+    const user = try authenticate(io, allocator, cfg, session, peer_ip);
     const channel = try acceptSftpSubsystem(session);
 
-    try runSftp(io, allocator, channel, user, cfg.server.idle_timeout_ms);
+    try runSftp(io, allocator, channel, user, cfg.server.idle_timeout_ms, peer_ip);
     c.ssh_disconnect(session);
 }
 
@@ -381,6 +438,7 @@ fn authenticate(
     allocator: std.mem.Allocator,
     cfg: config.Config,
     session: c.ssh_session,
+    peer_ip: ?[]const u8,
 ) !*const config.UserConfig {
     const allowed_methods: c_int = @intCast(c.SSH_AUTH_METHOD_PASSWORD | c.SSH_AUTH_METHOD_PUBLICKEY);
 
@@ -404,17 +462,17 @@ fn authenticate(
                 if (cfg.findUser(username)) |user| {
                     if (auth.verifyPassword(io, allocator, user, password)) {
                         _ = c.ssh_message_auth_reply_success(msg, 0);
-                        audit.log(io, username, "auth.password", null, .ok, "");
+                        audit.log(io, username, "auth.password", null, .ok, "", peer_ip orelse "");
                         return user;
                     }
-                    audit.log(io, username, "auth.password", null, .denied, "bad password");
+                    audit.log(io, username, "auth.password", null, .denied, "bad password", peer_ip orelse "");
                 } else {
                     _ = auth.verifyLogin(io, allocator, cfg, username, password);
-                    audit.log(io, username, "auth.password", null, .denied, "unknown user");
+                    audit.log(io, username, "auth.password", null, .denied, "unknown user", peer_ip orelse "");
                 }
             }
         } else if (subtype == c.SSH_AUTH_METHOD_PUBLICKEY) {
-            const decision = handlePublicKeyMessage(io, cfg, msg);
+            const decision = handlePublicKeyMessage(io, cfg, msg, peer_ip);
             switch (decision) {
                 .accepted => |user| return user,
                 .offered => continue,
@@ -444,24 +502,27 @@ fn handlePublicKeyMessage(
     io: std.Io,
     cfg: config.Config,
     msg: c.ssh_message,
+    peer_ip: ?[]const u8,
 ) PublicKeyDecision {
     const username_ptr = c.ssh_message_auth_user(msg);
     if (username_ptr == null) return .denied;
     const username = std.mem.span(username_ptr);
 
+    const ip_str = peer_ip orelse "";
+
     const presented = c.ssh_message_auth_pubkey(msg);
     if (presented == null) {
-        audit.log(io, username, "auth.publickey", null, .denied, "no key in message");
+        audit.log(io, username, "auth.publickey", null, .denied, "no key in message", ip_str);
         return .denied;
     }
 
     const user = cfg.findUser(username) orelse {
-        audit.log(io, username, "auth.publickey", null, .denied, "unknown user");
+        audit.log(io, username, "auth.publickey", null, .denied, "unknown user", ip_str);
         return .denied;
     };
 
     if (!matchesAnyConfiguredKey(user, presented)) {
-        audit.log(io, username, "auth.publickey", null, .denied, "key not configured");
+        audit.log(io, username, "auth.publickey", null, .denied, "key not configured", ip_str);
         return .denied;
     }
 
@@ -472,19 +533,19 @@ fn handlePublicKeyMessage(
             // will then receive a signed follow-up that comes back with
             // SSH_PUBLICKEY_STATE_VALID after libssh verifies the signature.
             if (c.ssh_message_auth_reply_pk_ok_simple(msg) != c.SSH_OK) {
-                audit.log(io, username, "auth.publickey", null, .failed, "pk_ok reply failed");
+                audit.log(io, username, "auth.publickey", null, .failed, "pk_ok reply failed", ip_str);
                 return .denied;
             }
             return .offered;
         },
         c.SSH_PUBLICKEY_STATE_VALID => {
             _ = c.ssh_message_auth_reply_success(msg, 0);
-            audit.log(io, username, "auth.publickey", null, .ok, user.keys[0].algorithm);
+            audit.log(io, username, "auth.publickey", null, .ok, user.keys[0].algorithm, ip_str);
             return .{ .accepted = user };
         },
         else => {
             // SSH_PUBLICKEY_STATE_WRONG, SSH_PUBLICKEY_STATE_ERROR, anything else.
-            audit.log(io, username, "auth.publickey", null, .denied, "signature invalid");
+            audit.log(io, username, "auth.publickey", null, .denied, "signature invalid", ip_str);
             return .denied;
         },
     }
@@ -556,6 +617,7 @@ fn runSftp(
     channel: c.ssh_channel,
     user: *const config.UserConfig,
     idle_timeout_ms: u64,
+    peer_ip: ?[]const u8,
 ) !void {
     var jail = try vfs_mod.Vfs.init(io, allocator, user.root);
     defer jail.deinit(allocator);
@@ -565,6 +627,7 @@ fn runSftp(
         .allocator = allocator,
         .channel = channel,
         .user = user,
+        .peer_ip = peer_ip,
         .vfs = jail,
         .idle_timeout_ms = idle_timeout_ms,
         .last_activity_ms = nowMs(),
@@ -572,9 +635,10 @@ fn runSftp(
     defer state.deinit();
 
     var payload_buf: [8192]u8 = undefined;
+    const ip_str = peer_ip orelse "";
     const first_payload = readPacketTimed(&state, &payload_buf) catch |err| switch (err) {
         error.IdleTimeout => {
-            audit.log(io, user.name, "idle.timeout", null, .ok, "");
+            audit.log(io, user.name, "idle.timeout", null, .ok, "", ip_str);
             return;
         },
         else => return err,
@@ -586,7 +650,7 @@ fn runSftp(
     while (true) {
         const payload = readPacketTimed(&state, &payload_buf) catch |err| switch (err) {
             error.IdleTimeout => {
-                audit.log(io, user.name, "idle.timeout", null, .ok, "");
+                audit.log(io, user.name, "idle.timeout", null, .ok, "", ip_str);
                 return;
             },
             else => return,
@@ -641,6 +705,10 @@ const SftpState = struct {
     allocator: std.mem.Allocator,
     channel: c.ssh_channel,
     user: *const config.UserConfig,
+    /// Peer IP captured at session accept (PLAN §8.5). Borrowed; the
+    /// underlying buffer lives on `handleSession`'s stack frame for
+    /// the life of this state.
+    peer_ip: ?[]const u8 = null,
     vfs: vfs_mod.Vfs,
     /// Configured `idle-timeout` in ms. 0 disables the check.
     idle_timeout_ms: u64 = 0,
@@ -657,15 +725,15 @@ const SftpState = struct {
     }
 
     fn auditOk(self: *SftpState, op: []const u8, vpath: ?[]const u8, detail: []const u8) void {
-        audit.log(self.io, self.user.name, op, vpath, .ok, detail);
+        audit.log(self.io, self.user.name, op, vpath, .ok, detail, self.peer_ip orelse "");
     }
 
     fn auditDenied(self: *SftpState, op: []const u8, vpath: ?[]const u8) void {
-        audit.log(self.io, self.user.name, op, vpath, .denied, "");
+        audit.log(self.io, self.user.name, op, vpath, .denied, "", self.peer_ip orelse "");
     }
 
     fn auditFailed(self: *SftpState, op: []const u8, vpath: ?[]const u8, detail: []const u8) void {
-        audit.log(self.io, self.user.name, op, vpath, .failed, detail);
+        audit.log(self.io, self.user.name, op, vpath, .failed, detail, self.peer_ip orelse "");
     }
 
     fn handleRealpath(self: *SftpState, request_id: u32, payload: []const u8) !void {

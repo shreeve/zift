@@ -430,6 +430,12 @@ fn parseServerProperty(
         if (std.mem.eql(u8, value, "stderr")) {
             server.log = .stderr;
         } else {
+            // PLAN §7.4: file destinations must be absolute paths so
+            // logrotate's "rename old, signal SIGUSR1, recreate" cycle
+            // operates on a known stable target. Relative paths are
+            // ambiguous (relative to whose cwd?) and rejected at parse
+            // time rather than discovered at first reload.
+            if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
             server.log = .{ .file = try dupNonEmpty(allocator, value) };
         }
     } else {
