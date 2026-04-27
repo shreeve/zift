@@ -546,6 +546,14 @@ const Handle = struct {
     dir_iter: ?std.Io.Dir.Iterator = null,
     dir_done: bool = false,
     file: ?std.Io.File = null,
+    /// Whether SSH_FXP_READ is permitted against this handle. Set at
+    /// OPEN time from the SFTP open flags + matching `.open_read` policy.
+    /// PLAN §6.3: `read` controls SSH_FXP_READ.
+    can_read: bool = false,
+    /// Whether SSH_FXP_WRITE is permitted against this handle. Set at
+    /// OPEN time from the SFTP open flags + matching `.open_write` policy.
+    /// PLAN §6.3: `write` controls SSH_FXP_WRITE.
+    can_write: bool = false,
 };
 
 const SftpState = struct {
@@ -670,32 +678,51 @@ const SftpState = struct {
         if (cursor.len < 4) return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad flags");
         const flags = readU32(cursor[0..4]);
 
-        const wants_write = (flags & @as(u32, @intCast(c.SSH_FXF_WRITE | c.SSH_FXF_CREAT | c.SSH_FXF_TRUNC))) != 0;
-        if (wants_write) {
-            if (policy.check(self.user, .open_write, path.value) == .deny) {
-                self.auditDenied("open_write", path.value);
-                return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
-            }
+        // Per RFC draft-ietf-secsh-filexfer-02 §6.3: SSH_FXF_READ controls
+        // read access; SSH_FXF_WRITE/APPEND/CREAT/TRUNC imply write. We
+        // derive the requested access *bits* before anything else so policy
+        // and the per-handle access record stay aligned.
+        const want_write = (flags & @as(u32, @intCast(
+            c.SSH_FXF_WRITE | c.SSH_FXF_APPEND | c.SSH_FXF_CREAT | c.SSH_FXF_TRUNC,
+        ))) != 0;
+        // SFTP clients (notably OpenSSH `sftp get`) sometimes send no
+        // explicit flags, expecting read-mode by default. Honor that.
+        var want_read = (flags & @as(u32, @intCast(c.SSH_FXF_READ))) != 0;
+        if (!want_read and !want_write) want_read = true;
+
+        // Both policies must allow the bits the client requested. PLAN §6.3.
+        if (want_write and policy.check(self.user, .open_write, path.value) == .deny) {
+            self.auditDenied("open_write", path.value);
+            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+        }
+        if (want_read and policy.check(self.user, .open_read, path.value) == .deny) {
+            self.auditDenied("open_read", path.value);
+            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+        }
+
+        const op_label: []const u8 = if (want_write) "open_write" else "open_read";
+
+        if (want_write) {
             const real = try self.vfs.resolveForCreate(self.io, self.allocator, path.value);
             defer self.allocator.free(real);
-            const file = std.Io.Dir.cwd().createFile(self.io, real, .{ .read = true, .truncate = (flags & @as(u32, @intCast(c.SSH_FXF_TRUNC))) != 0 }) catch {
-                self.auditFailed("open_write", path.value, "create failed");
+            const file = std.Io.Dir.cwd().createFile(self.io, real, .{
+                .read = want_read,
+                .truncate = (flags & @as(u32, @intCast(c.SSH_FXF_TRUNC))) != 0,
+            }) catch {
+                self.auditFailed(op_label, path.value, "create failed");
                 return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
             };
             self.vfs.verifyFile(self.io, file) catch {
                 file.close(self.io);
-                self.auditDenied("open_write", path.value);
+                self.auditDenied(op_label, path.value);
                 return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
             };
-            const id = try self.addFileHandle(file);
-            self.auditOk("open_write", path.value, "");
+            const id = try self.addFileHandle(file, want_read, want_write);
+            self.auditOk(op_label, path.value, "");
             return replyHandle(self.channel, request_id, id);
         }
 
-        if (policy.check(self.user, .open_read, path.value) == .deny) {
-            self.auditDenied("open_read", path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
-        }
+        // Pure read open.
         const real = self.vfs.resolveExisting(self.io, self.allocator, path.value) catch {
             return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
         };
@@ -709,7 +736,7 @@ const SftpState = struct {
             self.auditDenied("open_read", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         };
-        const id = try self.addFileHandle(file);
+        const id = try self.addFileHandle(file, true, false);
         self.auditOk("open_read", path.value, "");
         try replyHandle(self.channel, request_id, id);
     }
@@ -722,6 +749,14 @@ const SftpState = struct {
         const offset = readU64(cursor[0..8]);
         const len = @min(readU32(cursor[8..12]), 32 * 1024);
         const handle = self.findHandle(id, .file) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+
+        // Per PLAN §6.3, `read` permission gates SSH_FXP_READ. Enforcing
+        // this only at OPEN time would let a write-only-permitted client
+        // exfiltrate via the same handle they wrote to.
+        if (!handle.can_read) {
+            self.auditDenied("read", null);
+            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+        }
 
         var buf = try self.allocator.alloc(u8, len);
         defer self.allocator.free(buf);
@@ -740,6 +775,12 @@ const SftpState = struct {
         const offset = readU64(cursor[0..8]);
         const data = parseString(cursor[8..]) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad data");
         const handle = self.findHandle(id, .file) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+
+        // Per PLAN §6.3, `write` permission gates SSH_FXP_WRITE.
+        if (!handle.can_write) {
+            self.auditDenied("write", null);
+            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+        }
 
         handle.file.?.writePositionalAll(self.io, data.value, offset) catch {
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "write failed");
@@ -867,12 +908,19 @@ const SftpState = struct {
         return id;
     }
 
-    fn addFileHandle(self: *SftpState, file: std.Io.File) !u32 {
+    fn addFileHandle(
+        self: *SftpState,
+        file: std.Io.File,
+        can_read: bool,
+        can_write: bool,
+    ) !u32 {
         const id = self.nextHandleId();
         try self.handles.append(self.allocator, .{
             .id = id,
             .kind = .file,
             .file = file,
+            .can_read = can_read,
+            .can_write = can_write,
         });
         return id;
     }
