@@ -120,11 +120,13 @@ jobs:
         run: |
           mkdir -p release
           # Pull every binary into one directory; concatenate the
-          # per-host SHA256SUMS files into one canonical manifest.
-          # `sort -u` produces a stable ordering across reruns and
-          # de-dupes if the same artifact is uploaded twice.
+          # per-target SHA256SUMS-{target} files into one canonical
+          # manifest. `sort -u` produces a stable ordering across
+          # reruns and de-dupes if the same artifact is uploaded twice.
+          # Glob matches both v0.1.x's `SHA256SUMS` and v0.2.0+'s
+          # `SHA256SUMS-{target}` per-target files.
           cp dist/release-*/zift-* release/
-          cat dist/release-*/SHA256SUMS | sort -u > release/SHA256SUMS
+          cat dist/release-*/SHA256SUMS* | sort -u > release/SHA256SUMS
           echo "=== release/ contents ==="
           ls -la release/
           echo "=== SHA256SUMS ==="

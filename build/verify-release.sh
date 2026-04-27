@@ -55,20 +55,25 @@ case "$magic" in
 esac
 
 # ----- per-kind allowlist + extraction --------------------------------------
-# `LINUX_ALLOWED`: regex matched against each DT_NEEDED basename. Phase 2
-# of the release pipeline (static linking) flips this to `^$` so any
-# NEEDED entry at all fails the build. Until then, we accept the small
-# set of known dynamic deps the build legitimately produces.
-#
-# The dynamic loader (`ld-linux-*.so.[12]`) is technically `PT_INTERP`
-# but Zig 0.16 also emits it as a `DT_NEEDED` — keep it in the
-# allowlist or every build will fail this check.
-LINUX_ALLOWED='^(libssh\.so\.4|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1)$'
+# `LINUX_ALLOWED`: regex matched against each DT_NEEDED basename.
+# v0.2.0+ ships fully-static Linux binaries (libssh + mbedTLS + zlib
+# all linked statically), so the allowlist is empty — any NEEDED
+# entry at all fails the build. The empty alternation `^()$` matches
+# the empty line, so when `deps` is empty (truly zero NEEDED) the
+# `grep -Ev` filter yields no unexpected output and we pass with
+# "(zero entries — fully static)". Any non-empty NEEDED entry falls
+# through and fails.
+LINUX_ALLOWED=''
 
-# `MACOS_ALLOWED`: regex matched against each LC_LOAD_DYLIB path. Phase 2
-# tightens this to `libSystem` + `/System/Library/Frameworks` only (no
-# Homebrew paths). Until then we accept libssh through Homebrew.
-MACOS_ALLOWED='^(/opt/homebrew/.*libssh\.[0-9]+\.dylib|/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\..*\.dylib|/System/Library/Frameworks/.*\.framework/.*)$'
+# `MACOS_ALLOWED`: regex matched against each LC_LOAD_DYLIB path.
+# v0.2.0+ links statically against vendored libssh + mbedTLS, leaving
+# only `libSystem` (the macOS C runtime — there is no static libc on
+# Darwin) and optionally `libc++` (only present if Zig pulls in C++
+# parts of stdlib, which it doesn't here, but kept in case it does
+# in a future build) and system frameworks. NO Homebrew paths
+# permitted: an `/opt/homebrew/.../libssh.4.dylib` entry would mean
+# the static-link broke and we accidentally went back to dynamic.
+MACOS_ALLOWED='^(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\..*\.dylib|/System/Library/Frameworks/.*\.framework/.*)$'
 
 case "$kind" in
     elf)

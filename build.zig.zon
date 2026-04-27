@@ -3,7 +3,20 @@
     .version = "0.1.0",
     .fingerprint = 0x60f164f8d47ab2f,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .libssh_source = .{
+            .url = "git+https://gitlab.com/libssh/libssh-mirror.git?ref=libssh-0.11.3#301d0e16dfa8a5cac1cff956b6880ca90eb82864",
+            .hash = "N-V-__8AAJ4jTQDM7VOkAl1kkGkbqhjOUPN_-RgeAcBYF9Np",
+        },
+        .mbedtls = .{
+            .url = "git+https://github.com/allyourcodebase/mbedtls?ref=main#3aa71a19acc173ae57b6a1114d62f2fdfd22960c",
+            .hash = "mbedtls-3.6.4-E4NUR2wWAAAUSvVbho9aaU31-e4D8glu9l1VfxKezBkV",
+        },
+        .zlib = .{
+            .url = "git+https://github.com/allyourcodebase/zlib?ref=main#d3b5519d3b73616a6bfece0712f080029d2a9244",
+            .hash = "zlib-1.3.2-ZZQ7lc8NAAAHm9MDfplvwoesXvk4tVm6VCsiI8KnIbT0",
+        },
+    },
     .paths = .{
         "README.md",
         "build.zig",

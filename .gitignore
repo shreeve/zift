@@ -2,3 +2,4 @@
 zig-out/
 test/.venv/
 test/tmp/
+zig-pkg/

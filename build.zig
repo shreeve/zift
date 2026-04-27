@@ -1,10 +1,406 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Default version for local builds. The release CI workflow overrides
 /// this via `-Dversion=...` extracted from the pushed git tag, so the
 /// shipped artifact name matches the tag exactly. Local `zig build release`
 /// invocations without `-Dversion=...` use this value as a stable fallback.
-const default_version = "0.1.0";
+const default_version = "0.2.0";
+
+/// libssh version we vendor. Must match the tag in `build.zig.zon`'s
+/// `libssh_source` URL. Tracked here in source rather than parsed at
+/// build time because both the version header and a few CMake config
+/// fields are populated from it.
+const libssh_major: u32 = 0;
+const libssh_minor: u32 = 11;
+const libssh_patch: u32 = 3;
+
+/// Per-target shape we want to produce: a libssh static archive (built
+/// from the vendored upstream source via our own build steps), the
+/// matching translate-c module for the `@import("libssh")` Zig surface,
+/// and the build-options container that exposes our own version /
+/// optimize / target metadata to `src/build_options`. Keeping the
+/// construction in one helper means `zig build`, `zig build test`, and
+/// `zig build release` produce binaries linked against the SAME libssh
+/// build (same version, same crypto backend, same flags).
+const Linkage = struct {
+    libssh_lib: *std.Build.Step.Compile,
+    libssh_module: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
+};
+
+fn buildLinkage(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zift_version: []const u8,
+    target_triple: []const u8,
+    optimize_label: []const u8,
+) Linkage {
+    // mbedTLS provides our crypto backend. Picked over OpenSSL because
+    // the OpenSSL Zig package only supports Linux and we want a
+    // statically-linked binary on every supported target. mbedTLS is
+    // also notably smaller (~600 KB vs OpenSSL's ~3 MB) — fine for
+    // SFTP, which uses a small subset of crypto primitives.
+    const mbedtls_dep = b.dependency("mbedtls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const mbedtls_lib = mbedtls_dep.artifact("mbedtls");
+
+    // zlib provides on-the-wire compression for SSH channels. Optional
+    // per the SSH spec but real value for SFTP partner workflows that
+    // ship text-heavy payloads (CSVs, JSON, logs) — typical 50-80%
+    // size reduction. OpenSSH clients negotiate `zlib@openssh.com`
+    // when available.
+    const zlib_dep = b.dependency("zlib", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zlib_lib = zlib_dep.artifact("z");
+
+    const libssh_lib = buildLibssh(b, target, optimize, mbedtls_lib, zlib_lib);
+
+    // The C-to-Zig translator needs the libssh public headers at
+    // generate time. The libssh artifact installs them via
+    // `installHeadersDirectory` into its emitted include tree;
+    // grabbing that LazyPath gives us the same headers the linker
+    // will resolve symbols against.
+    const libssh_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/libssh_root.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    libssh_translate.addIncludePath(libssh_lib.getEmittedIncludeTree());
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", zift_version);
+    build_options.addOption([]const u8, "optimize", optimize_label);
+    build_options.addOption([]const u8, "target", target_triple);
+
+    return .{
+        .libssh_lib = libssh_lib,
+        .libssh_module = libssh_translate.createModule(),
+        .build_options = build_options,
+    };
+}
+
+/// Compile libssh from vendored source as a static library. Mirrors
+/// what `thomashn/libssh`'s build.zig does, ported to Zig 0.16 API
+/// (`Compile.foo` -> `Compile.root_module.foo` everywhere) and
+/// trimmed to just the features Zift uses: server side, SFTP, mbedTLS
+/// crypto backend, zlib compression, ECC + curve25519, no GSSAPI,
+/// no NaCl, no debug crypto/packet output, no PKCS#11.
+fn buildLibssh(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    mbedtls_lib: *std.Build.Step.Compile,
+    zlib_lib: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
+    const src = b.dependency("libssh_source", .{});
+
+    const is_unix = target.result.os.tag == .linux or target.result.os.tag == .macos;
+    const is_linux = target.result.os.tag == .linux;
+    const is_macos = target.result.os.tag == .macos;
+    const is_musl = target.result.abi == .musl;
+
+    // -------- generated headers ---------------------------------------------
+    const version_header = b.addConfigHeader(.{
+        .style = .{ .cmake = src.path("include/libssh/libssh_version.h.cmake") },
+        .include_path = "libssh/libssh_version.h",
+    }, .{
+        .libssh_VERSION_MAJOR = libssh_major,
+        .libssh_VERSION_MINOR = libssh_minor,
+        .libssh_VERSION_PATCH = libssh_patch,
+    });
+
+    const config_header = b.addConfigHeader(.{
+        .style = .{ .cmake = src.path("config.h.cmake") },
+        .include_path = "config.h",
+    }, .{
+        .PROJECT_NAME = "libssh",
+        .PROJECT_VERSION = b.fmt("{d}.{d}.{d}", .{ libssh_major, libssh_minor, libssh_patch }),
+        // Most of these are paths CMake would template into the
+        // source. None are reached at runtime in our build because
+        // we never load /etc/ssh/* config files (PLAN §5: explicit
+        // config only, no /etc lookups). Setting them to harmless
+        // strings keeps the build hermetic.
+        .SYSCONFDIR = "/etc",
+        .BINARYDIR = "/usr/local/bin",
+        .SOURCEDIR = "/src/libssh",
+        .USR_GLOBAL_BIND_CONFIG = "/etc/ssh/libssh_server_config",
+        .GLOBAL_BIND_CONFIG = "/etc/ssh/libssh_server_config",
+        .USR_GLOBAL_CLIENT_CONFIG = "/etc/ssh/ssh_config",
+        .GLOBAL_CLIENT_CONFIG = "/etc/ssh/ssh_config",
+
+        // Platform feature detection. Hardcoded based on target
+        // properties rather than CMake-style probing — Zig's cross-
+        // compile means every target is a known shape.
+        .HAVE_ARGP_H = is_linux and !is_musl,
+        .HAVE_ARPA_INET_H = is_unix,
+        .HAVE_GLOB_H = is_unix,
+        .HAVE_VALGRIND_VALGRIND_H = false,
+        .HAVE_PTY_H = is_linux,
+        .HAVE_UTMP_H = 1,
+        .HAVE_UTIL_H = is_macos,
+        .HAVE_LIBUTIL_H = false,
+        .HAVE_SYS_TIME_H = 1,
+        .HAVE_SYS_UTIME_H = 0,
+        .HAVE_IO_H = 1,
+        .HAVE_TERMIOS_H = is_unix,
+        .HAVE_UNISTD_H = 1,
+        .HAVE_STDINT_H = 1,
+        .HAVE_IFADDRS_H = is_unix,
+        .HAVE_OPENSSL_AES_H = false,
+        .HAVE_WSPIAPI_H = 1,
+        .HAVE_OPENSSL_DES_H = false,
+        .HAVE_OPENSSL_ECDH_H = false,
+        .HAVE_OPENSSL_EC_H = false,
+        .HAVE_OPENSSL_ECDSA_H = false,
+        .HAVE_PTHREAD_H = 1,
+        .HAVE_OPENSSL_ECC = false,
+        .HAVE_GCRYPT_ECC = false,
+        .HAVE_ECC = 1,
+        .HAVE_GLOB_GL_FLAGS_MEMBER = !is_musl,
+        .HAVE_GCRYPT_CHACHA_POLY = false,
+        .HAVE_OPENSSL_EVP_CHACHA20 = false,
+        .HAVE_OPENSSL_EVP_KDF_CTX = false,
+        .HAVE_OPENSSL_FIPS_MODE = false,
+
+        // Stdlib features we know exist on every modern target we ship.
+        .HAVE_SNPRINTF = 1,
+        .HAVE__SNPRINTF = 1,
+        .HAVE__SNPRINTF_S = 1,
+        .HAVE_VSNPRINTF = 1,
+        .HAVE__VSNPRINTF = 1,
+        .HAVE__VSNPRINTF_S = 1,
+        .HAVE_ISBLANK = 1,
+        .HAVE_STRNCPY = 1,
+        .HAVE_STRNDUP = is_unix,
+        .HAVE_CFMAKERAW = 1,
+        .HAVE_GETADDRINFO = 1,
+        .HAVE_POLL = is_unix,
+        .HAVE_SELECT = 1,
+        .HAVE_CLOCK_GETTIME = 1,
+        .HAVE_NTOHLL = 0,
+        .HAVE_HTONLL = 0,
+        .HAVE_STRTOULL = 1,
+        .HAVE___STRTOULL = 1,
+        .HAVE__STRTOUI64 = 1,
+        .HAVE_GLOB = is_unix,
+        .HAVE_EXPLICIT_BZERO = is_linux,
+        .HAVE_MEMSET_S = is_unix,
+        .HAVE_SECURE_ZERO_MEMORY = 1,
+        .HAVE_CMOCKA_SET_TEST_FILTER = false,
+
+        // Crypto backend selection. mbedTLS only.
+        .HAVE_BLOWFISH = false,
+        .HAVE_LIBCRYPTO = false,
+        .HAVE_LIBGCRYPT = false,
+        .HAVE_LIBMBEDCRYPTO = true,
+
+        // Threading. mbedTLS's Zig-built variant has a known issue with
+        // libssh's pthread integration; disabling HAVE_PTHREAD here makes
+        // libssh use its `noop` threading shim. SAFE FOR ZIFT because
+        // every libssh session is owned by exactly one OS thread (our
+        // `sessionThread` worker) — no concurrent calls into a single
+        // ssh_session. This matches OpenSSH's per-connection-fork
+        // model.
+        .HAVE_PTHREAD = false,
+        .HAVE_CMOCKA = false,
+
+        // Compiler attribute support. Zig's clang frontend supports
+        // all of these on every target; the GCC/MSVC variants are
+        // unused.
+        .HAVE_GCC_THREAD_LOCAL_STORAGE = 1,
+        .HAVE_MSC_THREAD_LOCAL_STORAGE = 0,
+        .HAVE_FALLTHROUGH_ATTRIBUTE = 1,
+        .HAVE_UNUSED_ATTRIBUTE = 1,
+        .HAVE_WEAK_ATTRIBUTE = 1,
+        .HAVE_CONSTRUCTOR_ATTRIBUTE = 1,
+        .HAVE_DESTRUCTOR_ATTRIBUTE = 1,
+        .HAVE_GCC_VOLATILE_MEMORY_PROTECTION = 0,
+        .HAVE_COMPILER__FUNC__ = 1,
+        .HAVE_COMPILER__FUNCTION__ = 1,
+        .HAVE_GCC_BOUNDED_ATTRIBUTE = 0,
+
+        // libssh feature toggles. Server + SFTP + GEX + zlib on, the
+        // rest off.
+        .WITH_GSSAPI = false,
+        .WITH_ZLIB = true,
+        .WITH_SFTP = true,
+        .WITH_SERVER = true,
+        .WITH_GEX = true,
+        .WITH_INSECURE_NONE = false,
+        .WITH_EXEC = false,
+        .WITH_BLOWFISH_CIPHER = false,
+        .DEBUG_CRYPTO = false,
+        .DEBUG_PACKET = false,
+        .WITH_PCAP = true,
+        .DEBUG_CALLTRACE = false,
+        .WITH_NACL = false,
+        .WITH_PKCS11_URI = false,
+        .WITH_PKCS11_PROVIDER = false,
+        .WORDS_BIGENDIAN = 0,
+    });
+
+    // -------- the static library --------------------------------------------
+    const lib = b.addLibrary(.{
+        .name = "libssh",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    lib.root_module.addCMacro("LIBSSH_STATIC", "1");
+    lib.root_module.addConfigHeader(version_header);
+    lib.root_module.addConfigHeader(config_header);
+    lib.root_module.addIncludePath(src.path("include"));
+
+    // Public headers: install everything under `include/` so our
+    // translate-c step can find them via `getEmittedIncludeTree`.
+    lib.installHeadersDirectory(
+        src.path("include"),
+        ".",
+        .{ .include_extensions = &.{ ".h", ".hpp" } },
+    );
+    lib.installConfigHeader(config_header);
+    lib.installConfigHeader(version_header);
+
+    lib.root_module.linkLibrary(mbedtls_lib);
+    lib.root_module.linkLibrary(zlib_lib);
+
+    // -------- libssh source files ------------------------------------------
+    // Core SSH client + protocol surface. Same list as thomashn's
+    // build.zig, kept here so we don't lose track when libssh's
+    // upstream adds/removes files in a future update — we'll need to
+    // re-sync against the upstream CMakeLists.txt at every libssh
+    // version bump.
+    lib.root_module.addCSourceFiles(.{
+        .root = src.path("src"),
+        .files = &.{
+            "agent.c",
+            "auth.c",
+            "base64.c",
+            "bignum.c",
+            "buffer.c",
+            "callbacks.c",
+            "channels.c",
+            "client.c",
+            "config.c",
+            "connect.c",
+            "connector.c",
+            "crypto_common.c",
+            "curve25519.c",
+            "dh.c",
+            "ecdh.c",
+            "error.c",
+            "getpass.c",
+            "gzip.c",
+            "init.c",
+            "kdf.c",
+            "kex.c",
+            "known_hosts.c",
+            "knownhosts.c",
+            "legacy.c",
+            "log.c",
+            "match.c",
+            "messages.c",
+            "misc.c",
+            "options.c",
+            "packet.c",
+            "packet_cb.c",
+            "packet_crypt.c",
+            "pcap.c",
+            "pki.c",
+            "pki_container_openssh.c",
+            "poll.c",
+            "session.c",
+            "scp.c",
+            "socket.c",
+            "string.c",
+            "threads.c",
+            "ttyopts.c",
+            "wrapper.c",
+            "external/bcrypt_pbkdf.c",
+            "external/blowfish.c",
+            "config_parser.c",
+            "token.c",
+            "pki_ed25519_common.c",
+        },
+    });
+
+    // Threading shim. We disabled `HAVE_PTHREAD` (see config above), so
+    // we only need the noop shim — every libssh session is single-
+    // threaded from our worker's perspective.
+    lib.root_module.addCSourceFiles(.{
+        .root = src.path("src"),
+        .files = &.{"threads/noop.c"},
+    });
+
+    // mbedTLS crypto backend. Includes ed25519 from libssh's external/
+    // since mbedTLS doesn't ship that algorithm.
+    lib.root_module.addCSourceFiles(.{
+        .root = src.path("src"),
+        .files = &.{
+            "threads/mbedtls.c",
+            "libmbedcrypto.c",
+            "mbedcrypto_missing.c",
+            "pki_mbedcrypto.c",
+            "ecdh_mbedcrypto.c",
+            "getrandom_mbedcrypto.c",
+            "md_mbedcrypto.c",
+            "dh_key.c",
+            "pki_ed25519.c",
+            "external/ed25519.c",
+            "external/fe25519.c",
+            "external/ge25519.c",
+            "external/sc25519.c",
+            "external/chacha.c",
+            "external/poly1305.c",
+            "chachapoly.c",
+        },
+    });
+
+    // SFTP wire protocol + server.
+    lib.root_module.addCSourceFiles(.{
+        .root = src.path("src"),
+        .files = &.{
+            "sftp.c",
+            "sftp_common.c",
+            "sftp_aio.c",
+            "sftpserver.c",
+        },
+    });
+
+    // SSH server side (bind, accept, message dispatch).
+    lib.root_module.addCSourceFiles(.{
+        .root = src.path("src"),
+        .files = &.{
+            "server.c",
+            "bind.c",
+            "bind_config.c",
+        },
+    });
+
+    // DH group exchange (key-exchange algorithm family).
+    lib.root_module.addCSourceFiles(.{
+        .root = src.path("src"),
+        .files = &.{"dh-gex.c"},
+    });
+
+    // Curve25519 reference implementation.
+    lib.root_module.addCSourceFiles(.{
+        .root = src.path("src"),
+        .files = &.{"external/curve25519_ref.c"},
+    });
+
+    return lib;
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -13,30 +409,16 @@ pub fn build(b: *std.Build) void {
     const zift_version = b.option(
         []const u8,
         "version",
-        "Override the version string (e.g. -Dversion=0.2.0). Defaults to the source-tree default.",
+        "Override the version string (e.g. -Dversion=0.2.1). Defaults to the source-tree default.",
     ) orelse default_version;
 
-    // Homebrew on macOS installs libssh under /opt/homebrew. Linux uses
-    // distro packages on the default search path, so leave those alone.
-    const is_macos = target.result.os.tag == .macos;
-
-    const libssh = b.addTranslateC(.{
-        .root_source_file = b.path("src/libssh_root.h"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    if (is_macos) libssh.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    libssh.linkSystemLibrary("ssh", .{});
-
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", zift_version);
-    build_options.addOption([]const u8, "optimize", @tagName(optimize));
     const target_triple = b.fmt("{s}-{s}", .{
         @tagName(target.result.cpu.arch),
         @tagName(target.result.os.tag),
     });
-    build_options.addOption([]const u8, "target", target_triple);
+
+    // ----- default `zig build` and `zig build run` ---------------------------
+    const dev = buildLinkage(b, target, optimize, zift_version, target_triple, @tagName(optimize));
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -44,83 +426,52 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    exe_mod.addImport("libssh", libssh.createModule());
-    exe_mod.addOptions("build_options", build_options);
-    exe_mod.linkSystemLibrary("ssh", .{});
-    if (is_macos) {
-        exe_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-        exe_mod.addRPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    }
+    exe_mod.addImport("libssh", dev.libssh_module);
+    exe_mod.addOptions("build_options", dev.build_options);
 
     const exe = b.addExecutable(.{
         .name = "zift",
         .root_module = exe_mod,
     });
-
+    exe.root_module.linkLibrary(dev.libssh_lib);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-
     const run_step = b.step("run", "Run zift");
     run_step.dependOn(&run_cmd.step);
 
+    // ----- `zig build test` --------------------------------------------------
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    test_mod.addImport("libssh", libssh.createModule());
-    test_mod.addOptions("build_options", build_options);
-    test_mod.linkSystemLibrary("ssh", .{});
-    if (is_macos) {
-        test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-        test_mod.addRPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    }
+    test_mod.addImport("libssh", dev.libssh_module);
+    test_mod.addOptions("build_options", dev.build_options);
 
-    const unit_tests = b.addTest(.{
-        .root_module = test_mod,
-    });
+    const unit_tests = b.addTest(.{ .root_module = test_mod });
+    unit_tests.root_module.linkLibrary(dev.libssh_lib);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // -----------------------------------------------------------------
-    // Release target (PLAN §13)
+    // ----- `zig build release` (PLAN §13) -----------------------------------
     //
-    // `zig build release` produces a versioned, target-tagged binary
-    // under `zig-out/release/zift-{version}-{target}` along with a
-    // `SHA256SUMS` line so partners can verify the bytes they got.
+    // Produces `zig-out/release/zift-{version}-{target}` plus a
+    // `SHA256SUMS` line. Always linked ReleaseSafe regardless of the
+    // global `-Doptimize=...` so production binaries get the same
+    // safety checks integration tests run against.
     //
-    // Today this step still links DYNAMICALLY against the host's
-    // libssh: cross-compilation works only if a libssh sysroot is
-    // available for the target. Static linking against vendored
-    // libssh + libcrypto sources is the next milestone (TODOS.md
-    // P1: "No release target, no SHA256 manifest, no signature step"
-    // — this commit lands the FIRST two of those three; signing
-    // and the static-linking story are follow-ups). Once vendored,
-    // the same `zig build release -Dtarget=...` invocation will
-    // produce a cross-target static binary without further changes
-    // to this step.
-    //
-    // Tip: the release artifact is ALWAYS built ReleaseSafe, ignoring
-    // the global `-Doptimize=...` flag. Release binaries get the same
-    // safety checks integration tests run against; we trade a bit of
-    // throughput for the ability to attribute crashes precisely.
-    // -----------------------------------------------------------------
-    // The release build_options report `optimize = "ReleaseSafe"` in
-    // `zift version`, regardless of any `-Doptimize=...` flag the
-    // operator may have set for the dev target. Release binaries
-    // ALWAYS get ReleaseSafe — operators reading `zift version` on a
-    // production host should see that, not whatever the dev was
-    // compiling with at the moment.
-    const release_build_options = b.addOptions();
-    release_build_options.addOption([]const u8, "version", zift_version);
-    release_build_options.addOption([]const u8, "optimize", @tagName(.ReleaseSafe));
-    release_build_options.addOption([]const u8, "target", target_triple);
+    // Dev/test/release all use the SAME vendored libssh + mbedTLS +
+    // zlib (the shared `buildLinkage` helper). No partner ever needs
+    // `apt install libssh-4`; every release artifact is self-contained
+    // (`verify-release.sh` confirms zero `DT_NEEDED` on Linux, only
+    // `libSystem` on macOS).
+    const release = buildLinkage(b, target, .ReleaseSafe, zift_version, target_triple, @tagName(.ReleaseSafe));
 
     const release_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -128,26 +479,14 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
         .link_libc = true,
     });
-    const release_libssh = b.addTranslateC(.{
-        .root_source_file = b.path("src/libssh_root.h"),
-        .target = target,
-        .optimize = .ReleaseSafe,
-        .link_libc = true,
-    });
-    if (is_macos) release_libssh.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    release_libssh.linkSystemLibrary("ssh", .{});
-    release_mod.addImport("libssh", release_libssh.createModule());
-    release_mod.addOptions("build_options", release_build_options);
-    release_mod.linkSystemLibrary("ssh", .{});
-    if (is_macos) {
-        release_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-        release_mod.addRPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    }
+    release_mod.addImport("libssh", release.libssh_module);
+    release_mod.addOptions("build_options", release.build_options);
 
     const release_exe = b.addExecutable(.{
         .name = "zift",
         .root_module = release_mod,
     });
+    release_exe.root_module.linkLibrary(release.libssh_lib);
 
     const artifact_name = b.fmt("zift-{s}-{s}", .{ zift_version, target_triple });
     const install_release = b.addInstallArtifact(release_exe, .{
@@ -155,36 +494,31 @@ pub fn build(b: *std.Build) void {
         .dest_sub_path = artifact_name,
     });
 
-    // SHA256SUMS line for the artifact. `shasum -a 256` is portable on
-    // both macOS (default) and Ubuntu (perl-base, always installed),
-    // produces the same `<hash>  <filename>` format `sha256sum` does,
-    // and is what GitHub's actions/upload-artifact downloaders verify
-    // against. Output is rewritten on every release build so partial
-    // / stale checksums never linger.
+    // Per-target SHA256SUMS file. Naming the output `SHA256SUMS-{target}`
+    // means multiple `zig build release -Dtarget=...` runs in the same
+    // workspace produce ADJACENT files rather than overwriting a single
+    // SHA256SUMS — important now that cross-compile works, because
+    // `zig build release -Dtarget=x86_64-linux` followed by
+    // `... -Dtarget=aarch64-linux` would otherwise lose the first hash.
+    // The release CI workflow concatenates these into one canonical
+    // SHA256SUMS at publish time before signing.
     const checksum_cmd = b.addSystemCommand(&.{ "sh", "-c" });
     checksum_cmd.addArg(b.fmt(
-        "cd zig-out/release && shasum -a 256 '{s}' > SHA256SUMS && cat SHA256SUMS",
-        .{artifact_name},
+        "cd zig-out/release && shasum -a 256 '{s}' > 'SHA256SUMS-{s}' && cat 'SHA256SUMS-{s}'",
+        .{ artifact_name, target_triple, target_triple },
     ));
     checksum_cmd.step.dependOn(&install_release.step);
 
-    // Verify the release artifact's runtime dependency surface against
-    // a known allowlist. Today's allowlist accepts the small set of
-    // dynamic deps the build legitimately produces (libssh + libc on
-    // Linux, libssh + libSystem on macOS). When static linking lands
-    // (vendored libssh + libcrypto via build.zig.zon), `verify-release.sh`
-    // gets a one-line allowlist tightening that turns this into the
-    // literal "zero NEEDED" check PLAN §13 promises for Linux. The
-    // script itself dispatches on ELF vs Mach-O magic so it works on
-    // any host inspecting any target binary.
     const verify_cmd = b.addSystemCommand(&.{
         "build/verify-release.sh",
         b.fmt("zig-out/release/{s}", .{artifact_name}),
     });
     verify_cmd.step.dependOn(&install_release.step);
 
-    const release_step = b.step("release", "Build a versioned release binary into zig-out/release/");
+    const release_step = b.step("release", "Build a versioned, fully-static release binary into zig-out/release/");
     release_step.dependOn(&install_release.step);
     release_step.dependOn(&checksum_cmd.step);
     release_step.dependOn(&verify_cmd.step);
+
+    _ = builtin; // referenced for cross-platform branches, kept around for future targets.
 }

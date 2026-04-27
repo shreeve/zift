@@ -4,7 +4,9 @@ Production deployment of Zift on an Ubuntu host with ZFS-backed partner roots.
 
 ## Prerequisites
 
-- Ubuntu 22.04+ or equivalent
+- Linux 3.x+ (kernel-only requirement; Zift v0.2.0+ binaries are fully
+  statically linked — no `apt install libssh-4` needed). Ubuntu, Debian,
+  RHEL, Alpine, distroless images, etc. all work.
 - ZFS pool for partner data (recommended)
 - `fail2ban` installed
 - SSH admin access on port 22, key-only, IP-restricted (separate from Zift)
