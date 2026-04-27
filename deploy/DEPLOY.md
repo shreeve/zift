@@ -46,6 +46,13 @@ the upper envelope of `m=262144`). Either drop `max-connections` to 14,
 raise `MemoryMax` in the unit, or lower the Argon2id `m` parameter on the
 hashes you generate — but make all three numbers consistent.
 
+`max-unauth-connections` is an independent cap on the pre-auth slot
+pool (PLAN §8.4). It bounds handshake-storm pressure: with the default
+`max-unauth-connections=0` (no separate cap), an attacker can pin the
+entire `max-connections` pool with stuck pre-auth sockets until each
+`idle-timeout` elapses. Setting it to roughly `max-connections / 4`
+preserves headroom for authenticated partners. Must be `≤ max-connections`.
+
 ```bash
 sudo tee /etc/zift/zift.conf << 'EOF'
 server
@@ -53,6 +60,7 @@ server
   host-key /etc/zift/host_ed25519
   idle-timeout 5m
   max-connections 14
+  max-unauth-connections 4
   reload-interval 2s
   log /var/log/zift/audit.jsonl
 

@@ -16,13 +16,14 @@ documented trade-off), or **FINDING** (actionable issue with recommended fix).
   audit line for rejected connections.
 - **OK**: Listening socket closed immediately at drain start (`std.c.close(bind_fd)`)
   so no new TCP connections land during grace period. PLAN §7.1.
-- **CAVEAT**: `max-connections` is a single global cap covering both
-  pre-auth and post-auth sessions. The `idle-timeout` on pre-auth
-  sessions reaps stuck slots within the timeout window so the cap
-  remains meaningful under handshake-storm pressure, but a future
-  enhancement should split it into independent pre-auth and post-auth
-  limits and track each via a separate atomic counter. Tracked in
-  TODOS.md as a P1.
+- **OK**: `signals.unauth_sessions` counts pre-auth sessions
+  separately from `signals.active_sessions` (the global counter).
+  When `max-unauth-connections` is configured (>0), the accept loop
+  rejects new pre-auth slots once that cap is hit, even though the
+  global pool may still have headroom. Audit lines distinguish the
+  two cases via the `detail` field (`max-connections reached` vs
+  `max-unauth-connections reached`) so operators can tell handshake-
+  storm rejections apart from organic load. PLAN §8.4.
 
 ### SSH handshake and authentication
 
