@@ -161,10 +161,30 @@ pub const Sink = struct {
 /// We deliberately do not try to recurse through the audit pipeline
 /// for self-reporting — that would risk recursive lock/format errors
 /// during a real outage. Operators see the bare line on stderr.
+///
+/// Rate-limited to at most one stderr line per `warn_min_interval_ms`
+/// (default 5 s) so a runaway destination (full disk, broken pipe to
+/// supervisor) can't itself cause a stderr storm. The first failure
+/// in any window is always logged; subsequent failures within the
+/// window are silently dropped.
+const warn_min_interval_ms: i64 = 5_000;
+var last_warn_ms: std.atomic.Value(i64) = .init(0);
+
 fn warnWriteFailure(name: []const u8) void {
+    const now = nowMonotonicMs();
+    const last = last_warn_ms.load(.acquire);
+    if (now - last < warn_min_interval_ms and last != 0) return;
+    last_warn_ms.store(now, .release);
+
     writeStderrRaw("zift: audit write failed: ");
     writeStderrRaw(name);
     writeStderrRaw("\n");
+}
+
+fn nowMonotonicMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
 }
 
 /// Single-syscall raw stderr write. Used for audit-pipeline diagnostic

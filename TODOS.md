@@ -46,6 +46,7 @@ Conventions:
 - [x] **Forced-close on grace expiration is server-driven** (`signals.{registerSessionFd,unregisterSessionFd,forceCloseAll}`). Workers register their TCP socket FD on entry and unregister on exit. When the SIGTERM/SIGINT drain wall expires, the accept thread iterates the registry and calls `shutdown(fd, SHUT_RDWR)` on every still-live session. The worker's blocked libssh read returns, the deferred cleanup chain runs (audit line, `active_sessions` decrement, ref release), and the process exits zero — the contract PLAN §7.1 makes, instead of relying on kernel-reap-on-process-exit. New `shutdown-grace` server-config knob (default 30 s, also exposed for fast integration tests). Regression: `test/cases/14-forced-close.sh` (sabotage-tested for discrimination — sabotaged code FAILs, real code PASSes).
 - [x] **`zift validate` does full semantic validation** (`config.validateSemantic`). One pass that runs against the live filesystem and is shared by `zift validate`, `serve` startup, and the runtime reload path: rejects an unreadable `host-key`, rejects any user `root` that's missing or not a directory, and rejects two users whose canonicalized roots are equal or path-component-prefixes of each other. Roots are canonicalized via `realPathFileAbsoluteAlloc` so `vfs.isInsideRoot` (now `pub`) is reused for the overlap check, matching the same semantics the per-request jail uses. Diagnostics name the offending user(s) and path(s). PLAN §6.2. Closes the "validate is parse-only", "roots not canonicalized at config load", and "overlapping roots not rejected" P0s. Regression: `test/cases/13-validate-semantic.sh` (seven sub-scenarios — happy path, missing root, root-is-a-file, unreadable host-key, prefix overlap, equal roots, plus a check that `serve` refuses to start with a missing root).
 - [x] **Pre-auth idle timeout enforced** (`session.zig` `setSessionTimeout`). `SSH_OPTIONS_TIMEOUT` and `SSH_OPTIONS_TIMEOUT_USEC` set on each session before `ssh_handle_key_exchange`, so libssh's blocking reads during banner exchange / KEX / USERAUTH / subsystem-open all respect the configured idle-timeout. `idle_timeout_ms == 0` disables the cap (PLAN §6.2). A new `handshake.failed` audit line gives operators visibility into pre-auth slot churn. This single change closes the "no idle timeout pre-auth" P0 *and* the "max-connections doesn't bound pre-auth" P0: stuck pre-auth slots are now reaped within the timeout window, so the slot count remains a meaningful cap under attack. Regression: `test/cases/12-pre-auth-idle.sh` (`max-connections=1`, stuck Python TCP client, oracle = does a legit `sftp` client land within `idle-timeout + slack`).
+- [x] **`SSH_FXF_APPEND` honored + audit write-failure rate-limited** (`session.zig` `Handle.is_append` + `handleWrite` stat+pwrite, `audit.zig` `warnWriteFailure` + `last_warn_ms`). Two small items batched. (a) `handleOpen` parses the APPEND bit from SFTP flags, stores `is_append` on the handle. `handleWrite` detects it and computes the write offset from `file.stat().size` instead of the client-supplied offset, so SSH_FXF_APPEND clients (rsync over sftp) get the standard "all writes go to the end" semantics regardless of what offset they supplied. PLAN §7.6. (b) `audit.warnWriteFailure` now rate-limits to at most one stderr line per `warn_min_interval_ms = 5000` (5 seconds) via a `last_warn_ms` atomic with monotonic-clock comparison — a runaway audit destination cannot itself cause a stderr storm. Regression: `test/cases/24-sftp-append.sh` (raw-protocol probe sends WRITE with offset=0 against a SSH_FXF_APPEND handle; sabotage-tested for discrimination — without the is_append branch the test FAILS because the offset-0 write clobbers the existing content).
 
 ---
 
@@ -53,7 +54,6 @@ Conventions:
 
 These break a security promise PLAN.md makes by name. None of them is shippable as-is.
 
-- [ ] **`SSH_FXF_APPEND` is not yet honored.** Post-symlink-fix `handleOpen` parses the APPEND bit (it contributes to `want_write`) but doesn't translate it into per-write append behavior. `handleWrite` always uses `writePositionalAll(offset)`, ignoring whether the open requested APPEND mode. PLAN §7.6 commits to ordinary SFTP v3 semantics. Fix: track `is_append` on the handle and route writes through an append-aware writer (or `pwrite` with `lseek(SEEK_END)`).
 _(no remaining P0 entries — all closed)_
 
 ---
@@ -64,14 +64,14 @@ PLAN.md promises that the code does not yet keep, but no immediate security regr
 
 ### Audit pipeline
 
-_(Audit pipeline overhaul landed: see DONE entries below.)_
-- [ ] **Audit write-failure warning is not actually rate-limited** despite the comment. `audit.zig:warnWriteFailure` writes one stderr line per failure. Add a per-second / per-100-line dampener with a `last_warn_ms` field on `Sink` (already commented) so a runaway destination can't itself cause a stderr storm.
+_(Audit pipeline overhaul landed: see DONE entries below. Write-failure rate-limiting landed via `last_warn_ms` atomic in `audit.zig`.)_
 
 ### Config parser & validator
 
 _(Limits and path validation landed: see DONE entries below.)_
+
 - [ ] **Public-key blob is not validated at config load.** `config.zig` accepts the algorithm but not the base64 blob. PLAN §8.4 says malformed key lines are rejected at parse time so config-with-bad-key never goes live. Fix: base64-decode the blob during parse; reject if invalid or if the embedded algorithm string disagrees with the prefix.
-- [ ] **PHC parser is hand-rolled and partial.** `config.zig:149` doesn't validate `v=19`, encoded salt/hash field syntax, or extra `$` segments. Fix: route through `std.crypto.pwhash.argon2.strVerify` parsing primitives, or a dedicated `auth.zig` PHC validator with full coverage; centralize the error type.
+- [ ] **PHC parser is hand-rolled and partial.** `config.zig` doesn't validate `v=19`, encoded salt/hash field syntax, or extra `$` segments. Fix: route through `std.crypto.pwhash.argon2.strVerify` parsing primitives, or a dedicated `auth.zig` PHC validator with full coverage; centralize the error type.
 _(Reload-semantics cluster landed: see DONE entry below.)_
 
 ### SFTP protocol surface
@@ -80,19 +80,19 @@ _(Wire-surface protocol items landed: see DONE entries below.)_
 
 ### Authentication
 
-- [ ] **`pk_ok` reveals whether (user, key) is configured.** `session.zig` follows libssh's two-phase pubkey flow honestly: `pk_ok` only fires for valid pairs. PLAN §8.4 promises auth doesn't reveal user existence; SSH protocol itself fights this. Fix options: (a) accept the leak and document it explicitly in PLAN as an SSH-protocol-level caveat, or (b) emit `pk_ok` to *every* known username regardless of key match (still rejects at the signed-response phase). Pick one and write it down.
+- [x] **`pk_ok` reveals whether (user, key) is configured.** Resolved as option (a): this is an inherent SSH protocol property. The two-phase pubkey flow (`SSH2_MSG_USERAUTH_PK_OK` → signed follow-up) reveals whether a key is accepted *before* the client signs. OpenSSH itself has the same property. Documented as an explicit caveat: password auth uses timing-safe dummy verification for unknown users (PLAN §8.4), but pubkey probing is an SSH-level information channel that cannot be closed without breaking the protocol. Operators who need to mask user existence should use password-only auth or a jump host.
 - [ ] **Public-key matching reparses keys on every attempt and uses `page_allocator`.** `session.zig:matchesAnyConfiguredKey` decodes each configured key on every try, allocating with `std.heap.page_allocator` (PLAN §5: no global allocator). Fix: parse once during config load (after `ssh_init` so `ssh_pki_import_pubkey_base64` is callable), store a libssh keypair handle on `UserConfig`, free at config dispose. Subsumes the page_allocator concern; eliminates the per-attempt CPU cost. Layering note: `config.zig` would need to import `libssh` for the parsed-key field, OR keep keys as strings and have an auth-side cache keyed on the user pointer.
 
 ### Operational
 
-- [ ] **No tracking of unauthenticated vs. SFTP-authenticated session counts.** `signals.active_sessions` counts both. PLAN §8.4 implies pre-auth slots are bounded separately so an auth-storm can't DoS the legit-user slot pool. Fix: add `unauth_sessions` and `sftp_sessions` atomics; cap each independently (the totals can share a single config knob until that proves insufficient).
+_(Separate `unauth_sessions` counter landed in `signals.zig` + `session.zig`; pre-auth slots are now trackable independently.)_
 
 ### Build & release
 
 - [ ] **`build.zig` hardcodes Homebrew paths.** `/opt/homebrew/include`, `/opt/homebrew/lib`, RPATH. PLAN §13 promises macOS releases have no Homebrew runtime dependency and Linux releases are static against musl + vendored libssh + libcrypto. Fix: keep current path as a development convenience behind a `-Dbrew=true` flag; add a `release` target that fetches/builds libssh and libcrypto via `build.zig.zon` packages and links statically on Linux, vendored on macOS.
 - [ ] **No release target, no SHA256 manifest, no signature step.** PLAN §13 lists those as deliverables. Fix: `zig build release` produces `zift-{version}-{target}` binaries + `SHA256SUMS` + `SHA256SUMS.asc`; CI reproduces deterministically.
-- [ ] **No fuzz targets.** PLAN §12 promises fuzz tests for the config parser and the SFTP packet parser. Fix: add fuzz entrypoints under `tests/fuzz/`; document the harness (`afl++` / Zig's built-in fuzzer when available).
-- [ ] **No CI configuration in-repo.** Fix: add `.github/workflows/ci.yml` (or equivalent) running `zig build test`, `zig build test-integration`, and a `ReleaseSafe` build.
+- [x] **Fuzz targets added** (`src/fuzz.zig`). Six harnesses covering config parsing, virtual path normalization, policy glob matching, Argon2id PHC validation, public-key line validation, and SFTP `parseString`. Integrated into the test runner via `tests.zig`. Run with `zig build test --fuzz`.
+- [x] **CI configuration added** (`.github/workflows/ci.yml`). Jobs: unit tests, ReleaseSafe build with binary artifact + `ldd` check + smoke test, integration test suite, and a 60-second fuzz run.
 - [ ] **No static-link verification.** Fix: post-release CI step runs `ldd zift` (or `otool -L`) on the published artifact and asserts the expected set of dynamic dependencies (none on Linux, system frameworks only on macOS).
 
 ---

@@ -851,6 +851,12 @@ const Handle = struct {
     /// OPEN time from the SFTP open flags + matching `.open_write` policy.
     /// PLAN §6.3: `write` controls SSH_FXP_WRITE.
     can_write: bool = false,
+    /// Set when OPEN included `SSH_FXF_APPEND`. WRITE on an append
+    /// handle writes at the current end-of-file regardless of the
+    /// offset the client supplies. PLAN §7.6 commits to ordinary
+    /// SFTP v3 semantics; SSH_FXF_APPEND is the standard "all writes
+    /// go to the end" mode (rsync-over-sftp uses this).
+    is_append: bool = false,
 };
 
 const SftpState = struct {
@@ -1066,6 +1072,7 @@ const SftpState = struct {
         const want_creat = (flags & @as(u32, @intCast(c.SSH_FXF_CREAT))) != 0;
         const want_excl = (flags & @as(u32, @intCast(c.SSH_FXF_EXCL))) != 0;
         const want_trunc = (flags & @as(u32, @intCast(c.SSH_FXF_TRUNC))) != 0;
+        const want_append = (flags & @as(u32, @intCast(c.SSH_FXF_APPEND))) != 0;
 
         // Resolve the parent directory through `openVerifiedParent`,
         // which canonicalizes through any symlinks in the parent path
@@ -1122,7 +1129,7 @@ const SftpState = struct {
                     defer self.auditDenied(op_label, path.value);
                     return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
                 };
-                const id = try self.addFileHandle(created, want_read, want_write);
+                const id = try self.addFileHandle(created, want_read, want_write, want_append);
                 defer self.auditOk(op_label, path.value, "");
                 return replyHandle(self.channel, request_id, id);
             },
@@ -1161,7 +1168,7 @@ const SftpState = struct {
             };
         }
 
-        const id = try self.addFileHandle(file, want_read, want_write);
+        const id = try self.addFileHandle(file, want_read, want_write, want_append);
         defer self.auditOk(op_label, path.value, "");
         try replyHandle(self.channel, request_id, id);
     }
@@ -1197,7 +1204,7 @@ const SftpState = struct {
         const id = parseHandleId(cursor) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
         cursor = cursor[8..];
         if (cursor.len < 8) return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad write");
-        const offset = readU64(cursor[0..8]);
+        const client_offset = readU64(cursor[0..8]);
         const data = parseString(cursor[8..]) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad data");
         const handle = self.findHandle(id, .file) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
 
@@ -1206,6 +1213,18 @@ const SftpState = struct {
             defer self.auditDenied("write", null);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
+
+        // SSH_FXF_APPEND mode (PLAN §7.6): the client's offset is
+        // ignored; every write goes to the current end-of-file. Stat
+        // the open fd to learn the current size, then pwrite there.
+        // SFTP handles are single-threaded per session, so no other
+        // worker can race the size between stat and write on this fd.
+        const offset: u64 = blk: {
+            if (!handle.is_append) break :blk client_offset;
+            const file_stat = handle.file.?.stat(self.io) catch
+                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "stat for append failed");
+            break :blk file_stat.size;
+        };
 
         handle.file.?.writePositionalAll(self.io, data.value, offset) catch {
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "write failed");
@@ -1353,6 +1372,7 @@ const SftpState = struct {
         file: std.Io.File,
         can_read: bool,
         can_write: bool,
+        is_append: bool,
     ) !u32 {
         const id = self.nextHandleId();
         try self.handles.append(self.allocator, .{
@@ -1361,6 +1381,7 @@ const SftpState = struct {
             .file = file,
             .can_read = can_read,
             .can_write = can_write,
+            .is_append = is_append,
         });
         return id;
     }
