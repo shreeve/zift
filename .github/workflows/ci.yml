@@ -110,9 +110,17 @@ jobs:
           # a copy in a per-run private tmpdir so dependency resolution
           # succeeds without touching /etc and without colliding with
           # any stale artifact at a predictable /tmp path.
+          #
+          # We also rewrite `ExecStart` to `/bin/true` for the verify
+          # copy. The verifier checks that the ExecStart path actually
+          # exists and is executable on the host running verify; on a
+          # CI runner where zift isn't installed the unit-file syntax
+          # is correct but the path check fails. We're verifying the
+          # SHIPPED unit's directive syntax (hardening, capabilities,
+          # etc.), not the deployment-specific binary path.
           tmpdir=$(mktemp -d)
           trap 'rm -rf "$tmpdir"' EXIT
-          install -m 0644 deploy/zift.service "$tmpdir/zift.service"
+          sed 's|^ExecStart=.*|ExecStart=/bin/true|' deploy/zift.service > "$tmpdir/zift.service"
 
           set +e
           out=$(systemd-analyze verify "$tmpdir/zift.service" 2>&1)

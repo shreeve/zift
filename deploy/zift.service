@@ -72,7 +72,8 @@ RestrictAddressFamilies=AF_INET AF_INET6
 # the 32-bit syscall ABI on x86_64 hosts (a frequent confused-deputy
 # vector).
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged ~@resources
+SystemCallFilter=~@privileged
+SystemCallFilter=~@resources
 SystemCallArchitectures=native
 
 # Kernel keyring. Zift does not use the keyring; isolate it.
