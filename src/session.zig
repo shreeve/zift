@@ -843,7 +843,19 @@ fn runSftp(
                 audit.log(io, user.name, "idle.timeout", null, .ok, "", ip_str);
                 return;
             },
-            else => return,
+            else => |e| {
+                // Either the client closed the channel cleanly (EOF
+                // on `ssh_channel_read_timeout` returning 0) or a
+                // real transport / libssh failure. Either way the
+                // session is over, but a SILENT exit here means a
+                // session that drops unexpectedly leaves no audit
+                // breadcrumb at all — operators can't distinguish
+                // "client said bye" from "wire got reset" from "a
+                // bug in our packet read." Always emit one line so
+                // the close has a reason on it.
+                audit.log(io, user.name, "session.ended", null, .ok, @errorName(e), ip_str);
+                return;
+            },
         };
         state.last_activity_ms = nowMs();
         if (payload.len < 5) return error.LibsshFailure;
