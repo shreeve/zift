@@ -78,13 +78,10 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Install libssh (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssh-dev
-
-      - name: Install libssh (macOS)
-        if: runner.os == 'macOS'
-        run: brew install libssh
+      # No libssh / mbedTLS / zlib install step needed since v0.2.0 —
+      # `zig build release` compiles all three from vendored source via
+      # build.zig.zon. Hermetic build, reproducible from a clean
+      # checkout on any host with Zig 0.16.0 installed.
 
       - name: Build release artifact
         run: zig build release -Dversion=${{ steps.version.outputs.version }}
@@ -92,7 +89,12 @@ jobs:
       - name: Show artifact + checksum
         run: |
           ls -la zig-out/release/
-          cat zig-out/release/SHA256SUMS
+          # Per-target SHA256SUMS-{target} files (build.zig writes one
+          # per `-Dtarget=...` invocation to avoid clobbering the file
+          # when multi-target builds run in the same workspace). The
+          # publish job aggregates all of them into one canonical
+          # SHA256SUMS via `cat dist/release-*/SHA256SUMS*`.
+          cat zig-out/release/SHA256SUMS-*
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
