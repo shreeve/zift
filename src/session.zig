@@ -866,10 +866,9 @@ fn runSftp(
                 audit.log(io, user.name, "session.ended", null, .failed, w.buffered(), ip_str);
                 return;
             },
-            else => |e| {
-                audit.log(io, user.name, "session.ended", null, .failed, @errorName(e), ip_str);
-                return;
-            },
+            // No `else` — `readPacketTimed`'s error union is fully
+            // enumerated above. ReleaseSafe's exhaustiveness check
+            // rejects an unreachable `else` prong.
         };
         state.last_activity_ms = nowMs();
         if (payload.len < 5) return error.LibsshFailure;
