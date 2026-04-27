@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 /// this via `-Dversion=...` extracted from the pushed git tag, so the
 /// shipped artifact name matches the tag exactly. Local `zig build release`
 /// invocations without `-Dversion=...` use this value as a stable fallback.
-const default_version = "0.2.0";
+const default_version = "0.2.1";
 
 /// libssh version we vendor. Must match the tag in `build.zig.zon`'s
 /// `libssh_source` URL. Tracked here in source rather than parsed at
