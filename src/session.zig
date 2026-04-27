@@ -451,25 +451,7 @@ fn sessionThread(args: *SessionArgs) void {
         };
         registered = true;
 
-        // TCP_NODELAY — disable Nagle's algorithm on this connection.
-        // SFTP is a tight request/response protocol with many small
-        // packets per command (4-6 round trips for a single `ls`).
-        // Without TCP_NODELAY, the kernel may batch our 4-byte length
-        // prefix with the SFTP payload that immediately follows it,
-        // adding ~40ms of TCP delayed-ACK latency PER round trip.
-        // Across 4 round trips that's up to ~160ms of avoidable lag
-        // on every interactive command. Every modern SSH/HTTP server
-        // sets this; we should too.
-        const flag: c_int = 1;
-        const ipproto_tcp: c_int = 6; // IPPROTO_TCP — same on Linux + macOS
-        const tcp_nodelay: c_int = 1; // TCP_NODELAY    — same on Linux + macOS
-        _ = std.c.setsockopt(
-            session_fd,
-            ipproto_tcp,
-            tcp_nodelay,
-            @ptrCast(&flag),
-            @sizeOf(c_int),
-        );
+        configureSocket(session_fd);
     }
 
     // PLAN §8.4: the pre-auth slot is owned by `sessionThread` until
@@ -552,6 +534,64 @@ fn setSessionTimeout(session: c.ssh_session, idle_timeout_ms: u64) void {
     const usec: c_long = @intCast((idle_timeout_ms % 1000) * 1000);
     _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT, &seconds);
     _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT_USEC, &usec);
+}
+
+/// Apply the socket options every accepted connection should have.
+/// All best-effort: a failed setsockopt leaves the option at its
+/// default and we still serve the session.
+///
+///   TCP_NODELAY    Disable Nagle. SFTP is tight request/response —
+///                  Nagle adds ~40ms of delayed-ACK latency per
+///                  round trip otherwise. Same constant on Linux +
+///                  macOS (1).
+///   SO_KEEPALIVE   Enable TCP keepalive probes so a dead peer (NAT
+///                  rebind, partner network drop, hung client) is
+///                  detected and the kernel drops the socket. Constant
+///                  values for `SOL_SOCKET`/`SO_KEEPALIVE` differ
+///                  between Linux and macOS; we use Zig's platform-
+///                  aware `std.posix` so we don't accidentally pass
+///                  a Linux value on a macOS host (which silently
+///                  configures a different option entirely — see
+///                  `TCP_NOPUSH=4` on Darwin which is what an
+///                  innocent-looking `TCP_KEEPIDLE=4` would hit).
+///   TCP_KEEPIDLE   Linux only. Wait 60s of idle before starting
+///                  probes — much faster than the 7200s default.
+///                  macOS uses `TCP_KEEPALIVE` for the same idea
+///                  but Linux is our primary deploy target so we
+///                  only tighten the timing there. macOS keeps
+///                  defaults (still gets the basic SO_KEEPALIVE on).
+///   TCP_KEEPINTVL  Linux only. Probe every 10s.
+///   TCP_KEEPCNT    Linux only. Give up after 6 probes
+///                  (~60s idle + 60s probing = ~120s to declare dead).
+fn configureSocket(fd: c_int) void {
+    if (fd < 0) return;
+    const enable: c_int = 1;
+    _ = std.c.setsockopt(
+        fd,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        @ptrCast(&enable),
+        @sizeOf(c_int),
+    );
+    _ = std.c.setsockopt(
+        fd,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.KEEPALIVE,
+        @ptrCast(&enable),
+        @sizeOf(c_int),
+    );
+
+    if (@import("builtin").os.tag == .linux) {
+        const idle_seconds: c_int = 60;
+        const intvl_seconds: c_int = 10;
+        const probe_count: c_int = 6;
+        // These three are Linux-specific TCP keepalive timing knobs;
+        // on macOS they don't exist (or have entirely different values
+        // that mean entirely different things), so we don't touch them.
+        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPIDLE, @ptrCast(&idle_seconds), @sizeOf(c_int));
+        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPINTVL, @ptrCast(&intvl_seconds), @sizeOf(c_int));
+        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT, @ptrCast(&probe_count), @sizeOf(c_int));
+    }
 }
 
 fn authenticate(
@@ -826,6 +866,7 @@ fn runSftp(
     var jail = try vfs_mod.Vfs.init(io, allocator, user.root);
     defer jail.deinit(allocator);
 
+    const start_ms = nowMs();
     var state = SftpState{
         .io = io,
         .allocator = allocator,
@@ -834,7 +875,8 @@ fn runSftp(
         .peer_ip = peer_ip,
         .vfs = jail,
         .idle_timeout_ms = idle_timeout_ms,
-        .last_activity_ms = nowMs(),
+        .last_activity_ms = start_ms,
+        .session_started_ms = start_ms,
     };
     defer state.deinit();
 
@@ -860,30 +902,28 @@ fn runSftp(
     while (true) {
         const payload = readPacketTimed(&state, payload_buf) catch |err| switch (err) {
             error.IdleTimeout => {
-                audit.log(io, user.name, "idle.timeout", null, .ok, "", ip_str);
+                state.emitSessionEnded("idle timeout", .ok, ip_str);
                 return;
             },
             error.ChannelEof => {
                 // Clean half-close: client sent SSH_MSG_CHANNEL_EOF
-                // (the standard "I'm done writing" signal). Treat as
-                // a normal session exit. Result is `ok`; nothing's
-                // wrong on either side.
-                audit.log(io, user.name, "session.ended", null, .ok, "client closed channel", ip_str);
+                // (the standard "I'm done writing" signal). Normal
+                // session exit; nothing's wrong on either side.
+                state.emitSessionEnded("client closed channel", .ok, ip_str);
                 return;
             },
             error.LibsshFailure => {
                 // Real transport / libssh failure. Capture libssh's
                 // last-error string so an operator can see WHY the
                 // wire dropped — "Socket error: disconnected", "Read
-                // (socket)…", whatever the underlying issue is. The
-                // detail field is bounded by audit.zig's truncation
-                // so a runaway error string can't blow the line cap.
-                var detail_buf: [256]u8 = undefined;
-                var w = std.Io.Writer.fixed(&detail_buf);
-                w.writeAll("LibsshFailure: ") catch {};
+                // (socket)…", or "spurious-eof cap reached" when
+                // libssh wedged itself reporting EOF forever.
+                var lib_buf: [128]u8 = undefined;
+                var lw = std.Io.Writer.fixed(&lib_buf);
+                lw.writeAll("LibsshFailure: ") catch {};
                 const lib_err = c.ssh_get_error(@as(?*anyopaque, @ptrCast(state.channel)));
-                if (lib_err != null) w.writeAll(std.mem.span(lib_err)) catch {};
-                audit.log(io, user.name, "session.ended", null, .failed, w.buffered(), ip_str);
+                if (lib_err != null) lw.writeAll(std.mem.span(lib_err)) catch {};
+                state.emitSessionEnded(lw.buffered(), .failed, ip_str);
                 return;
             },
             // No `else` — `readPacketTimed`'s error union is fully
@@ -972,6 +1012,17 @@ const SftpState = struct {
     idle_timeout_ms: u64 = 0,
     /// Monotonic timestamp of the last successfully-read SFTP message.
     last_activity_ms: i64 = 0,
+    /// Monotonic timestamp captured when this session entered runSftp.
+    /// Used to populate `duration_ms` in the `session.ended` audit so
+    /// operators can see how long sessions ran.
+    session_started_ms: i64 = 0,
+    /// Tally of `ssh_channel_read_timeout` returns of 0 that
+    /// `ssh_channel_is_eof` immediately disagreed with — i.e. libssh
+    /// telling us the channel is at EOF when it actually isn't. We
+    /// retry these (rc.4 fix) but track how often it happens. Logged
+    /// in `session.ended`'s detail when non-zero so a deployment
+    /// where libssh is misbehaving leaves an empirical trail.
+    spurious_eof_count: u32 = 0,
     next_handle: u32 = 1,
     handles: std.ArrayList(Handle) = .empty,
 
@@ -980,6 +1031,31 @@ const SftpState = struct {
             self.closeHandle(handle);
         }
         self.handles.deinit(self.allocator);
+    }
+
+    /// Emit the canonical `session.ended` audit line with operator-
+    /// facing telemetry tacked onto the detail field:
+    ///   - duration_ms : monotonic ms since runSftp started
+    ///   - spurious_eof: count of spurious-EOF retries we absorbed
+    ///                   (only printed when non-zero — keeps the
+    ///                   line short for healthy sessions while still
+    ///                   surfacing libssh quality issues empirically)
+    fn emitSessionEnded(
+        self: *const SftpState,
+        reason: []const u8,
+        result: audit.Result,
+        ip_str: []const u8,
+    ) void {
+        var buf: [320]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        const duration_ms: i64 = nowMs() - self.session_started_ms;
+        w.writeAll(reason) catch {};
+        w.print(" (duration_ms={d}", .{duration_ms}) catch {};
+        if (self.spurious_eof_count != 0) {
+            w.print(", spurious_eof={d}", .{self.spurious_eof_count}) catch {};
+        }
+        w.writeAll(")") catch {};
+        audit.log(self.io, self.user.name, "session.ended", null, result, w.buffered(), ip_str);
     }
 
     /// Validate a freshly-parsed client path against PLAN §7.6 (length)
@@ -1613,7 +1689,17 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
             // if it reports the channel is NOT actually EOF, treat the
             // bogus 0 as a transient and try again. The idle-timeout
             // path still bounds the max wait.
+            //
+            // Cap consecutive spurious returns to avoid an infinite
+            // spin if libssh ever lands in a permanently-stuck state.
+            // 1000 is generous (~200s of 200ms slices) — well past
+            // anything we've observed in practice.
+            const spurious_eof_cap: u32 = 1000;
             if (c.ssh_channel_is_eof(state.channel) == 0) {
+                state.spurious_eof_count += 1;
+                if (state.spurious_eof_count >= spurious_eof_cap) {
+                    return error.LibsshFailure;
+                }
                 if (state.idle_timeout_ms != 0) {
                     const elapsed: i64 = nowMs() - state.last_activity_ms;
                     if (elapsed >= @as(i64, @intCast(state.idle_timeout_ms))) {
