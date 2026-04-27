@@ -4,13 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Homebrew on macOS installs libssh under /opt/homebrew. Linux uses
+    // distro packages on the default search path, so leave those alone.
+    const is_macos = target.result.os.tag == .macos;
+
     const libssh = b.addTranslateC(.{
         .root_source_file = b.path("src/libssh_root.h"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    libssh.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    if (is_macos) libssh.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     libssh.linkSystemLibrary("ssh", .{});
 
     const build_options = b.addOptions();
@@ -31,8 +35,10 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("libssh", libssh.createModule());
     exe_mod.addOptions("build_options", build_options);
     exe_mod.linkSystemLibrary("ssh", .{});
-    exe_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    exe_mod.addRPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    if (is_macos) {
+        exe_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        exe_mod.addRPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    }
 
     const exe = b.addExecutable(.{
         .name = "zift",
@@ -57,8 +63,10 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("libssh", libssh.createModule());
     test_mod.addOptions("build_options", build_options);
     test_mod.linkSystemLibrary("ssh", .{});
-    test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    test_mod.addRPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    if (is_macos) {
+        test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        test_mod.addRPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    }
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
