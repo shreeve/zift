@@ -238,6 +238,15 @@ const ActiveConfig = struct {
             return;
         };
         errdefer next_config.deinit();
+
+        // Cross-cutting semantic checks (PLAN.md §6.2). On failure, the
+        // running config keeps serving; diagnostics already on stderr.
+        config.validateSemantic(self.io, self.allocator, &next_config) catch {
+            next_config.deinit();
+            try stderr.writeStreamingAll(self.io, "zift: config reload rejected (kept previous)\n");
+            return;
+        };
+
         const next_ref = try ConfigRef.create(self.allocator, next_config);
 
         self.mutex.lockUncancelable(self.io);

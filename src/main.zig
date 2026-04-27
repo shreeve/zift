@@ -94,6 +94,12 @@ fn validate(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
     };
     defer cfg.deinit();
 
+    // Cross-cutting semantic checks against the live filesystem
+    // (PLAN.md §6.2). Diagnostics already written to stderr by the
+    // validator; we only need to translate the error into the exit
+    // code.
+    config.validateSemantic(io, gpa, &cfg) catch return 1;
+
     const stdout = std.Io.File.stdout();
     var buf: [128]u8 = undefined;
     const summary = std.fmt.bufPrint(&buf, "ok: {s} ({d} user{s}, listen {s})\n", .{
@@ -122,7 +128,14 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     const stdout = std.Io.File.stdout();
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 20));
     defer gpa.free(contents);
-    const cfg = try config.parse(gpa, contents);
+    var cfg = try config.parse(gpa, contents);
+
+    // Refuse to start serving until the live-filesystem invariants
+    // hold (PLAN.md §6.2). Diagnostics already written to stderr.
+    config.validateSemantic(io, gpa, &cfg) catch |err| {
+        cfg.deinit();
+        return err;
+    };
 
     try stdout.writeStreamingAll(io, "zift: libssh initialized\n");
     try stdout.writeStreamingAll(io, "zift: config path: ");

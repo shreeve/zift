@@ -179,7 +179,11 @@ fn joinRoot(allocator: std.mem.Allocator, root: []const u8, normalized_virtual: 
     return try out.toOwnedSlice(allocator);
 }
 
-fn isInsideRoot(root: []const u8, path: []const u8) bool {
+/// True iff `path` is `root` or sits inside `root` at a path-component
+/// boundary (so `/foo/bar` is inside `/foo` but `/foobar` is not).
+/// Used by both the per-request jail check and `config.validateSemantic`
+/// to detect overlapping user roots.
+pub fn isInsideRoot(root: []const u8, path: []const u8) bool {
     if (std.mem.eql(u8, root, path)) return true;
     if (!std.mem.startsWith(u8, path, root)) return false;
     return path.len > root.len and path[root.len] == '/';

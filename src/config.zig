@@ -1,4 +1,18 @@
 const std = @import("std");
+const vfs = @import("vfs.zig");
+
+/// Errors produced by `validateSemantic` for cross-cutting checks that
+/// can only be performed against a live filesystem (PLAN.md §6.2). The
+/// individual error names are also written to stderr verbatim by the
+/// validator for operator-facing diagnostics; integration tests grep for
+/// the specific phrase next to the error to assert the right rejection.
+pub const SemanticError = error{
+    HostKeyUnreadable,
+    UserRootMissing,
+    UserRootNotDirectory,
+    OverlappingRoots,
+    OutOfMemory,
+};
 
 pub const Permission = enum {
     read,
@@ -77,6 +91,100 @@ pub const Config = struct {
         return null;
     }
 };
+
+/// Cross-cutting semantic validation against the live filesystem.
+///
+/// `parse` only proves the config is *syntactically* well-formed and
+/// internally consistent (Argon2id parameter envelope, accepted key
+/// algorithms, no users without credentials). PLAN.md §6.2 also
+/// requires that, before a config is allowed to take effect:
+///
+///   - the configured `host-key` path is readable,
+///   - every user's `root` exists and is a directory,
+///   - no two user roots overlap (one is `==` or path-prefix of another).
+///
+/// Called from `zift validate`, from `zift serve` startup, and from the
+/// runtime reload path. Diagnostics are written to stderr in the
+/// canonical `zift: ...` form so the same message appears whether the
+/// rejection happens at validate time, startup time, or reload time.
+pub fn validateSemantic(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+) SemanticError!void {
+    const stderr = std.Io.File.stderr();
+
+    // 1. Host-key file must exist and be readable.
+    _ = std.Io.Dir.cwd().statFile(io, cfg.server.host_key, .{}) catch {
+        stderr.writeStreamingAll(io, "zift: host-key unreadable: ") catch {};
+        stderr.writeStreamingAll(io, cfg.server.host_key) catch {};
+        stderr.writeStreamingAll(io, "\n") catch {};
+        return error.HostKeyUnreadable;
+    };
+
+    // 2. Each user root must exist, be a directory, and canonicalize
+    // through symlinks. We canonicalize via realPath so the overlap
+    // check below operates on absolute symlink-resolved paths, the
+    // same form the per-request `vfs.isInsideRoot` check uses.
+    // `realPathFileAbsoluteAlloc` returns a sentinel-terminated slice
+    // (`[:0]const u8`), and `Allocator.free` requires the freeing call
+    // to use the same sentinel-typed slice it was allocated with — the
+    // backing allocation length includes the trailing null. Storing as
+    // `[]const u8` strips the sentinel and triggers `Invalid free`.
+    var canonical_roots = try allocator.alloc([:0]const u8, cfg.users.len);
+    var canonical_count: usize = 0;
+    defer {
+        for (canonical_roots[0..canonical_count]) |path| allocator.free(path);
+        allocator.free(canonical_roots);
+    }
+
+    for (cfg.users) |*user| {
+        // Resolve the user's root (follows symlinks; fails on missing).
+        const real = std.Io.Dir.realPathFileAbsoluteAlloc(io, user.root, allocator) catch {
+            stderr.writeStreamingAll(io, "zift: user '") catch {};
+            stderr.writeStreamingAll(io, user.name) catch {};
+            stderr.writeStreamingAll(io, "' root does not exist or is unreadable: ") catch {};
+            stderr.writeStreamingAll(io, user.root) catch {};
+            stderr.writeStreamingAll(io, "\n") catch {};
+            return error.UserRootMissing;
+        };
+        // Verify the resolved target is actually a directory.
+        const dir = std.Io.Dir.openDirAbsolute(io, real, .{}) catch {
+            allocator.free(real);
+            stderr.writeStreamingAll(io, "zift: user '") catch {};
+            stderr.writeStreamingAll(io, user.name) catch {};
+            stderr.writeStreamingAll(io, "' root is not a directory: ") catch {};
+            stderr.writeStreamingAll(io, user.root) catch {};
+            stderr.writeStreamingAll(io, "\n") catch {};
+            return error.UserRootNotDirectory;
+        };
+        dir.close(io);
+
+        canonical_roots[canonical_count] = real;
+        canonical_count += 1;
+    }
+
+    // 3. Overlap detection on the canonicalized paths. Two roots
+    // overlap iff one is equal to or a path-component prefix of the
+    // other (PLAN.md §6.2). Equal roots are caught by `isInsideRoot`'s
+    // `eql` short-circuit, so the symmetric check is enough.
+    for (canonical_roots[0..canonical_count], 0..) |a, i| {
+        for (canonical_roots[i + 1 .. canonical_count], i + 1..) |b, j| {
+            if (vfs.isInsideRoot(a, b) or vfs.isInsideRoot(b, a)) {
+                stderr.writeStreamingAll(io, "zift: overlapping roots for users '") catch {};
+                stderr.writeStreamingAll(io, cfg.users[i].name) catch {};
+                stderr.writeStreamingAll(io, "' and '") catch {};
+                stderr.writeStreamingAll(io, cfg.users[j].name) catch {};
+                stderr.writeStreamingAll(io, "': ") catch {};
+                stderr.writeStreamingAll(io, a) catch {};
+                stderr.writeStreamingAll(io, " vs ") catch {};
+                stderr.writeStreamingAll(io, b) catch {};
+                stderr.writeStreamingAll(io, "\n") catch {};
+                return error.OverlappingRoots;
+            }
+        }
+    }
+}
 
 const ServerBuilder = struct {
     listen: ?[]const u8 = null,
