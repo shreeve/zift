@@ -173,6 +173,57 @@ grep -q "overlapping roots" "$TEST_TMP/equal_roots.stderr" \
     || fail "equal-roots: expected 'overlapping roots' diagnostic, got: $(cat "$TEST_TMP/equal_roots.stderr")"
 ok "equal user roots rejected as overlapping"
 
+# ---------- max-unauth-connections > max-connections ----------
+cat > "$TEST_TMP/bad_cap.conf" <<EOF
+server
+  listen 127.0.0.1:$TEST_PORT
+  host-key $HOST_KEY
+  max-connections 8
+  max-unauth-connections 16
+
+user alice
+  password $hash
+  root $TEST_TMP/root_a
+  allow / read list
+EOF
+
+set +e
+run_validate bad_cap
+rc=$?
+set -e
+[[ "$rc" == "1" ]] || fail "bad-cap: validate returned $rc instead of 1"
+grep -q "max-unauth-connections (16) exceeds max-connections (8)" "$TEST_TMP/bad_cap.stderr" \
+    || fail "bad-cap: expected 'exceeds max-connections' diagnostic, got: $(cat "$TEST_TMP/bad_cap.stderr")"
+ok "max-unauth-connections > max-connections rejected with named diagnostic"
+
+# ---------- ordering: numeric cap fails before host-key stat ----------
+# Both max-unauth (16) > max-connections (8) AND host-key path is
+# missing. The pure-numeric check must fire FIRST so the operator
+# fixes the typo before discovering the host-key issue.
+cat > "$TEST_TMP/bad_cap_and_hostkey.conf" <<EOF
+server
+  listen 127.0.0.1:$TEST_PORT
+  host-key $TEST_TMP/no_such_host_key
+  max-connections 8
+  max-unauth-connections 16
+
+user alice
+  password $hash
+  root $TEST_TMP/root_a
+  allow / read list
+EOF
+
+set +e
+run_validate bad_cap_and_hostkey
+rc=$?
+set -e
+[[ "$rc" == "1" ]] || fail "bad-cap-and-hostkey: validate returned $rc instead of 1"
+grep -q "max-unauth-connections" "$TEST_TMP/bad_cap_and_hostkey.stderr" \
+    || fail "bad-cap-and-hostkey: cap diagnostic missing, got: $(cat "$TEST_TMP/bad_cap_and_hostkey.stderr")"
+grep -q "host-key unreadable" "$TEST_TMP/bad_cap_and_hostkey.stderr" \
+    && fail "bad-cap-and-hostkey: host-key diagnostic appeared first; cap check should fire before any I/O"
+ok "numeric cap check fires before host-key stat (ordering preserved)"
+
 # ---------- serve also rejects malformed configs at startup ----------
 # Re-use the missing_root config: zift serve must refuse to listen.
 set +e
