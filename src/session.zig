@@ -132,27 +132,59 @@ pub fn run(
         thread.detach();
     }
 
-    // Graceful drain. The listening socket is already implicitly closed
-    // when we return (defer ssh_bind_free), but workers keep their own
-    // session sockets. Wait for in-flight sessions to finish on their own
-    // up to the grace period; if they don't, exit anyway. PLAN §7.1.
+    // Graceful drain. The listening socket is closed implicitly on
+    // return via `defer ssh_bind_free`; workers keep their own session
+    // sockets. We wait for the active-sessions counter to drain on its
+    // own up to `shutdown_grace_ms`; if it doesn't, we actively
+    // `shutdown(2)` every still-registered session FD so libssh reads
+    // unblock, workers tear down their state, and we don't have to
+    // rely on kernel reap at process exit (PLAN §7.1).
     const stderr = std.Io.File.stderr();
     try stderr.writeStreamingAll(io, "zift: shutdown signal received, draining sessions\n");
 
-    const grace_ms: i64 = 30_000;
+    const grace_ms: i64 = @intCast(active.current.config.server.shutdown_grace_ms);
     const drain_deadline = nowMs() + grace_ms;
     while (signals.active_sessions.load(.acquire) != 0 and nowMs() < drain_deadline) {
         std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
     }
 
-    const remaining = signals.active_sessions.load(.acquire);
-    if (remaining == 0) {
+    if (signals.active_sessions.load(.acquire) == 0) {
         try stderr.writeStreamingAll(io, "zift: all sessions drained, exiting\n");
     } else {
+        // Force-close path. Snapshot the count, shut down every
+        // registered FD, then give workers a brief window to finish
+        // their cleanup before we return up the stack.
+        const closed = signals.forceCloseAll(io);
         var buf: [128]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "zift: grace period expired with {d} session(s) still in flight, exiting\n", .{remaining}) catch unreachable;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "zift: grace period expired, force-closing {d} session(s)\n",
+            .{closed},
+        ) catch unreachable;
         try stderr.writeStreamingAll(io, line);
+
+        // 500 ms is generous: every libssh read on a shut-down socket
+        // returns immediately; the worker's deferred decrement is one
+        // mutex acquisition + atomic op away.
+        const final_deadline = nowMs() + 500;
+        while (signals.active_sessions.load(.acquire) != 0 and nowMs() < final_deadline) {
+            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+        }
+
+        const stragglers = signals.active_sessions.load(.acquire);
+        if (stragglers == 0) {
+            try stderr.writeStreamingAll(io, "zift: all sessions drained after force-close, exiting\n");
+        } else {
+            const line2 = std.fmt.bufPrint(
+                &buf,
+                "zift: {d} session(s) still alive after force-close; exiting anyway\n",
+                .{stragglers},
+            ) catch unreachable;
+            try stderr.writeStreamingAll(io, line2);
+        }
     }
+
+    signals.deinitSessionRegistry(io, allocator);
 }
 
 const ConfigRef = struct {
@@ -274,7 +306,21 @@ fn sessionThread(args: *SessionArgs) void {
     const ssh_session = args.session;
     allocator.destroy(args);
 
+    // Register this session's TCP FD so the graceful-drain path can
+    // actively shut down the socket if grace expires before the worker
+    // finishes naturally (PLAN §7.1). Failure to register isn't fatal —
+    // we still serve the request, just without forced-close visibility.
+    const session_fd = c.ssh_get_fd(ssh_session);
+    var registered = false;
+    if (session_fd >= 0) {
+        signals.registerSessionFd(io, allocator, session_fd) catch |err| {
+            logLibsshError(io, @errorName(err), ssh_session) catch {};
+        };
+        registered = true;
+    }
+
     defer {
+        if (registered) signals.unregisterSessionFd(io, session_fd);
         ref.release(allocator);
         _ = signals.active_sessions.fetchSub(1, .acq_rel);
     }

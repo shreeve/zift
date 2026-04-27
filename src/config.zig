@@ -50,6 +50,12 @@ pub const ServerConfig = struct {
     /// Per PLAN.md §6.2 default 128. Excess accepted connections are
     /// disconnected immediately at the SSH layer with an audit line.
     max_connections: u32,
+    /// Per PLAN.md §7.1 default 30_000 (30 seconds). Time the server
+    /// waits for in-flight sessions to finish naturally on SIGTERM/SIGINT
+    /// before actively shutting down their sockets and exiting. Exposed
+    /// primarily so integration tests can run drain scenarios in
+    /// seconds rather than minutes.
+    shutdown_grace_ms: u64,
     log: LogTarget,
 };
 
@@ -192,6 +198,7 @@ const ServerBuilder = struct {
     reload_interval_ms: u64 = 2000,
     idle_timeout_ms: u64 = 300_000,
     max_connections: u32 = 128,
+    shutdown_grace_ms: u64 = 30_000,
     log: ?LogTarget = null,
 };
 
@@ -394,6 +401,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
             .reload_interval_ms = server.reload_interval_ms,
             .idle_timeout_ms = server.idle_timeout_ms,
             .max_connections = server.max_connections,
+            .shutdown_grace_ms = server.shutdown_grace_ms,
             .log = server.log orelse .stderr,
         },
         .users = final_users,
@@ -416,6 +424,8 @@ fn parseServerProperty(
         server.idle_timeout_ms = try parseDurationMs(value);
     } else if (std.mem.eql(u8, key, "max-connections")) {
         server.max_connections = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidConfig;
+    } else if (std.mem.eql(u8, key, "shutdown-grace")) {
+        server.shutdown_grace_ms = try parseDurationMs(value);
     } else if (std.mem.eql(u8, key, "log")) {
         if (std.mem.eql(u8, value, "stderr")) {
             server.log = .stderr;
