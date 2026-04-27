@@ -128,9 +128,8 @@ sftp_password() {
     cmd_file="$TEST_TMP/sftp-cmds-$$.exp"
     {
         echo 'set timeout 30'
-        echo 'spawn sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\'
-        echo "    -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 \\"
-        echo "    -P $TEST_PORT $user@127.0.0.1"
+        printf 'spawn sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 -P %s %s@127.0.0.1\n' \
+            "$TEST_PORT" "$user"
         echo 'expect "password:"'
         echo "send \"$pass\r\""
         echo 'expect "sftp>"'
