@@ -11,8 +11,50 @@ Production deployment of Zift on an Ubuntu host with ZFS-backed partner roots.
 
 ## Install the binary
 
+### Download from GitHub Releases
+
+Each tagged release publishes target-specific binaries plus a
+`SHA256SUMS` manifest signed by the release workflow's GitHub
+identity (cosign keyless via Sigstore). Pick the artifact for your
+host's architecture.
+
 ```bash
-sudo install -m 0755 zift /usr/local/bin/zift
+# Pick the version you want.
+ZIFT_VERSION=v0.1.0
+
+gh release download "$ZIFT_VERSION" \
+    --repo shreeve/zift \
+    --pattern 'zift-*' \
+    --pattern 'SHA256SUMS' \
+    --pattern 'SHA256SUMS.bundle'
+```
+
+### Verify provenance + integrity
+
+The signature attests that THIS workflow run on `shreeve/zift` produced
+the manifest. Verify before installing:
+
+```bash
+# 1. Verify the signature against Sigstore's public good instance.
+#    This proves SHA256SUMS was signed by the release.yml workflow on
+#    shreeve/zift, not by an attacker who compromised the release page.
+cosign verify-blob \
+    --bundle SHA256SUMS.bundle \
+    --certificate-identity-regexp 'https://github.com/shreeve/zift/.+' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    SHA256SUMS
+
+# 2. Verify the binary's bytes match the manifest.
+shasum -a 256 -c SHA256SUMS
+```
+
+Both must succeed before installing. If either fails, **stop** —
+either the download was tampered with or the trust root has shifted.
+
+### Install
+
+```bash
+sudo install -m 0755 zift-*-linux-x86_64 /usr/local/bin/zift
 zift version
 ```
 

@@ -1,10 +1,20 @@
 const std = @import("std");
 
-const zift_version = "0.1.0";
+/// Default version for local builds. The release CI workflow overrides
+/// this via `-Dversion=...` extracted from the pushed git tag, so the
+/// shipped artifact name matches the tag exactly. Local `zig build release`
+/// invocations without `-Dversion=...` use this value as a stable fallback.
+const default_version = "0.1.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const zift_version = b.option(
+        []const u8,
+        "version",
+        "Override the version string (e.g. -Dversion=0.2.0). Defaults to the source-tree default.",
+    ) orelse default_version;
 
     // Homebrew on macOS installs libssh under /opt/homebrew. Linux uses
     // distro packages on the default search path, so leave those alone.

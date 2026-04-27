@@ -1,0 +1,168 @@
+name: Release
+
+# Triggered on a `vX.Y.Z` (or `vX.Y.Z-prerelease`) tag push. Builds
+# release artifacts on every supported host runner, aggregates them
+# into a unified SHA256SUMS, signs with cosign keyless via GitHub
+# OIDC, and publishes a GitHub Release with everything attached.
+#
+# Why cosign keyless: zero secret management, signature is bound to
+# THIS workflow running in shreeve/zift via the OIDC certificate, and
+# the verification command for partners is one well-documented call
+# (see deploy/DEPLOY.md). A traditional GPG flow can be added later
+# as additive without disturbing this one.
+#
+# Coverage today:
+#   ubuntu-latest  -> Linux x86_64  (dynamic libssh from apt)
+#   macos-latest   -> macOS aarch64 (dynamic libssh from Homebrew)
+#
+# Coverage gaps (tracked in TODOS.md as the rest of PLAN §13):
+#   - Linux aarch64 + macOS x86_64: needs cross-build via vendored
+#     libssh + libcrypto so we don't depend on a per-target sysroot.
+#   - Static linking: same blocker — once libssh is vendored, the
+#     `verify-release.sh` allowlist tightens to "zero NEEDED" on
+#     Linux and "libSystem only" on macOS, and the binaries become
+#     drop-in for any host.
+#
+# Verification by partners:
+#   gh release download vX.Y.Z --pattern 'zift-*' --pattern 'SHA256SUMS*'
+#   cosign verify-blob \
+#     --bundle SHA256SUMS.bundle \
+#     --certificate-identity-regexp 'https://github.com/shreeve/zift/.+' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     SHA256SUMS
+#   shasum -a 256 -c SHA256SUMS
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # create releases, upload assets
+  id-token: write   # OIDC token for cosign keyless signing
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag format
+        run: |
+          # Reject tags that don't match the documented release naming
+          # so a stray push doesn't ship a release named "vmain" or
+          # "v-test". `v<major>.<minor>.<patch>` plus optional prerelease
+          # suffix matches semver and the `-Dversion=...` flag's expected
+          # input.
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "FAIL: tag '$GITHUB_REF_NAME' does not match v<major>.<minor>.<patch>[-prerelease]"
+            exit 1
+          fi
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag $GITHUB_REF_NAME -> version $version"
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install libssh (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssh-dev
+
+      - name: Install libssh (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libssh
+
+      - name: Build release artifact
+        run: zig build release -Dversion=${{ steps.version.outputs.version }}
+
+      - name: Show artifact + checksum
+        run: |
+          ls -la zig-out/release/
+          cat zig-out/release/SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Per-runner artifact name. The publish job picks both up
+          # via `dist/release-*` glob to build the unified manifest.
+          name: release-${{ matrix.os }}
+          path: zig-out/release/
+          if-no-files-found: error
+
+  publish:
+    name: Sign + publish release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Stage release directory + unified SHA256SUMS
+        id: stage
+        run: |
+          mkdir -p release
+          # Pull every binary into one directory; concatenate the
+          # per-host SHA256SUMS files into one canonical manifest.
+          # `sort -u` produces a stable ordering across reruns and
+          # de-dupes if the same artifact is uploaded twice.
+          cp dist/release-*/zift-* release/
+          cat dist/release-*/SHA256SUMS | sort -u > release/SHA256SUMS
+          echo "=== release/ contents ==="
+          ls -la release/
+          echo "=== SHA256SUMS ==="
+          cat release/SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign SHA256SUMS (cosign keyless via OIDC)
+        env:
+          # Tell cosign to use Sigstore's public good instance. This
+          # is the default; we set it explicitly so a future Sigstore
+          # config change doesn't silently switch trust roots.
+          COSIGN_EXPERIMENTAL: "0"
+        run: |
+          cd release
+          cosign sign-blob \
+            --yes \
+            --bundle SHA256SUMS.bundle \
+            SHA256SUMS
+          echo "=== bundle ==="
+          ls -la SHA256SUMS.bundle
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # gh CLI is preinstalled on ubuntu-latest. Prerelease flag
+          # auto-set when the tag carries a hyphen (e.g. v0.2.0-rc.1).
+          cd release
+          prerelease_flag=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Zift $GITHUB_REF_NAME" \
+            --generate-notes \
+            $prerelease_flag \
+            zift-* SHA256SUMS SHA256SUMS.bundle
