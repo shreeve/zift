@@ -156,5 +156,10 @@ ok() {
 
 fail() {
     echo "  fail: $*" >&2
-    return 1
+    # Hard-exit the test case. Without this, an `if … else fail "…" fi`
+    # block produced a fail message but let the script keep running, so
+    # the test runner's "exit-code-only" pass/fail check could mark a
+    # test "PASS" even after internal assertions failed. Always exit
+    # with a non-zero code instead.
+    exit 1
 }
