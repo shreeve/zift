@@ -581,7 +581,7 @@ fn authenticate(
                 }
             }
         } else if (subtype == c.SSH_AUTH_METHOD_PUBLICKEY) {
-            const decision = handlePublicKeyMessage(io, cfg, msg, peer_ip);
+            const decision = handlePublicKeyMessage(io, allocator, cfg, msg, peer_ip);
             switch (decision) {
                 .accepted => |user| return user,
                 .offered => continue,
@@ -618,6 +618,7 @@ const PublicKeyDecision = union(enum) {
 
 fn handlePublicKeyMessage(
     io: std.Io,
+    allocator: std.mem.Allocator,
     cfg: config.Config,
     msg: c.ssh_message,
     peer_ip: ?[]const u8,
@@ -640,7 +641,7 @@ fn handlePublicKeyMessage(
         // Without this, an attacker can probe valid usernames by
         // measuring the response time difference. PLAN §8.4: failed
         // authentication does not reveal whether the username exists.
-        _ = matchAgainstDummyKey(presented);
+        _ = matchAgainstDummyKey(allocator, presented);
         audit.log(io, username, "auth.publickey", null, .denied, "unknown user", ip_str);
         return .denied;
     };
@@ -648,12 +649,12 @@ fn handlePublicKeyMessage(
     if (user.keys.len == 0) {
         // Known user, password-only. Same dummy work so the timing
         // discriminator (does this user accept keys?) is also masked.
-        _ = matchAgainstDummyKey(presented);
+        _ = matchAgainstDummyKey(allocator, presented);
         audit.log(io, username, "auth.publickey", null, .denied, "no keys configured", ip_str);
         return .denied;
     }
 
-    const matched_idx = matchesAnyConfiguredKey(user, presented) orelse {
+    const matched_idx = matchesAnyConfiguredKey(allocator, user, presented) orelse {
         audit.log(io, username, "auth.publickey", null, .denied, "key not configured", ip_str);
         return .denied;
     };
@@ -690,15 +691,24 @@ fn handlePublicKeyMessage(
 /// presented key, or `null` if none match. Returning the index lets
 /// the audit log identify which configured key the client used —
 /// `user.keys[0]` would lie for users with multiple keys.
-fn matchesAnyConfiguredKey(user: *const config.UserConfig, presented: c.ssh_key) ?usize {
+fn matchesAnyConfiguredKey(
+    allocator: std.mem.Allocator,
+    user: *const config.UserConfig,
+    presented: c.ssh_key,
+) ?usize {
     if (user.keys.len == 0) return null;
     const presented_type = c.ssh_key_type(presented);
 
     for (user.keys, 0..) |configured, i| {
-        const algo_z = std.heap.page_allocator.dupeZ(u8, configured.algorithm) catch return null;
-        defer std.heap.page_allocator.free(algo_z);
-        const blob_z = std.heap.page_allocator.dupeZ(u8, configured.blob) catch return null;
-        defer std.heap.page_allocator.free(blob_z);
+        // Per-attempt scratch dupes go through the session's allocator
+        // (PLAN §5: no global allocator). Lifetime is one loop iteration;
+        // each `defer free` runs before the next attempt. A future
+        // optimization may cache the parsed `ssh_key` per session to
+        // skip the import on repeat lookups (see SECURITY-AUDIT.md).
+        const algo_z = allocator.dupeZ(u8, configured.algorithm) catch return null;
+        defer allocator.free(algo_z);
+        const blob_z = allocator.dupeZ(u8, configured.blob) catch return null;
+        defer allocator.free(blob_z);
 
         const want_type = c.ssh_key_type_from_name(algo_z.ptr);
         if (want_type != presented_type) continue;
@@ -729,11 +739,16 @@ const dummy_pubkey_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIIH9hN3OvKbo/u+wsxJjPXpOAFn4m
 /// match. Always returns `false`. The point is the *cost* — masking
 /// the timing channel between "this user exists / has keys" and "this
 /// user does not."
-fn matchAgainstDummyKey(presented: c.ssh_key) bool {
-    const algo_z = std.heap.page_allocator.dupeZ(u8, dummy_pubkey_algorithm) catch return false;
-    defer std.heap.page_allocator.free(algo_z);
-    const blob_z = std.heap.page_allocator.dupeZ(u8, dummy_pubkey_blob) catch return false;
-    defer std.heap.page_allocator.free(blob_z);
+fn matchAgainstDummyKey(allocator: std.mem.Allocator, presented: c.ssh_key) bool {
+    // Same allocator path `matchesAnyConfiguredKey` uses (PLAN §5).
+    // Symmetry matters: any caching added there must also be added
+    // here, or known-user vs unknown-user paths develop a measurable
+    // timing difference that re-opens the username-enumeration channel
+    // PLAN §8.4 closed via the dummy-import cost.
+    const algo_z = allocator.dupeZ(u8, dummy_pubkey_algorithm) catch return false;
+    defer allocator.free(algo_z);
+    const blob_z = allocator.dupeZ(u8, dummy_pubkey_blob) catch return false;
+    defer allocator.free(blob_z);
 
     const want_type = c.ssh_key_type_from_name(algo_z.ptr);
     var parsed: c.ssh_key = null;

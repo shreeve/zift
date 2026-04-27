@@ -37,11 +37,24 @@ documented trade-off), or **FINDING** (actionable issue with recommended fix).
 - **CAVEAT**: `pk_ok` reveals whether a (user, key) pair is configured. This is
   inherent to the SSH protocol's two-phase pubkey flow. Documented as an
   explicit caveat rather than a code fix.
-- **FINDING (low)**: `matchesAnyConfiguredKey` reparses each configured key blob
-  via `ssh_pki_import_pubkey_base64` on every auth attempt, allocating with
-  `page_allocator`. Functionally correct but wastes CPU and memory under
-  auth-storm conditions. **Recommended**: parse keys once at config load, cache
-  the libssh key handle on `UserConfig`, free at config dispose.
+- **OK**: `matchesAnyConfiguredKey` and `matchAgainstDummyKey` allocate
+  the per-attempt scratch dupes through the session's allocator (PLAN §5
+  no-global-allocator rule). The two paths use the same allocator, so
+  the timing-parity property PLAN §8.4 commits to holds across the
+  known-user and unknown-user cases.
+- **CAVEAT**: Both functions still re-import each public key via
+  `ssh_pki_import_pubkey_base64` on every auth attempt. Decode is
+  cheap (sub-millisecond for ed25519, the only algorithm libssh
+  decodes for an OpenSSH ed25519 wire blob; ECDSA P-256/384/521 are
+  slightly heavier but still bounded by the 4 KiB key-line cap). The
+  `max-unauth-connections × max_auth_attempts × keys_per_user` envelope
+  bounds the total decode cost per attack window. A future per-session
+  cache (lazy `[]?ssh_key` aligned to `UserConfig.keys[]`, freed on
+  session exit) would eliminate the repeat decode. **Constraint**: any
+  caching MUST be added to BOTH `matchesAnyConfiguredKey` AND
+  `matchAgainstDummyKey`, or the timing channel between known and
+  unknown users that PLAN §8.4 closes via the dummy-import cost
+  re-opens. Cache both or neither.
 
 ### SFTP packet parsing
 
@@ -195,7 +208,7 @@ documented trade-off), or **FINDING** (actionable issue with recommended fix).
 
 | Module | Findings |
 |--------|----------|
-| session.zig | 1 low (key reparsing per attempt) + 1 caveat (single cap) |
+| session.zig | 0 (1 caveat: optional pubkey-decode caching, see §1) |
 | vfs.zig | 0 |
 | config.zig | 0 |
 | auth.zig | 0 |
@@ -205,11 +218,11 @@ documented trade-off), or **FINDING** (actionable issue with recommended fix).
 | reload | 0 |
 
 **Overall assessment**: The codebase is in good shape for public exposure
-on a port-2222-style deployment with partner IP allowlisting. The
-remaining P1 items tracked in TODOS.md — pre-parsing public keys at
-config load, splitting `max-connections` into pre-auth and post-auth
-caps, and a static-link / signed-release pipeline — are operational
-hardenings rather than known security defects in the runtime path.
+on a port-2222-style deployment with partner IP allowlisting. No
+security defects remain in the runtime path. The one remaining P1 in
+`TODOS.md` — a static-link / signed-release pipeline — is an
+operational hardening for the build/release surface, not a runtime
+security item.
 
 **This audit is a snapshot.** It should be re-run before any release
 that touches `session.zig`, `vfs.zig`, `config.zig`, or `auth.zig`,
