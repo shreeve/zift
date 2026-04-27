@@ -127,8 +127,9 @@ pub const Config = struct {
 /// touch the filesystem and so can be unit-tested directly without
 /// having to construct a `std.Io`. Always called first by
 /// `validateSemantic` so an obviously-wrong cap arrangement fails
-/// before we waste a stat() on the host-key path.
-pub fn validatePureNumeric(cfg: *const Config) error{UnauthCapExceedsTotal}!void {
+/// before we waste a stat() on the host-key path. Not `pub`; tests
+/// in this file can reach it without expanding the public surface.
+fn validatePureNumeric(cfg: *const Config) error{UnauthCapExceedsTotal}!void {
     // The pre-auth cap, if configured (>0), must be ≤ the total cap.
     // A pre-auth cap LARGER than the total cap can't ever fire (the
     // total cap rejects first) and silently letting it slide hides
@@ -1043,6 +1044,18 @@ test "max-unauth-connections parses as a non-negative integer" {
     try std.testing.expectEqual(@as(u32, 16), cfg.server.max_unauth_connections);
 }
 
+test "max-unauth-connections explicit 0 parses (operator-documented opt-out)" {
+    // The docs say `0` is the "no separate cap" value. Operators may
+    // set it explicitly to document the choice rather than omit the
+    // directive. This test pins the parser's acceptance of that form.
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n" ++
+        "  max-connections 64\n  max-unauth-connections 0\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 0), cfg.server.max_unauth_connections);
+}
+
 // The pure-numeric semantic check is called from `validateSemantic`
 // before any I/O. We exercise it directly here so unit tests don't
 // need a `std.Io` to assert the right rejection behavior.
@@ -1071,11 +1084,16 @@ test "validatePureNumeric: unauth cap exceeding total rejected" {
     try std.testing.expectError(error.UnauthCapExceedsTotal, validatePureNumeric(&cfg));
 }
 
-test "validatePureNumeric: unauth cap of u32-max with smaller total rejected" {
-    // Operator typo ("max-unauth-connections 4096" with a 64-conn pool).
-    // We don't want a silently-too-permissive value to slip through
-    // because the cap "can never fire" — that's the misconfig signal.
-    var cfg = makeNumericTestConfig(.{ .max_total = 64, .max_unauth = 4096 });
+test "validatePureNumeric: unauth cap at u32 max boundary rejected" {
+    // The diagnostic formatter in `validateSemantic` writes the two
+    // cap values into a `[16]u8` buffer via `bufPrint("{d}", ...)`.
+    // 4_294_967_295 (u32 max) is 10 digits and fits easily, but
+    // pinning the boundary value here protects us from a future
+    // refactor that picks too small a buffer.
+    var cfg = makeNumericTestConfig(.{
+        .max_total = 64,
+        .max_unauth = std.math.maxInt(u32),
+    });
     defer cfg.deinit();
     try std.testing.expectError(error.UnauthCapExceedsTotal, validatePureNumeric(&cfg));
 }

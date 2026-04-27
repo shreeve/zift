@@ -196,10 +196,17 @@ grep -q "max-unauth-connections (16) exceeds max-connections (8)" "$TEST_TMP/bad
     || fail "bad-cap: expected 'exceeds max-connections' diagnostic, got: $(cat "$TEST_TMP/bad_cap.stderr")"
 ok "max-unauth-connections > max-connections rejected with named diagnostic"
 
-# ---------- ordering: numeric cap fails before host-key stat ----------
+# ---------- ordering: numeric cap diagnostic, no host-key diagnostic ----------
 # Both max-unauth (16) > max-connections (8) AND host-key path is
-# missing. The pure-numeric check must fire FIRST so the operator
+# missing. The pure-numeric check must run first so the operator
 # fixes the typo before discovering the host-key issue.
+#
+# The oracle is the host-key diagnostic's ABSENCE: because the
+# host-key path doesn't exist, validateSemantic's `statFile` call —
+# if it ever ran — would emit "host-key unreadable: ...". Seeing
+# the cap diagnostic but NOT the host-key one therefore proves the
+# stat() never happened, which proves the pure-numeric check ran
+# and short-circuited first.
 cat > "$TEST_TMP/bad_cap_and_hostkey.conf" <<EOF
 server
   listen 127.0.0.1:$TEST_PORT
@@ -221,8 +228,8 @@ set -e
 grep -q "max-unauth-connections" "$TEST_TMP/bad_cap_and_hostkey.stderr" \
     || fail "bad-cap-and-hostkey: cap diagnostic missing, got: $(cat "$TEST_TMP/bad_cap_and_hostkey.stderr")"
 grep -q "host-key unreadable" "$TEST_TMP/bad_cap_and_hostkey.stderr" \
-    && fail "bad-cap-and-hostkey: host-key diagnostic appeared first; cap check should fire before any I/O"
-ok "numeric cap check fires before host-key stat (ordering preserved)"
+    && fail "bad-cap-and-hostkey: host-key diagnostic appeared; numeric check should fail before any stat()"
+ok "numeric cap check short-circuits before host-key stat (no I/O on cap typo)"
 
 # ---------- serve also rejects malformed configs at startup ----------
 # Re-use the missing_root config: zift serve must refuse to listen.

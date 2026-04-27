@@ -103,12 +103,15 @@ jobs:
 
           # `systemd-analyze verify` walks the unit's [Install] deps,
           # which expects the unit to live under a system path. Drop
-          # a copy in /tmp and point at it from there so dependency
-          # resolution succeeds without polluting /etc.
-          install -m 0644 deploy/zift.service /tmp/zift.service
+          # a copy in a per-run private tmpdir so dependency resolution
+          # succeeds without touching /etc and without colliding with
+          # any stale artifact at a predictable /tmp path.
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          install -m 0644 deploy/zift.service "$tmpdir/zift.service"
 
           set +e
-          out=$(systemd-analyze verify /tmp/zift.service 2>&1)
+          out=$(systemd-analyze verify "$tmpdir/zift.service" 2>&1)
           rc=$?
           set -e
 
