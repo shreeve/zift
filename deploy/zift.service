@@ -38,8 +38,14 @@ ReadWritePaths=/zfs/sftp /var/log/zift
 ReadOnlyPaths=/etc/zift
 
 # Resource limits: bound Argon2id memory pressure from auth storms.
-# max-connections * worst-case-Argon2id-memory (256 MiB) = 32 GiB for 128 conns.
-# Tune to your host's capacity.
+# Argon2id worst-case memory at the upper envelope is 256 MiB per
+# in-flight verification. With MemoryMax=4G the host can safely run
+# ~14 concurrent password verifications before the cgroup OOMs Zift,
+# which is the right order of magnitude for a 16-connection partner
+# install. Pair this with `max-connections` in zift.conf — keep the
+# product `max-connections * 256 MiB` strictly below MemoryMax. For
+# larger deployments, lower the Argon2id `m` parameter or raise
+# MemoryMax (and ensure the host has the headroom).
 LimitNOFILE=4096
 MemoryMax=4G
 

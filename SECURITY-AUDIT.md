@@ -16,12 +16,13 @@ documented trade-off), or **FINDING** (actionable issue with recommended fix).
   audit line for rejected connections.
 - **OK**: Listening socket closed immediately at drain start (`std.c.close(bind_fd)`)
   so no new TCP connections land during grace period. PLAN §7.1.
-- **OK**: `unauth_sessions` counter tracks pre-auth slots separately from
-  authenticated sessions. Operators can monitor auth-storm pressure independently.
-- **CAVEAT**: `max-connections` is a single global cap. A future enhancement
-  could split it into separate pre-auth and post-auth limits, but the
-  `idle-timeout` on pre-auth sessions already reaps stuck slots, making the
-  single cap workable for the current threat model.
+- **CAVEAT**: `max-connections` is a single global cap covering both
+  pre-auth and post-auth sessions. The `idle-timeout` on pre-auth
+  sessions reaps stuck slots within the timeout window so the cap
+  remains meaningful under handshake-storm pressure, but a future
+  enhancement should split it into independent pre-auth and post-auth
+  limits and track each via a separate atomic counter. Tracked in
+  TODOS.md as a P1.
 
 ### SSH handshake and authentication
 
@@ -46,8 +47,12 @@ documented trade-off), or **FINDING** (actionable issue with recommended fix).
 - **OK**: `readPacketTimed` reads a 4-byte length prefix, then rejects frames
   exceeding the 256 KiB cap with `SSH_FX_BAD_MESSAGE` before disconnecting.
 - **OK**: `parseString` checks `payload.len < 4` and `payload.len < 4 + len`
-  before slicing. No integer overflow risk because `len` is `u32` and
-  `payload.len` is `usize` (64-bit on all targets).
+  before slicing. No integer overflow risk on the 64-bit targets we
+  ship (PLAN §4.7 lists Linux x86_64 / aarch64 and macOS x86_64 / aarch64
+  as the supported set); on a hypothetical 32-bit target the `4 + len`
+  expression in `usize` would still bound-check correctly because both
+  operands are `usize` and the SFTP `length` field cannot exceed the
+  packet cap (256 KiB) before `readPacketTimed` rejects it.
 - **OK**: `readU32` / `readU64` operate on fixed-size slices passed by callers
   after length checks. No out-of-bounds risk.
 - **OK**: `parseHandleId` validates the handle string is exactly 4 bytes.
@@ -189,15 +194,22 @@ documented trade-off), or **FINDING** (actionable issue with recommended fix).
 
 | Module | Findings |
 |--------|----------|
-| session.zig | 1 low (key reparsing per attempt) |
+| session.zig | 1 low (key reparsing per attempt) + 1 caveat (single cap) |
 | vfs.zig | 0 |
 | config.zig | 0 |
 | auth.zig | 0 |
 | policy.zig | 0 |
-| audit.zig | 0 |
+| audit.zig | 0 (1 caveat: not fail-closed by design) |
 | signals.zig | 0 |
 | reload | 0 |
 
-**Overall assessment**: The codebase is in good shape for public exposure once
-the remaining P1 items (key caching, CI, fuzz targets) are resolved and the
-deployment is hardened with firewall rules, systemd sandboxing, and fail2ban.
+**Overall assessment**: The codebase is in good shape for public exposure
+on a port-2222-style deployment with partner IP allowlisting. The
+remaining P1 items tracked in TODOS.md — pre-parsing public keys at
+config load, splitting `max-connections` into pre-auth and post-auth
+caps, and a static-link / signed-release pipeline — are operational
+hardenings rather than known security defects in the runtime path.
+
+**This audit is a snapshot.** It should be re-run before any release
+that touches `session.zig`, `vfs.zig`, `config.zig`, or `auth.zig`,
+and after any change to the SFTP wire surface.

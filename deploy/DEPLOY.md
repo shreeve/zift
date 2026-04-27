@@ -39,13 +39,20 @@ printf '%s\n' 'partner-password' | zift hash-password
 
 Write the config:
 
+Pick `max-connections` so that `max-connections * Argon2id-worst-case-memory`
+fits under the cgroup's `MemoryMax` (default 4 GiB in the shipped systemd
+unit, which leaves headroom for ~14 concurrent password verifications at
+the upper envelope of `m=262144`). Either drop `max-connections` to 14,
+raise `MemoryMax` in the unit, or lower the Argon2id `m` parameter on the
+hashes you generate — but make all three numbers consistent.
+
 ```bash
 sudo tee /etc/zift/zift.conf << 'EOF'
 server
   listen 0.0.0.0:2222
   host-key /etc/zift/host_ed25519
   idle-timeout 5m
-  max-connections 64
+  max-connections 14
   reload-interval 2s
   log /var/log/zift/audit.jsonl
 
@@ -94,8 +101,16 @@ sudo systemctl status zift
 
 ## Validate the config before reload
 
+The config is owned by `root:zift` with mode 0640, so an admin who is
+not in group `zift` must run validate via sudo (either as root or as
+the zift user). Either form is fine; running as the service user is a
+slightly stronger sanity check because it exercises the same path
+permissions the running process will see.
+
 ```bash
-zift validate /etc/zift/zift.conf
+sudo -u zift zift validate /etc/zift/zift.conf   # preferred
+# or:
+sudo zift validate /etc/zift/zift.conf
 ```
 
 Adding a partner: edit the config, save, and the server picks it up within

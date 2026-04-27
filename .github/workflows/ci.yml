@@ -126,5 +126,17 @@ jobs:
 
       - name: Fuzz (60s cap)
         run: |
-          timeout 60 zig build test --fuzz || true
-          echo "Fuzz run completed (60s cap)"
+          # `timeout` exits 124 on its own kill — the only failure mode
+          # we want to swallow. Any other non-zero (compile error, real
+          # crash, fuzz finding) must fail the job.
+          set +e
+          timeout 60 zig build test --fuzz
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ] || [ "$rc" -eq 124 ]; then
+            echo "Fuzz run completed (rc=$rc, 60s cap)"
+            exit 0
+          else
+            echo "Fuzz run failed (rc=$rc)"
+            exit "$rc"
+          fi
