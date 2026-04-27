@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const auth = @import("auth.zig");
 const config = @import("config.zig");
 const session = @import("session.zig");
+const signals = @import("signals.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -114,6 +115,9 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     const rc = c.ssh_init();
     if (rc != c.SSH_OK) return error.LibsshInitFailed;
     defer _ = c.ssh_finalize();
+
+    // Install operational signal handlers before any worker threads exist.
+    signals.install();
 
     const stdout = std.Io.File.stdout();
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 20));

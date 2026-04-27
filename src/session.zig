@@ -4,6 +4,7 @@ const audit = @import("audit.zig");
 const auth = @import("auth.zig");
 const config = @import("config.zig");
 const policy = @import("policy.zig");
+const signals = @import("signals.zig");
 const vfs_mod = @import("vfs.zig");
 
 pub const Error = error{
@@ -11,6 +12,15 @@ pub const Error = error{
     LibsshFailure,
     OutOfMemory,
 };
+
+/// Monotonic-clock millisecond reading. Used for idle-timeout deadlines
+/// and graceful-shutdown drain timing. The Linux/macOS `CLOCK_MONOTONIC`
+/// is unaffected by wall-clock changes.
+fn nowMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
+}
 
 pub fn run(
     io: std.Io,
@@ -45,20 +55,56 @@ pub fn run(
         return error.LibsshFailure;
     }
 
+    // Drive the accept loop with poll() against libssh's listening fd so
+    // operational signals (SIGTERM / SIGHUP) interrupt within ~poll-timeout
+    // ms instead of being trapped behind a blocking ssh_bind_accept.
+    c.ssh_bind_set_blocking(bind, 0);
+    const bind_fd = c.ssh_bind_get_fd(bind);
+    var pfd = [1]std.posix.pollfd{.{
+        .fd = bind_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+
     const stdout = std.Io.File.stdout();
     try stdout.writeStreamingAll(io, "zift: listening on ");
     try stdout.writeStreamingAll(io, active.current.config.server.listen);
     try stdout.writeStreamingAll(io, "\n");
 
-    while (true) {
+    accept_loop: while (true) {
+        if (signals.shutdown_requested.load(.acquire)) break :accept_loop;
+
+        // SIGHUP forces a reload regardless of mtime (PLAN §7.2).
+        if (signals.reload_requested.swap(false, .acq_rel)) {
+            active.forceReload(config_path, &config_mtime);
+        }
+
+        const ready = std.posix.poll(&pfd, 1000) catch continue :accept_loop;
+        if (ready == 0) {
+            // Idle tick: piggyback the mtime watcher here so reload remains
+            // a same-thread, lock-protected operation.
+            try active.reloadIfChanged(config_path, &config_mtime);
+            continue :accept_loop;
+        }
+
         const session = c.ssh_new() orelse return error.LibsshFailure;
-        if (c.ssh_bind_accept(bind, session) != c.SSH_OK) {
+        const accept_rc = c.ssh_bind_accept(bind, session);
+        if (accept_rc != c.SSH_OK) {
             try logLibsshError(io, "ssh_bind_accept", bind);
             c.ssh_free(session);
-            continue;
+            continue :accept_loop;
         }
 
         try active.reloadIfChanged(config_path, &config_mtime);
+
+        const max = active.current.config.server.max_connections;
+        if (signals.active_sessions.load(.acquire) >= max) {
+            audit.log(io, null, "accept", null, .denied, "max-connections reached");
+            c.ssh_disconnect(session);
+            c.ssh_free(session);
+            continue :accept_loop;
+        }
+
         const ref = active.acquire();
         const args = allocator.create(SessionArgs) catch |err| {
             ref.release(allocator);
@@ -72,14 +118,40 @@ pub fn run(
             .session = session,
         };
 
+        // Reserve the slot before spawn so subsequent accepts see it.
+        _ = signals.active_sessions.fetchAdd(1, .acq_rel);
+
         const thread = std.Thread.spawn(.{}, sessionThread, .{args}) catch |err| {
+            _ = signals.active_sessions.fetchSub(1, .acq_rel);
             ref.release(allocator);
             c.ssh_free(session);
             allocator.destroy(args);
             try logLibsshError(io, @errorName(err), session);
-            continue;
+            continue :accept_loop;
         };
         thread.detach();
+    }
+
+    // Graceful drain. The listening socket is already implicitly closed
+    // when we return (defer ssh_bind_free), but workers keep their own
+    // session sockets. Wait for in-flight sessions to finish on their own
+    // up to the grace period; if they don't, exit anyway. PLAN §7.1.
+    const stderr = std.Io.File.stderr();
+    try stderr.writeStreamingAll(io, "zift: shutdown signal received, draining sessions\n");
+
+    const grace_ms: i64 = 30_000;
+    const drain_deadline = nowMs() + grace_ms;
+    while (signals.active_sessions.load(.acquire) != 0 and nowMs() < drain_deadline) {
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+    }
+
+    const remaining = signals.active_sessions.load(.acquire);
+    if (remaining == 0) {
+        try stderr.writeStreamingAll(io, "zift: all sessions drained, exiting\n");
+    } else {
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "zift: grace period expired with {d} session(s) still in flight, exiting\n", .{remaining}) catch unreachable;
+        try stderr.writeStreamingAll(io, line);
     }
 }
 
@@ -129,7 +201,27 @@ const ActiveConfig = struct {
     ) !void {
         const mtime = currentConfigMtime(self.io, path) catch return;
         if (mtime.nanoseconds == known_mtime.nanoseconds) return;
+        try self.applyReload(path, mtime, known_mtime);
+    }
 
+    /// Reload triggered by SIGHUP. Skips the mtime comparison so atomic
+    /// deploy patterns that preserve or rewind mtime still take effect
+    /// (PLAN §7.3 mtime caveat).
+    fn forceReload(
+        self: *ActiveConfig,
+        path: []const u8,
+        known_mtime: *std.Io.Timestamp,
+    ) void {
+        const mtime = currentConfigMtime(self.io, path) catch std.Io.Timestamp.zero;
+        self.applyReload(path, mtime, known_mtime) catch {};
+    }
+
+    fn applyReload(
+        self: *ActiveConfig,
+        path: []const u8,
+        mtime: std.Io.Timestamp,
+        known_mtime: *std.Io.Timestamp,
+    ) !void {
         const stderr = std.Io.File.stderr();
         const contents = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1 << 20)) catch |err| {
             try stderr.writeStreamingAll(self.io, "zift: config reload read failed: ");
@@ -173,7 +265,10 @@ fn sessionThread(args: *SessionArgs) void {
     const ssh_session = args.session;
     allocator.destroy(args);
 
-    defer ref.release(allocator);
+    defer {
+        ref.release(allocator);
+        _ = signals.active_sessions.fetchSub(1, .acq_rel);
+    }
     handleSession(io, allocator, ref.config, ssh_session) catch |err| {
         logLibsshError(io, @errorName(err), ssh_session) catch {};
     };
@@ -197,7 +292,7 @@ fn handleSession(
     const user = try authenticate(io, allocator, cfg, session);
     const channel = try acceptSftpSubsystem(session);
 
-    try runSftp(io, allocator, channel, user);
+    try runSftp(io, allocator, channel, user, cfg.server.idle_timeout_ms);
     c.ssh_disconnect(session);
 }
 
@@ -375,7 +470,13 @@ fn acceptSftpSubsystem(session: c.ssh_session) !c.ssh_channel {
     }
 }
 
-fn runSftp(io: std.Io, allocator: std.mem.Allocator, channel: c.ssh_channel, user: *const config.UserConfig) !void {
+fn runSftp(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    channel: c.ssh_channel,
+    user: *const config.UserConfig,
+    idle_timeout_ms: u64,
+) !void {
     var jail = try vfs_mod.Vfs.init(io, allocator, user.root);
     defer jail.deinit(allocator);
 
@@ -385,16 +486,32 @@ fn runSftp(io: std.Io, allocator: std.mem.Allocator, channel: c.ssh_channel, use
         .channel = channel,
         .user = user,
         .vfs = jail,
+        .idle_timeout_ms = idle_timeout_ms,
+        .last_activity_ms = nowMs(),
     };
     defer state.deinit();
 
     var payload_buf: [8192]u8 = undefined;
-    const first_payload = try readPacket(channel, &payload_buf);
+    const first_payload = readPacketTimed(&state, &payload_buf) catch |err| switch (err) {
+        error.IdleTimeout => {
+            audit.log(io, user.name, "idle.timeout", null, .ok, "");
+            return;
+        },
+        else => return err,
+    };
     if (first_payload.len < 5 or first_payload[0] != c.SSH_FXP_INIT) return error.LibsshFailure;
     try writeVersion(channel);
+    state.last_activity_ms = nowMs();
 
     while (true) {
-        const payload = readPacket(channel, &payload_buf) catch return;
+        const payload = readPacketTimed(&state, &payload_buf) catch |err| switch (err) {
+            error.IdleTimeout => {
+                audit.log(io, user.name, "idle.timeout", null, .ok, "");
+                return;
+            },
+            else => return,
+        };
+        state.last_activity_ms = nowMs();
         if (payload.len < 5) return error.LibsshFailure;
 
         const msg_type = payload[0];
@@ -437,6 +554,10 @@ const SftpState = struct {
     channel: c.ssh_channel,
     user: *const config.UserConfig,
     vfs: vfs_mod.Vfs,
+    /// Configured `idle-timeout` in ms. 0 disables the check.
+    idle_timeout_ms: u64 = 0,
+    /// Monotonic timestamp of the last successfully-read SFTP message.
+    last_activity_ms: i64 = 0,
     next_handle: u32 = 1,
     handles: std.ArrayList(Handle) = .empty,
 
@@ -805,6 +926,56 @@ fn readExact(channel: c.ssh_channel, out: []u8) !void {
     while (offset < out.len) {
         const n = c.ssh_channel_read(channel, out[offset..].ptr, @intCast(out.len - offset), 0);
         if (n <= 0) return error.LibsshFailure;
+        offset += @intCast(n);
+    }
+}
+
+/// Idle-timeout-aware variant of `readPacket`. Returns `error.IdleTimeout`
+/// if the per-session idle-timeout (PLAN §6.2) elapses without progress.
+fn readPacketTimed(state: *SftpState, payload_buf: []u8) ![]u8 {
+    var len_buf: [4]u8 = undefined;
+    try readExactTimed(state, &len_buf);
+    const len = readU32(&len_buf);
+    if (len > payload_buf.len) return error.LibsshFailure;
+    const payload = payload_buf[0..len];
+    try readExactTimed(state, payload);
+    return payload;
+}
+
+fn readExactTimed(state: *SftpState, out: []u8) !void {
+    // Slice ssh_channel_read into ~1-second polls so we can enforce the
+    // per-session idle deadline (PLAN §6.2) without rewriting libssh's
+    // I/O. We deliberately do NOT consult the process-wide shutdown flag
+    // here: PLAN §7.1 specifies that in-flight sessions are *granted* a
+    // grace period to finish naturally; the process-level 30-second drain
+    // then exits if any worker overstays its welcome.
+    //
+    // libssh return-code semantics for ssh_channel_read_timeout:
+    //   > 0          bytes read
+    //   == 0         end-of-file
+    //   SSH_AGAIN    timeout elapsed without data
+    //   SSH_ERROR    transport / channel failure
+    const slice_ms: c_int = 1000;
+    var offset: usize = 0;
+    while (offset < out.len) {
+        const n = c.ssh_channel_read_timeout(
+            state.channel,
+            out[offset..].ptr,
+            @intCast(out.len - offset),
+            0,
+            slice_ms,
+        );
+        if (n == c.SSH_ERROR) return error.LibsshFailure;
+        if (n == 0) return error.LibsshFailure; // EOF
+        if (n == c.SSH_AGAIN) {
+            if (state.idle_timeout_ms != 0) {
+                const elapsed: i64 = nowMs() - state.last_activity_ms;
+                if (elapsed >= @as(i64, @intCast(state.idle_timeout_ms))) {
+                    return error.IdleTimeout;
+                }
+            }
+            continue;
+        }
         offset += @intCast(n);
     }
 }

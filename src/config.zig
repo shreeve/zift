@@ -31,6 +31,11 @@ pub const ServerConfig = struct {
     listen: []const u8,
     host_key: []const u8,
     reload_interval_ms: u64,
+    /// Per PLAN.md §6.2 default 300_000 (5 minutes). 0 disables the timeout.
+    idle_timeout_ms: u64,
+    /// Per PLAN.md §6.2 default 128. Excess accepted connections are
+    /// disconnected immediately at the SSH layer with an audit line.
+    max_connections: u32,
     log: LogTarget,
 };
 
@@ -77,6 +82,8 @@ const ServerBuilder = struct {
     listen: ?[]const u8 = null,
     host_key: ?[]const u8 = null,
     reload_interval_ms: u64 = 2000,
+    idle_timeout_ms: u64 = 300_000,
+    max_connections: u32 = 128,
     log: ?LogTarget = null,
 };
 
@@ -277,6 +284,8 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
             .listen = server.listen orelse return error.MissingListen,
             .host_key = server.host_key orelse return error.MissingHostKey,
             .reload_interval_ms = server.reload_interval_ms,
+            .idle_timeout_ms = server.idle_timeout_ms,
+            .max_connections = server.max_connections,
             .log = server.log orelse .stderr,
         },
         .users = final_users,
@@ -295,6 +304,10 @@ fn parseServerProperty(
         server.host_key = try dupNonEmpty(allocator, value);
     } else if (std.mem.eql(u8, key, "reload-interval")) {
         server.reload_interval_ms = try parseDurationMs(value);
+    } else if (std.mem.eql(u8, key, "idle-timeout")) {
+        server.idle_timeout_ms = try parseDurationMs(value);
+    } else if (std.mem.eql(u8, key, "max-connections")) {
+        server.max_connections = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidConfig;
     } else if (std.mem.eql(u8, key, "log")) {
         if (std.mem.eql(u8, value, "stderr")) {
             server.log = .stderr;
@@ -590,4 +603,22 @@ test "user with neither password nor key rejected" {
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
         "user empty\n  root /tmp/a\n";
     try std.testing.expectError(error.MissingCredentials, parse(std.testing.allocator, text));
+}
+
+test "server defaults applied when properties omitted" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u64, 300_000), cfg.server.idle_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 128), cfg.server.max_connections);
+}
+
+test "idle-timeout and max-connections parse" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  idle-timeout 30s\n  max-connections 64\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u64, 30_000), cfg.server.idle_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 64), cfg.server.max_connections);
 }

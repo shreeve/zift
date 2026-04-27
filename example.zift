@@ -2,6 +2,8 @@ server
   listen 127.0.0.1:2222
   host-key /tmp/zift_host_ed25519
   reload-interval 2s
+  idle-timeout 5m
+  max-connections 128
   log stderr
 
 user ally
