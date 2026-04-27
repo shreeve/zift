@@ -67,10 +67,14 @@ jobs:
             | sort -u)
           echo "$needed" | sed 's/^/  /'
 
-          # The dynamic loader (`ld-linux-*.so.2`) is the binary's
-          # `PT_INTERP` entry, not a `DT_NEEDED`, so it does not appear
-          # in the awk filter above and is intentionally absent here.
-          allowed='libssh\.so\.4|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1'
+          # The dynamic loader (`ld-linux-*.so.[12]`) is technically the
+          # binary's `PT_INTERP` entry, but on Linux/Zig 0.16 builds it
+          # ALSO shows up as a `DT_NEEDED`. The CI on 2026-04-27 failed
+          # because we'd dropped it from the allowlist based on the
+          # PT_INTERP-only assumption; empirically Zig emits it in both
+          # places. Keep it in the allowlist until/unless a future Zig
+          # release stops emitting the redundant DT_NEEDED.
+          allowed='libssh\.so\.4|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1'
           unexpected=$(echo "$needed" | grep -Ev "^(${allowed})$" || true)
           if [ -n "$unexpected" ]; then
             echo
@@ -182,6 +186,22 @@ jobs:
   fuzz-short:
     name: Short fuzz run
     runs-on: ubuntu-latest
+    # Disabled pending an upstream Zig fix.
+    #
+    # Zig 0.16.0's `compiler/test_runner.zig` mixes two distinct
+    # `StackTrace` types (`std.builtin.StackTrace` vs.
+    # `std.debug.StackTrace`) when invoked with `--fuzz`. The compile
+    # fails with:
+    #     test_runner.zig:566: error: expected type
+    #     '*const debug.StackTrace', found '*builtin.StackTrace'
+    # …and the fuzz binary can't be built at all, regardless of our
+    # harness code. The harnesses themselves run fine in non-fuzz
+    # mode (each runs once with empty input) and are exercised by
+    # the `unit-tests` job above. Only the random-input generation
+    # pass is missing until Zig ships a stdlib fix; track upstream
+    # and flip this back to `if: true` (or remove the gate) when a
+    # patched Zig release is pinned in `ZIG_VERSION`.
+    if: false
     steps:
       - uses: actions/checkout@v4
 

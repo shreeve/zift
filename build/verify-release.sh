@@ -59,7 +59,11 @@ esac
 # of the release pipeline (static linking) flips this to `^$` so any
 # NEEDED entry at all fails the build. Until then, we accept the small
 # set of known dynamic deps the build legitimately produces.
-LINUX_ALLOWED='^(libssh\.so\.4|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1)$'
+#
+# The dynamic loader (`ld-linux-*.so.[12]`) is technically `PT_INTERP`
+# but Zig 0.16 also emits it as a `DT_NEEDED` — keep it in the
+# allowlist or every build will fail this check.
+LINUX_ALLOWED='^(libssh\.so\.4|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1)$'
 
 # `MACOS_ALLOWED`: regex matched against each LC_LOAD_DYLIB path. Phase 2
 # tightens this to `libSystem` + `/System/Library/Frameworks` only (no
