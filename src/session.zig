@@ -175,6 +175,23 @@ pub fn run(
             continue :accept_loop;
         }
 
+        // Independent pre-auth cap (PLAN §8.4). When configured (>0),
+        // bounds handshake-storm pressure so an attacker can't consume
+        // the entire `max-connections` pool with stuck pre-auth sockets.
+        // `0` falls back to the global cap above, preserving the
+        // behavior operators see when they don't tune this knob.
+        const max_unauth_cfg = active.current.config.server.max_unauth_connections;
+        if (max_unauth_cfg != 0 and
+            signals.unauth_sessions.load(.acquire) >= max_unauth_cfg)
+        {
+            var ip_buf: [64]u8 = undefined;
+            const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
+            audit.log(io, null, "accept.rejected", null, .denied, "max-unauth-connections reached", peer_ip);
+            c.ssh_disconnect(session);
+            c.ssh_free(session);
+            continue :accept_loop;
+        }
+
         const ref = active.acquire();
         const args = allocator.create(SessionArgs) catch |err| {
             ref.release(allocator);
@@ -188,11 +205,16 @@ pub fn run(
             .session = session,
         };
 
-        // Reserve the slot before spawn so subsequent accepts see it.
+        // Reserve both slots before spawn so subsequent accepts see
+        // them. Pre-auth slot is released at successful auth (or at
+        // session exit if auth never completes); total slot is
+        // released at session exit unconditionally.
         _ = signals.active_sessions.fetchAdd(1, .acq_rel);
+        _ = signals.unauth_sessions.fetchAdd(1, .acq_rel);
 
         const thread = std.Thread.spawn(.{}, sessionThread, .{args}) catch |err| {
             _ = signals.active_sessions.fetchSub(1, .acq_rel);
+            _ = signals.unauth_sessions.fetchSub(1, .acq_rel);
             ref.release(allocator);
             c.ssh_free(session);
             allocator.destroy(args);
@@ -430,12 +452,20 @@ fn sessionThread(args: *SessionArgs) void {
         registered = true;
     }
 
+    // PLAN §8.4: the pre-auth slot is owned by `sessionThread` until
+    // either (a) `handleSession` flips this flag at successful auth
+    // and decrements the counter directly, or (b) the session exits
+    // before reaching that point and the defer below releases the
+    // slot on the way out. The flag prevents double-decrement.
+    var auth_completed = false;
+
     defer {
+        if (!auth_completed) _ = signals.unauth_sessions.fetchSub(1, .acq_rel);
         if (registered) signals.unregisterSessionFd(io, session_fd);
         ref.release(allocator);
         _ = signals.active_sessions.fetchSub(1, .acq_rel);
     }
-    handleSession(io, allocator, ref.config, ssh_session) catch |err| {
+    handleSession(io, allocator, ref.config, ssh_session, &auth_completed) catch |err| {
         logLibsshError(io, @errorName(err), ssh_session) catch {};
     };
 }
@@ -450,6 +480,7 @@ fn handleSession(
     allocator: std.mem.Allocator,
     cfg: config.Config,
     session: c.ssh_session,
+    auth_completed: *bool,
 ) !void {
     defer c.ssh_free(session);
 
@@ -474,6 +505,14 @@ fn handleSession(
     }
 
     const user = try authenticate(io, allocator, cfg, session, peer_ip);
+
+    // Auth succeeded: release the pre-auth slot immediately so the next
+    // handshake-storm packet has a slot. Set the flag BEFORE the
+    // decrement so a defer in sessionThread that unwinds via panic
+    // (Zig's `defer` runs on panic too) does not double-decrement.
+    auth_completed.* = true;
+    _ = signals.unauth_sessions.fetchSub(1, .acq_rel);
+
     const channel = try acceptSftpSubsystem(session);
 
     try runSftp(io, allocator, channel, user, cfg.server.idle_timeout_ms, peer_ip);

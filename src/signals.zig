@@ -34,6 +34,16 @@ pub var log_reopen_requested: std.atomic.Value(bool) = .init(false);
 /// to enforce `max-connections` and to wait for graceful drain.
 pub var active_sessions: std.atomic.Value(u32) = .init(0);
 
+/// Live count of pre-auth session worker threads (handshake done OR
+/// pending, but no successful auth yet). Bumped at accept, decremented
+/// either at successful auth (the slot is freed for the next pre-auth
+/// attempt) OR at session exit if auth never completed. Always less
+/// than or equal to `active_sessions`. Read by the accept loop to
+/// enforce `max-unauth-connections` independently of the global cap,
+/// so a handshake-storm cannot consume the entire `max-connections`
+/// pool and DoS authenticated partner sessions (PLAN §8.4).
+pub var unauth_sessions: std.atomic.Value(u32) = .init(0);
+
 /// Registry of underlying TCP socket FDs for every in-flight session.
 /// On graceful-shutdown grace expiration the accept thread iterates
 /// this list and calls `shutdown(fd, SHUT_RDWR)` on each entry: the

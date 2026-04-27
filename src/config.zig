@@ -11,6 +11,7 @@ pub const SemanticError = error{
     UserRootMissing,
     UserRootNotDirectory,
     OverlappingRoots,
+    UnauthCapExceedsTotal,
     OutOfMemory,
 };
 
@@ -50,6 +51,15 @@ pub const ServerConfig = struct {
     /// Per PLAN.md §6.2 default 128. Excess accepted connections are
     /// disconnected immediately at the SSH layer with an audit line.
     max_connections: u32,
+    /// Per PLAN.md §8.4. Independent cap on the number of pre-auth
+    /// (unauthenticated) sessions. Bounds handshake-storm pressure so
+    /// an attacker cannot consume the entire `max_connections` pool
+    /// with stuck pre-auth sockets, leaving authenticated partner
+    /// sessions DoS'd. `0` disables the separate cap (= behavior is
+    /// the same as having only `max_connections` enforced). When set,
+    /// must be ≤ `max_connections`. A value of `max_connections / 4`
+    /// is a reasonable starting point for partner deployments.
+    max_unauth_connections: u32,
     /// Per PLAN.md §7.1 default 30_000 (30 seconds). Time the server
     /// waits for in-flight sessions to finish naturally on SIGTERM/SIGINT
     /// before actively shutting down their sockets and exiting. Exposed
@@ -128,6 +138,25 @@ pub fn validateSemantic(
         return error.HostKeyUnreadable;
     };
 
+    // 1a. The pre-auth cap, if configured, must be ≤ the total cap.
+    // A pre-auth cap LARGER than the total cap can't ever fire (the
+    // total cap rejects first), and silently letting it slide hides
+    // an operator misconfiguration that probably should be a typo
+    // for `max-connections` instead.
+    if (cfg.server.max_unauth_connections != 0 and
+        cfg.server.max_unauth_connections > cfg.server.max_connections)
+    {
+        stderr.writeStreamingAll(io, "zift: max-unauth-connections (") catch {};
+        var num_buf: [16]u8 = undefined;
+        const u = std.fmt.bufPrint(&num_buf, "{d}", .{cfg.server.max_unauth_connections}) catch num_buf[0..0];
+        stderr.writeStreamingAll(io, u) catch {};
+        stderr.writeStreamingAll(io, ") exceeds max-connections (") catch {};
+        const t = std.fmt.bufPrint(&num_buf, "{d}", .{cfg.server.max_connections}) catch num_buf[0..0];
+        stderr.writeStreamingAll(io, t) catch {};
+        stderr.writeStreamingAll(io, ")\n") catch {};
+        return error.UnauthCapExceedsTotal;
+    }
+
     // 2. Each user root must exist, be a directory, and canonicalize
     // through symlinks. We canonicalize via realPath so the overlap
     // check below operates on absolute symlink-resolved paths, the
@@ -198,6 +227,8 @@ const ServerBuilder = struct {
     reload_interval_ms: u64 = 2000,
     idle_timeout_ms: u64 = 300_000,
     max_connections: u32 = 128,
+    /// 0 = no separate cap, fall back to `max_connections`.
+    max_unauth_connections: u32 = 0,
     shutdown_grace_ms: u64 = 30_000,
     log: ?LogTarget = null,
 };
@@ -520,6 +551,7 @@ pub fn parseWithDiag(
             .reload_interval_ms = server.reload_interval_ms,
             .idle_timeout_ms = server.idle_timeout_ms,
             .max_connections = server.max_connections,
+            .max_unauth_connections = server.max_unauth_connections,
             .shutdown_grace_ms = server.shutdown_grace_ms,
             .log = server.log orelse .stderr,
         },
@@ -543,6 +575,8 @@ fn parseServerProperty(
         server.idle_timeout_ms = try parseDurationMs(value);
     } else if (std.mem.eql(u8, key, "max-connections")) {
         server.max_connections = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidConfig;
+    } else if (std.mem.eql(u8, key, "max-unauth-connections")) {
+        server.max_unauth_connections = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidConfig;
     } else if (std.mem.eql(u8, key, "shutdown-grace")) {
         server.shutdown_grace_ms = try parseDurationMs(value);
     } else if (std.mem.eql(u8, key, "log")) {

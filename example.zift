@@ -4,6 +4,7 @@ server
   reload-interval 2s
   idle-timeout 5m
   max-connections 128
+  max-unauth-connections 32
   log stderr
 
 user ally
