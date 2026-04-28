@@ -1,6 +1,6 @@
 # Zift TODOs
 
-Living gap list between the implementation and PLAN.md. Reviewed jointly by the in-Cursor agent (Claude Opus) and the peer agent (GPT-5.5) on 2026-04-26 against the current `main` branch.
+Living gap list between the implementation and PLAN.md. Reviewed jointly by the in-Cursor agent (Claude Opus) and the peer agent (GPT-5.5). Last refresh: 2026-04-28 against `main` at v0.5.3.
 
 Conventions:
 
@@ -14,7 +14,15 @@ Conventions:
 
 ## DONE
 
-- [x] Build scaffold: Zig 0.16, libssh 0.12 via translateC, build_options module, `.gitignore`.
+- [x] **v0.5.3 — raw-syscall errno fix (true root cause of v0.4.0+ CI failures)** (`src/listing.zig` + `src/session.zig` + `.github/workflows/ci.yml`). Diagnosed via instrumented debug branch (CI run 25076319249) — the kernel was correctly returning `-ENOENT` (rc = `0xFFFFFFFFFFFFFFFE`) but `std.posix.errno` mapped it to `.SUCCESS`. Cause: zift links libc (for libssh threading), so `std.posix.system = std.c` and `std.posix.errno = std.c.errno`, whose body is `if (rc == -1) errno else .SUCCESS` — the libc-call convention. Linux raw syscalls return the negative errno directly as `usize` (`0xFFFF…FE` for `-ENOENT`), which never equals `-1`, so every raw-syscall error was silently SUCCESS. Switched all 5 raw-syscall callers (`statAt`, `statFd`, `fillRandomBytes`, and the two `linux.open`/`linux.read` calls in `readFromUrandom`) to `std.os.linux.errno`, which has the correct shape. Reverted v0.5.2's `existsAtParent`/`faccessat` workaround (helper deleted; `publishStagedHandle` uses the now-correct `listing.statAt`). v0.5.2's "optimizer UB" misdiagnosis explicitly retracted in `listing.zig` comment. Also: `setPermissions(0o700)`/`(0o600)` after `createDir`/`createFile` to defeat umask (the v0.5.1 mode claims were technically dependent on a `0` umask); `handleClose` audit-target buffer asserts `tv.len <= 4096` instead of silently truncating; CI `build-release-safe` job switched to `-Dtarget=x86_64-linux-musl` so the CI artifact is identical to the release binary (the dynamic-glibc/static-musl mismatch is what hid the errno bug across v0.4.0 → v0.5.2). All 32 integration tests now pass on real x86_64 Linux. Used PR #2 instead of pushing fix attempts to main directly.
+- [x] **v0.5.1 — atomic-upload hostile-review hardening** (`src/session.zig` + `src/vfs.zig` + `test/cases/35` + new `test/cases/36-staging-hardening.sh`). GPT-5.5 review of v0.5.0 caught: (a) `generateStagingName` ignored getrandom(2) return — would have hex-encoded undefined bytes on Linux <3.17 or under EINTR; replaced with robust `fillRandomBytes` that loops until full, retries EINTR, falls back to `/dev/urandom` on ENOSYS via raw syscalls, and fails closed with `error.RandomFailed`. (b) Pre-existing `.zift-staging` could be a v0.4.0-planted symlink → `lstat`-verify with `AT_SYMLINK_NOFOLLOW`, refuse anything not `S_IFDIR` (`StagingDirCorrupt`); also reject pre-existing dirs with any group/other access bits (`StagingDirUnsafe`) so loose perms can't expose in-flight upload bytes or be raced between `rename`-by-path and the kernel. (c) Fresh dirs created `0o700`, fresh files `0o600` for confidentiality on multi-user hosts. (d) `handleClose` audit UAF: target_vpath was read after `closeHandle` freed it and `swapRemove` moved the slot — now captured into a 4096-byte stack buffer first. (e) `replyStatus` no longer emits literal "ok" for non-OK statuses; new `auditOk("publish",...)` makes the actual visible-file creation event auditable. (f) Test 36 plants a malicious symlink at `<root>/.zift-staging` before zift starts and asserts upload fails AND no bytes leak; also exercises 9 reserved-path operations (OPEN-write, MKDIR ×2, REMOVE-real, RENAME-from-real, RENAME-to, RMDIR ×2, dot-segment escape) under `allow / full` so failures can't be explained by policy denial. README updated with v0.4.0 `read`-includes-`list` migration callout, atomic-upload TOCTOU caveat, EXDEV/setgid/ACL filesystem caveats, and v0.5.0→v0.5.1 upgrade notes.
+- [x] **v0.5.0 — server-side staging-rename for atomic uploads** (`src/vfs.zig` `openStagingDir` + `staging_dir_name` reservation; `src/session.zig` Handle staging fields + `handleOpen` CREAT-on-non-existent path + `handleClose` `publishStagedHandle` + `closeHandle` orphan cleanup; new `test/cases/35-atomic-upload.sh`). New file uploads now write to a randomly-named file in `<root>/.zift-staging/` (32 hex chars, ~2^128 namespace). Target path appears on the operator-visible filesystem only when the partner sends `CLOSE` — at which point `publishStagedHandle` re-resolves the parent via `openVerifiedParent`, re-checks the v0.4.0 clobber rule (lstat target, require `.remove` if it materialized between OPEN and CLOSE), and atomically renames staging→target. Disconnect mid-upload unlinks the staging file via `closeHandle`'s orphan cleanup. The `.zift-staging` name is reserved by `normalizeVirtualPath` so partners can never reach staging files via the SFTP wire surface. Filtered from listings (defense-in-depth alongside path-validator). Test 35 covers: atomic appearance (target absent during upload, present after CLOSE), staging-dir invisibility, orphan cleanup on disconnect, and clobber-during-upload race (racer's content survives even when partner has `add`).
+- [x] **v0.4.0 — unified clobber rule + verb model simplification** (`src/config.zig` parser + `src/policy.zig` + `src/session.zig` `handleOpen` + `handleRename`; new `test/cases/34-clobber.sh`). Three primary verbs cover every SFTP wire op: `read` (now expands to `read+list` — covers stat+readdir+download), `add` (upload+mkdir+rename), `remove` (unlink+rmdir+clobber authority). Plus shorthand `full = read+add+remove` and four advanced/granular escapes (`list`, `write`, `mkdir`, `rename`). The unified clobber rule — any operation modifying or replacing an existing entry requires `.remove` permission in addition to whatever verb authorizes the operation itself — is now enforced uniformly across `OPEN(write+TRUNC)`, partial pwrite, append, and rename-over-existing. An `add`-only partner can create new files / new names, but cannot truncate-and-rewrite, modify in place, append to existing, or rename over existing. Test 34 sabotage-discriminates each of the four destructive vectors (B3/B4/B5 from threat model + RENAME); granting `remove` makes them succeed.
+- [x] **v0.3.0+ — virtual listing mode + GNU `ls -l` rendering + panic-proof `breakTime`** (`src/listing.zig` new file; `src/session.zig` `handleReaddir` integration; `src/policy.zig` `policyDerivedMode`; `test/cases/31-sftp-listing.sh` and `33-listing-reality.sh`). New `listing-mode virtual` (default) shows partners their own user name, group `sftp`, and policy-derived `rwx` bits — they see what they CAN DO, not who owns the file on disk. World triplet always `---`; setuid/setgid/sticky stripped. `listing-mode reality` is the v0.2.x-compatible escape hatch. `formatLongname` renders GNU-`ls -l`-style longnames (mode string, owner, group, size with K/M/G suffix, mtime). `breakTime` rewritten using Howard Hinnant's `civil_from_days` algorithm — O(1), panic-proof across the full `i64` range including pre-1970 mtimes (the prior `u16 year` panicked on negative-epoch files). `NameResolver` per-session uid→name / gid→name cache. `listing.statAt` and `statFd` provide platform-portable stat wrappers (Linux `statx` raw syscall, macOS `fstatat`/`fstat` via libc). 256-byte handle metadata limits enforced.
+
+---
+
+
 - [x] Config DSL parser: indentation-based grammar, `server` and `user` sections, `allow`/`deny` rules, `password` PHC validation, `key` ed25519/ECDSA validation, line-oriented errors at the file level (PLAN §6.2, §6.3).
 - [x] Argon2id parameter envelope enforcement (m: 64–256 MiB, t: 2–8, p: 1–4) with rejection at parse time (PLAN §8.4).
 - [x] Argon2id dummy-hash path for unknown users using upper-bound parameters (PLAN §8.4).
@@ -77,42 +85,33 @@ _(no remaining P0 entries — all closed)_
 
 PLAN.md promises that the code does not yet keep, but no immediate security regression.
 
-### Audit pipeline
+_(no remaining P1 entries — all closed)_
 
-_(Audit pipeline overhaul landed: see DONE entries below. Write-failure rate-limiting landed via `last_warn_ms` atomic in `audit.zig`.)_
-
-### Config parser & validator
-
-_(Limits, path validation, public-key blob base64 check, and PHC strengthening landed: see DONE entries below.)_
-_(Reload-semantics cluster landed: see DONE entry below.)_
-
-### SFTP protocol surface
-
-_(Wire-surface protocol items landed: see DONE entries below.)_
-
-### Authentication
-
-- [x] **`pk_ok` reveals whether (user, key) is configured.** Resolved as option (a): this is an inherent SSH protocol property. The two-phase pubkey flow (`SSH2_MSG_USERAUTH_PK_OK` → signed follow-up) reveals whether a key is accepted *before* the client signs. OpenSSH itself has the same property. Documented as an explicit caveat: password auth uses timing-safe dummy verification for unknown users (PLAN §8.4), but pubkey probing is an SSH-level information channel that cannot be closed without breaking the protocol. Operators who need to mask user existence should use password-only auth or a jump host.
-_(Public-key matching `page_allocator` violation closed: see DONE entry below. The remaining piece — caching parsed `ssh_key` handles to avoid the repeat decode — is now an OPTIONAL optimization, not a spec violation, and is tracked as a CAVEAT in `SECURITY-AUDIT.md` rather than a P1 here.)_
-
-### Operational
-
-_(Separate pre-auth cap landed: see DONE entry below.)_
-
-### Build & release
-
-_(Homebrew paths gated to macOS, fuzz targets added, CI workflow added: see DONE entries below.)_
-
-_(Static-linked release pipeline landed: see DONE entry below — all four PLAN §4.7 targets cross-compile from any host, zero `DT_NEEDED` on Linux, libSystem-only on macOS, no system libssh dep at runtime.)_
-_(Static-link verification infrastructure landed: see DONE entry below. The script lives at `build/verify-release.sh` and runs on every `zig build release`. Today it asserts the small allowlist of known dynamic deps; phase-2 (after static linking lands) flips the Linux allowlist to `^$` so the literal "zero NEEDED" PLAN §13 promise holds.)_
+The historical P1 clusters (audit pipeline overhaul, config parser limits + validator, reload semantics, wire-surface protocol coverage, separate pre-auth cap, fully-static release pipeline + signing) all landed in earlier work; see DONE for citations. The pubkey `pk_ok` "user-existence oracle" P1 was resolved as a documented limitation of the SSH protocol itself rather than a fix in zift; the page-allocator violation in pubkey matching is closed with the residual `ssh_key`-cache optimization tracked as a CAVEAT in `SECURITY-AUDIT.md`, not a P1.
 
 ---
 
 ## P2 — Minor / Polish
 
+### Concurrency / lifetime
+
 - [ ] **`ConfigRef` lifetime is correct but untested under load.** PLAN §7.3 mandates that an existing session keeps its old config alive across reloads. Add a stress test: 32 concurrent sessions, hammer config reloads on a separate thread, observe no use-after-free / double-free.
 - [ ] **`active_sessions` lives in `signals.zig`.** It isn't signal state. Move to a `server_state.zig` or attach to `ActiveConfig`.
 - [ ] **`channel` cleanup on session exit.** `handleSession` doesn't explicitly `ssh_channel_send_eof` / `ssh_channel_close` / `ssh_channel_free`. We removed an explicit close earlier because of a segfault, but the right fix is to call EOF + close + free in a single defer, in the right order.
+
+### Atomic-upload hardening (raised by GPT-5.5 hostile review of v0.5.x; deferred from v0.5.3)
+
+- [ ] **Hermetic publish-time clobber via `renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)`.** v0.5.0+ `publishStagedHandle` does `lstat(dest) → if exists check .remove → rename(staging, dest)`. The window between the `lstat` and the `rename` is a real TOCTOU: a target appearing in that gap would still get overwritten because `rename(2)` is the kernel's own "atomic replace" primitive. Same window applies to `handleRename`'s v0.3.0+ destination-existence guard. Closing it hermetically requires the no-replace rename primitives — `renameat2(RENAME_NOREPLACE)` on Linux ≥ 3.15 (with EOPNOTSUPP fallback for older kernels), `renamex_np(RENAME_EXCL)` on macOS. Already documented in `README.md` as a known limitation; this bullet is to actually implement it. PLAN §8.3.
+- [ ] **`openStagingDir` lstat-then-open TOCTOU.** v0.5.1's hardening rejects a pre-existing `.zift-staging` that's a symlink or has loose perms via `listing.statAt` (lstat-equivalent), then opens by name. A local OS-level attacker with write access to the partner root could swap the entry between the lstat and the openDir. The path-validator reserves `.zift-staging` from every SFTP wire path, so this is purely a local-attacker race outside the SFTP threat model — but the README sells the hardening as hermetic. Stronger pattern: `openat(O_DIRECTORY|O_NOFOLLOW)` then `fstat` the resulting fd to verify mode bits. Requires either a Zig 0.16 `std.Io.Dir.openDir` option for `O_NOFOLLOW`, or an `@extern("openat")` fall-back.
+- [ ] **Linux-only regression test for raw-syscall errno mismatch.** The v0.4.0+ class of bug ("statx returns -ENOENT, `std.posix.errno` says SUCCESS") was silent for several releases because no test directly asserted the errno mapping. Add a small Linux-only unit test: open a known-empty directory FD, call `listing.statAt(fd, "definitely-not-present")`, assert `error.NotFound`. Failure mode would have caught the v0.4.0+ failure on the FIRST CI run. Same shape for `fillRandomBytes` (force ENOSYS path via mocking, assert `RandomFailed` not silent zero).
+
+---
+
+## P3 — Nits / Polish
+
+- [ ] **Cross-restart staging orphan sweep.** If zift crashes mid-upload, files in `<root>/.zift-staging/` persist after restart. Currently documented as a manual `rm -f` runbook in README and `deinit` comment. Real fix: at server startup, walk every partner root's `.zift-staging/` and unlink any pre-existing entries before serving (no live session can have a handle to them yet). Cheap, runs once per startup, and lets the README claim "self-healing" instead of "manual cleanup".
+- [ ] **Per-session `ssh_key` handle cache.** Currently `matchesAnyConfiguredKey` and `matchAgainstDummyKey` re-decode the configured pubkey blob on every auth attempt. Caching the parsed `ssh_key` handle on first use would cut work per attempt; constraint is that the configured-key path AND the dummy-key path must apply the same caching strategy or no caching, otherwise the timing-parity property in PLAN §8.4 breaks. Tracked as a CAVEAT in `SECURITY-AUDIT.md`. P3 because it's an optimization, not a correctness gap.
+- [ ] **TODOS.md timestamp / review cadence.** This file has been the joint review log since 2026-04-26. Consider trimming the DONE section periodically (move entries older than 6 months to a `CHANGELOG.md`-style archive) so the open items stay visually prominent.
 
 ---
 
