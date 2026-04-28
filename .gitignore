@@ -5,3 +5,5 @@ bin/
 release/
 test/.venv/
 test/tmp/
+core
+qemu_zift_*.core

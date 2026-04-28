@@ -76,32 +76,30 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
     const at_flags: u32 = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
 
     if (builtin.os.tag == .linux) {
-        // Linux: statx syscall. Available since kernel 4.11 (2017),
-        // covering every reasonable target. We ask for exactly the
-        // fields we use; the kernel is allowed to fill more if it's
-        // cheap, and we just ignore the extras.
+        // Linux: statx syscall. Available since kernel 4.11 (2017).
         //
-        // CRITICAL — DO NOT USE `undefined` HERE. Zig 0.16's
-        // ReleaseSafe optimizer (caught on Linux 2026-04-28, manifests
-        // only on cross-compiled musl x86_64 builds) treats `var sx:
-        // Statx = undefined` as "the value is undefined at every
-        // read", and propagates the 0xAA debug-fill pattern at the
-        // read sites — even though the inline-asm syscall wrapper
-        // declares `: .{ .memory = true }` and writes through `&sx`
-        // via the kernel. The compiler cannot see the kernel's write
-        // through the pointer, only the memory clobber, and concludes
-        // (legally per the language spec) that `sx.mode` etc. are
-        // still undefined → emits the 0xAA fill at the load. The
-        // observable bug: every statAt-on-missing-file returns SUCCESS
-        // with garbage data, so v0.5.0's CLOSE-time clobber check
-        // sees `dest_exists = true` for fresh uploads and denies the
-        // publish.
+        // CRITICAL — read this before "simplifying" the volatile
+        // reads below. Zig 0.16's ReleaseSafe optimizer (caught on
+        // x86_64-linux CI, 2026-04-28) treats `var sx: Statx =
+        // undefined` (and also `= zeroes`) as a value the compiler
+        // can constant-propagate THROUGH the inline-asm syscall —
+        // the asm clobbers `memory` but does NOT declare `sx` as a
+        // memory output operand, so the optimizer "knows" that the
+        // 32 bytes the kernel wrote into `sx` are still the original
+        // 0xAA debug fill at every read site. Net effect: statAt on
+        // a missing file returned SUCCESS with mode=0xAAAA, and
+        // v0.5.0's CLOSE-time clobber check saw `dest_exists = true`
+        // for every fresh upload, denying the publish.
         //
-        // Initializing to zero forces the compiler to track sx as
-        // having a defined value (zero) before the syscall; the
-        // memory-clobber asm then correctly invalidates that cached
-        // knowledge, and the post-syscall reads re-fetch from memory
-        // — picking up the kernel's actual writes.
+        // The fix: read every field via a `*volatile` pointer. A
+        // volatile load is required by spec to actually re-fetch from
+        // memory and cannot be folded with prior knowledge of the
+        // value. This is the smallest possible patch — it leaves the
+        // direct syscall path intact (no libc dependency, no extra
+        // function call overhead) and only adds an opacity barrier
+        // at the read site. If Zig stdlib later fixes the asm to
+        // declare `sx` as an output operand, these volatile reads
+        // become free no-ops.
         var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
         const mask: std.os.linux.STATX = .{
             .TYPE = true,
@@ -119,24 +117,22 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
             .NOENT, .NOTDIR => return error.NotFound,
             else => return error.Unexpected,
         }
+        const sxv: *volatile std.os.linux.Statx = &sx;
         return EntryInfo{
-            .mode = sx.mode,
-            .nlink = sx.nlink,
-            .uid = sx.uid,
-            .gid = sx.gid,
-            .size = sx.size,
-            .mtime_secs = sx.mtime.sec,
+            .mode = sxv.mode,
+            .nlink = sxv.nlink,
+            .uid = sxv.uid,
+            .gid = sxv.gid,
+            .size = sxv.size,
+            .mtime_secs = sxv.mtime.sec,
         };
     } else {
         // macOS / *BSD / Solaris: libc `fstatat` against `std.c.Stat`.
-        // The Stat layout differs per OS; std.c picks the right one.
-        // `std.c.errno(rc)` does the right thing here: it checks
-        // `rc == -1` and reads the libc thread-local errno on its
-        // own. Pass `rc` directly — earlier code wrapped it in a
-        // double cast (`@as(usize, @bitCast(@as(isize, rc)))`) that
-        // worked only by accident because `usize == -1` happens to
-        // coerce correctly on 64-bit. Cargo cult; removed.
-        var st: std.c.Stat = undefined;
+        // Function-call boundary forces the compiler to honor memory
+        // effects — no UB optimizer license to elide the kernel's
+        // writes through the buffer pointer. Zero-init for symmetry
+        // with the Linux path.
+        var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
         const rc = std.c.fstatat(dir_fd, cname, &st, at_flags);
         if (rc != 0) {
             return switch (std.posix.errno(rc)) {
@@ -161,11 +157,9 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
 /// hand). Same portable shape as `statAt`.
 pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
     if (builtin.os.tag == .linux) {
-        // Linux: `statx` with `AT_EMPTY_PATH` against the fd. Same
-        // flow as `statAt` minus the path argument. See `statAt` for
-        // the explanation of why this struct is zero-initialized
-        // rather than `undefined` (Zig 0.16 ReleaseSafe optimizer
-        // bug — produces 0xAA-filled struct fields at read sites).
+        // Linux: statx with AT_EMPTY_PATH against the fd. Same
+        // volatile-read pattern as `statAt` to dodge the ReleaseSafe
+        // optimizer bug — see the long-form explanation there.
         var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
         const mask: std.os.linux.STATX = .{
             .TYPE = true,
@@ -185,16 +179,17 @@ pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
             .BADF, .NOENT => return error.NotFound,
             else => return error.Unexpected,
         }
+        const sxv: *volatile std.os.linux.Statx = &sx;
         return EntryInfo{
-            .mode = sx.mode,
-            .nlink = sx.nlink,
-            .uid = sx.uid,
-            .gid = sx.gid,
-            .size = sx.size,
-            .mtime_secs = sx.mtime.sec,
+            .mode = sxv.mode,
+            .nlink = sxv.nlink,
+            .uid = sxv.uid,
+            .gid = sxv.gid,
+            .size = sxv.size,
+            .mtime_secs = sxv.mtime.sec,
         };
     } else {
-        var st: std.c.Stat = undefined;
+        var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
         const rc = std.c.fstat(fd, &st);
         if (rc != 0) {
             return switch (std.posix.errno(rc)) {
