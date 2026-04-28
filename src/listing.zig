@@ -111,7 +111,12 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
             .MTIME = true,
         };
         const rc = std.os.linux.statx(dir_fd, cname, at_flags, mask, &sx);
-        switch (std.posix.errno(rc)) {
+        const e = std.posix.errno(rc);
+        std.debug.print("[v053-statx] dir_fd={d} name={s} at_flags=0x{x} rc={d} errno={s} sx.mask=0x{x} sx.mode=0x{x} sx.size={d}\n", .{
+            dir_fd, name, at_flags, rc, @tagName(e),
+            @as(u32, @bitCast(sx.mask)), sx.mode, sx.size,
+        });
+        switch (e) {
             .SUCCESS => {},
             .ACCES, .PERM => return error.AccessDenied,
             .NOENT, .NOTDIR => return error.NotFound,

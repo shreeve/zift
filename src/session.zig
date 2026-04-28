@@ -1918,14 +1918,28 @@ const SftpState = struct {
         };
         defer to_parent.deinit(self.io, self.allocator);
 
-        // Re-check the clobber rule at CLOSE time. The OPEN-time
-        // check fired only if the target existed THEN; in the
-        // gap between OPEN and CLOSE another session could have
-        // created the target. Probe via faccessat (libc function
-        // call → opaque to the optimizer) — see `existsAtParent`
-        // below for the rationale on not using `listing.statAt`
-        // here.
-        const dest_exists = existsAtParent(to_parent.parent.handle, to_parent.base);
+        // DEBUG INSTRUMENTATION (v0.5.3 root-cause hunt). Compare
+        // statAt and faccessat side by side. Both should agree on
+        // existence. If they disagree, the buggy path is statAt;
+        // log the actual rc/errno/fields so we can determine
+        // whether the kernel returned ENOENT (errno mishandling)
+        // or returned 0 (statx-of-a-different-file or kernel bug).
+        const stat_result = listing.statAt(to_parent.parent.handle, to_parent.base);
+        const access_exists = existsAtParent(to_parent.parent.handle, to_parent.base);
+        const stat_says_exists = if (stat_result) |info| blk: {
+            std.debug.print("[v053] statAt OK target={s} mode=0x{x} size={d} nlink={d} uid={d}\n", .{
+                target_vpath, info.mode, info.size, info.nlink, info.uid,
+            });
+            break :blk true;
+        } else |err| blk: {
+            std.debug.print("[v053] statAt err target={s} err={s}\n", .{ target_vpath, @errorName(err) });
+            break :blk false;
+        };
+        std.debug.print("[v053] faccessat says exists={} for target={s}\n", .{ access_exists, target_vpath });
+        if (stat_says_exists != access_exists) {
+            std.debug.print("[v053] !!! DISAGREEMENT: statAt={} access={}\n", .{ stat_says_exists, access_exists });
+        }
+        const dest_exists = access_exists;
 
         if (dest_exists) {
             if (handle.staging_excl) {
