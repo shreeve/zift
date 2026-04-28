@@ -78,28 +78,34 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
     if (builtin.os.tag == .linux) {
         // Linux: statx syscall. Available since kernel 4.11 (2017).
         //
-        // CRITICAL — read this before "simplifying" the volatile
-        // reads below. Zig 0.16's ReleaseSafe optimizer (caught on
-        // x86_64-linux CI, 2026-04-28) treats `var sx: Statx =
-        // undefined` (and also `= zeroes`) as a value the compiler
-        // can constant-propagate THROUGH the inline-asm syscall —
-        // the asm clobbers `memory` but does NOT declare `sx` as a
-        // memory output operand, so the optimizer "knows" that the
-        // 32 bytes the kernel wrote into `sx` are still the original
-        // 0xAA debug fill at every read site. Net effect: statAt on
-        // a missing file returned SUCCESS with mode=0xAAAA, and
-        // v0.5.0's CLOSE-time clobber check saw `dest_exists = true`
-        // for every fresh upload, denying the publish.
+        // CRITICAL — `std.posix.errno` is the WRONG conversion for a
+        // raw syscall return value when libc is linked (which zift
+        // does for libssh's threading symbols). With `use_libc`
+        // active, `std.posix.system = std.c` and `std.posix.errno =
+        // std.c.errno`, whose body is `if (rc == -1) errno else
+        // .SUCCESS`. That's the LIBC convention: libc functions
+        // return -1 on error and stash the actual errno in the
+        // thread-local `errno` variable. Linux RAW SYSCALLS use a
+        // different convention: the syscall return value IS the
+        // negative errno, encoded as a `usize` (e.g. -ENOENT comes
+        // back as 0xFFFFFFFFFFFFFFFE). 0xFFFFFFFFFFFFFFFE != -1, so
+        // the libc-style errno check returns `.SUCCESS` for every
+        // raw-syscall error, silently swallowing failures.
         //
-        // The fix: read every field via a `*volatile` pointer. A
-        // volatile load is required by spec to actually re-fetch from
-        // memory and cannot be folded with prior knowledge of the
-        // value. This is the smallest possible patch — it leaves the
-        // direct syscall path intact (no libc dependency, no extra
-        // function call overhead) and only adds an opacity barrier
-        // at the read site. If Zig stdlib later fixes the asm to
-        // declare `sx` as an output operand, these volatile reads
-        // become free no-ops.
+        // This is what caused tests 27/28/30/34/35 to fail in CI
+        // since v0.4.0. statx-on-missing-file returned -ENOENT;
+        // `std.posix.errno` treated that as SUCCESS; statAt
+        // returned a zero-filled EntryInfo instead of NotFound;
+        // publishStagedHandle saw `dest_exists = true` and denied
+        // the publish. The misdiagnosis we shipped briefly in
+        // v0.5.2 ("optimizer UB") was wrong — the buffer was
+        // genuinely zeroed by `std.mem.zeroes`, the syscall
+        // genuinely returned the right -ENOENT, but the errno
+        // conversion threw away the result.
+        //
+        // FIX: use `std.os.linux.errno` (the raw-syscall-shape
+        // converter) directly. Same pattern at every other raw-
+        // syscall call site in zift.
         var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
         const mask: std.os.linux.STATX = .{
             .TYPE = true,
@@ -111,21 +117,12 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
             .MTIME = true,
         };
         const rc = std.os.linux.statx(dir_fd, cname, at_flags, mask, &sx);
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             .ACCES, .PERM => return error.AccessDenied,
             .NOENT, .NOTDIR => return error.NotFound,
             else => return error.Unexpected,
         }
-        // Compiler barrier: forces the optimizer to consider every
-        // byte of `sx` as potentially written by something it can't
-        // see (the kernel did, via the asm syscall — but Zig 0.16
-        // ReleaseSafe doesn't deduce that on its own). Without this,
-        // sx.mode et al. get constant-propagated to their pre-syscall
-        // values (zero from std.mem.zeroes, or 0xAA from undefined),
-        // and v0.5.0's CLOSE-time clobber check sees `dest_exists =
-        // true` for every fresh upload.
-        std.mem.doNotOptimizeAway(&sx);
         return EntryInfo{
             .mode = sx.mode,
             .nlink = sx.nlink,
@@ -165,9 +162,11 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
 /// hand). Same portable shape as `statAt`.
 pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
     if (builtin.os.tag == .linux) {
-        // Linux: statx with AT_EMPTY_PATH against the fd. Same
-        // volatile-read pattern as `statAt` to dodge the ReleaseSafe
-        // optimizer bug — see the long-form explanation there.
+        // Linux: statx with AT_EMPTY_PATH against the fd. Use
+        // `std.os.linux.errno` (raw-syscall errno shape), NOT
+        // `std.posix.errno` — see `statAt` for the long-form
+        // explanation of why those two are not interchangeable
+        // when libc is linked.
         var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
         const mask: std.os.linux.STATX = .{
             .TYPE = true,
@@ -181,14 +180,12 @@ pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
         const empty: [*:0]const u8 = "";
         const at_empty: u32 = @intCast(std.posix.AT.EMPTY_PATH);
         const rc = std.os.linux.statx(fd, empty, at_empty, mask, &sx);
-        switch (std.posix.errno(rc)) {
+        switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
             .ACCES, .PERM => return error.AccessDenied,
             .BADF, .NOENT => return error.NotFound,
             else => return error.Unexpected,
         }
-        // See `statAt` for the rationale.
-        std.mem.doNotOptimizeAway(&sx);
         return EntryInfo{
             .mode = sx.mode,
             .nlink = sx.nlink,

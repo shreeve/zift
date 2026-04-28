@@ -38,55 +38,38 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Install libssh
-        run: sudo apt-get update && sudo apt-get install -y libssh-dev
-
-      - name: Build ReleaseSafe
-        run: zig build -Doptimize=ReleaseSafe
+      # Build the same fully-static x86_64-linux-musl binary that we
+      # ship as a release artifact. No `libssh-dev` install needed —
+      # libssh, mbedTLS, and zlib are all vendored and built from
+      # source via build.zig.zon. Static-musl matches the binary
+      # downstream users actually run, so CI tests exercise the
+      # same artifact rather than a dynamic-glibc variant that only
+      # CI ever sees. (v0.5.2 and earlier built dynamic-glibc; the
+      # mismatch hid the v0.4.0+ raw-syscall errno bug for several
+      # releases — fixed in v0.5.3.)
+      - name: Build ReleaseSafe (static musl)
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl
 
       - name: Verify binary exists
         run: test -f bin/zift
 
-      - name: Check direct dynamic dependencies (NEEDED allowlist)
+      - name: Verify fully static (zero DT_NEEDED entries)
         run: |
-          echo "=== Full dynamic resolution (informational) ==="
-          ldd bin/zift || true
           echo "=== Binary size ==="
           ls -lh bin/zift
-
-          # Assert the *direct* NEEDED entries on the binary, not the
-          # full transitive resolution that `ldd` reports. libssh on
-          # Ubuntu pulls libgssapi-krb5-2, libkrb5-3, libcom_err.so.2,
-          # libk5crypto.so.3, libkeyutils.so.1 etc. transitively — those
-          # are libssh's choice, not ours, and they shift across distro
-          # upgrades. What we genuinely control is what *our* binary
-          # has in its DT_NEEDED entries, which is short and stable.
+          # Static-musl binaries must have ZERO direct NEEDED entries —
+          # libssh, mbedTLS, zlib, and musl libc are all linked in.
+          # If anything shows up in DT_NEEDED, the build picked up an
+          # unintended dynamic dependency.
           echo "=== Direct NEEDED entries ==="
-          needed=$(objdump -p bin/zift \
-            | awk '/NEEDED/ {print $2}' \
-            | sort -u)
-          echo "$needed" | sed 's/^/  /'
-
-          # The dynamic loader (`ld-linux-*.so.[12]`) is technically the
-          # binary's `PT_INTERP` entry, but on Linux/Zig 0.16 builds it
-          # ALSO shows up as a `DT_NEEDED`. The CI on 2026-04-27 failed
-          # because we'd dropped it from the allowlist based on the
-          # PT_INTERP-only assumption; empirically Zig emits it in both
-          # places. Keep it in the allowlist until/unless a future Zig
-          # release stops emitting the redundant DT_NEEDED.
-          allowed='libssh\.so\.4|libc\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libm\.so\.6|libgcc_s\.so\.1|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1'
-          unexpected=$(echo "$needed" | grep -Ev "^(${allowed})$" || true)
-          if [ -n "$unexpected" ]; then
+          needed=$(objdump -p bin/zift | awk '/NEEDED/ {print $2}' | sort -u)
+          if [ -n "$needed" ]; then
+            echo "$needed" | sed 's/^/  /'
             echo
-            echo "FAIL: NEEDED entries outside the allowlist:"
-            echo "$unexpected" | sed 's/^/  /'
-            echo
-            echo "Either the binary picked up a new system library (build"
-            echo "regression) or the allowlist needs updating to match a"
-            echo "deliberate change in our dependency surface."
+            echo "FAIL: static binary should have zero DT_NEEDED entries."
             exit 1
           fi
-          echo "All NEEDED entries are on the allowlist."
+          echo "  (zero entries — fully static)"
 
       - name: Verify systemd unit (catch inline-comment & directive bugs)
         run: |
@@ -181,8 +164,10 @@ jobs:
 
       - name: Install test dependencies
         run: |
+          # No `libssh-4` — zift is a static-musl binary with libssh
+          # vendored in. Test harnesses still need expect/openssh/python.
           sudo apt-get update
-          sudo apt-get install -y expect openssh-client python3-venv lsof libssh-4
+          sudo apt-get install -y expect openssh-client python3-venv lsof
           python3 -m venv test/.venv
           test/.venv/bin/pip install paramiko
 
