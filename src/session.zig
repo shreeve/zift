@@ -2295,25 +2295,33 @@ const SftpState = struct {
 
     /// Linux fallback when `getrandom(2)` is unavailable (kernel <
     /// 3.17 — vanishingly rare in 2026 but worth handling correctly).
-    /// Read from `/dev/urandom` directly via posix syscalls (skip
-    /// the std.Io.File abstraction so we don't have to thread an `Io`
-    /// here). Once the entropy pool is seeded — which any running
-    /// userspace satisfies — `/dev/urandom` never blocks and
-    /// short-reads only on signal.
+    /// Read from `/dev/urandom` directly via raw syscalls (Zig 0.16's
+    /// std.posix doesn't expose `open` on all targets, and we don't
+    /// need to thread an Io through this fallback). Once the entropy
+    /// pool is seeded — which any running userspace satisfies —
+    /// `/dev/urandom` never blocks and short-reads only on signal.
     fn readFromUrandom(buf: []u8) !void {
-        const fd = std.posix.open("/dev/urandom", .{ .ACCMODE = .RDONLY }, 0) catch
-            return error.RandomFailed;
-        defer std.posix.close(fd);
+        const linux = std.os.linux;
+        const path: [*:0]const u8 = "/dev/urandom";
+        const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+        switch (std.posix.errno(fd_rc)) {
+            .SUCCESS => {},
+            else => return error.RandomFailed,
+        }
+        const fd: i32 = @intCast(fd_rc);
+        defer _ = linux.close(fd);
+
         var filled: usize = 0;
         while (filled < buf.len) {
-            const n = std.posix.read(fd, buf[filled..]) catch |err| switch (err) {
-                // Signal during read: retry; the read returned no
-                // bytes and the next iteration just retries.
-                error.WouldBlock, error.Interrupted => continue,
+            const rc = linux.read(fd, buf.ptr + filled, buf.len - filled);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.RandomFailed;
+                    filled += @intCast(rc);
+                },
+                .INTR => continue,
                 else => return error.RandomFailed,
-            };
-            if (n == 0) return error.RandomFailed;
-            filled += n;
+            }
         }
     }
 
