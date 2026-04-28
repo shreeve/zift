@@ -117,14 +117,26 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
             .NOENT, .NOTDIR => return error.NotFound,
             else => return error.Unexpected,
         }
-        const sxv: *volatile std.os.linux.Statx = &sx;
+        // Memory-clobber barrier: empty asm that declares the
+        // statx buffer as a memory input and clobbers all memory.
+        // This is the C "compiler barrier" idiom; required because
+        // std.os.linux.statx's asm doesn't declare sx as an output
+        // operand, so the optimizer (Zig 0.16 ReleaseSafe) constant-
+        // propagates the pre-syscall value of sx (zero or 0xAA fill)
+        // through to the reads below. The barrier forces the compiler
+        // to materialize sx in memory before this point and re-load
+        // every field after.
+        asm volatile (""
+            :
+            : [_] "m" (sx),
+            : .{ .memory = true });
         return EntryInfo{
-            .mode = sxv.mode,
-            .nlink = sxv.nlink,
-            .uid = sxv.uid,
-            .gid = sxv.gid,
-            .size = sxv.size,
-            .mtime_secs = sxv.mtime.sec,
+            .mode = sx.mode,
+            .nlink = sx.nlink,
+            .uid = sx.uid,
+            .gid = sx.gid,
+            .size = sx.size,
+            .mtime_secs = sx.mtime.sec,
         };
     } else {
         // macOS / *BSD / Solaris: libc `fstatat` against `std.c.Stat`.
@@ -179,14 +191,18 @@ pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
             .BADF, .NOENT => return error.NotFound,
             else => return error.Unexpected,
         }
-        const sxv: *volatile std.os.linux.Statx = &sx;
+        // See `statAt` for the rationale on this asm barrier.
+        asm volatile (""
+            :
+            : [_] "m" (sx),
+            : .{ .memory = true });
         return EntryInfo{
-            .mode = sxv.mode,
-            .nlink = sxv.nlink,
-            .uid = sxv.uid,
-            .gid = sxv.gid,
-            .size = sxv.size,
-            .mtime_secs = sxv.mtime.sec,
+            .mode = sx.mode,
+            .nlink = sx.nlink,
+            .uid = sx.uid,
+            .gid = sx.gid,
+            .size = sx.size,
+            .mtime_secs = sx.mtime.sec,
         };
     } else {
         var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
