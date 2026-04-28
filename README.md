@@ -146,66 +146,106 @@ server
 user ally
   password $argon2id$v=19$m=65536,t=3,p=1$...
   root /tmp/zift/ally
-  allow / read list
-  allow /pending read list add remove
-  allow /archive read list
+  allow /             read              # `read` covers list+stat+download
+  allow /pending      read add remove   # full mutate (or `full` for short)
+  allow /archive      read              # read-only browse
   # `**` crosses path boundaries (gitignore-style); `*` does not.
   deny **.exe
   deny **/.ssh/**
 ```
 
+### Common workflow patterns
+
+```zift
+# Drop-zone: vendor uploads, can't read others' files, can't delete.
+allow /          read      # ls /, see one's own uploads
+allow /incoming  add       # upload only; clobber rule blocks overwriting
+
+# Pickup-and-clear: partner downloads + deletes after consumption.
+allow /          read
+allow /reports   read remove
+
+# Read-only archive.
+allow /          read
+
+# Mutable workspace (full r/w/d).
+allow /workspace full
+
+# Atomic upload (the SFTP-classic temp+rename idiom).
+allow /          read
+allow /staging   add        # tmp file + rename; clobber prevents overwriting
+```
+
 ### Permission verbs
 
-The four-verb model covers every SFTP wire op a partner can perform:
+Three primary verbs cover every SFTP wire op a partner can perform:
 
 | Verb | Grants |
 |---|---|
-| `read` | download (SSH_FXP_READ), STAT/LSTAT |
-| `list` | readdir / OPENDIR / READDIR |
-| `add` | upload (SSH_FXP_WRITE) + mkdir + rename — symmetric with `remove` |
-| `remove` | unlink files + rmdir empty directories |
+| `read` | stat + readdir + download (covers SSH_FXP_OPEN(read), STAT, LSTAT, OPENDIR, READDIR) |
+| `add` | upload + mkdir + rename (covers SSH_FXP_OPEN(write), MKDIR, RENAME) |
+| `remove` | unlink + rmdir + clobber authority (covers SSH_FXP_REMOVE, RMDIR; required to modify or rename-over an existing entry) |
 
-The granular verbs `write`, `mkdir`, and `rename` are still accepted
-for fine-grained control (e.g. an immutable-receive workflow that
-allows uploads but forbids renames), but `add` is the recommended
-shorthand for the common "let them mutate this dir" case.
+Plus one shorthand:
 
-Permissions are default-deny. `deny` rules override `allow` rules.
+| Verb | Grants |
+|---|---|
+| `full` | `read + add + remove` |
 
-#### `add`-without-`remove` and rename semantics
+And four advanced/granular escapes for tight-control workflows:
 
-`add` grants `rename`. There are two ways rename can be destructive:
+| Verb | Grants |
+|---|---|
+| `list` | stat + readdir only, **no download** (rare; e.g. tokenized-name delivery) |
+| `write` | upload only (no mkdir, no rename) — for immutable-receive workflows |
+| `mkdir` | create directories only |
+| `rename` | rename only (still subject to the clobber rule on the destination) |
 
-1. **Source-name removal.** Rename always moves the source name to
-   the destination. A partner with `add` (no `remove`) can still make
-   a file "disappear from its expected path" by renaming it to a
-   different name in the same dir. The inode lives on, but the path
-   the operator might be polling for is now empty. If you don't want
-   that, use the granular verbs (`write mkdir` instead of `add`) — they
-   include upload + directory creation but exclude rename.
+Permissions are **default-deny**. `deny` rules override `allow` rules.
 
-2. **Destination overwrite.** POSIX `rename(2)` atomically overwrites
-   an existing destination. Without a guard, an `add`-only partner
-   could destroy any existing entry by `rename src dest_to_destroy`.
-   Zift refuses this case: at rename time, if the destination exists
-   in any form (file, dir, symlink, socket, FIFO), the partner must
-   ALSO have `remove` permission on the destination path.
+### The clobber rule
 
-Behavior summary:
+A core security invariant of zift v0.4.0+:
 
-| Setup | rename can create new names? | rename can move existing names within scope? | rename can overwrite an existing destination? |
-|---|---|---|---|
-| `allow /pending write mkdir` (no `rename`, no `remove`) | yes (via upload + mkdir) | no | no |
-| `allow /pending add` (= write+mkdir+rename, no `remove`) | yes | yes | NO — refused at the destination |
-| `allow /pending add remove` | yes | yes | yes |
+> **Any operation that would modify or replace an existing entry
+> requires `remove` permission on that entry's path, in addition to
+> whatever verb (`add`, `write`, `rename`) authorizes the operation
+> itself.**
 
-The destination-overwrite guard uses a stat-then-rename sequence
-which has a small TOCTOU window — two concurrent partner sessions
-could in principle race the check. Closing that window hermetically
-requires `renameat2(RENAME_NOREPLACE)` on Linux or
-`renamex_np(RENAME_EXCL)` on macOS, which is tracked as a P2
-follow-up. For typical partner workflows (one session per partner,
-no pipelined adversarial renames) the portable check is sufficient.
+Concretely, with `add` granted but `remove` NOT granted, a partner
+can:
+
+- Create new files, directories, and symlinks (where the destination
+  doesn't already exist).
+- Rename their own creations to fresh names (where the destination
+  doesn't already exist).
+
+But CANNOT:
+
+- Truncate-and-rewrite an existing file (`SSH_FXP_OPEN(write+TRUNC)`).
+- Modify bytes of an existing file in place (partial pwrite, append).
+- Rename over an existing file/dir (would destroy the destination).
+- Delete files or directories.
+
+To get those, grant `remove` (or use `full = read + add + remove`).
+
+The rule applies uniformly across all destructive paths — write-open,
+rename, and (transitively) the temp+rename idiom that classical SFTP
+clients use for "atomic upload."
+
+| Setup | Create new file | Overwrite existing file | Rename to new name | Rename over existing | Delete |
+|---|---|---|---|---|---|
+| `read` | no | no | no | no | no |
+| `read add` | yes | **no** | yes | **no** | no |
+| `read add remove` (= `full`) | yes | yes | yes | yes | yes |
+| `read remove` | no | no (no add) | no (no add) | no (no add) | yes |
+
+The rename-over-existing guard has a small stat-then-rename TOCTOU
+window — closing it hermetically requires `renameat2(RENAME_NOREPLACE)`
+on Linux or `renamex_np(RENAME_EXCL)` on macOS, tracked as a P2
+follow-up. Write-open's clobber check is race-free (the existence
+test is implicit in `openFile` returning either a usable fd OR
+`FileNotFound`, with no separate stat).
 
 ### Listing mode
 

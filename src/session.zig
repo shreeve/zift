@@ -1595,7 +1595,38 @@ const SftpState = struct {
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         };
 
-        // Truncation only after the FD is proven inside the jail.
+        // CLOBBER RULE (v0.4.0): we got here because OPEN(write) on an
+        // EXISTING file succeeded. The partner is about to either
+        // truncate it (TRUNC), partially overwrite it (pwrite at
+        // offset), or append to it (APPEND) — three different ways
+        // to mutate someone else's existing content. All of them
+        // require the partner to have BOTH "add"-style (already
+        // checked above as `.open_write`) AND `.remove` permission
+        // on this path. The `.remove` half is the new check: it
+        // generalizes the v0.3.0 rename-overwrite guard to every
+        // write-open of an existing entry. Without this, an
+        // `add`-only partner could destroy the operator's files via
+        // OPEN(write+TRUNC), pwrite-at-offset, or APPEND mode — see
+        // attack scenarios B3, B4, B5 in the threat model.
+        //
+        // Race note: the existence check is implicit in "openFile
+        // succeeded vs returned FileNotFound" — no separate stat,
+        // so no TOCTOU window between probe and act. The fd we
+        // hold IS the existing file we're checking authorization
+        // for.
+        if (want_write and policy.check(self.user, .remove, path.value) == .deny) {
+            file.close(self.io);
+            defer self.auditDenied(op_label, path.value);
+            return replyStatus(
+                self.channel,
+                request_id,
+                c.SSH_FX_PERMISSION_DENIED,
+                "would clobber an existing entry; partner lacks remove",
+            );
+        }
+
+        // Truncation only after the FD is proven inside the jail
+        // AND the clobber check has passed.
         if (want_trunc and want_write) {
             file.setLength(self.io, 0) catch {
                 file.close(self.io);

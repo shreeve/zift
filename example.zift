@@ -15,18 +15,19 @@ server
 user ally
   password $argon2id$v=19$m=65536,t=3,p=4$example$replace-me
   root /tmp/zift/ally
-  # The four-verb model `(read | list | add | remove)` covers every
-  # SFTP wire op a partner can perform. `add` is shorthand for the
-  # union of write+mkdir+rename — granting all three together avoids
-  # the "I forgot to allow rename" surprise.
+  # The four-verb model covers every SFTP wire op:
+  #   read    = stat + readdir + download (`read` includes `list` since v0.4.0)
+  #   add     = upload + mkdir + rename
+  #   remove  = unlink + rmdir + clobber authority
+  #   full    = read + add + remove (shorthand for "everything")
   #
-  # Note: `add` grants rename, and POSIX rename atomically overwrites
-  # existing files. Zift's rename handler refuses overwrites when the
-  # partner lacks `remove` on the destination, so `add`-without-`remove`
-  # really means "create new names only" — see README for details.
-  allow / read list
-  allow /pending read list add remove
-  allow /archive read list
+  # Clobber rule (v0.4.0): any OPEN(write) on an existing file
+  # requires `remove` permission on that path. So `add`-without-
+  # `remove` lets the partner CREATE new files but never modify or
+  # destroy existing ones. Same applies to rename-over-existing.
+  allow / read
+  allow /pending read add remove
+  allow /archive read
   # `**` crosses path boundaries (gitignore-style); `*` does not.
   # `**.exe` denies executables anywhere under the partner root;
   # `**/.ssh/**` denies anything inside a `.ssh` dir at any depth.

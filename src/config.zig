@@ -726,20 +726,47 @@ fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []con
     var permissions = PermissionSet.initEmpty();
     var saw_permission = false;
     while (parts.next()) |token| {
-        if (std.mem.eql(u8, token, "add")) {
+        if (std.mem.eql(u8, token, "read")) {
+            // v0.4.0 simplification: `read` is now a superset of
+            // `list`. The asymmetry it replaced was confusing —
+            // `allow X read` without `list` meant "can download
+            // known names but can't `ls`," which is a
+            // security-through-obscurity-coded pattern that real
+            // partner workflows almost never want. So the
+            // recommended `read` verb now grants both
+            // SSH_FXP_OPEN(read)/STAT/LSTAT AND OPENDIR/READDIR
+            // — what most operators meant when they wrote `read`
+            // anyway. The narrower `list` verb still exists
+            // (advanced/legacy use case: enumeration without
+            // download) but is no longer needed in everyday configs.
+            permissions.insert(.read);
+            permissions.insert(.list);
+        } else if (std.mem.eql(u8, token, "add")) {
             // `add` is a compound verb that grants every "create-or-modify-
             // by-name" operation: file upload, directory creation, and rename
             // of either kind. Symmetric with `remove` (which already covers
-            // both file unlink AND rmdir via policy.permissionFor). So the
-            // four-verb model `(read | list | add | remove)` covers every
-            // SFTP wire op a partner can perform — fewer knobs, less room
-            // for "I forgot to grant rename" surprises. The granular
-            // verbs (`write`, `mkdir`, `rename`) remain valid for operators
-            // who genuinely need that distinction (e.g. an immutable-receive
-            // workflow that allows uploads but no renames).
+            // both file unlink AND rmdir via policy.permissionFor). The
+            // granular verbs (`write`, `mkdir`, `rename`) remain valid for
+            // operators who genuinely need that distinction (e.g. an
+            // immutable-receive workflow that allows uploads but no renames).
             permissions.insert(.write);
             permissions.insert(.mkdir);
             permissions.insert(.rename);
+        } else if (std.mem.eql(u8, token, "full")) {
+            // `full` = read + add + remove. The everyday three-verb
+            // pattern (`read | add | remove`) collapses to a single
+            // word for operators who want partners to have complete
+            // access to a directory subtree. Equivalent to writing
+            // out all six granular verbs but reads as a single
+            // intent. NOT a default — operators must opt in
+            // explicitly per path; the deny-by-default floor is
+            // unchanged.
+            permissions.insert(.read);
+            permissions.insert(.list);
+            permissions.insert(.write);
+            permissions.insert(.mkdir);
+            permissions.insert(.rename);
+            permissions.insert(.remove);
         } else {
             permissions.insert(parsePermission(token) orelse return error.InvalidPermission);
         }
@@ -892,6 +919,90 @@ test "parse: 'add' verb expands to write+mkdir+rename" {
     // add | remove` ⇒ {read, list, write, mkdir, rename, remove}. If
     // someone "simplifies" the parser to alias add↔write only, this
     // test catches it (mkdir + rename would go missing).
+    try std.testing.expect(rule.permissions.contains(.read));
+    try std.testing.expect(rule.permissions.contains(.list));
+    try std.testing.expect(rule.permissions.contains(.write));
+    try std.testing.expect(rule.permissions.contains(.mkdir));
+    try std.testing.expect(rule.permissions.contains(.rename));
+    try std.testing.expect(rule.permissions.contains(.remove));
+}
+
+test "parse: 'read' is now a superset of 'list' (v0.4.0)" {
+    // `read` should grant both `.read` (open-for-read, stat) AND
+    // `.list` (readdir). This closes the v0.3.x asymmetry where
+    // `allow X read` would let a partner `get` known filenames but
+    // refuse `ls`. If a future refactor forgets the `.list` insert,
+    // this test catches it.
+    const text =
+        \\server
+        \\  listen 127.0.0.1:2222
+        \\  host-key /tmp/zift_host_ed25519
+        \\  log stderr
+        \\
+        \\user alice
+        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  root /tmp/zift/alice
+        \\  allow /pending read
+        \\
+    ;
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    const alice = cfg.findUser("alice").?;
+    const rule = alice.rules[0];
+    try std.testing.expect(rule.permissions.contains(.read));
+    try std.testing.expect(rule.permissions.contains(.list));
+    // But `read` should NOT silently grant any mutation.
+    try std.testing.expect(!rule.permissions.contains(.write));
+    try std.testing.expect(!rule.permissions.contains(.mkdir));
+    try std.testing.expect(!rule.permissions.contains(.rename));
+    try std.testing.expect(!rule.permissions.contains(.remove));
+}
+
+test "parse: bare 'list' keeps its narrow v0.3.x meaning" {
+    // `list` alone grants only `.list` — no `.read`, no download.
+    // This preserves the rare but valid "see filenames but can't
+    // download" workflow (e.g. tokenized-name delivery) and
+    // ensures pre-v0.4.0 configs that wrote `allow X list`
+    // intending "metadata only" don't silently gain download
+    // capability after the upgrade.
+    const text =
+        \\server
+        \\  listen 127.0.0.1:2222
+        \\  host-key /tmp/zift_host_ed25519
+        \\  log stderr
+        \\
+        \\user alice
+        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  root /tmp/zift/alice
+        \\  allow /pending list
+        \\
+    ;
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    const alice = cfg.findUser("alice").?;
+    const rule = alice.rules[0];
+    try std.testing.expect(rule.permissions.contains(.list));
+    try std.testing.expect(!rule.permissions.contains(.read));
+}
+
+test "parse: 'full' grants every permission" {
+    const text =
+        \\server
+        \\  listen 127.0.0.1:2222
+        \\  host-key /tmp/zift_host_ed25519
+        \\  log stderr
+        \\
+        \\user alice
+        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  root /tmp/zift/alice
+        \\  allow /workspace full
+        \\
+    ;
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    const alice = cfg.findUser("alice").?;
+    const rule = alice.rules[0];
+    // All six granular permissions should be set.
     try std.testing.expect(rule.permissions.contains(.read));
     try std.testing.expect(rule.permissions.contains(.list));
     try std.testing.expect(rule.permissions.contains(.write));

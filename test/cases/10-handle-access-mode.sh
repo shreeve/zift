@@ -31,7 +31,12 @@ server
 user drop
   password $hash
   root $TEST_TMP/jail
-  allow /inbox write list
+  # write+remove: write enables OPEN(write); remove satisfies the
+  # v0.4.0 clobber rule (any OPEN(write) on an existing file
+  # requires `remove` permission). The test's purpose is to verify
+  # handle-mode authorization, not the clobber rule — so we grant
+  # both verbs explicitly to isolate what we're testing.
+  allow /inbox write list remove
 EOF
 
 start_zift
