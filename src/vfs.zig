@@ -30,6 +30,28 @@ pub const Vfs = struct {
         self.* = undefined;
     }
 
+    /// Open (creating if needed) the partner-root's staging directory
+    /// `<root>/.zift-staging/`. v0.5.0+ uses this for atomic-upload
+    /// staging — every OPEN(write+CREAT) on a non-existent target
+    /// goes to a randomly-named staging file here, then atomically
+    /// renames to the real target at CLOSE. The directory name is
+    /// reserved by `normalizeVirtualPath` so partners can never
+    /// reach staging files via the SFTP wire surface.
+    ///
+    /// Caller owns the returned `Dir` and must close it.
+    pub fn openStagingDir(self: Vfs, io: std.Io) !std.Io.Dir {
+        var root = try std.Io.Dir.openDirAbsolute(io, self.root, .{});
+        defer root.close(io);
+        // makeDir is idempotent-by-pattern: on first session it
+        // creates the dir; on subsequent ones it returns
+        // PathAlreadyExists which we swallow.
+        root.createDir(io, staging_dir_name, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        return try root.openDir(io, staging_dir_name, .{ .iterate = true });
+    }
+
     pub fn resolveExisting(
         self: Vfs,
         io: std.Io,
@@ -214,6 +236,13 @@ pub const ParentResolution = struct {
     }
 };
 
+/// Reserved directory name (top-level under each partner's root)
+/// that zift uses for staging atomic uploads (v0.5.0+). The wire-
+/// surface validator rejects any virtual path containing this segment
+/// so partners cannot reach staging files via the SFTP protocol —
+/// belt-and-suspenders alongside the listing renderer's filter.
+pub const staging_dir_name: []const u8 = ".zift-staging";
+
 fn normalizeVirtualPath(allocator: std.mem.Allocator, virtual_path: []const u8) Error![]u8 {
     // PLAN §7.6 max length, §8.3 byte-set restrictions.
     if (virtual_path.len > max_virtual_path_bytes) return error.PathTooLong;
@@ -237,6 +266,15 @@ fn normalizeVirtualPath(allocator: std.mem.Allocator, virtual_path: []const u8) 
             _ = parts.pop();
             continue;
         }
+        // v0.5.0: reserve `.zift-staging` as a path component name
+        // ANYWHERE in the virtual path. This is the directory zift
+        // uses for atomic-upload staging files, which partners must
+        // never reach through the SFTP wire surface — neither to
+        // read other partners' in-flight uploads, nor to plant
+        // entries that the rename-from-staging step would later
+        // pick up. Rejecting here, before any policy or filesystem
+        // resolution, is the cheapest correct check.
+        if (std.mem.eql(u8, part, staging_dir_name)) return error.InvalidPath;
         try parts.append(allocator, part);
     }
 
@@ -291,6 +329,30 @@ test "normalize rejects nul byte" {
         error.InvalidPath,
         Vfs.normalizeVirtual(std.testing.allocator, "/pending/a\x00b"),
     );
+}
+
+test "normalize rejects /.zift-staging anywhere in path (v0.5.0)" {
+    // Top-level: never reachable.
+    try std.testing.expectError(
+        error.InvalidPath,
+        Vfs.normalizeVirtual(std.testing.allocator, "/.zift-staging"),
+    );
+    // Any descent into the staging dir.
+    try std.testing.expectError(
+        error.InvalidPath,
+        Vfs.normalizeVirtual(std.testing.allocator, "/.zift-staging/abc123"),
+    );
+    // Even if it appears mid-path (e.g. operator misconfigured a
+    // partner root that contains a `.zift-staging` subdir for some
+    // unrelated reason).
+    try std.testing.expectError(
+        error.InvalidPath,
+        Vfs.normalizeVirtual(std.testing.allocator, "/pending/.zift-staging/something"),
+    );
+    // Non-staging dotfiles are fine.
+    const ok = try Vfs.normalizeVirtual(std.testing.allocator, "/pending/.cache/foo");
+    defer std.testing.allocator.free(ok);
+    try std.testing.expectEqualStrings("/pending/.cache/foo", ok);
 }
 
 test "resolve blocks symlink escape" {

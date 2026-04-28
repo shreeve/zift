@@ -170,11 +170,50 @@ allow /          read
 
 # Mutable workspace (full r/w/d).
 allow /workspace full
-
-# Atomic upload (the SFTP-classic temp+rename idiom).
-allow /          read
-allow /staging   add        # tmp file + rename; clobber prevents overwriting
 ```
+
+### Atomic uploads (v0.5.0+)
+
+Zift uploads new files through a server-side staging area before
+publishing them at their target path. Partners do `OPEN(write+CREAT,
+/pending/report.csv)` and zift writes to a randomly-named file under
+`/.zift-staging/` instead. Only when the partner sends `CLOSE` does
+zift atomically rename the staging file to the real target.
+
+This means an operator's processor watching `/pending` never sees a
+half-uploaded file. Partial bytes only ever exist at the staging
+path (which is hidden from partners' listings AND rejected by the
+SFTP path-validator). When `report.csv` appears at the partner-
+visible path, it's complete.
+
+Effects worth knowing:
+
+- **The classic `temp + rename` idiom is still safe but no longer
+  necessary.** Partners can upload directly with the final filename.
+  The atomicity is automatic.
+- **Disconnect during upload = clean state.** If the partner's
+  connection drops mid-upload, the staging file is unlinked when
+  the session tears down. The target was never published.
+- **Clobber checked at CLOSE.** If another session created the
+  target between this session's OPEN and CLOSE, the publish step
+  re-runs the clobber rule. Without `remove` permission on the
+  destination, the upload is refused and the racer's content
+  survives.
+- **Staging files cost the same disk space as the target.** A 1 GB
+  upload occupies ~1 GB in `.zift-staging/` until CLOSE renames
+  it, then 0 in staging and 1 GB at the target.
+- **Write-on-existing-files bypasses staging.** If the target
+  already exists at OPEN time, the v0.4.0 clobber rule kicks in:
+  either the partner has `remove` (direct write to existing
+  inode, no staging) or the OPEN is denied. Staging only applies
+  to creating-new-file workflows.
+
+The staging directory `<root>/.zift-staging/` is created lazily on
+first upload. Operators don't need to provision it. Cross-restart
+orphans (rare; only happen if zift crashes mid-upload) can be
+swept with `rm -f /srv/sftp/<partner>/.zift-staging/*` between
+zift restarts; this is safe because partners can't reach that path
+even if they wanted to.
 
 ### Permission verbs
 

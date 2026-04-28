@@ -1028,6 +1028,22 @@ const Handle = struct {
     /// SFTP v3 semantics; SSH_FXF_APPEND is the standard "all writes
     /// go to the end" mode (rsync-over-sftp uses this).
     is_append: bool = false,
+    /// v0.5.0 staging-rename: when this handle was opened with
+    /// CREAT against a non-existent target, the actual fd points at
+    /// `<root>/.zift-staging/<staging_basename>` instead of the
+    /// target path. At CLOSE we atomically rename the staging file
+    /// to `staging_target_vpath`. Until that rename succeeds, the
+    /// target path doesn't exist on the operator-visible filesystem
+    /// — so an operator-side processor never sees a partial file.
+    /// Both fields are heap-allocated in `addStagedHandle` and
+    /// freed in `closeHandle`.
+    staging_target_vpath: ?[]const u8 = null,
+    staging_basename: ?[]const u8 = null,
+    /// Set when OPEN included `SSH_FXF_EXCL`. Honored at CLOSE
+    /// time for staged handles: if the target appeared during the
+    /// upload (race with another partner / operator), reply EEXIST
+    /// instead of overwriting.
+    staging_excl: bool = false,
 };
 
 const SftpState = struct {
@@ -1071,12 +1087,29 @@ const SftpState = struct {
     /// `reality` shows the real uid/gid/mode for operators who
     /// want the on-disk view.
     listing_mode: config.ListingMode = .virtual,
+    /// v0.5.0 staging-rename: open Dir fd to `<root>/.zift-staging/`,
+    /// shared across all handles in this session. Lazily opened the
+    /// first time a partner does an OPEN(write+CREAT) on a
+    /// non-existent target — most sessions never need it, so we
+    /// don't pay the mkdir+open syscalls until the partner's
+    /// workflow actually requires staging.
+    staging_dir: ?std.Io.Dir = null,
 
     fn deinit(self: *SftpState) void {
+        // closeHandle handles per-handle cleanup, including
+        // unlinking any staging file whose CLOSE never ran (partner
+        // disconnected mid-upload, or session ended via SIGTERM
+        // before the partner sent SSH_FXP_CLOSE). The staging dir
+        // itself stays around — if other concurrent sessions for
+        // this partner are still running, they'd be using it.
+        // Process-wide startup sweep handles cross-restart orphans;
+        // we don't try to gc the dir at session end.
         for (self.handles.items) |*handle| {
             self.closeHandle(handle);
         }
         self.handles.deinit(self.allocator);
+        if (self.staging_dir) |*dir| dir.close(self.io);
+        self.staging_dir = null;
     }
 
     /// Emit the canonical `session.ended` audit line with operator-
@@ -1364,6 +1397,18 @@ const SftpState = struct {
                 break;
             };
 
+            // v0.5.0: hide the staging directory from listings. Every
+            // partner root has `<root>/.zift-staging/` (created lazily
+            // on first upload). The path-validator already rejects
+            // any virtual path containing this segment, so a partner
+            // can't OPEN/REMOVE/STAT the staging dir or its contents.
+            // But READDIR walks the real filesystem and would surface
+            // the entry as "exists with no permissions" — leaking
+            // the implementation detail and cluttering listings.
+            // Skip it here, before the stat call, so it never reaches
+            // the partner's view at all.
+            if (std.mem.eql(u8, entry.name, vfs_mod.staging_dir_name)) continue;
+
             // `fstatat(dir_fd, name, AT_SYMLINK_NOFOLLOW)`. Stays inside
             // the path-jail because `dir_fd` was opened through the
             // verified-parent path and we never leave it. A symlink at
@@ -1546,27 +1591,60 @@ const SftpState = struct {
                 if (!want_creat or !want_write) {
                     return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
                 }
-                // Race-free create at the verified parent. `exclusive=true`
-                // ensures we don't blindly clobber a file (or symlink) that
-                // appeared between our no-follow probe and this createFile.
-                // Truncation is deferred until after verifyFile so a
-                // hypothetical kernel quirk that defeated O_NOFOLLOW in the
-                // probe still can't truncate an outside-jail target.
-                const created = parent.parent.createFile(self.io, parent.base, .{
+                // v0.5.0 atomic-upload: create-on-non-existent goes
+                // through a staging file in `<root>/.zift-staging/`,
+                // not the target path. The fd we hand back to the
+                // partner is the staging file's; partner's WRITE
+                // requests land there. At CLOSE time, we atomically
+                // rename staging → target. The operator's view of
+                // the partner directory never shows a partial file:
+                // either the target is absent (upload in progress)
+                // or it is fully present (CLOSE succeeded).
+                //
+                // Failure modes are bounded: if the partner
+                // disconnects mid-upload, `closeHandle`'s orphan-
+                // cleanup unlinks the staging file. If the rename
+                // at CLOSE fails for any reason, the staging file
+                // is also unlinked — no half-states leak.
+                var staging = self.ensureStagingDir() catch {
+                    defer self.auditFailed(op_label, path.value, "staging dir unavailable");
+                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                };
+
+                var staging_name_buf: [32]u8 = undefined;
+                generateStagingName(&staging_name_buf);
+                const staging_name = staging_name_buf[0..];
+
+                const created = staging.createFile(self.io, staging_name, .{
                     .read = want_read,
                     .truncate = false,
                     .exclusive = true,
                 }) catch {
-                    defer self.auditFailed(op_label, path.value, "create failed");
+                    defer self.auditFailed(op_label, path.value, "staging create failed");
                     return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
-                self.vfs.verifyFile(self.io, created) catch {
-                    created.close(self.io);
-                    defer self.auditDenied(op_label, path.value);
-                    return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+
+                // Truncate request is moot here (we just created an
+                // empty file). EXCL is honored at CLOSE-time via
+                // the existence re-check.
+                const id = self.addStagedHandle(
+                    created,
+                    path.value,
+                    staging_name,
+                    want_read,
+                    want_write,
+                    want_append,
+                    want_excl,
+                ) catch |alloc_err| {
+                    // addStagedHandle failed (OOM in dupe). The
+                    // errdefer inside it closes `created`, but we
+                    // also need to unlink the file we created in
+                    // staging — otherwise it'd be an orphan.
+                    staging.deleteFile(self.io, staging_name) catch {};
+                    defer self.auditFailed(op_label, path.value, @errorName(alloc_err));
+                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
-                const id = try self.addFileHandle(created, want_read, want_write, want_append);
-                defer self.auditOk(op_label, path.value, "");
+                defer self.auditOk(op_label, path.value, "staged");
                 return replyHandle(self.channel, request_id, id);
             },
             error.SymLinkLoop => {
@@ -1705,19 +1783,117 @@ const SftpState = struct {
         // when we find it. swapRemove keeps the array dense — closed
         // handles free their slot, so a long-running session that
         // opens-and-closes 10000 files still uses bounded memory and
-        // can keep opening up to the per-session cap. v0.1.x marked
-        // closed slots `id=0, kind=.file` and left them in the array,
-        // which broke the new handle cap (every closed slot still
-        // counted toward `handles.items.len`).
+        // can keep opening up to the per-session cap.
         var i: usize = 0;
         while (i < self.handles.items.len) : (i += 1) {
             if (self.handles.items[i].id == id) {
-                self.closeHandle(&self.handles.items[i]);
+                const handle = &self.handles.items[i];
+
+                // v0.5.0 staging-rename: if this is a staged handle,
+                // CLOSE means "publish the upload" — atomically
+                // rename the staging file to its real target.
+                // We must do this BEFORE closeHandle (which would
+                // unlink the staging file as orphan cleanup if the
+                // staging_basename is still set).
+                if (handle.staging_basename != null and handle.staging_target_vpath != null) {
+                    const close_status = self.publishStagedHandle(handle) catch |err| {
+                        // Publish failed. closeHandle will then
+                        // unlink the staging file (since
+                        // staging_basename is still set). The
+                        // partner gets a FAILURE reply but the
+                        // session continues.
+                        self.closeHandle(handle);
+                        _ = self.handles.swapRemove(i);
+                        self.auditFailed("close", handle.staging_target_vpath orelse "", @errorName(err));
+                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "close failed");
+                    };
+                    // publishStagedHandle clears staging_basename
+                    // on success so closeHandle doesn't unlink the
+                    // (now-renamed) target.
+                    self.closeHandle(handle);
+                    _ = self.handles.swapRemove(i);
+                    return replyStatus(self.channel, request_id, close_status, "ok");
+                }
+
+                self.closeHandle(handle);
                 _ = self.handles.swapRemove(i);
                 return replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
             }
         }
         try replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+    }
+
+    /// Rename a staged file from `<root>/.zift-staging/<basename>`
+    /// to its target virtual path. Called from `handleClose`. On
+    /// success, clears `staging_basename` so the subsequent
+    /// `closeHandle` won't try to unlink the (now-renamed) file.
+    /// On any failure, leaves `staging_basename` intact so the
+    /// caller's cleanup unlinks the orphan.
+    fn publishStagedHandle(self: *SftpState, handle: *Handle) !c_int {
+        const target_vpath = handle.staging_target_vpath.?;
+        const staging_basename = handle.staging_basename.?;
+        const staging = self.staging_dir.?;
+
+        // Close the file fd FIRST. POSIX rename atomically replaces
+        // the target inode whether or not the source file is open,
+        // but closing first means the rename happens against a
+        // freshly-flushed file (no half-buffered state) and any
+        // delayed-write errors surface here, before the rename.
+        if (handle.file) |f| {
+            f.close(self.io);
+            handle.file = null;
+        }
+
+        // Re-resolve the target's parent (the destination dir may
+        // have been removed/created by another session during the
+        // upload). openVerifiedParent re-runs the path-jail dance,
+        // so even if the operator restructured the partner root
+        // mid-upload, the rename target is still inside the jail.
+        var to_parent = self.vfs.openVerifiedParent(self.io, self.allocator, target_vpath) catch |err| {
+            return err;
+        };
+        defer to_parent.deinit(self.io, self.allocator);
+
+        // Re-check the clobber rule at CLOSE time. The OPEN-time
+        // check fired only if the target existed THEN; in the
+        // gap between OPEN and CLOSE another session could have
+        // created the target. lstat the destination via the
+        // verified parent FD.
+        const dest_exists = blk: {
+            _ = listing.statAt(to_parent.parent.handle, to_parent.base) catch |err| switch (err) {
+                error.NotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+
+        if (dest_exists) {
+            if (handle.staging_excl) {
+                // EXCL was set at OPEN — fail if target appeared.
+                self.auditDenied("close", target_vpath);
+                return c.SSH_FX_FAILURE;
+            }
+            if (policy.check(self.user, .remove, target_vpath) == .deny) {
+                self.auditDenied("close", target_vpath);
+                return c.SSH_FX_PERMISSION_DENIED;
+            }
+        }
+
+        // The atomic publish step.
+        std.Io.Dir.rename(
+            staging,
+            staging_basename,
+            to_parent.parent,
+            to_parent.base,
+            self.io,
+        ) catch |err| return err;
+
+        // Rename succeeded — clear staging_basename so closeHandle
+        // doesn't unlink the file we just published.
+        self.allocator.free(staging_basename);
+        handle.staging_basename = null;
+
+        return c.SSH_FX_OK;
     }
 
     fn handleMkdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1932,6 +2108,88 @@ const SftpState = struct {
         return id;
     }
 
+    /// v0.5.0 staging-rename: register a write handle whose underlying
+    /// fd points at a randomly-named file in `<root>/.zift-staging/`,
+    /// not at the target path. The Handle remembers the target so
+    /// CLOSE can atomically rename staging → target. If the partner
+    /// disconnects before CLOSE, `closeHandle` will unlink the
+    /// staging file as orphan cleanup.
+    fn addStagedHandle(
+        self: *SftpState,
+        file: std.Io.File,
+        target_vpath: []const u8,
+        staging_basename: []const u8,
+        can_read: bool,
+        can_write: bool,
+        is_append: bool,
+        excl: bool,
+    ) !u32 {
+        var file_local = file;
+        errdefer file_local.close(self.io);
+
+        const target_owned = try self.allocator.dupe(u8, target_vpath);
+        errdefer self.allocator.free(target_owned);
+        const staging_owned = try self.allocator.dupe(u8, staging_basename);
+        errdefer self.allocator.free(staging_owned);
+
+        const id = self.nextHandleId();
+        try self.handles.append(self.allocator, .{
+            .id = id,
+            .kind = .file,
+            .file = file_local,
+            .can_read = can_read,
+            .can_write = can_write,
+            .is_append = is_append,
+            .staging_target_vpath = target_owned,
+            .staging_basename = staging_owned,
+            .staging_excl = excl,
+        });
+        return id;
+    }
+
+    /// Lazily open `<root>/.zift-staging/`, creating it if needed.
+    /// First call per-session pays the mkdir+open cost; subsequent
+    /// calls just return the cached handle. Sessions that never
+    /// stage anything (read-only partners, all uploads-to-existing-
+    /// files clobber paths) never create the dir at all.
+    fn ensureStagingDir(self: *SftpState) !std.Io.Dir {
+        if (self.staging_dir) |dir| return dir;
+        const dir = try self.vfs.openStagingDir(self.io);
+        self.staging_dir = dir;
+        return dir;
+    }
+
+    /// Generate a stage-unique filename: 32 hex chars from the OS's
+    /// CSPRNG. ~128 bits of entropy — collision probability is
+    /// dominated by birthday-bound across all concurrent staging
+    /// files for a given partner; with 2^64 possible names a partner
+    /// would need 2^32 in-flight uploads before collision was
+    /// meaningful, which is well past every other cap zift enforces
+    /// (max-handles-per-session = 256).
+    ///
+    /// Uses platform-native primitives directly because Zig 0.16
+    /// dropped the `std.crypto.random` shim:
+    ///   - Linux: `getrandom(2)` syscall.
+    ///   - macOS / *BSD: `arc4random_buf(3)` libc.
+    fn generateStagingName(out: *[32]u8) void {
+        var raw: [16]u8 = undefined;
+        if (@import("builtin").os.tag == .linux) {
+            // getrandom returns short reads only on signal; for our
+            // 16-byte ask it always either fills the buffer or
+            // we accept the (vanishingly unlikely) underfill — the
+            // result is still high-entropy enough that an attacker
+            // observing stage-name collisions has no useful signal.
+            _ = std.os.linux.getrandom(&raw, raw.len, 0);
+        } else {
+            std.c.arc4random_buf(&raw, raw.len);
+        }
+        const hex = "0123456789abcdef";
+        for (raw, 0..) |b, i| {
+            out[i * 2 + 0] = hex[(b >> 4) & 0xF];
+            out[i * 2 + 1] = hex[b & 0xF];
+        }
+    }
+
     fn nextHandleId(self: *SftpState) u32 {
         const id = self.next_handle;
         self.next_handle += 1;
@@ -1949,9 +2207,26 @@ const SftpState = struct {
         if (handle.dir) |dir| dir.close(self.io);
         if (handle.file) |file| file.close(self.io);
         if (handle.dir_vpath) |vp| self.allocator.free(vp);
+        // Staging cleanup: if a staged handle reaches closeHandle WITH
+        // staging_basename still set, it means CLOSE never ran the
+        // rename-to-target step (partner disconnected mid-upload,
+        // or the rename itself failed and we left the staging file
+        // for cleanup). Either way, unlink the staging file so it
+        // doesn't accumulate as an orphan. Best-effort — if the
+        // unlink fails (FS error, dir gone) there's nothing useful
+        // we can do besides leak the bytes.
+        if (handle.staging_basename) |sb| {
+            if (self.staging_dir) |*dir| {
+                dir.deleteFile(self.io, sb) catch {};
+            }
+            self.allocator.free(sb);
+        }
+        if (handle.staging_target_vpath) |tv| self.allocator.free(tv);
         handle.dir = null;
         handle.file = null;
         handle.dir_vpath = null;
+        handle.staging_basename = null;
+        handle.staging_target_vpath = null;
     }
 };
 
