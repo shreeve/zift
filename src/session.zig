@@ -1639,14 +1639,21 @@ const SftpState = struct {
                     .exclusive = true,
                     // Confidentiality: partial-upload bytes must
                     // not be readable by other local users on the
-                    // host. Default `createFile` mode is 0o666
-                    // masked by umask, which can land at 0o644 —
-                    // world-readable. Force 0o600 so only the
-                    // user zift runs as can see staging files
-                    // before the partner publishes them.
+                    // host. The `permissions` field is the requested
+                    // create mode but is masked by the process's
+                    // umask, so we ALSO `setPermissions` after open
+                    // to pin the actual on-disk mode at 0o600
+                    // regardless of umask.
                     .permissions = .fromMode(0o600),
                 }) catch {
                     defer self.auditFailed(op_label, path.value, "staging create failed");
+                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                };
+                created.setPermissions(self.io, .fromMode(0o600)) catch {
+                    var f = created;
+                    f.close(self.io);
+                    staging.deleteFile(self.io, staging_name) catch {};
+                    defer self.auditFailed(op_label, path.value, "staging chmod failed");
                     return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
 
@@ -1832,16 +1839,17 @@ const SftpState = struct {
                     // a sibling slot into this index). v0.5.0
                     // shipped this UAF; v0.5.1 fixes it. Buffer
                     // sized to the path validator's 4096-byte
-                    // ceiling — silent truncation here would
-                    // collide audit entries for two attacker-
-                    // controlled paths sharing a prefix, defeating
-                    // the audit log's evidentiary value.
+                    // ceiling. Hard-asserting `tv.len` is within
+                    // bounds (rather than silently truncating) so
+                    // a path-validator regression that let a longer
+                    // path through can't make two attacker-
+                    // controlled prefixes collide in the audit log.
                     var audit_target_buf: [4096]u8 = undefined;
                     const audit_target = blk: {
                         const tv = handle.staging_target_vpath.?;
-                        const n = @min(tv.len, audit_target_buf.len);
-                        @memcpy(audit_target_buf[0..n], tv[0..n]);
-                        break :blk audit_target_buf[0..n];
+                        std.debug.assert(tv.len <= audit_target_buf.len);
+                        @memcpy(audit_target_buf[0..tv.len], tv);
+                        break :blk audit_target_buf[0..tv.len];
                     };
 
                     const close_status = self.publishStagedHandle(handle) catch |err| {
@@ -1919,13 +1927,19 @@ const SftpState = struct {
         defer to_parent.deinit(self.io, self.allocator);
 
         // Re-check the clobber rule at CLOSE time. The OPEN-time
-        // check fired only if the target existed THEN; in the
-        // gap between OPEN and CLOSE another session could have
-        // created the target. Probe via faccessat (libc function
-        // call → opaque to the optimizer) — see `existsAtParent`
-        // below for the rationale on not using `listing.statAt`
-        // here.
-        const dest_exists = existsAtParent(to_parent.parent.handle, to_parent.base);
+        // check fired only if the target existed THEN; in the gap
+        // between OPEN and CLOSE another session could have created
+        // the target. lstat the destination via the verified parent
+        // FD using the AT_SYMLINK_NOFOLLOW path. A dangling symlink
+        // counts as "exists" — rename would replace the symlink
+        // entry, which is exactly the clobber we want to gate on.
+        const dest_exists = blk: {
+            _ = listing.statAt(to_parent.parent.handle, to_parent.base) catch |err| switch (err) {
+                error.NotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
 
         if (dest_exists) {
             if (handle.staging_excl) {
@@ -2263,7 +2277,16 @@ const SftpState = struct {
                     buf.len - filled,
                     0,
                 );
-                switch (std.posix.errno(rc)) {
+                // `std.os.linux.errno`, NOT `std.posix.errno` — see
+                // src/listing.zig statAt for the long-form rationale
+                // on why those two converters disagree on raw-syscall
+                // returns when libc is linked. Using the wrong one
+                // here would have masked every getrandom failure
+                // (EINTR, ENOSYS, etc.) as SUCCESS with rc=0, then
+                // eaten the rc==0 guard below as the only remaining
+                // signal. Same fix applied at every other raw-syscall
+                // site in zift.
+                switch (std.os.linux.errno(rc)) {
                     .SUCCESS => {
                         // Defense against a hypothetical
                         // SUCCESS+rc=0 return — would otherwise
@@ -2300,7 +2323,8 @@ const SftpState = struct {
         const linux = std.os.linux;
         const path: [*:0]const u8 = "/dev/urandom";
         const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
-        switch (std.posix.errno(fd_rc)) {
+        // `std.os.linux.errno` for raw-syscall returns; see statAt.
+        switch (linux.errno(fd_rc)) {
             .SUCCESS => {},
             else => return error.RandomFailed,
         }
@@ -2310,7 +2334,7 @@ const SftpState = struct {
         var filled: usize = 0;
         while (filled < buf.len) {
             const rc = linux.read(fd, buf.ptr + filled, buf.len - filled);
-            switch (std.posix.errno(rc)) {
+            switch (linux.errno(rc)) {
                 .SUCCESS => {
                     if (rc == 0) return error.RandomFailed;
                     filled += @intCast(rc);
@@ -2734,74 +2758,6 @@ const PacketWriter = struct {
         self.index += value.len;
     }
 };
-
-/// Existence check for a path component under a directory FD, used
-/// by `publishStagedHandle` for the CLOSE-time clobber re-check.
-/// Goes through `faccessat(2)` because:
-///
-///  - It's a real libc function call. The compiler must honor the
-///    calling convention and treat memory as fully clobbered. No
-///    UB-license to constant-propagate. The companion `listing.statAt`
-///    on Linux uses the inline-asm `statx` syscall, which Zig 0.16
-///    ReleaseSafe miscompiles (the asm declares `:.{ .memory = true }`
-///    but the optimizer still propagates the pre-syscall init value
-///    of the destination buffer through to the field reads — every
-///    "missing file" lookup returns SUCCESS with zero/0xAA fields).
-///
-///  - We only need the boolean "does this path exist". `faccessat`
-///    answers exactly that, with no metadata to corrupt.
-///
-///  - `AT_SYMLINK_NOFOLLOW` semantics are preserved: a dangling
-///    symlink at the basename returns 0 (entry exists, even though
-///    the symlink target doesn't). This is the right answer for
-///    clobber: a symlink IS an existing entry that the rename would
-///    overwrite.
-///
-/// Implementation notes:
-///   - Linux's std.c.faccessat is intentionally `void` in Zig 0.16
-///     (Zig nudges Linux callers toward the syscall path). We
-///     declare the libc symbol ourselves; both glibc and musl
-///     export it from libc.
-///   - On macOS / *BSD, std.c.faccessat is a real wrapper.
-///   - Returns false on ENOENT, ENOTDIR (the parent isn't a dir
-///     anymore — same effective answer for clobber). Returns true
-///     on success or any other error (conservative: prefer false-
-///     positive existence over a false-negative that would let an
-///     attacker overwrite a file).
-fn existsAtParent(parent_fd: std.posix.fd_t, base: []const u8) bool {
-    if (base.len >= 256) return false;
-    var name_buf: [256]u8 = undefined;
-    @memcpy(name_buf[0..base.len], base);
-    name_buf[base.len] = 0;
-    const cname: [*:0]const u8 = @ptrCast(&name_buf);
-    const at_flags: c_int = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
-    const F_OK: c_int = 0;
-    const rc = libc_faccessat(parent_fd, cname, F_OK, at_flags);
-    if (rc == 0) return true;
-    return switch (std.posix.errno(rc)) {
-        .NOENT, .NOTDIR => false,
-        else => true,
-    };
-}
-
-const libc_faccessat = if (@import("builtin").os.tag == .linux)
-    @extern(*const fn (
-        dirfd: std.posix.fd_t,
-        path: [*:0]const u8,
-        mode: c_int,
-        flags: c_int,
-    ) callconv(.c) c_int, .{ .name = "faccessat" })
-else
-    struct {
-        fn shim(
-            dirfd: std.posix.fd_t,
-            path: [*:0]const u8,
-            mode: c_int,
-            flags: c_int,
-        ) c_int {
-            return std.c.faccessat(dirfd, path, @intCast(mode), @intCast(flags));
-        }
-    }.shim;
 
 fn readU32(bytes: []const u8) u32 {
     return (@as(u32, bytes[0]) << 24) |

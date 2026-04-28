@@ -65,9 +65,12 @@ pub const Vfs = struct {
     ///    this hardening on upgrade should
     ///    `rm -f <root>/.zift-staging` to clear the bad entry.
     ///
-    ///  - Created with mode `0o700`. Partial uploads are confidential
-    ///    until the partner sends CLOSE — letting other local users
-    ///    on the host browse them defeats half the value of staging.
+    ///  - Created with mode `0o700`, then `fchmod`'d to pin the bits
+    ///    against umask. `createDir` honors the partner's umask
+    ///    (a `022` umask leaves the dir at `0o755`, world-listable).
+    ///    Pinning is necessary because partial-upload bytes must
+    ///    not be browsable by other local users — and because test
+    ///    35 stat-asserts the exact mode bits.
     ///    Pre-existing directories are intentionally NOT chmodded
     ///    (won't silently change operator-customized state) but ARE
     ///    rejected if they grant any group or other access bits
@@ -91,9 +94,12 @@ pub const Vfs = struct {
         const private_dir = std.Io.File.Permissions.fromMode(0o700);
         const create_status = root.createDir(io, staging_dir_name, private_dir);
         if (create_status) |_| {
-            // We just created it with 0o700. Open and return —
-            // definitively a real directory at this moment.
-            return try root.openDir(io, staging_dir_name, .{ .iterate = true });
+            // We just created it. Open, fchmod to pin the mode
+            // against umask, and return.
+            var dir = try root.openDir(io, staging_dir_name, .{ .iterate = true });
+            errdefer dir.close(io);
+            try dir.setPermissions(io, private_dir);
+            return dir;
         } else |err| switch (err) {
             error.PathAlreadyExists => {
                 // Pre-existing entry. lstat it: must be a real
