@@ -1939,7 +1939,10 @@ const SftpState = struct {
         if (stat_says_exists != access_exists) {
             std.debug.print("[v053] !!! DISAGREEMENT: statAt={} access={}\n", .{ stat_says_exists, access_exists });
         }
-        const dest_exists = access_exists;
+        // Use the BUGGY path so we reproduce the v0.4.0+ symptom on
+        // CI and the artifact upload-on-failure step archives the
+        // diagnostic prints from above.
+        const dest_exists = stat_says_exists;
 
         if (dest_exists) {
             if (handle.staging_excl) {
