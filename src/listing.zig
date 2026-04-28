@@ -117,19 +117,15 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
             .NOENT, .NOTDIR => return error.NotFound,
             else => return error.Unexpected,
         }
-        // Memory-clobber barrier: empty asm that declares the
-        // statx buffer as a memory input and clobbers all memory.
-        // This is the C "compiler barrier" idiom; required because
-        // std.os.linux.statx's asm doesn't declare sx as an output
-        // operand, so the optimizer (Zig 0.16 ReleaseSafe) constant-
-        // propagates the pre-syscall value of sx (zero or 0xAA fill)
-        // through to the reads below. The barrier forces the compiler
-        // to materialize sx in memory before this point and re-load
-        // every field after.
-        asm volatile (""
-            :
-            : [_] "m" (sx),
-            : .{ .memory = true });
+        // Compiler barrier: forces the optimizer to consider every
+        // byte of `sx` as potentially written by something it can't
+        // see (the kernel did, via the asm syscall — but Zig 0.16
+        // ReleaseSafe doesn't deduce that on its own). Without this,
+        // sx.mode et al. get constant-propagated to their pre-syscall
+        // values (zero from std.mem.zeroes, or 0xAA from undefined),
+        // and v0.5.0's CLOSE-time clobber check sees `dest_exists =
+        // true` for every fresh upload.
+        std.mem.doNotOptimizeAway(&sx);
         return EntryInfo{
             .mode = sx.mode,
             .nlink = sx.nlink,
@@ -191,11 +187,8 @@ pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
             .BADF, .NOENT => return error.NotFound,
             else => return error.Unexpected,
         }
-        // See `statAt` for the rationale on this asm barrier.
-        asm volatile (""
-            :
-            : [_] "m" (sx),
-            : .{ .memory = true });
+        // See `statAt` for the rationale.
+        std.mem.doNotOptimizeAway(&sx);
         return EntryInfo{
             .mode = sx.mode,
             .nlink = sx.nlink,

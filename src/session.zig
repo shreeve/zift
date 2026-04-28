@@ -1921,15 +1921,11 @@ const SftpState = struct {
         // Re-check the clobber rule at CLOSE time. The OPEN-time
         // check fired only if the target existed THEN; in the
         // gap between OPEN and CLOSE another session could have
-        // created the target. lstat the destination via the
-        // verified parent FD.
-        const dest_exists = blk: {
-            _ = listing.statAt(to_parent.parent.handle, to_parent.base) catch |err| switch (err) {
-                error.NotFound => break :blk false,
-                else => return err,
-            };
-            break :blk true;
-        };
+        // created the target. Probe via faccessat (libc function
+        // call → opaque to the optimizer) — see `existsAtParent`
+        // below for the rationale on not using `listing.statAt`
+        // here.
+        const dest_exists = existsAtParent(to_parent.parent.handle, to_parent.base);
 
         if (dest_exists) {
             if (handle.staging_excl) {
@@ -2738,6 +2734,74 @@ const PacketWriter = struct {
         self.index += value.len;
     }
 };
+
+/// Existence check for a path component under a directory FD, used
+/// by `publishStagedHandle` for the CLOSE-time clobber re-check.
+/// Goes through `faccessat(2)` because:
+///
+///  - It's a real libc function call. The compiler must honor the
+///    calling convention and treat memory as fully clobbered. No
+///    UB-license to constant-propagate. The companion `listing.statAt`
+///    on Linux uses the inline-asm `statx` syscall, which Zig 0.16
+///    ReleaseSafe miscompiles (the asm declares `:.{ .memory = true }`
+///    but the optimizer still propagates the pre-syscall init value
+///    of the destination buffer through to the field reads — every
+///    "missing file" lookup returns SUCCESS with zero/0xAA fields).
+///
+///  - We only need the boolean "does this path exist". `faccessat`
+///    answers exactly that, with no metadata to corrupt.
+///
+///  - `AT_SYMLINK_NOFOLLOW` semantics are preserved: a dangling
+///    symlink at the basename returns 0 (entry exists, even though
+///    the symlink target doesn't). This is the right answer for
+///    clobber: a symlink IS an existing entry that the rename would
+///    overwrite.
+///
+/// Implementation notes:
+///   - Linux's std.c.faccessat is intentionally `void` in Zig 0.16
+///     (Zig nudges Linux callers toward the syscall path). We
+///     declare the libc symbol ourselves; both glibc and musl
+///     export it from libc.
+///   - On macOS / *BSD, std.c.faccessat is a real wrapper.
+///   - Returns false on ENOENT, ENOTDIR (the parent isn't a dir
+///     anymore — same effective answer for clobber). Returns true
+///     on success or any other error (conservative: prefer false-
+///     positive existence over a false-negative that would let an
+///     attacker overwrite a file).
+fn existsAtParent(parent_fd: std.posix.fd_t, base: []const u8) bool {
+    if (base.len >= 256) return false;
+    var name_buf: [256]u8 = undefined;
+    @memcpy(name_buf[0..base.len], base);
+    name_buf[base.len] = 0;
+    const cname: [*:0]const u8 = @ptrCast(&name_buf);
+    const at_flags: c_int = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
+    const F_OK: c_int = 0;
+    const rc = libc_faccessat(parent_fd, cname, F_OK, at_flags);
+    if (rc == 0) return true;
+    return switch (std.posix.errno(rc)) {
+        .NOENT, .NOTDIR => false,
+        else => true,
+    };
+}
+
+const libc_faccessat = if (@import("builtin").os.tag == .linux)
+    @extern(*const fn (
+        dirfd: std.posix.fd_t,
+        path: [*:0]const u8,
+        mode: c_int,
+        flags: c_int,
+    ) callconv(.c) c_int, .{ .name = "faccessat" })
+else
+    struct {
+        fn shim(
+            dirfd: std.posix.fd_t,
+            path: [*:0]const u8,
+            mode: c_int,
+            flags: c_int,
+        ) c_int {
+            return std.c.faccessat(dirfd, path, @intCast(mode), @intCast(flags));
+        }
+    }.shim;
 
 fn readU32(bytes: []const u8) u32 {
     return (@as(u32, bytes[0]) << 24) |
