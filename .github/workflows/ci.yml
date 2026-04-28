@@ -191,6 +191,14 @@ jobs:
           export PATH="$PWD/bin:$PATH"
           bash test/run.sh
 
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs
+          path: test/tmp/
+          if-no-files-found: ignore
+
   fuzz-short:
     name: Short fuzz run
     runs-on: ubuntu-latest
