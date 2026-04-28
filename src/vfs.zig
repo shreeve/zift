@@ -7,6 +7,19 @@ pub const Error = error{
     OutOfMemory,
     PathTooLong,
     PathTraversal,
+    /// `.zift-staging` exists at a partner root but is not a
+    /// real directory (could be a symlink, file, FIFO, etc.).
+    /// Operators must `rm -f <root>/.zift-staging` to clear and
+    /// let zift create the real directory on next session.
+    StagingDirCorrupt,
+    /// `.zift-staging` is a real directory but has group or
+    /// other access bits set. Loose perms let local users
+    /// observe in-flight upload names and (if writable) tamper
+    /// with staging files between zift's rename-by-path and
+    /// the kernel rename syscall. Operators must `chmod 0700
+    /// <root>/.zift-staging` (or delete it and let zift
+    /// recreate at 0700) before uploads will succeed.
+    StagingDirUnsafe,
 } || std.Io.Dir.RealPathFileAllocError;
 
 /// PLAN §7.6: maximum virtual path length is 4096 bytes. Applies to
@@ -38,18 +51,64 @@ pub const Vfs = struct {
     /// reserved by `normalizeVirtualPath` so partners can never
     /// reach staging files via the SFTP wire surface.
     ///
+    /// **Hardening (v0.5.1)**:
+    ///
+    ///  - In v0.4.0 and earlier, `.zift-staging` was a legal partner-
+    ///    creatable name. A partner with `add` could have planted a
+    ///    SYMLINK with that name pointing OUTSIDE the jail before
+    ///    upgrading. Without verification, the upgraded server would
+    ///    happily follow that symlink and write upload bytes to the
+    ///    attacker-controlled location. We refuse to proceed if
+    ///    `.zift-staging` exists and is not a real directory: lstat
+    ///    via `statAt` (AT_SYMLINK_NOFOLLOW semantics), reject
+    ///    anything whose `S_IFMT` is not `S_IFDIR`. Operators hit by
+    ///    this hardening on upgrade should
+    ///    `rm -f <root>/.zift-staging` to clear the bad entry.
+    ///
+    ///  - Created with mode `0o700`. Partial uploads are confidential
+    ///    until the partner sends CLOSE — letting other local users
+    ///    on the host browse them defeats half the value of staging.
+    ///    Pre-existing directories are intentionally NOT chmodded
+    ///    (won't silently change operator-customized state) but ARE
+    ///    rejected if they grant any group or other access bits
+    ///    (`(mode & 0o077) != 0`). A loose-perms staging dir would
+    ///    let local users observe in-flight upload names AND, if
+    ///    group/other-writable, replace staging files between zift's
+    ///    rename-by-path and the kernel's rename syscall — turning a
+    ///    confidentiality issue into an integrity one. Operators who
+    ///    hit this on upgrade from a v0.5.0 install (which created
+    ///    the dir without an explicit mode) should:
+    ///
+    ///        chmod 0700 <root>/.zift-staging
+    ///
+    ///    or delete it and let zift recreate at `0o700`.
+    ///
     /// Caller owns the returned `Dir` and must close it.
     pub fn openStagingDir(self: Vfs, io: std.Io) !std.Io.Dir {
         var root = try std.Io.Dir.openDirAbsolute(io, self.root, .{});
         defer root.close(io);
-        // makeDir is idempotent-by-pattern: on first session it
-        // creates the dir; on subsequent ones it returns
-        // PathAlreadyExists which we swallow.
-        root.createDir(io, staging_dir_name, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
+
+        const private_dir = std.Io.File.Permissions.fromMode(0o700);
+        const create_status = root.createDir(io, staging_dir_name, private_dir);
+        if (create_status) |_| {
+            // We just created it with 0o700. Open and return —
+            // definitively a real directory at this moment.
+            return try root.openDir(io, staging_dir_name, .{ .iterate = true });
+        } else |err| switch (err) {
+            error.PathAlreadyExists => {
+                // Pre-existing entry. lstat it: must be a real
+                // directory (not a symlink, FIFO, etc.) AND must
+                // not grant group or other access. statAt has
+                // AT_SYMLINK_NOFOLLOW semantics so a symlink
+                // returns its OWN metadata, not the target's.
+                const info = try @import("listing.zig").statAt(root.handle, staging_dir_name);
+                const file_type = info.mode & 0o170000;
+                if (file_type != 0o040000) return error.StagingDirCorrupt;
+                if ((info.mode & 0o077) != 0) return error.StagingDirUnsafe;
+                return try root.openDir(io, staging_dir_name, .{ .iterate = true });
+            },
             else => return err,
-        };
-        return try root.openDir(io, staging_dir_name, .{ .iterate = true });
+        }
     }
 
     pub fn resolveExisting(

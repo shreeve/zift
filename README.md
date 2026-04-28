@@ -198,7 +198,11 @@ Effects worth knowing:
   target between this session's OPEN and CLOSE, the publish step
   re-runs the clobber rule. Without `remove` permission on the
   destination, the upload is refused and the racer's content
-  survives.
+  survives. Like the rename-over-existing guard, this has a small
+  stat-then-rename TOCTOU window: a target that appears between
+  zift's lstat and rename calls would still be overwritten. Closing
+  this race hermetically requires `renameat2(RENAME_NOREPLACE)` on
+  Linux / `renamex_np(RENAME_EXCL)` on macOS, tracked as P2.
 - **Staging files cost the same disk space as the target.** A 1 GB
   upload occupies ~1 GB in `.zift-staging/` until CLOSE renames
   it, then 0 in staging and 1 GB at the target.
@@ -208,14 +212,74 @@ Effects worth knowing:
   inode, no staging) or the OPEN is denied. Staging only applies
   to creating-new-file workflows.
 
-The staging directory `<root>/.zift-staging/` is created lazily on
-first upload. Operators don't need to provision it. Cross-restart
-orphans (rare; only happen if zift crashes mid-upload) can be
-swept with `rm -f /srv/sftp/<partner>/.zift-staging/*` between
-zift restarts; this is safe because partners can't reach that path
-even if they wanted to.
+#### Filesystem caveats
+
+Zift's staging directory lives at `<root>/.zift-staging/`, sibling
+to every partner-visible subdirectory. The atomic rename at CLOSE
+moves bytes from this single staging location to the actual target
+path, which means:
+
+- **Same-filesystem requirement.** If a partner-visible directory
+  (e.g. `/pending`) is a bind mount or separate filesystem from
+  the partner root, the rename fails with `EXDEV` and the upload
+  is refused at CLOSE. Keep partner roots on a single filesystem
+  per partner. (Cross-filesystem staging would require copy-then-
+  unlink, which loses atomicity — not a tradeoff zift makes.)
+- **Default ACLs and `setgid` directories don't transfer.** A
+  `setgid` group bit on `/pending`, or a default POSIX ACL on the
+  target parent, applies at file-create time — which under zift
+  staging happens in `.zift-staging/`, not the target parent. The
+  rename inherits the original create-time ownership and ACLs
+  unchanged. If your processor relies on group-inheritance via
+  `setgid` directories, set the equivalent default ACL on the
+  partner root itself, or apply group-fixup in your processor.
+
+#### Operator notes
+
+- **Staging directory is created lazily** on first upload.
+  Operators don't need to provision it.
+- **Cross-restart orphan sweep.** If zift itself crashes mid-
+  upload, staging files persist after restart. Zift does not
+  currently sweep them at startup (tracked as P3). Operators with
+  a hard zift crash can manually clear:
+
+      rm -f /srv/sftp/<partner>/.zift-staging/*
+
+  Always safe — partners can never reach that path via the SFTP
+  wire surface (the path-validator rejects any path containing
+  `.zift-staging`, regardless of operation).
+- **Confidentiality.** Fresh staging directories are created
+  `0o700` and staging files `0o600` — partial-upload bytes are
+  not readable by other local users on the host.
+- **v0.5.0 → v0.5.1 upgraders, read this:** in v0.4.0 and
+  earlier, `.zift-staging` was a legal partner-creatable name,
+  so a partner with `add` could have planted a SYMLINK with that
+  name pointing outside their jail. v0.5.0 created the directory
+  with the default mode (often `0o755`, world-listable). v0.5.1
+  rejects both shapes:
+    - Non-directory `<root>/.zift-staging` (symlink, regular file,
+      FIFO, etc.) → `error.StagingDirCorrupt`. Fix: `rm -f
+      <root>/.zift-staging` and zift recreates at `0o700`.
+    - Real directory but group/other-accessible (any of `0o077`
+      bits set) → `error.StagingDirUnsafe`. Fix: `chmod 0700
+      <root>/.zift-staging` (or `rm -rf` and recreate). The
+      strict mode requirement protects in-flight bytes from
+      local users AND prevents the rename-by-path syscall from
+      racing against an attacker who can mutate the staging
+      directory's contents.
 
 ### Permission verbs
+
+> **v0.3.x → v0.4.0 migration note.** In v0.3.x, `read` granted
+> stat + download only; you had to write `read list` to also allow
+> `ls`/readdir. Starting in v0.4.0, **bare `read` includes `list`**.
+> This affects existing configs: `allow /pending read` now permits
+> directory listing in addition to download. The narrow form `list`
+> still means "stat + readdir, no download" (so this is not a
+> download privilege expansion, but it is a discovery/enumeration
+> expansion). If your v0.3.x config relied on read-without-list
+> as a partial-information defense (rare), audit those rules and
+> swap to bare `list` where appropriate.
 
 Three primary verbs cover every SFTP wire op a partner can perform:
 

@@ -1102,8 +1102,16 @@ const SftpState = struct {
         // before the partner sent SSH_FXP_CLOSE). The staging dir
         // itself stays around — if other concurrent sessions for
         // this partner are still running, they'd be using it.
-        // Process-wide startup sweep handles cross-restart orphans;
-        // we don't try to gc the dir at session end.
+        //
+        // CROSS-RESTART ORPHANS: if zift itself crashes mid-upload,
+        // the staging files persist after restart. zift does NOT
+        // currently sweep them at startup (tracked as a P3 follow-
+        // up). Operators with a hard zift crash can manually clear:
+        //
+        //     rm -f <root>/.zift-staging/*
+        //
+        // Safe to do anytime — partners can never reach those paths
+        // via the SFTP wire surface (path-validator rejects them).
         for (self.handles.items) |*handle| {
             self.closeHandle(handle);
         }
@@ -1612,13 +1620,31 @@ const SftpState = struct {
                 };
 
                 var staging_name_buf: [32]u8 = undefined;
-                generateStagingName(&staging_name_buf);
+                generateStagingName(&staging_name_buf) catch {
+                    // Refusing to continue with a non-random staging
+                    // name is the safe choice — every other guarantee
+                    // (no collision, no predictable target paths) hangs
+                    // off this entropy. Vanishingly rare in practice
+                    // (only fires on Linux < 3.17 with /dev/urandom
+                    // also unavailable, or post-fork crypto state
+                    // damage) but the failure mode must not be silent.
+                    defer self.auditFailed(op_label, path.value, "no entropy for staging name");
+                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                };
                 const staging_name = staging_name_buf[0..];
 
                 const created = staging.createFile(self.io, staging_name, .{
                     .read = want_read,
                     .truncate = false,
                     .exclusive = true,
+                    // Confidentiality: partial-upload bytes must
+                    // not be readable by other local users on the
+                    // host. Default `createFile` mode is 0o666
+                    // masked by umask, which can land at 0o644 —
+                    // world-readable. Force 0o600 so only the
+                    // user zift runs as can see staging files
+                    // before the partner publishes them.
+                    .permissions = .fromMode(0o600),
                 }) catch {
                     defer self.auditFailed(op_label, path.value, "staging create failed");
                     return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
@@ -1796,6 +1822,28 @@ const SftpState = struct {
                 // unlink the staging file as orphan cleanup if the
                 // staging_basename is still set).
                 if (handle.staging_basename != null and handle.staging_target_vpath != null) {
+                    // CRITICAL: capture the target vpath into a
+                    // stack-local copy BEFORE closeHandle frees the
+                    // heap allocation, and BEFORE swapRemove moves
+                    // the slot. Otherwise the audit log path below
+                    // would dereference a stale pointer to either
+                    // freed memory (closeHandle freed the buffer)
+                    // or a different handle (swapRemove relocated
+                    // a sibling slot into this index). v0.5.0
+                    // shipped this UAF; v0.5.1 fixes it. Buffer
+                    // sized to the path validator's 4096-byte
+                    // ceiling — silent truncation here would
+                    // collide audit entries for two attacker-
+                    // controlled paths sharing a prefix, defeating
+                    // the audit log's evidentiary value.
+                    var audit_target_buf: [4096]u8 = undefined;
+                    const audit_target = blk: {
+                        const tv = handle.staging_target_vpath.?;
+                        const n = @min(tv.len, audit_target_buf.len);
+                        @memcpy(audit_target_buf[0..n], tv[0..n]);
+                        break :blk audit_target_buf[0..n];
+                    };
+
                     const close_status = self.publishStagedHandle(handle) catch |err| {
                         // Publish failed. closeHandle will then
                         // unlink the staging file (since
@@ -1804,15 +1852,31 @@ const SftpState = struct {
                         // session continues.
                         self.closeHandle(handle);
                         _ = self.handles.swapRemove(i);
-                        self.auditFailed("close", handle.staging_target_vpath orelse "", @errorName(err));
-                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "close failed");
+                        self.auditFailed("close", audit_target, @errorName(err));
+                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "publish failed");
                     };
                     // publishStagedHandle clears staging_basename
                     // on success so closeHandle doesn't unlink the
                     // (now-renamed) target.
                     self.closeHandle(handle);
                     _ = self.handles.swapRemove(i);
-                    return replyStatus(self.channel, request_id, close_status, "ok");
+
+                    // Map the wire-status to a human-readable reply
+                    // message so audit logs and partner errors agree
+                    // about WHY a close failed. v0.5.0 used the
+                    // literal "ok" for every status; that confused
+                    // operators reading audit lines for a denied or
+                    // failed publish.
+                    const reply_msg: []const u8 = switch (close_status) {
+                        c.SSH_FX_OK => "ok",
+                        c.SSH_FX_PERMISSION_DENIED => "publish denied: target appeared and partner lacks remove",
+                        c.SSH_FX_FAILURE => "publish failed: target appeared with EXCL set",
+                        else => "publish status",
+                    };
+                    if (close_status == c.SSH_FX_OK) {
+                        self.auditOk("publish", audit_target, "");
+                    }
+                    return replyStatus(self.channel, request_id, close_status, reply_msg);
                 }
 
                 self.closeHandle(handle);
@@ -2160,33 +2224,96 @@ const SftpState = struct {
     }
 
     /// Generate a stage-unique filename: 32 hex chars from the OS's
-    /// CSPRNG. ~128 bits of entropy — collision probability is
-    /// dominated by birthday-bound across all concurrent staging
-    /// files for a given partner; with 2^64 possible names a partner
-    /// would need 2^32 in-flight uploads before collision was
-    /// meaningful, which is well past every other cap zift enforces
-    /// (max-handles-per-session = 256).
+    /// CSPRNG. 16 random bytes = 2^128 namespace, so collision
+    /// probability across all concurrent staging files for a partner
+    /// is negligible: max-handles-per-session caps the in-flight
+    /// count at 256, and 256 random draws from a 2^128 space
+    /// collide with probability ~256² / 2 / 2^128 ≈ 2^-113.
     ///
-    /// Uses platform-native primitives directly because Zig 0.16
-    /// dropped the `std.crypto.random` shim:
-    ///   - Linux: `getrandom(2)` syscall.
-    ///   - macOS / *BSD: `arc4random_buf(3)` libc.
-    fn generateStagingName(out: *[32]u8) void {
+    /// Robustness contract (v0.5.1):
+    ///   - On any platform, this MUST either fill `raw` with high-
+    ///     entropy bytes or return an error. Never hex-encode
+    ///     undefined bytes — that would produce predictable
+    ///     filenames and break the staging-collision argument.
+    ///   - Linux: prefer `getrandom(2)` (kernel 3.17+); on older
+    ///     kernels (`ENOSYS`) fall back to reading `/dev/urandom`.
+    ///     Handle `EINTR` (signal during getrandom) by retrying.
+    ///   - macOS / *BSD: `arc4random_buf(3)` is documented to
+    ///     never fail, so a single call is sufficient.
+    fn generateStagingName(out: *[32]u8) !void {
         var raw: [16]u8 = undefined;
-        if (@import("builtin").os.tag == .linux) {
-            // getrandom returns short reads only on signal; for our
-            // 16-byte ask it always either fills the buffer or
-            // we accept the (vanishingly unlikely) underfill — the
-            // result is still high-entropy enough that an attacker
-            // observing stage-name collisions has no useful signal.
-            _ = std.os.linux.getrandom(&raw, raw.len, 0);
-        } else {
-            std.c.arc4random_buf(&raw, raw.len);
-        }
+        try fillRandomBytes(&raw);
         const hex = "0123456789abcdef";
         for (raw, 0..) |b, i| {
             out[i * 2 + 0] = hex[(b >> 4) & 0xF];
             out[i * 2 + 1] = hex[b & 0xF];
+        }
+    }
+
+    /// Block until `buf` is full of cryptographic-grade random bytes
+    /// or return `error.RandomFailed` if the OS can't provide them.
+    /// Used by staging-name generation; must NEVER return
+    /// silently-zeroed or partially-filled output.
+    fn fillRandomBytes(buf: []u8) !void {
+        if (@import("builtin").os.tag == .linux) {
+            // Loop until the buffer is full. `getrandom` short-reads
+            // only when interrupted by a signal; we retry on EINTR
+            // and fall back to /dev/urandom on ENOSYS (Linux < 3.17,
+            // e.g. very old embedded distros).
+            var filled: usize = 0;
+            while (filled < buf.len) {
+                const rc = std.os.linux.getrandom(
+                    buf.ptr + filled,
+                    buf.len - filled,
+                    0,
+                );
+                switch (std.posix.errno(rc)) {
+                    .SUCCESS => {
+                        // Defense against a hypothetical
+                        // SUCCESS+rc=0 return — would otherwise
+                        // spin forever. The kernel doesn't return
+                        // this today, but the loop guard is cheap.
+                        if (rc == 0) return error.RandomFailed;
+                        filled += @intCast(rc);
+                    },
+                    .INTR => continue,
+                    // ENOSYS happens on the first call, before any
+                    // bytes are filled; the slice we pass is
+                    // therefore always `buf` here, not `buf[filled..]`.
+                    // But forwarding the unfilled tail is correct
+                    // even if a future kernel quirk made this
+                    // mid-loop reachable.
+                    .NOSYS => return readFromUrandom(buf[filled..]),
+                    else => return error.RandomFailed,
+                }
+            }
+        } else {
+            // arc4random_buf is documented to never fail.
+            std.c.arc4random_buf(buf.ptr, buf.len);
+        }
+    }
+
+    /// Linux fallback when `getrandom(2)` is unavailable (kernel <
+    /// 3.17 — vanishingly rare in 2026 but worth handling correctly).
+    /// Read from `/dev/urandom` directly via posix syscalls (skip
+    /// the std.Io.File abstraction so we don't have to thread an `Io`
+    /// here). Once the entropy pool is seeded — which any running
+    /// userspace satisfies — `/dev/urandom` never blocks and
+    /// short-reads only on signal.
+    fn readFromUrandom(buf: []u8) !void {
+        const fd = std.posix.open("/dev/urandom", .{ .ACCMODE = .RDONLY }, 0) catch
+            return error.RandomFailed;
+        defer std.posix.close(fd);
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            const n = std.posix.read(fd, buf[filled..]) catch |err| switch (err) {
+                // Signal during read: retry; the read returned no
+                // bytes and the next iteration just retries.
+                error.WouldBlock, error.Interrupted => continue,
+                else => return error.RandomFailed,
+            };
+            if (n == 0) return error.RandomFailed;
+            filled += n;
         }
     }
 

@@ -63,6 +63,21 @@ assert not os.path.exists(target_path), \
     f"target should NOT exist mid-upload, but it does: {target_path}"
 print("ok: target absent from operator's view during upload")
 
+# v0.5.1 confidentiality: the in-flight staging file must NOT be
+# readable by other local users. createFile defaults to 0o666
+# masked by umask (typically 0o644 — world-readable); zift forces
+# 0o600. Likewise the staging directory must be 0o700.
+import stat
+staging_dir = "$TEST_TMP/data/.zift-staging"
+dir_mode = stat.S_IMODE(os.stat(staging_dir).st_mode)
+assert dir_mode == 0o700, f"staging dir mode should be 0o700, got 0o{dir_mode:o}"
+staging_files = os.listdir(staging_dir)
+assert len(staging_files) == 1, f"expected 1 staging file mid-upload, got {staging_files}"
+sf_path = os.path.join(staging_dir, staging_files[0])
+file_mode = stat.S_IMODE(os.stat(sf_path).st_mode)
+assert file_mode == 0o600, f"staging file mode should be 0o600, got 0o{file_mode:o}"
+print(f"ok: staging dir is 0o{dir_mode:o} and staging file is 0o{file_mode:o} mid-upload")
+
 # Write more, then CLOSE.
 f.write(b"Y" * 4096)
 f.close()
