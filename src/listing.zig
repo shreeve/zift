@@ -80,7 +80,29 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
         // covering every reasonable target. We ask for exactly the
         // fields we use; the kernel is allowed to fill more if it's
         // cheap, and we just ignore the extras.
-        var sx: std.os.linux.Statx = undefined;
+        //
+        // CRITICAL — DO NOT USE `undefined` HERE. Zig 0.16's
+        // ReleaseSafe optimizer (caught on Linux 2026-04-28, manifests
+        // only on cross-compiled musl x86_64 builds) treats `var sx:
+        // Statx = undefined` as "the value is undefined at every
+        // read", and propagates the 0xAA debug-fill pattern at the
+        // read sites — even though the inline-asm syscall wrapper
+        // declares `: .{ .memory = true }` and writes through `&sx`
+        // via the kernel. The compiler cannot see the kernel's write
+        // through the pointer, only the memory clobber, and concludes
+        // (legally per the language spec) that `sx.mode` etc. are
+        // still undefined → emits the 0xAA fill at the load. The
+        // observable bug: every statAt-on-missing-file returns SUCCESS
+        // with garbage data, so v0.5.0's CLOSE-time clobber check
+        // sees `dest_exists = true` for fresh uploads and denies the
+        // publish.
+        //
+        // Initializing to zero forces the compiler to track sx as
+        // having a defined value (zero) before the syscall; the
+        // memory-clobber asm then correctly invalidates that cached
+        // knowledge, and the post-syscall reads re-fetch from memory
+        // — picking up the kernel's actual writes.
+        var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
         const mask: std.os.linux.STATX = .{
             .TYPE = true,
             .MODE = true,
@@ -140,8 +162,11 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
 pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
     if (builtin.os.tag == .linux) {
         // Linux: `statx` with `AT_EMPTY_PATH` against the fd. Same
-        // flow as `statAt` minus the path argument.
-        var sx: std.os.linux.Statx = undefined;
+        // flow as `statAt` minus the path argument. See `statAt` for
+        // the explanation of why this struct is zero-initialized
+        // rather than `undefined` (Zig 0.16 ReleaseSafe optimizer
+        // bug — produces 0xAA-filled struct fields at read sites).
+        var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
         const mask: std.os.linux.STATX = .{
             .TYPE = true,
             .MODE = true,
