@@ -243,7 +243,7 @@ path, which means:
   currently sweep them at startup (tracked as P3). Operators with
   a hard zift crash can manually clear:
 
-      rm -f /srv/sftp/<partner>/.zift-staging/*
+      rm -f <partner-root>/.zift-staging/*
 
   Always safe — partners can never reach that path via the SFTP
   wire surface (the path-validator rejects any path containing
