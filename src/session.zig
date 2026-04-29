@@ -623,8 +623,6 @@ fn authenticate(
     session: c.ssh_session,
     peer_ip: ?[]const u8,
 ) !*const config.UserConfig {
-    const allowed_methods: c_int = @intCast(c.SSH_AUTH_METHOD_PASSWORD | c.SSH_AUTH_METHOD_PUBLICKEY);
-
     // PLAN §8.4 implies a finite ceiling on auth attempts per session.
     // 6 matches OpenSSH's `MaxAuthTries` default. Successes return
     // early; pubkey "offered" (probing) does not count because libssh
@@ -644,8 +642,32 @@ fn authenticate(
 
         const subtype: c_uint = @intCast(c.ssh_message_subtype(msg));
 
+        // v0.7.1: read username early so the failure-path methods
+        // bitmask can be narrowed per-user. The username accessor is
+        // safe here because the `ssh_message_type` check above
+        // already filtered out non-auth messages — every codepath
+        // reaching this point holds a `SSH_REQUEST_AUTH` message,
+        // including `none`/`password`/`publickey` subtypes (all of
+        // which carry a username).
+        //
+        // Anti-enumeration trade-off (see `methodsForUser` for the
+        // matrix): only password-only known users get a narrowed
+        // response. The unknown-user response shape is unchanged
+        // from v0.7.0 (`PASSWORD|PUBLICKEY`), so probing for valid
+        // usernames via the methods list still has to confront the
+        // ambiguity between "unknown user" and "known user with
+        // password+keys" / "known user with keys only". A
+        // password-only known user IS intentionally distinguishable
+        // from those — that's the cost of the noise reduction, and
+        // it's the right cost for the partner-deploy threat model
+        // where partner usernames are pre-shared anyway.
+        const username_ptr = c.ssh_message_auth_user(msg);
+        const username_for_methods: ?[]const u8 = if (username_ptr != null)
+            std.mem.span(username_ptr)
+        else
+            null;
+
         if (subtype == c.SSH_AUTH_METHOD_PASSWORD) {
-            const username_ptr = c.ssh_message_auth_user(msg);
             const password_ptr = c.ssh_message_auth_password(msg);
             if (username_ptr != null and password_ptr != null) {
                 const username = std.mem.span(username_ptr);
@@ -680,9 +702,49 @@ fn authenticate(
             return error.LibsshFailure;
         }
 
-        _ = c.ssh_message_auth_set_methods(msg, allowed_methods);
+        _ = c.ssh_message_auth_set_methods(msg, methodsForUser(cfg, username_for_methods));
         _ = c.ssh_message_reply_default(msg);
     }
+}
+
+/// Compute the auth-methods bitmask sent in `userauth_failure` to
+/// the client for `username`. Modern SSH clients use this list to
+/// decide which methods to keep trying — when the server says
+/// `PASSWORD` only, well-behaved clients stop offering keys.
+///
+/// Trade-off vs PLAN §8.4 anti-enumeration: full anti-enumeration
+/// would require an indistinguishable response shape across "valid
+/// user with X auth" and "unknown user." This patch sacrifices
+/// some of that — a password-only known user gets a narrower
+/// methods bitmask than the unknown-user response, so an attacker
+/// who probes can distinguish "exists with password-only" from
+/// "unknown OR exists with password+keys OR exists with keys
+/// only." The narrowing matrix:
+///
+///   - User exists with both password AND keys → `PASSWORD|PUBLICKEY`
+///     (= unknown-user default; no leak, no narrowing benefit).
+///   - User exists with password only           → `PASSWORD` (narrowed).
+///     INTENTIONALLY distinguishable from the unknown-user default —
+///     leaks "this username exists with password-only auth." For
+///     the partner-deploy threat model where partner usernames are
+///     known to the partner anyway, and the operational pain of
+///     the wider bitmask is real (clients try every key in the
+///     agent before the password prompt, drowning the audit log
+///     and burning fail2ban budget), that leak is the right trade.
+///     Operators with a stricter posture configure both methods on
+///     every user so the response stays at the default.
+///   - User exists with keys only               → `PASSWORD|PUBLICKEY`
+///     (no narrowing; matches unknown-user default — the rarer
+///     key-only case stays anti-enumeration safe).
+///   - User unknown                              → `PASSWORD|PUBLICKEY`.
+fn methodsForUser(cfg: config.Config, username: ?[]const u8) c_int {
+    const both: c_int = @intCast(c.SSH_AUTH_METHOD_PASSWORD | c.SSH_AUTH_METHOD_PUBLICKEY);
+    const name = username orelse return both;
+    const user = cfg.findUser(name) orelse return both;
+    if (user.password_hash != null and user.keys.len == 0) {
+        return @intCast(c.SSH_AUTH_METHOD_PASSWORD);
+    }
+    return both;
 }
 
 const PublicKeyDecision = union(enum) {
