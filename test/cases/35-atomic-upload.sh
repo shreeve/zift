@@ -63,10 +63,12 @@ assert not os.path.exists(target_path), \
     f"target should NOT exist mid-upload, but it does: {target_path}"
 print("ok: target absent from operator's view during upload")
 
-# v0.5.1 confidentiality: the in-flight staging file must NOT be
-# readable by other local users. createFile defaults to 0o666
-# masked by umask (typically 0o644 — world-readable); zift forces
-# 0o600. Likewise the staging directory must be 0o700.
+# v0.6.0: the in-flight staging file's mode is the configured
+# `publish-mode` (default 0o660), so it lands at the target with
+# the right mode after the atomic rename — POSIX rename(2) preserves
+# the inode's mode. Confidentiality of partial uploads is enforced
+# by the staging directory itself being 0o700 (only the daemon UID
+# can traverse it), independent of the file's own mode.
 import stat
 staging_dir = "$TEST_TMP/data/.zift-staging"
 dir_mode = stat.S_IMODE(os.stat(staging_dir).st_mode)
@@ -75,7 +77,7 @@ staging_files = os.listdir(staging_dir)
 assert len(staging_files) == 1, f"expected 1 staging file mid-upload, got {staging_files}"
 sf_path = os.path.join(staging_dir, staging_files[0])
 file_mode = stat.S_IMODE(os.stat(sf_path).st_mode)
-assert file_mode == 0o600, f"staging file mode should be 0o600, got 0o{file_mode:o}"
+assert file_mode == 0o660, f"staging file mode should be 0o660 (publish-mode default), got 0o{file_mode:o}"
 print(f"ok: staging dir is 0o{dir_mode:o} and staging file is 0o{file_mode:o} mid-upload")
 
 # Write more, then CLOSE.
@@ -86,6 +88,15 @@ assert os.path.exists(target_path), "target should exist after CLOSE"
 size = os.path.getsize(target_path)
 assert size == 8192, f"expected 8192 bytes after CLOSE, got {size}"
 print("ok: target appears at CLOSE with full content (8192 bytes)")
+
+# v0.6.0: the published file's mode is the configured `publish-mode`
+# (default 0o660). rename(2) preserves the inode's mode, so the
+# file should appear at the target with exactly the same mode it
+# had in staging — operators in group `zift` can read+write it,
+# world has nothing.
+target_mode = stat.S_IMODE(os.stat(target_path).st_mode)
+assert target_mode == 0o660, f"published file mode should be 0o660, got 0o{target_mode:o}"
+print(f"ok: published file mode is 0o{target_mode:o} (publish-mode default)")
 
 # --- 2. STAGING DIR INVISIBLE TO PARTNER -------------------------------
 # /.zift-staging is reserved by the path-validator AND filtered from
