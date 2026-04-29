@@ -26,6 +26,28 @@ Adding a partner = `sudo -u zift mkdir -p /home/zift/<name>/<subdirs>`,
 edit `zift.conf` to add the `user <name>` block, save. Reload picks
 it up within `reload-interval` (default 2 s) or on `SIGHUP`.
 
+## File manifest
+
+Everything zift needs is in this `deploy/` directory. Source paths are
+relative to a checkout of the repo on the install host (`git clone`
+or unpack a release tarball into a temp dir is fine). Each file gets
+copied/installed into the system location shown.
+
+| Source (`deploy/`) | Destination | Owner / mode | Required? |
+|---|---|---|---|
+| `zift.conf.example` | `/home/zift/zift.conf` | `zift:zift` `0600` | mandatory |
+| `zift.service` | `/etc/systemd/system/zift.service` | `root:root` `0644` | mandatory |
+| `fail2ban-zift.conf` | `/etc/fail2ban/filter.d/zift.conf` | `root:root` `0644` | optional (fail2ban) |
+| `fail2ban-zift-jail.conf` | append to `/etc/fail2ban/jail.local` | `root:root` `0644` | optional (fail2ban) |
+| `logrotate-zift.conf` | `/etc/logrotate.d/zift` | `root:root` `0644` | optional (logrotate) |
+
+Plus one generated artifact: `/home/zift/host_ed25519` (the SSH host
+private key — generated on first install, see step 3 below).
+
+If you skip fail2ban + logrotate, the deploy is just two install steps
+(copy `zift.service`, copy/edit `zift.conf.example`) plus the
+`useradd` + `ssh-keygen` ceremony.
+
 ## Prerequisites
 
 - Linux 3.x+ (kernel-only requirement; zift v0.2.0+ binaries are fully
@@ -114,26 +136,17 @@ printf '%s\n' 'alice-secret' | zift hash-password
 
 ## 5. Write the config
 
-```bash
-sudo -u zift tee /home/zift/zift.conf > /dev/null << 'EOF'
-server
-  listen 0.0.0.0:2222
-  host-key /home/zift/host_ed25519
-  idle-timeout 5m
-  max-connections 14
-  max-unauth-connections 4
-  reload-interval 2s
-  log /home/zift/audit.jsonl
+Copy the starter config from `deploy/zift.conf.example`, then edit
+the two things you have to customize (the password hash and the
+partner block). Comments inside the file flag every spot you'd
+typically touch.
 
-user alice
-  password $argon2id$v=19$m=65536,t=3,p=1$...paste-hash-here...
-  root /home/zift/alice
-  allow /inbox  read add
-  allow /outbox read
-  deny **.exe
-  deny **/.ssh/**
-EOF
-sudo chmod 0600 /home/zift/zift.conf
+```bash
+sudo install -o zift -g zift -m 0600 deploy/zift.conf.example /home/zift/zift.conf
+sudo -u zift "${EDITOR:-nano}" /home/zift/zift.conf
+# Paste your real Argon2id hash where the file says
+# REPLACE-WITH-REAL-SALT$REPLACE-WITH-REAL-HASH; tune the partner
+# block to your policy.
 ```
 
 A note on `max-connections`: pick it so that
@@ -204,26 +217,36 @@ sudo -u zift zift validate /home/zift/zift.conf
 Validating BEFORE saving over a known-good config protects against
 typos that would crash a reload.
 
-## 7. fail2ban
+## 7. fail2ban (optional)
+
+Two files: the **filter** (regex that recognizes a ban-worthy line) and
+the **jail** (which file to watch + ban thresholds). Both are
+pre-written; install and restart fail2ban.
 
 ```bash
-sudo cp deploy/fail2ban-zift.conf /etc/fail2ban/filter.d/zift.conf
+# Filter: regex that matches zift's auth-failure JSON.
+sudo install -m 0644 deploy/fail2ban-zift.conf /etc/fail2ban/filter.d/zift.conf
 
-sudo tee -a /etc/fail2ban/jail.local << 'EOF'
+# Jail: append to /etc/fail2ban/jail.local (or create it if absent).
+if [ -f /etc/fail2ban/jail.local ]; then
+    sudo tee -a /etc/fail2ban/jail.local < deploy/fail2ban-zift-jail.conf
+else
+    sudo install -m 0644 deploy/fail2ban-zift-jail.conf /etc/fail2ban/jail.local
+fi
 
-[zift]
-enabled  = true
-port     = 2222
-filter   = zift
-logpath  = /home/zift/audit.jsonl
-maxretry = 5
-bantime  = 3600
-findtime = 600
-EOF
-
+# Verify + restart.
+sudo fail2ban-client -t                       # syntax check
 sudo systemctl restart fail2ban
+sleep 2                                       # let the control socket open
 sudo fail2ban-client status zift
 ```
+
+The status output should show `File list: /home/zift/audit.jsonl` —
+that's the line that confirms fail2ban is tailing the file rather
+than the systemd journal. (The shipped jail explicitly sets
+`backend = polling` to force file-watching; without that line,
+fail2ban's `auto` backend on Debian/Ubuntu defaults to systemd-journald
+and silently ignores the `logpath`.)
 
 The shipped filter matches only auth-layer failures
 (`auth.password` / `auth.publickey` / `accept.rejected` /
@@ -231,26 +254,27 @@ The shipped filter matches only auth-layer failures
 (an authenticated partner hitting `deny /elsewhere`) do **not**
 trigger bans — those are normal access-control events.
 
-## 8. Log rotation
+End-to-end smoke test (one bad-password attempt should bump
+`Total failed` from 0 to 1):
 
 ```bash
-sudo tee /etc/logrotate.d/zift << 'EOF'
-/home/zift/audit.jsonl {
-    daily
-    rotate 30
-    compress
-    missingok
-    notifempty
-    postrotate
-        systemctl kill -s USR1 zift
-    endscript
-}
-EOF
+sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -P 2222 alice@127.0.0.1
+# type a wrong password, Ctrl-C
+sleep 2
+sudo fail2ban-client status zift              # Total failed: 1
 ```
 
-`SIGUSR1` triggers zift's audit-log reopen handler — the rotated file
-keeps the old fd's buffered writes, the new file picks up subsequent
-lines.
+## 8. Log rotation (optional)
+
+```bash
+sudo install -m 0644 deploy/logrotate-zift.conf /etc/logrotate.d/zift
+sudo logrotate -d /etc/logrotate.d/zift       # dry-run, doesn't actually rotate
+```
+
+`SIGUSR1` (fired by the postrotate hook) triggers zift's audit-log
+reopen handler — the rotated file keeps its buffered writes, the new
+file picks up subsequent lines without restarting the daemon.
 
 ## 9. Firewall
 
@@ -316,13 +340,36 @@ zift-specific backup story.
 ## Verification checklist
 
 ```bash
-sudo systemctl status zift
-sudo -u zift zift validate /home/zift/zift.conf
-sudo systemd-analyze verify /etc/systemd/system/zift.service
-sudo fail2ban-client status zift
-sudo ufw status verbose
+# zift itself
+sudo systemctl is-active zift                                       # active
+sudo systemctl is-enabled zift                                      # enabled
+sudo -u zift zift validate /home/zift/zift.conf                     # no errors
+sudo systemd-analyze verify /etc/systemd/system/zift.service        # silent
+
+# fail2ban (skip if not installed)
+sudo fail2ban-client -t                                             # OK
+sudo fail2ban-client status zift | grep -E 'File list|Total failed' # File list: /home/zift/audit.jsonl
+
+# logrotate (skip if not installed)
+sudo logrotate -d /etc/logrotate.d/zift 2>&1 | tail -5              # no errors
+
+# Live activity
 journalctl -u zift --since "5 min ago" --no-pager
-tail -n 20 /home/zift/audit.jsonl   # last 20 audit events
+tail -n 20 /home/zift/audit.jsonl                                   # recent audit events
+
+# Network
+sudo ufw status verbose                                             # if ufw is in use
+nc -z -w2 127.0.0.1 2222 && echo "tcp:2222 reachable"
+```
+
+A one-shot health summary you can run anytime:
+
+```bash
+systemctl is-active zift && systemctl is-enabled zift
+sudo fail2ban-client status zift 2>/dev/null | grep -q 'File list' \
+    && echo "fail2ban: tailing /home/zift/audit.jsonl" \
+    || echo "fail2ban: not configured"
+nc -z -w2 127.0.0.1 2222 && echo "tcp:2222 reachable" || echo "tcp:2222 down"
 ```
 
 ## Alternative: FHS-style layout
