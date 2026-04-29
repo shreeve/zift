@@ -21,7 +21,7 @@ server
   log stderr
 
 user runner
-  password $hash
+  auth $hash
   root $TEST_TMP/data
   allow / read list
 EOF

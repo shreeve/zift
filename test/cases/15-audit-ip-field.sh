@@ -15,7 +15,7 @@ server
   log stderr
 
 user ally
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF
@@ -61,16 +61,29 @@ loopback_count=$(grep -c '"ip":"127.0.0.1"' "$ZIFT_LOG" || true)
 [[ "$loopback_count" -ge "2" ]] || fail "expected ip=127.0.0.1, none found"
 ok "ip field carries the actual peer address (127.0.0.1)"
 
-# PLAN §7.4 stable order: event, user, operation, result, path, detail, ip.
-# Pick one auth.password line and verify ip comes after operation/result.
+# v0.7.0 stable order: time, event, user, operation, result, path, detail, ip.
+# Pick one auth.password line and verify the leading-time invariant
+# plus the relative ordering of the rest.
 sample=$(grep '"operation":"auth.password"' "$ZIFT_LOG" | head -1)
 [[ -n "$sample" ]] || fail "no auth.password line to inspect"
 echo "  sample: $sample"
+time_pos=$(echo "$sample" | awk '{print index($0,"\"time\"")}')
 event_pos=$(echo "$sample" | awk '{print index($0,"\"event\"")}')
 op_pos=$(echo "$sample" | awk '{print index($0,"\"operation\"")}')
 result_pos=$(echo "$sample" | awk '{print index($0,"\"result\"")}')
 ip_pos=$(echo "$sample" | awk '{print index($0,"\"ip\"")}')
+[[ "$time_pos" == "2" ]] \
+    || fail "expected time at position 2 (immediately after opening '{'), got $time_pos"
+[[ "$time_pos" -lt "$event_pos" ]] || fail "expected time before event"
 [[ "$event_pos" -lt "$op_pos" ]] || fail "expected event before operation"
 [[ "$op_pos" -lt "$result_pos" ]] || fail "expected operation before result"
 [[ "$result_pos" -lt "$ip_pos" ]] || fail "expected result before ip (got result=$result_pos ip=$ip_pos)"
-ok "field order matches PLAN §7.4: event < operation < result < ip"
+ok "field order matches v0.7.0 schema: time(1) < event < operation < result < ip"
+
+# Every audit line carries an RFC 3339 UTC timestamp with millisecond
+# precision: `YYYY-MM-DDTHH:MM:SS.mmmZ` — exactly 24 chars between
+# the quotes after `"time":`.
+ts_count=$(grep -cE '"time":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"' "$ZIFT_LOG" || true)
+[[ "$ts_count" == "$total" ]] \
+    || fail "expected RFC3339 ms timestamp on every audit line ($ts_count/$total)"
+ok "every audit line carries an RFC 3339 UTC ms timestamp ($ts_count/$total)"

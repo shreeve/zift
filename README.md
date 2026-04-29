@@ -106,11 +106,20 @@ auto-flag as GitHub prereleases.
 
 ## Run
 
-Generate a host key and a password hash for a virtual user:
+Generate a host key and provision per-partner credentials. Each
+partner can authenticate by password, key, or both:
 
 ```sh
 ssh-keygen -t ed25519 -f /tmp/zift_host_ed25519 -N ""
+
+# Option A — password (Argon2id PHC string).
 printf 'secret\n' | bin/zift hash-password
+# → $argon2id$v=19$m=65536,t=3,p=1$...
+
+# Option B — public key. Generate one (or accept the partner's
+# `id_ed25519.pub`) and store it in an operator-managed file.
+ssh-keygen -t ed25519 -f /tmp/zift/keys/ally -N "" -C "ally"
+# → /tmp/zift/keys/ally.pub
 ```
 
 Create the partner's root, edit `example.zift`, then start:
@@ -142,10 +151,18 @@ server
   max-connections 128
   max-unauth-connections 32
   log stderr
+  # When set, a user without an explicit `root` directive defaults
+  # to `<partner-root>/<user-name>`. Skip the directive entirely if
+  # you'd rather declare each root explicitly per-user.
+  partner-root /tmp/zift
 
 user ally
-  password $argon2id$v=19$m=65536,t=3,p=1$...
-  root /tmp/zift/ally
+  # `auth <value>` — v0.7.0 unified credential directive.
+  #   - $argon2id...   ⇒ password (Argon2id PHC string; one per user)
+  #   - /absolute/path ⇒ public-key file (operator-managed; multiple OK)
+  auth $argon2id$v=19$m=65536,t=3,p=1$...
+  auth /tmp/zift/keys/ally.pub
+  # `partner-root` above makes `root /tmp/zift/ally` the default.
   allow /             read              # `read` covers list+stat+download
   allow /pending      read add remove   # full mutate (or `full` for short)
   allow /archive      read              # read-only browse
@@ -362,6 +379,56 @@ bits are stripped from the displayed mode.
 Add `listing-mode reality` to the `server` block if you want the
 on-disk owner/group/mode to pass through unchanged (rare; mostly
 useful for debugging).
+
+## Migrating v0.6.x configs to v0.7.0
+
+v0.7.0 makes three breaking changes to the config grammar. There is
+no backward compatibility — Zift refuses to load a v0.6.x config until
+you update it. The error messages name the directive and the migration:
+
+| v0.6.x                          | v0.7.0                                | Notes                                                                 |
+| ------------------------------- | ------------------------------------- | --------------------------------------------------------------------- |
+| `password $argon2id$...`        | `auth $argon2id$...`                  | Same Argon2id PHC string; one per user.                               |
+| `key ssh-ed25519 AAAA... alice` | `auth /home/zift/keys/alice.pub`      | Public keys move to operator-managed files; multiple `auth /path` lines accumulate. |
+| `root /home/zift/alice` per user | `partner-root /home/zift` (server-level) | Optional shorthand: `root` defaults to `<partner-root>/<user-name>`. Explicit per-user `root` still wins. |
+
+`zift validate` on a v0.6.x config now emits one of:
+
+```text
+zift: zift.conf:line N: [user alice] 'password': PasswordDirectiveRemoved
+zift: zift.conf:line N: [user alice] 'key': KeyDirectiveRemoved
+```
+
+so the spot to edit is unambiguous. A typical v0.6 → v0.7 migration:
+
+```diff
+ server
+   listen 0.0.0.0:2222
+   host-key /home/zift/host_ed25519
++  partner-root /home/zift
+
+ user alice
+-  password $argon2id$v=19$m=65536,t=3,p=1$...
+-  key ssh-ed25519 AAAA... alice@laptop
+-  root /home/zift/alice
++  auth $argon2id$v=19$m=65536,t=3,p=1$...
++  auth /home/zift/keys/alice.pub
+   allow /inbox  read add
+   allow /outbox read
+```
+
+Public-key files are validated at config load:
+
+- The path must be absolute.
+- The file must be a regular file (no FIFOs / devices / dangling symlinks).
+- The file's mode must NOT have group-write or world-write bits — a writable key file is equivalent to a writable password hash, and Zift refuses to load a config that points at one. Recommended: `chmod 0640` and `chown root:zift /home/zift/keys/<partner>.pub`.
+- Each non-empty/non-comment line is parsed as a `<algorithm> <blob> [comment]` triple, exactly like a single-line `.pub` file.
+
+Audit logs gain a leading `time` field (RFC 3339 UTC milliseconds,
+e.g. `"time":"2026-04-29T10:17:39.124Z"`). Existing `jq`/awk
+filters that key on `event` / `operation` / `result` / `ip` continue
+to work; downstream consumers that asserted the line started with
+`{"event":...` need a one-character fix.
 
 ## Production deployment
 

@@ -27,7 +27,7 @@ server
   host-key $TEST_TMP/host_ed25519
 
 user alice
-  password $hash
+  auth $hash
   root $TEST_TMP
   bogus-key something
   allow / read list
@@ -55,7 +55,7 @@ server
   host-key $TEST_TMP/host_ed25519
 
 user bob
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF
@@ -83,7 +83,7 @@ server
 
 # Comment between sections
 user carol
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF
@@ -104,7 +104,7 @@ server
   reload-interval 5
 
 user dan
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF
@@ -134,7 +134,7 @@ server
   shutdown-grace 1h
 
 user erin
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF
@@ -156,7 +156,7 @@ server
   reload-interval 0
 
 user fred
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF

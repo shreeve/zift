@@ -42,7 +42,7 @@ server
   log stderr
 
 user user1
-  password $hash
+  auth $hash
   root $TEST_TMP/jail
   allow / read list
   allow /inbox read list

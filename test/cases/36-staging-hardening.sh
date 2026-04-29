@@ -49,7 +49,7 @@ server
   log stderr
 
 user partner
-  password $hash
+  auth $hash
   root $TEST_TMP/data
   # Grant 'full' (read + add + remove) on the entire jail. We
   # specifically want the partner to have permission for every

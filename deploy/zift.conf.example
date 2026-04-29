@@ -7,10 +7,18 @@
 #                `sudoedit /home/zift/zift.conf`.)
 #
 # Edit before going live:
-#   1. The Argon2id password hash (run `printf 'pw\n' | zift hash-password`
-#      to generate yours; paste the full $argon2id$... string here).
-#   2. The partner's username, root path, and allow/deny rules to match
-#      the workflow you've agreed with that partner.
+#   1. Provision each partner with one or more credentials via `auth`:
+#        - `auth $argon2id$...`     — password (run `printf 'pw\n' |
+#          zift hash-password` to generate the PHC string; paste the
+#          full `$argon2id$...` line here). At most one per user.
+#        - `auth /home/zift/keys/<partner>.pub` — public key in an
+#          operator-managed file (chmod 0640 root:zift). Multiple
+#          `auth /path` lines accumulate — handy for key rotation.
+#   2. The partner's username and allow/deny rules to match the
+#      workflow you've agreed with that partner. With `partner-root`
+#      below set to `/home/zift`, the user's `root` defaults to
+#      `/home/zift/<user>`; override per-user with an explicit
+#      `root /...` line if needed.
 #   3. `listen` IP/port if you want to bind somewhere other than
 #      0.0.0.0:2222 (e.g. an internal interface only).
 #   4. `max-connections` — keep `max-connections * 256 MiB ≤ MemoryMax`
@@ -46,10 +54,25 @@ server
   # subdirectories inherit `group=zift`. Allowed: 0o2700, 0o2750,
   # 0o2770.
   mkdir-mode 0o2770
+  # v0.7.0+: when set, every user without an explicit `root`
+  # directive defaults to `<partner-root>/<user-name>` —
+  # `/home/zift/alice` for the user block below. Operators
+  # pointing every partner at `/home/zift/...` no longer have to
+  # repeat the path in every user. The directive itself takes any
+  # absolute path; per-user overrides via an explicit `root` line
+  # are still honored.
+  partner-root /home/zift
 
 user alice
-  password $argon2id$v=19$m=65536,t=3,p=1$REPLACE-WITH-REAL-SALT$REPLACE-WITH-REAL-HASH
-  root /home/zift/alice
+  # `auth <value>` — v0.7.0 unified credential directive.
+  # Replace ONE of the two examples below (or use both for password
+  # + key parallel auth). At most one `auth $...` (password) per
+  # user; `auth /path` lines accumulate for multiple authorized keys.
+  auth $argon2id$v=19$m=65536,t=3,p=1$REPLACE-WITH-REAL-SALT$REPLACE-WITH-REAL-HASH
+  # auth /home/zift/keys/alice.pub
+  # `partner-root` above makes this user's root default to
+  # `/home/zift/alice`. If you want a different layout, add an
+  # explicit `root /...` line here.
   # The four-verb model covers every SFTP wire op:
   #   read    = stat + readdir + download (`read` includes `list` since v0.4.0)
   #   add     = upload + mkdir + rename

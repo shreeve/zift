@@ -43,7 +43,7 @@ server
   mkdir-mode 0o2750
 
 user partner
-  password $hash
+  auth $hash
   root $TEST_TMP/data
   # add-only — no remove. So clobber attempts return permission denied.
   allow / read add
