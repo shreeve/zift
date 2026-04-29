@@ -134,7 +134,7 @@ jobs:
             log stderr
 
           user ci
-            password $HASH
+            auth $HASH
             root /tmp/ci_root
             allow / read list
           EOF
