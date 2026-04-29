@@ -48,6 +48,70 @@ If you skip fail2ban + logrotate, the deploy is just two install steps
 (copy `zift.service`, copy/edit `zift.conf.example`) plus the
 `useradd` + `ssh-keygen` ceremony.
 
+## Quickstart
+
+Copy-paste runbook for an install on a fresh host. The detailed
+sections below explain each step's reasoning + cover the optional
+provenance verification, firewall, and health-check steps.
+
+```bash
+# --- 0. Get the repo (just for the deploy/ tree). -----------------
+git clone --depth 1 https://github.com/shreeve/zift.git
+cd zift
+
+# --- 1. Install the binary. ---------------------------------------
+ZIFT_VERSION=v0.5.3
+ARCH=$(uname -m)
+curl -fsSLO "https://github.com/shreeve/zift/releases/download/${ZIFT_VERSION}/zift-${ZIFT_VERSION#v}-${ARCH}-linux"
+sudo install -m 0755 "zift-${ZIFT_VERSION#v}-${ARCH}-linux" /usr/local/bin/zift
+
+# --- 2. Service user with a real home. ----------------------------
+sudo useradd --system --create-home --home-dir /home/zift \
+    --shell /usr/sbin/nologin zift
+sudo chmod 0750 /home/zift
+
+# --- 3. Host key. -------------------------------------------------
+sudo -u zift ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N ""
+
+# --- 4. zift config (edit before service starts). -----------------
+sudo install -o zift -g zift -m 0600 deploy/zift.conf.example /home/zift/zift.conf
+# Generate a real Argon2id hash for your partner:
+printf '%s\n' 'alice-secret' | zift hash-password
+# Paste the resulting $argon2id$... string into /home/zift/zift.conf
+# (replacing REPLACE-WITH-REAL-SALT$REPLACE-WITH-REAL-HASH).
+sudo -u zift "${EDITOR:-nano}" /home/zift/zift.conf
+sudo -u zift mkdir -p /home/zift/alice/inbox /home/zift/alice/outbox
+sudo -u zift zift validate /home/zift/zift.conf
+
+# --- 5. systemd unit. ---------------------------------------------
+sudo install -m 0644 deploy/zift.service /etc/systemd/system/zift.service
+sudo systemd-analyze verify /etc/systemd/system/zift.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now zift
+sudo systemctl status zift
+
+# --- 6. fail2ban (optional). --------------------------------------
+sudo install -m 0644 deploy/fail2ban-zift.conf /etc/fail2ban/filter.d/zift.conf
+if [ -f /etc/fail2ban/jail.local ]; then
+    sudo tee -a /etc/fail2ban/jail.local < deploy/fail2ban-zift-jail.conf
+else
+    sudo install -m 0644 deploy/fail2ban-zift-jail.conf /etc/fail2ban/jail.local
+fi
+sudo fail2ban-client -t
+sudo systemctl restart fail2ban
+sleep 2
+sudo fail2ban-client status zift   # expect: File list: /home/zift/audit.jsonl
+
+# --- 7. logrotate (optional). -------------------------------------
+sudo install -m 0644 deploy/logrotate-zift.conf /etc/logrotate.d/zift
+sudo logrotate -d /etc/logrotate.d/zift   # dry-run, no errors
+
+# --- 8. Smoke test. -----------------------------------------------
+nc -z -w2 127.0.0.1 2222 && echo "tcp:2222 reachable"
+sudo systemctl is-active zift
+sudo fail2ban-client status zift 2>/dev/null | grep 'File list'
+```
+
 ## Prerequisites
 
 - Linux 3.x+ (kernel-only requirement; zift v0.2.0+ binaries are fully
