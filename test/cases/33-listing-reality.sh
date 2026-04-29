@@ -40,7 +40,7 @@ server
   listing-mode reality
 
 user runner
-  password $hash
+  auth $hash
   root $TEST_TMP/data
   allow / read list
 EOF

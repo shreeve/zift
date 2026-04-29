@@ -29,7 +29,7 @@ server
   log stderr
 
 user drop
-  password $hash
+  auth $hash
   root $TEST_TMP/jail
   # write+remove: write enables OPEN(write); remove satisfies the
   # v0.4.0 clobber rule (any OPEN(write) on an existing file

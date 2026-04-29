@@ -12,6 +12,12 @@ pub const SemanticError = error{
     UserRootNotDirectory,
     OverlappingRoots,
     UnauthCapExceedsTotal,
+    AuthKeyFileUnreadable,
+    AuthKeyFileTooLarge,
+    AuthKeyFileMalformed,
+    AuthKeyFileEmpty,
+    AuthKeyFileNotRegular,
+    AuthKeyFileWritableByOthers,
     OutOfMemory,
 };
 
@@ -95,6 +101,14 @@ pub const ServerConfig = struct {
     /// whole subtree without UID gymnastics. Allowed values:
     /// `0o2700`, `0o2750`, `0o2770`. PLAN §6.2.
     mkdir_mode: u32,
+    /// Optional. When set, a user block without an explicit `root`
+    /// directive defaults its root to `${partner-root}/${user-name}`.
+    /// Operators pointing every partner at `/home/zift/<name>` no
+    /// longer have to copy-paste the same line into every user
+    /// block. There is deliberately NO hardcoded default — leaving
+    /// `partner-root` unset preserves the v0.6.x behavior where
+    /// every user must declare `root` explicitly. v0.7.0.
+    partner_root: ?[]const u8,
 };
 
 pub const ListingMode = enum {
@@ -117,8 +131,20 @@ pub const UserConfig = struct {
     name: []const u8,
     /// Argon2id PHC string when password auth is provisioned, else null.
     password_hash: ?[]const u8,
-    /// Public keys authorized for this user. May be empty.
+    /// Public keys authorized for this user. Empty after `parse`
+    /// because v0.7.0 removed inline keys (the `key ssh-ed25519 ...`
+    /// directive). Populated by `validateSemantic`, which opens
+    /// every `key_files[i]`, parses each non-comment line as a
+    /// public key, and stores the merged result here. The runtime
+    /// auth path reads only this field.
     keys: []const PublicKey,
+    /// Absolute paths to OpenSSH public-key files referenced by
+    /// `auth /path/to/key.pub` lines. Recorded by `parse` and
+    /// opened by `validateSemantic`. Kept on the resolved config
+    /// so a future reload-diff can detect when the operator has
+    /// added or removed a key file even when `zift.conf` itself
+    /// was unchanged.
+    key_files: []const []const u8,
     root: []const u8,
     rules: []const Rule,
 };
@@ -126,7 +152,11 @@ pub const UserConfig = struct {
 pub const Config = struct {
     arena: std.heap.ArenaAllocator,
     server: ServerConfig,
-    users: []const UserConfig,
+    /// Mutable so `validateSemantic` can replace each user's `keys`
+    /// after resolving `auth /path/...` references. Treat this as
+    /// `[]const UserConfig` everywhere except inside the validate
+    /// pass — the lifetime is the config arena either way.
+    users: []UserConfig,
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -178,7 +208,7 @@ fn validatePureNumeric(cfg: *const Config) error{UnauthCapExceedsTotal}!void {
 pub fn validateSemantic(
     io: std.Io,
     allocator: std.mem.Allocator,
-    cfg: *const Config,
+    cfg: *Config,
 ) SemanticError!void {
     const stderr = std.Io.File.stderr();
 
@@ -272,6 +302,204 @@ pub fn validateSemantic(
             }
         }
     }
+
+    // 4. v0.7.0 — resolve every `auth /path/to/key.pub` reference.
+    // Each file is opened, permission-checked, and parsed; every
+    // non-empty/non-comment line becomes an authorized public key.
+    // Errors are user-facing; the diagnostic names the user and
+    // the path so operators know exactly which line to fix.
+    try resolveAuthKeyFiles(io, allocator, cfg);
+}
+
+/// Open every key file referenced by an `auth /path/...` line,
+/// parse it, and merge the result into the user's `keys` list. The
+/// resolved `PublicKey` strings are allocated in `cfg.arena`; the
+/// raw file contents are allocated in the validate-time `gpa` and
+/// freed before this function returns so the config arena only
+/// holds the parsed data.
+///
+/// Permission posture (PLAN §6.2 / DEPLOY guidance): a key file
+/// that grants login shouldn't be writable by anyone the daemon's
+/// service account doesn't already trust. We reject any key file
+/// whose mode has the world-write or group-write bit set, and any
+/// non-regular file (so symlinks pointing at attacker-controlled
+/// paths can't slip past the parent-dir mode). Parent-directory
+/// writability is the operator's responsibility (documented in
+/// `deploy/DEPLOY.md`); enforcing it here would conflict with
+/// reasonable layouts like `/home/zift/keys/` group-rwx.
+fn resolveAuthKeyFiles(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    cfg: *Config,
+) SemanticError!void {
+    const stderr = std.Io.File.stderr();
+    const arena_alloc = cfg.arena.allocator();
+
+    for (cfg.users) |*user| {
+        if (user.key_files.len == 0) continue;
+
+        var combined: std.ArrayList(PublicKey) = .empty;
+        // `user.keys` is empty in v0.7.0 (no inline key directive),
+        // but copying through here keeps the structure resilient
+        // if a future entry point pre-populates keys before
+        // validate runs.
+        for (user.keys) |existing| try combined.append(arena_alloc, existing);
+
+        for (user.key_files) |path| {
+            try resolveOneKeyFile(io, gpa, stderr, arena_alloc, &combined, user.name, path);
+        }
+
+        user.keys = try combined.toOwnedSlice(arena_alloc);
+    }
+}
+
+/// Read+permission-check+parse a single key file, appending each
+/// well-formed public-key line to `combined`. Caller owns lifetime
+/// of `combined` (allocated in the config arena).
+fn resolveOneKeyFile(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    stderr: std.Io.File,
+    arena_alloc: std.mem.Allocator,
+    combined: *std.ArrayList(PublicKey),
+    user_name: []const u8,
+    path: []const u8,
+) SemanticError!void {
+    // Open with `follow_symlinks = false` so the open fails early
+    // if the path is a symlink — this closes the
+    // statFile-then-readFileAlloc TOCTOU window where an attacker
+    // could swap a checked regular file for a symlink between the
+    // two path resolutions. The single open here gives us a stable
+    // fd; both stat and read happen against that fd, so the inode
+    // we validate is byte-for-byte the inode we parse.
+    var file = std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        // POSIX/Linux: open() with O_NOFOLLOW on a symlink returns
+        // ELOOP, which Zig surfaces as `SymLinkLoop`. We translate
+        // that to the more operator-facing "symlinks not allowed"
+        // diagnostic + the dedicated `AuthKeyFileNotRegular` tag.
+        error.SymLinkLoop => {
+            writeKeyFileDiag(io, stderr, user_name, path, 0, "symlinks not allowed (use in-place rename for rotation)");
+            return error.AuthKeyFileNotRegular;
+        },
+        else => {
+            writeKeyFileDiag(io, stderr, user_name, path, 0, "unreadable");
+            return error.AuthKeyFileUnreadable;
+        },
+    };
+    defer file.close(io);
+
+    // fstat on the opened fd. Because we passed `follow_symlinks =
+    // false` to `openFile`, a symlink-at-path would have already
+    // errored out above; this fstat checks the regular-file +
+    // permission invariants on the actual inode we'll read from.
+    const stat = file.stat(io) catch {
+        writeKeyFileDiag(io, stderr, user_name, path, 0, "stat failed");
+        return error.AuthKeyFileUnreadable;
+    };
+    switch (stat.kind) {
+        .file => {},
+        else => {
+            writeKeyFileDiag(io, stderr, user_name, path, 0, "not a regular file");
+            return error.AuthKeyFileNotRegular;
+        },
+    }
+    // Reject any group-write or world-write bit. Group-read /
+    // world-read are fine — public keys are public; the value is
+    // in tamper-resistance, not secrecy.
+    const file_mode: u32 = @intCast(stat.permissions.toMode() & 0o7777);
+    const writable_by_others_mask: u32 = 0o022;
+    if ((file_mode & writable_by_others_mask) != 0) {
+        writeKeyFileDiag(io, stderr, user_name, path, 0, "writable by group/world (mode)");
+        return error.AuthKeyFileWritableByOthers;
+    }
+
+    // Generous slack above `max_keyline_bytes` so the formatter's
+    // line cap applies per-line, not per-file. A 4 KiB key plus
+    // up to 4 KiB of comment headers and trailing whitespace
+    // comfortably fits; pathological files exceeding the cap are
+    // rejected with a precise diagnostic instead of being treated
+    // as "unreadable".
+    const file_read_cap: usize = max_keyline_bytes * 4;
+
+    // Read from the open fd (NOT by re-resolving `path`). This is
+    // what closes the TOCTOU: the inode we just fstat'd is the
+    // inode we're now slurping bytes out of.
+    var file_reader = file.reader(io, &.{});
+    const contents = file_reader.interface.allocRemaining(gpa, .limited(file_read_cap)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => {
+            writeKeyFileDiag(io, stderr, user_name, path, 0, "too large");
+            return error.AuthKeyFileTooLarge;
+        },
+        error.ReadFailed => {
+            writeKeyFileDiag(io, stderr, user_name, path, 0, "read failed");
+            return error.AuthKeyFileUnreadable;
+        },
+    };
+    defer gpa.free(contents);
+
+    var parsed: usize = 0;
+    var line_no: u32 = 0;
+    var iter = std.mem.splitScalar(u8, contents, '\n');
+    while (iter.next()) |raw| {
+        line_no += 1;
+        const no_cr = std.mem.trimEnd(u8, raw, "\r");
+        const trimmed = std.mem.trim(u8, no_cr, " \t");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '#') continue;
+        if (trimmed.len > max_keyline_bytes) {
+            writeKeyFileDiag(io, stderr, user_name, path, line_no, "key line too long");
+            return error.AuthKeyFileMalformed;
+        }
+        const pubkey = parsePublicKeyLine(arena_alloc, trimmed) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                writeKeyFileDiag(io, stderr, user_name, path, line_no, "malformed public-key line");
+                return error.AuthKeyFileMalformed;
+            },
+        };
+        try combined.append(arena_alloc, pubkey);
+        parsed += 1;
+    }
+
+    if (parsed == 0) {
+        writeKeyFileDiag(io, stderr, user_name, path, 0, "no public-key lines found");
+        return error.AuthKeyFileEmpty;
+    }
+}
+
+/// Format a key-file diagnostic in the same shape as parse errors:
+///
+///   `zift: user '<name>': auth key file '<path>': <reason>`           (file-level)
+///   `zift: user '<name>': auth key file '<path>' line N: <reason>`    (per-line)
+///
+/// `line_no = 0` means "no specific line" — used for whole-file
+/// failures (mode, regular-file, readability, empty-file).
+fn writeKeyFileDiag(
+    io: std.Io,
+    stderr: std.Io.File,
+    user_name: []const u8,
+    path: []const u8,
+    line_no: u32,
+    reason: []const u8,
+) void {
+    stderr.writeStreamingAll(io, "zift: user '") catch {};
+    stderr.writeStreamingAll(io, user_name) catch {};
+    stderr.writeStreamingAll(io, "': auth key file '") catch {};
+    stderr.writeStreamingAll(io, path) catch {};
+    stderr.writeStreamingAll(io, "'") catch {};
+    if (line_no != 0) {
+        stderr.writeStreamingAll(io, " line ") catch {};
+        var num_buf: [16]u8 = undefined;
+        const printed = std.fmt.bufPrint(&num_buf, "{d}", .{line_no}) catch num_buf[0..0];
+        stderr.writeStreamingAll(io, printed) catch {};
+    }
+    stderr.writeStreamingAll(io, ": ") catch {};
+    stderr.writeStreamingAll(io, reason) catch {};
+    stderr.writeStreamingAll(io, "\n") catch {};
 }
 
 const ServerBuilder = struct {
@@ -287,12 +515,19 @@ const ServerBuilder = struct {
     listing_mode: ListingMode = .virtual,
     publish_mode: u32 = 0o660,
     mkdir_mode: u32 = 0o2770,
+    partner_root: ?[]const u8 = null,
 };
 
 const UserBuilder = struct {
     name: []const u8,
     password_hash: ?[]const u8 = null,
     keys: std.ArrayList(PublicKey) = .empty,
+    /// Public-key files referenced by `auth /path/to/key.pub` lines.
+    /// The parser only records the path; `validateSemantic` opens
+    /// each file, parses its first non-empty/non-comment line as a
+    /// public key, and merges the result into `keys`. See
+    /// `resolveAuthKeyFiles`.
+    key_files: std.ArrayList([]const u8) = .empty,
     root: ?[]const u8 = null,
     rules: std.ArrayList(Rule) = .empty,
 };
@@ -305,15 +540,18 @@ const Section = enum {
 
 pub const Error = error{
     DuplicateServerSection,
+    DuplicatePassword,
     DuplicateUser,
     EmptyUserName,
     InlineComment,
+    InvalidAuth,
     InvalidConfig,
     InvalidDuration,
     InvalidIndent,
     InvalidKeyLine,
     InvalidPermission,
     InvalidUserName,
+    KeyDirectiveRemoved,
     KeyLineTooLong,
     UsernameTooLong,
     MissingCredentials,
@@ -324,6 +562,7 @@ pub const Error = error{
     MissingRulePermissions,
     MissingServerSection,
     OutOfMemory,
+    PasswordDirectiveRemoved,
     PasswordHashNotArgon2id,
     PasswordHashMalformed,
     PasswordMemoryOutOfPolicy,
@@ -587,14 +826,41 @@ pub fn parseWithDiag(
 
     const final_users = try allocator.alloc(UserConfig, users.items.len);
     for (users.items, 0..) |*builder, i| {
-        if (builder.password_hash == null and builder.keys.items.len == 0) {
+        // A user must declare at least one credential: either a
+        // password (PHC string in an `auth $...` line) or a public
+        // key file (`auth /...` line). Pure key-only and pure
+        // password-only users remain valid. PLAN §6.2 (v0.7.0).
+        if (builder.password_hash == null and
+            builder.keys.items.len == 0 and
+            builder.key_files.items.len == 0)
+        {
             return error.MissingCredentials;
         }
+
+        // v0.7.0: derive a default root from `partner-root` when
+        // the user didn't declare one explicitly. Skipping this
+        // when both are unset preserves the v0.6.x rejection
+        // (`error.MissingRoot`) for legacy configs that didn't
+        // adopt the new directive. The `partner-root /` edge case
+        // is special-cased so a derived root never becomes `//foo`
+        // — POSIX leaves leading-`//` paths implementation-defined
+        // and we don't want a jail boundary depending on that.
+        const root_value: []const u8 = if (builder.root) |r|
+            r
+        else if (server.partner_root) |pr|
+            if (std.mem.eql(u8, pr, "/"))
+                try std.fmt.allocPrint(allocator, "/{s}", .{builder.name})
+            else
+                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pr, builder.name })
+        else
+            return error.MissingRoot;
+
         final_users[i] = .{
             .name = builder.name,
             .password_hash = builder.password_hash,
             .keys = try builder.keys.toOwnedSlice(allocator),
-            .root = builder.root orelse return error.MissingRoot,
+            .key_files = try builder.key_files.toOwnedSlice(allocator),
+            .root = root_value,
             .rules = try builder.rules.toOwnedSlice(allocator),
         };
     }
@@ -613,6 +879,7 @@ pub fn parseWithDiag(
             .listing_mode = server.listing_mode,
             .publish_mode = server.publish_mode,
             .mkdir_mode = server.mkdir_mode,
+            .partner_root = server.partner_root,
         },
         .users = final_users,
     };
@@ -662,6 +929,20 @@ fn parseServerProperty(
         server.publish_mode = try parsePublishMode(value);
     } else if (std.mem.eql(u8, key, "mkdir-mode")) {
         server.mkdir_mode = try parseMkdirMode(value);
+    } else if (std.mem.eql(u8, key, "partner-root")) {
+        // PLAN §6.2 (v0.7.0): absolute path only — relative paths
+        // are ambiguous (relative to whose cwd?) and would silently
+        // re-resolve depending on how the daemon was invoked. The
+        // path itself is not stat'd here; per-user roots derived
+        // from it are validated by `validateSemantic` exactly the
+        // same way an explicit `root` directive would be.
+        if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
+        // Trim trailing `/` so `partner-root /home/zift/` and
+        // `partner-root /home/zift` both produce the same derived
+        // root. The lone `/` (root) is intentionally preserved.
+        var pr = value;
+        while (pr.len > 1 and pr[pr.len - 1] == '/') pr = pr[0 .. pr.len - 1];
+        server.partner_root = try dupNonEmpty(allocator, pr);
     } else {
         return error.UnknownKey;
     }
@@ -719,45 +1000,102 @@ fn parseUserProperty(
     key: []const u8,
     value: []const u8,
 ) Error!void {
-    if (std.mem.eql(u8, key, "password")) {
-        try checkArgon2idPolicy(value, argon2id_policy);
-        user.password_hash = try dupNonEmpty(allocator, value);
-    } else if (std.mem.eql(u8, key, "key")) {
-        try parseUserKey(allocator, user, value);
+    if (std.mem.eql(u8, key, "auth")) {
+        try parseAuth(allocator, user, value);
     } else if (std.mem.eql(u8, key, "root")) {
         user.root = try dupNonEmpty(allocator, value);
     } else if (std.mem.eql(u8, key, "allow")) {
         try parseAllowRule(allocator, user, value);
     } else if (std.mem.eql(u8, key, "deny")) {
         try parseDenyRules(allocator, user, value);
+    } else if (std.mem.eql(u8, key, "password")) {
+        // v0.7.0 removed `password` in favor of unified `auth`.
+        // A v0.6.x config that still uses it deserves a precise
+        // migration diagnostic, not the generic `UnknownKey`.
+        return error.PasswordDirectiveRemoved;
+    } else if (std.mem.eql(u8, key, "key")) {
+        // v0.7.0 removed inline `key` lines; public keys now live
+        // in operator-managed files referenced by `auth /path/...`.
+        return error.KeyDirectiveRemoved;
     } else {
         return error.UnknownKey;
     }
 }
 
-fn parseUserKey(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
-    // PLAN §7.6: maximum public-key line length is 8192 bytes. Reject
-    // before tokenizing so we don't allocate per-token storage for an
-    // attacker-supplied huge value.
-    if (value.len > max_keyline_bytes) return error.KeyLineTooLong;
+/// Dispatch a single `auth <value>` line. v0.7.0 unifies the two
+/// previous credential directives (`password` and `key`) under a
+/// single name; the value's first byte selects which kind:
+///
+///   - `$` → Argon2id PHC string. Validated against the parameter
+///     envelope at parse time (same checks the v0.6.x `password`
+///     directive ran). At most one PHC `auth` line per user is
+///     accepted; a second is rejected as `error.DuplicatePassword`
+///     because the runtime stores a single `password_hash`.
+///   - `/` → absolute filesystem path to a public-key file. The
+///     path is recorded but NOT opened at parse time — that's
+///     `validateSemantic`'s job. Path-shape only is validated
+///     here (absolute, length cap); the file's *contents* are
+///     parsed when `validateSemantic` reads it.
+///   - anything else → `error.InvalidAuth`. We don't try to be
+///     clever about distinguishing what the operator meant; the
+///     two valid leading bytes (`$`, `/`) are unambiguous.
+///
+/// Multiple `auth /path/to/key.pub` lines accumulate (multiple
+/// authorized public keys), matching the v0.6.x behavior where
+/// multiple `key` lines were allowed.
+fn parseAuth(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
+    if (value.len == 0) return error.InvalidAuth;
+    switch (value[0]) {
+        '$' => {
+            // Check duplicate-password BEFORE running PHC validation
+            // — otherwise a second `auth $bcrypt$...` line gets
+            // rejected with `PasswordHashNotArgon2id`, when the real
+            // operator error is "you wrote two password lines for
+            // the same user." The duplicate diagnostic is more
+            // actionable.
+            if (user.password_hash != null) return error.DuplicatePassword;
+            try checkArgon2idPolicy(value, argon2id_policy);
+            user.password_hash = try dupNonEmpty(allocator, value);
+        },
+        '/' => {
+            // PLAN §7.6 length cap. The same upper bound that
+            // protected the inline `key` directive now protects the
+            // path field — a 4 KiB path is plenty (PATH_MAX is
+            // typically 4096 on Linux); anything longer is almost
+            // certainly an attack surface or a typo.
+            if (value.len > max_keyline_bytes) return error.KeyLineTooLong;
+            try user.key_files.append(allocator, try allocator.dupe(u8, value));
+        },
+        else => return error.InvalidAuth,
+    }
+}
 
-    var parts = std.mem.tokenizeAny(u8, value, " \t");
+/// Parse a single OpenSSH public-key line — `<algorithm> <blob>
+/// [comment]`. Pure (no I/O); used both for unit tests and as the
+/// per-line parser inside the file-loader called from
+/// `validateSemantic`. `algorithm` and `blob` are allocator-duped so
+/// the result outlives the input slice. Returns the same errors the
+/// v0.6.x inline `key` directive produced (`InvalidKeyLine`,
+/// `UnsupportedKeyAlgorithm`, `KeyLineTooLong`) — operator-facing
+/// behavior is unchanged from v0.6.x for malformed key content.
+pub fn parsePublicKeyLine(allocator: std.mem.Allocator, line: []const u8) Error!PublicKey {
+    if (line.len > max_keyline_bytes) return error.KeyLineTooLong;
+
+    var parts = std.mem.tokenizeAny(u8, line, " \t");
     const algorithm = parts.next() orelse return error.InvalidKeyLine;
     const blob = parts.next() orelse return error.InvalidKeyLine;
 
     if (!isAcceptedKeyAlgorithm(algorithm)) return error.UnsupportedKeyAlgorithm;
     if (blob.len == 0) return error.InvalidKeyLine;
 
-    // PLAN §8.4: reject malformed key blobs at config load so a
-    // config-with-bad-key never goes live. OpenSSH public-key blobs
-    // are strict RFC 4648 standard base64 (with padding). The parser
-    // makes the same accept/reject decision libssh would.
+    // Strict RFC 4648 standard base64. Same accept/reject behavior
+    // libssh applies on the wire when the partner sends a key.
     if (!isValidStandardBase64(blob)) return error.InvalidKeyLine;
 
-    try user.keys.append(allocator, .{
+    return .{
         .algorithm = try allocator.dupe(u8, algorithm),
         .blob = try allocator.dupe(u8, blob),
-    });
+    };
 }
 
 /// Strict RFC 4648 standard base64 used for OpenSSH wire blobs:
@@ -925,6 +1263,25 @@ fn splitKeyValue(line: []const u8) ?struct { []const u8, []const u8 } {
 }
 
 fn validUserName(name: []const u8) bool {
+    // v0.7.0: `partner-root <pr>` derives a user root by joining
+    // `<pr>/<user-name>` (see the user-finalize loop in `parse`).
+    // Reject the two filesystem-reserved component names that
+    // would let a hostile config name escape the partner-root:
+    //
+    //   - `.`  → derived root is `<pr>/.` ≡ `<pr>` (collides with
+    //            other partners' roots, breaks isolation)
+    //   - `..` → derived root is `<pr>/..` (escapes partner-root)
+    //
+    // We also reject names that *start* with `.` so dotfile-style
+    // names that confuse listing tools and obscure ops dashboards
+    // don't sneak through. None of these were valid as a real
+    // username anyway (POSIX `.` and `..` are reserved in every
+    // directory). Doing the check at parse time makes the bug
+    // unreachable from validateSemantic regardless of whether
+    // partner-root is in use.
+    if (name.len == 0) return false;
+    if (name[0] == '.') return false;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
     for (name) |ch| {
         const ok = std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.';
         if (!ok) return false;
@@ -948,7 +1305,7 @@ test "parse valid config" {
         \\  log stderr
         \\
         \\user ally
-        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
         \\  root /tmp/zift/ally
         \\  allow /pending read write list mkdir remove rename
         \\  allow /archive read list
@@ -976,7 +1333,7 @@ test "parse: 'add' verb expands to write+mkdir+rename" {
         \\  log stderr
         \\
         \\user alice
-        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
         \\  root /tmp/zift/alice
         \\  allow /pending read list add remove
         \\
@@ -1013,7 +1370,7 @@ test "parse: 'read' is now a superset of 'list' (v0.4.0)" {
         \\  log stderr
         \\
         \\user alice
-        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
         \\  root /tmp/zift/alice
         \\  allow /pending read
         \\
@@ -1045,7 +1402,7 @@ test "parse: bare 'list' keeps its narrow v0.3.x meaning" {
         \\  log stderr
         \\
         \\user alice
-        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
         \\  root /tmp/zift/alice
         \\  allow /pending list
         \\
@@ -1066,7 +1423,7 @@ test "parse: 'full' grants every permission" {
         \\  log stderr
         \\
         \\user alice
-        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
         \\  root /tmp/zift/alice
         \\  allow /workspace full
         \\
@@ -1094,7 +1451,7 @@ test "parse: 'add' alongside granular verbs is idempotent" {
         \\  log stderr
         \\
         \\user alice
-        \\  password $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
         \\  root /tmp/zift/alice
         \\  allow /pending read list add write rename
         \\
@@ -1116,15 +1473,15 @@ const valid_test_phc = "$argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy
 test "duplicate user is rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n\n" ++
-        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/b\n";
+        "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n\n" ++
+        "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/b\n";
     try std.testing.expectError(error.DuplicateUser, parse(std.testing.allocator, text));
 }
 
 test "publish-mode: defaults to 0o660 when not specified" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+        "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u32, 0o660), cfg.server.publish_mode);
@@ -1156,7 +1513,7 @@ test "publish-mode: accepts 0o600, 0o640, 0o660 — rejects everything else" {
     inline for (cases) |case| {
         const text =
             "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  publish-mode " ++ case.@"0" ++ "\n\n" ++
-            "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+            "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
         if (case.@"1") |expected| {
             var cfg = try parse(std.testing.allocator, text);
             defer cfg.deinit();
@@ -1170,7 +1527,7 @@ test "publish-mode: accepts 0o600, 0o640, 0o660 — rejects everything else" {
 test "mkdir-mode: defaults to 0o2770 when not specified" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+        "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u32, 0o2770), cfg.server.mkdir_mode);
@@ -1195,7 +1552,7 @@ test "mkdir-mode: accepts 0o2700, 0o2750, 0o2770 — rejects everything else" {
     inline for (cases) |case| {
         const text =
             "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  mkdir-mode " ++ case.@"0" ++ "\n\n" ++
-            "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+            "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
         if (case.@"1") |expected| {
             var cfg = try parse(std.testing.allocator, text);
             defer cfg.deinit();
@@ -1218,52 +1575,52 @@ test "unknown keys are rejected" {
     try std.testing.expectError(error.UnknownKey, parse(std.testing.allocator, text));
 }
 
-test "password rejected when not argon2id" {
+test "auth $... rejected when not argon2id" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $bcrypt$something\n  root /tmp/a\n";
+        "user ally\n  auth $bcrypt$something\n  root /tmp/a\n";
     try std.testing.expectError(error.PasswordHashNotArgon2id, parse(std.testing.allocator, text));
 }
 
-test "password rejected when phc malformed" {
+test "auth $... rejected when phc malformed" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $argon2id$broken\n  root /tmp/a\n";
+        "user ally\n  auth $argon2id$broken\n  root /tmp/a\n";
     try std.testing.expectError(error.PasswordHashMalformed, parse(std.testing.allocator, text));
 }
 
-test "password rejected when memory below envelope" {
+test "auth $... rejected when memory below envelope" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $argon2id$v=19$m=4096,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+        "user ally\n  auth $argon2id$v=19$m=4096,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
     try std.testing.expectError(error.PasswordMemoryOutOfPolicy, parse(std.testing.allocator, text));
 }
 
-test "password rejected when memory above envelope" {
+test "auth $... rejected when memory above envelope" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $argon2id$v=19$m=524288,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+        "user ally\n  auth $argon2id$v=19$m=524288,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
     try std.testing.expectError(error.PasswordMemoryOutOfPolicy, parse(std.testing.allocator, text));
 }
 
-test "password rejected when passes below envelope" {
+test "auth $... rejected when passes below envelope" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $argon2id$v=19$m=65536,t=1,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+        "user ally\n  auth $argon2id$v=19$m=65536,t=1,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
     try std.testing.expectError(error.PasswordPassesOutOfPolicy, parse(std.testing.allocator, text));
 }
 
-test "password rejected when parallelism above envelope" {
+test "auth $... rejected when parallelism above envelope" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $argon2id$v=19$m=65536,t=3,p=8$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+        "user ally\n  auth $argon2id$v=19$m=65536,t=3,p=8$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
     try std.testing.expectError(error.PasswordParallelismOutOfPolicy, parse(std.testing.allocator, text));
 }
 
-test "password accepted at envelope boundaries" {
+test "auth $... accepted at envelope boundaries" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $argon2id$v=19$m=262144,t=8,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+        "user ally\n  auth $argon2id$v=19$m=262144,t=8,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
 }
@@ -1278,55 +1635,38 @@ const valid_ed25519_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIPHj7SuD0g1xj0ZqLELSQ7Ux8RSj
 const valid_ecdsa_blob =
     "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPHj7SuD0g1xj0ZqLELSQ7Ux8RSjGlYBhVMxbfBhPXMd";
 
-test "key-only user accepted" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user runner\n  key ssh-ed25519 " ++ valid_ed25519_blob ++ " runner-1\n  root /tmp/a\n";
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    try std.testing.expectEqual(@as(usize, 1), cfg.users.len);
-    try std.testing.expectEqual(@as(?[]const u8, null), cfg.users[0].password_hash);
-    try std.testing.expectEqual(@as(usize, 1), cfg.users[0].keys.len);
-    try std.testing.expectEqualStrings("ssh-ed25519", cfg.users[0].keys[0].algorithm);
-    try std.testing.expectEqualStrings(valid_ed25519_blob, cfg.users[0].keys[0].blob);
+// Public-key file parsing is now exercised through `parsePublicKeyLine`
+// directly. The full file-loading round-trip (file open + first-line
+// extraction + parsing) is covered by the integration tests under
+// test/cases/ which stand up real key files.
+
+test "parsePublicKeyLine: valid ed25519 line" {
+    const line = "ssh-ed25519 " ++ valid_ed25519_blob ++ " comment";
+    const pk = try parsePublicKeyLine(std.testing.allocator, line);
+    defer std.testing.allocator.free(pk.algorithm);
+    defer std.testing.allocator.free(pk.blob);
+    try std.testing.expectEqualStrings("ssh-ed25519", pk.algorithm);
+    try std.testing.expectEqualStrings(valid_ed25519_blob, pk.blob);
 }
 
-test "multiple keys per user accepted" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user runner\n" ++
-        "  key ssh-ed25519 " ++ valid_ed25519_blob ++ " primary\n" ++
-        "  key ecdsa-sha2-nistp256 " ++ valid_ecdsa_blob ++ " backup\n" ++
-        "  root /tmp/a\n";
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    try std.testing.expectEqual(@as(usize, 2), cfg.users[0].keys.len);
-    try std.testing.expectEqualStrings("ecdsa-sha2-nistp256", cfg.users[0].keys[1].algorithm);
+test "parsePublicKeyLine: non-base64 blob rejected" {
+    const line = "ssh-ed25519 not!valid!base64 oops";
+    try std.testing.expectError(error.InvalidKeyLine, parsePublicKeyLine(std.testing.allocator, line));
 }
 
-test "key line with non-base64 blob rejected" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user runner\n  key ssh-ed25519 not!valid!base64 oops\n  root /tmp/a\n";
-    try std.testing.expectError(error.InvalidKeyLine, parse(std.testing.allocator, text));
+test "parsePublicKeyLine: bad base64 length rejected" {
+    // 29 chars — strict base64 rejects because length is not a multiple of 4.
+    const line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBLAH oops";
+    try std.testing.expectError(error.InvalidKeyLine, parsePublicKeyLine(std.testing.allocator, line));
 }
 
-test "key line with bad base64 length rejected" {
-    // 29 chars — the previous lax validator let this through; strict
-    // base64 rejects because length is not a multiple of 4.
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user runner\n  key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBLAH oops\n  root /tmp/a\n";
-    try std.testing.expectError(error.InvalidKeyLine, parse(std.testing.allocator, text));
-}
-
-test "real argon2id phc accepted (PHC base64 has no padding)" {
+test "auth $... real argon2id phc accepted (PHC base64 has no padding)" {
     // 22-char salt + 43-char hash — both `len % 4 != 0`, neither has
     // `=` padding. RFC 9106 / PHC §B explicitly forbids padding so the
     // strict OpenSSH-style validator must NOT be applied here.
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $argon2id$v=19$m=65536,t=3,p=1" ++
+        "user ally\n  auth $argon2id$v=19$m=65536,t=3,p=1" ++
         "$bSki6LMKgGqnScrLG0fo/2hpMLj8InvvY+irrZKEsS4" ++
         "$0HMWjuvAdHzgT2+GA1DdgQL5fdDrC4X0GEezlPDjimQ\n" ++
         "  root /tmp/a\n";
@@ -1334,48 +1674,221 @@ test "real argon2id phc accepted (PHC base64 has no padding)" {
     defer cfg.deinit();
 }
 
-test "phc with `=` padding in salt rejected" {
+test "auth $... phc with `=` padding in salt rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $argon2id$v=19$m=65536,t=3,p=1$xxxx==xx$yyyyyyyyyyyy\n" ++
+        "user ally\n  auth $argon2id$v=19$m=65536,t=3,p=1$xxxx==xx$yyyyyyyyyyyy\n" ++
         "  root /tmp/a\n";
     try std.testing.expectError(error.PasswordHashMalformed, parse(std.testing.allocator, text));
 }
 
-test "phc with non-alphabet char in hash rejected" {
+test "auth $... phc with non-alphabet char in hash rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password $argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyy!yyyyyyy\n" ++
+        "user ally\n  auth $argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyy!yyyyyyy\n" ++
         "  root /tmp/a\n";
     try std.testing.expectError(error.PasswordHashMalformed, parse(std.testing.allocator, text));
 }
 
-test "rsa key rejected" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user runner\n  key ssh-rsa AAAAB3NzaC1yc2EAAAA notallowed\n  root /tmp/a\n";
-    try std.testing.expectError(error.UnsupportedKeyAlgorithm, parse(std.testing.allocator, text));
+test "parsePublicKeyLine: rsa key rejected" {
+    try std.testing.expectError(
+        error.UnsupportedKeyAlgorithm,
+        parsePublicKeyLine(std.testing.allocator, "ssh-rsa AAAAB3NzaC1yc2EAAAA notallowed"),
+    );
 }
 
-test "dsa key rejected" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user runner\n  key ssh-dss AAAAB3NzaC1kc3MAAAA legacy\n  root /tmp/a\n";
-    try std.testing.expectError(error.UnsupportedKeyAlgorithm, parse(std.testing.allocator, text));
+test "parsePublicKeyLine: dsa key rejected" {
+    try std.testing.expectError(
+        error.UnsupportedKeyAlgorithm,
+        parsePublicKeyLine(std.testing.allocator, "ssh-dss AAAAB3NzaC1kc3MAAAA legacy"),
+    );
 }
 
-test "key line missing blob rejected" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user runner\n  key ssh-ed25519\n  root /tmp/a\n";
-    try std.testing.expectError(error.InvalidKeyLine, parse(std.testing.allocator, text));
+test "parsePublicKeyLine: missing blob rejected" {
+    try std.testing.expectError(
+        error.InvalidKeyLine,
+        parsePublicKeyLine(std.testing.allocator, "ssh-ed25519"),
+    );
 }
 
-test "user with neither password nor key rejected" {
+test "parsePublicKeyLine: ecdsa key accepted" {
+    const line = "ecdsa-sha2-nistp256 " ++ valid_ecdsa_blob ++ " backup";
+    const pk = try parsePublicKeyLine(std.testing.allocator, line);
+    defer std.testing.allocator.free(pk.algorithm);
+    defer std.testing.allocator.free(pk.blob);
+    try std.testing.expectEqualStrings("ecdsa-sha2-nistp256", pk.algorithm);
+}
+
+test "user with no auth lines rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
         "user empty\n  root /tmp/a\n";
     try std.testing.expectError(error.MissingCredentials, parse(std.testing.allocator, text));
+}
+
+test "two PHC auth lines for one user are rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n" ++
+        "  auth " ++ valid_test_phc ++ "\n" ++
+        "  auth " ++ valid_test_phc ++ "\n" ++
+        "  root /tmp/a\n";
+    try std.testing.expectError(error.DuplicatePassword, parse(std.testing.allocator, text));
+}
+
+test "duplicate-password check fires before PHC validation" {
+    // A second `$...` auth line with malformed-or-non-argon2id PHC
+    // should still report `DuplicatePassword`, not the PHC-shape
+    // error. The duplicate is the more actionable operator
+    // diagnostic; the malformed-second-line is a downstream
+    // consequence of the duplicate.
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n" ++
+        "  auth " ++ valid_test_phc ++ "\n" ++
+        "  auth $bcrypt$something\n" ++
+        "  root /tmp/a\n";
+    try std.testing.expectError(error.DuplicatePassword, parse(std.testing.allocator, text));
+}
+
+test "partner-root '/' derives single-slash user root (POSIX-safe)" {
+    // The lone-`/` partner-root is allowed but the derived user
+    // root must NOT be `//ally` — POSIX leaves leading-`//` paths
+    // implementation-defined and we don't want a jail boundary
+    // depending on that. Joiner special-cases this.
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /\n\n" ++
+        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("/ally", cfg.findUser("ally").?.root);
+    try std.testing.expectEqualStrings("/", cfg.server.partner_root.?);
+}
+
+test "auth value with neither $ nor / leading byte rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  auth wat\n  root /tmp/a\n";
+    try std.testing.expectError(error.InvalidAuth, parse(std.testing.allocator, text));
+}
+
+test "auth value with leading byte other than '$' or '/' rejected" {
+    // The dispatch byte must be one of the two well-known leading
+    // bytes; anything else hits the catch-all `error.InvalidAuth`
+    // arm in `parseAuth` regardless of how plausible the rest of
+    // the value looks. Tests `./relative`, plus a bare token, plus
+    // an empty value.
+    const inputs = [_][]const u8{
+        "./relative",
+        "wat",
+        "",
+    };
+    for (inputs) |val| {
+        const text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+                "user ally\n  auth {s}\n  root /tmp/a\n",
+            .{val},
+        );
+        defer std.testing.allocator.free(text);
+        const got = parse(std.testing.allocator, text);
+        try std.testing.expect(got == error.InvalidAuth or got == error.InvalidConfig);
+    }
+}
+
+test "username '..' rejected (partner-root path-traversal defense)" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
+        "user ..\n  auth " ++ valid_test_phc ++ "\n";
+    try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
+}
+
+test "username '.' rejected (partner-root path-traversal defense)" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
+        "user .\n  auth " ++ valid_test_phc ++ "\n";
+    try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
+}
+
+test "username with leading dot rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user .hidden\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+    try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
+}
+
+test "password directive removed: clear migration error" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordDirectiveRemoved, parse(std.testing.allocator, text));
+}
+
+test "key directive removed: clear migration error" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  auth " ++ valid_test_phc ++ "\n  key ssh-ed25519 " ++ valid_ed25519_blob ++ "\n  root /tmp/a\n";
+    try std.testing.expectError(error.KeyDirectiveRemoved, parse(std.testing.allocator, text));
+}
+
+test "partner-root: trailing slash trimmed before deriving user root" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift/\n\n" ++
+        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    // Trimmed `partner-root` stored as `/home/zift`; user root joined
+    // as `/home/zift/ally` — no double-slash.
+    try std.testing.expectEqualStrings("/home/zift", cfg.server.partner_root.?);
+    try std.testing.expectEqualStrings("/home/zift/ally", cfg.findUser("ally").?.root);
+}
+
+test "auth /path records path; key file resolved later" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user runner\n" ++
+        "  auth /tmp/zift_test_does_not_exist_yet.pub\n" ++
+        "  auth /tmp/zift_test_also_pending.pub\n" ++
+        "  root /tmp/a\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg.users[0].key_files.len);
+    try std.testing.expectEqualStrings("/tmp/zift_test_does_not_exist_yet.pub", cfg.users[0].key_files[0]);
+    try std.testing.expectEqual(@as(usize, 0), cfg.users[0].keys.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.users[0].password_hash);
+}
+
+test "partner-root: explicit user root overrides default" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
+        "user override\n  auth " ++ valid_test_phc ++ "\n  root /custom/path\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("/custom/path", cfg.findUser("override").?.root);
+}
+
+test "partner-root: missing user root defaults to <partner-root>/<user>" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
+        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("/home/zift/ally", cfg.findUser("ally").?.root);
+    try std.testing.expectEqualStrings("/home/zift", cfg.server.partner_root.?);
+}
+
+test "partner-root: unset, missing user root still rejected" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+    try std.testing.expectError(error.MissingRoot, parse(std.testing.allocator, text));
+}
+
+test "partner-root: relative path rejected at parse time" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root home/zift\n\n" ++
+        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+    try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
 }
 
 test "server defaults applied when properties omitted" {
@@ -1478,6 +1991,7 @@ fn makeNumericTestConfig(args: NumericTestArgs) Config {
             .listing_mode = .virtual,
             .publish_mode = 0o660,
             .mkdir_mode = 0o2770,
+            .partner_root = null,
         },
         .users = &.{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),

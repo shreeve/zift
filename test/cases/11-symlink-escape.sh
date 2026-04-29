@@ -31,7 +31,7 @@ server
   log stderr
 
 user partner
-  password $hash
+  auth $hash
   root $TEST_TMP/jail
   allow /inbox write list mkdir
 EOF

@@ -75,7 +75,7 @@ provenance verification, firewall, and health-check steps.
 
 ```bash
 # --- 0. Download the binary + deploy bundle. ----------------------
-ZIFT_VERSION=v0.6.0
+ZIFT_VERSION=v0.7.0
 ARCH=$(uname -m)
 cd /tmp
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/${ZIFT_VERSION}/zift-${ZIFT_VERSION#v}-${ARCH}-linux"
@@ -183,7 +183,7 @@ identity (cosign keyless via Sigstore). Pick the artifact for your
 host's architecture.
 
 ```bash
-ZIFT_VERSION=v0.6.0
+ZIFT_VERSION=v0.7.0
 ARCH=$(uname -m)        # x86_64 or aarch64
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/${ZIFT_VERSION}/zift-${ZIFT_VERSION#v}-${ARCH}-linux"
@@ -198,7 +198,7 @@ produced the manifest. Verify before installing on any host you care
 about:
 
 ```bash
-ZIFT_VERSION=v0.6.0
+ZIFT_VERSION=v0.7.0
 gh release download "$ZIFT_VERSION" \
     --repo shreeve/zift \
     --pattern 'SHA256SUMS' \
@@ -240,29 +240,62 @@ sudo -u zift ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N ""
 sudo chmod 0600 /home/zift/host_ed25519
 ```
 
-## 4. Generate partner password hashes + lay out partner roots
+## 4. Provision partner credentials + lay out partner roots
+
+v0.7.0 unifies the two old credential directives (`password`,
+`key`) under a single `auth <value>` line in the config. Generate
+**one or both** of the following per partner; mix and match.
+
+### 4a. Password (Argon2id PHC)
 
 ```bash
-# One per partner.
-sudo -u zift mkdir -p /home/zift/alice/inbox /home/zift/alice/outbox
-
-# Generate the Argon2id PHC string the partner will authenticate with.
+# One per partner you want to authenticate by password.
 printf '%s\n' 'alice-secret' | zift hash-password
 # → $argon2id$v=19$m=65536,t=3,p=1$...
+```
+
+Paste the full `$argon2id$...` string into the partner's user
+block as `auth $argon2id$...`. At most one PHC `auth` line per
+user (`error.DuplicatePassword` at parse time otherwise).
+
+### 4b. Public key (operator-managed file)
+
+If the partner sends you a `.pub` key (or you generate one for
+them), drop it under `/home/zift/keys/` and reference it from the
+config:
+
+```bash
+sudo install -d -o root -g zift -m 0750 /home/zift/keys
+sudo install -o root -g zift -m 0640 /path/to/alice.pub /home/zift/keys/alice.pub
+```
+
+Add `auth /home/zift/keys/alice.pub` to the partner's user block.
+Multiple `auth /path/...` lines accumulate (multiple authorized
+keys — handy for rotation).
+
+### 4c. Lay out partner roots
+
+```bash
+# One per partner. With `partner-root /home/zift` set in the
+# server block, you can skip the `root /...` line in the user
+# block and the daemon will default to /home/zift/<partner-name>.
+sudo install -d -o zift -g zift -m 2770 /home/zift/alice
+sudo install -d -o zift -g zift -m 2770 /home/zift/alice/inbox /home/zift/alice/outbox
 ```
 
 ## 5. Write the config
 
 Copy the starter config from `deploy/zift.conf.example`, then edit
-the two things you have to customize (the password hash and the
-partner block). Comments inside the file flag every spot you'd
-typically touch.
+the two things you have to customize (the partner credentials and
+the allow/deny rules). Comments inside the file flag every spot
+you'd typically touch.
 
 ```bash
-sudo install -o zift -g zift -m 0600 deploy/zift.conf.example /home/zift/zift.conf
-sudo -u zift "${EDITOR:-nano}" /home/zift/zift.conf
+sudo install -o root -g zift -m 0640 deploy/zift.conf.example /home/zift/zift.conf
+sudo -e /home/zift/zift.conf  # sudoedit — daemon never sees a writable handle
 # Paste your real Argon2id hash where the file says
-# REPLACE-WITH-REAL-SALT$REPLACE-WITH-REAL-HASH; tune the partner
+# REPLACE-WITH-REAL-SALT$REPLACE-WITH-REAL-HASH (and/or uncomment
+# the `auth /home/zift/keys/<partner>.pub` line); tune the partner
 # block to your policy.
 ```
 
@@ -565,6 +598,77 @@ echo | timeout 5 ssh -o StrictHostKeyChecking=no \
 
 For deeper probes, create a dedicated `healthcheck` user with read-only
 access to an empty directory and test with `sftp`.
+
+## Migrating v0.6.x configs to v0.7.0
+
+v0.7.0 makes three breaking changes to the config grammar. There is
+no backward compatibility — `zift validate` refuses to load a v0.6.x
+config until you update it. Apply this migration before upgrading
+the binary in place:
+
+| v0.6.x                          | v0.7.0                                | Notes                                                                       |
+| ------------------------------- | ------------------------------------- | --------------------------------------------------------------------------- |
+| `password $argon2id$...`        | `auth $argon2id$...`                  | Same Argon2id PHC string; one per user.                                     |
+| `key ssh-ed25519 AAAA... alice` | `auth /home/zift/keys/alice.pub`      | Public keys move to operator-managed files. Multiple `auth /path` lines accumulate. |
+| `root /home/zift/alice` per user | `partner-root /home/zift` (optional) | When set, `root` defaults to `<partner-root>/<user-name>`. Explicit `root` per user still wins. |
+
+Removed-directive rejections are explicit:
+
+```text
+zift: zift.conf:line N: [user alice] 'password': PasswordDirectiveRemoved
+zift: zift.conf:line N: [user alice] 'key': KeyDirectiveRemoved
+```
+
+A typical edit:
+
+```diff
+ server
+   listen 0.0.0.0:2222
+   host-key /home/zift/host_ed25519
++  partner-root /home/zift
+
+ user alice
+-  password $argon2id$v=19$m=65536,t=3,p=1$...
+-  key ssh-ed25519 AAAA... alice@laptop
+-  root /home/zift/alice
++  auth $argon2id$v=19$m=65536,t=3,p=1$...
++  auth /home/zift/keys/alice.pub
+   allow /inbox  read add
+   allow /outbox read
+```
+
+Public-key files are validated at config load:
+
+- Path must be absolute.
+- File must be a regular file (no FIFOs, devices, or non-`file` types).
+- Mode must NOT have group-write or world-write bits set. A writable
+  key file is equivalent to a writable password hash; Zift refuses to
+  load a config that points at one. Recommended: `chmod 0640` and
+  `chown root:zift /home/zift/keys/<partner>.pub`.
+- Each non-empty/non-comment line is parsed as a `<algorithm> <blob>
+  [comment]` triple — same shape as `~/.ssh/authorized_keys`. Multiple
+  keys per file are accumulated in order.
+
+Audit log changes worth knowing:
+
+- Every line now leads with `"time":"YYYY-MM-DDTHH:MM:SS.mmmZ"` (RFC
+  3339 UTC, millisecond precision).
+- The included `fail2ban-zift-filter.conf` adds a `datepattern` so
+  fail2ban reads event time from the line itself instead of relying
+  on file mtime — gives accurate findtime/bantime windows even when
+  the audit log is rotated or shipped off-host. If your fail2ban
+  version doesn't recognize the pattern, comment the `datepattern`
+  line out and fail2ban falls back to file mtime (same as v0.6.x
+  behavior).
+- Existing `jq`/awk filters that key on `event` / `operation` /
+  `result` / `ip` continue to work unchanged.
+
+After editing, validate before restarting the daemon:
+
+```bash
+sudo -u zift zift validate /home/zift/zift.conf
+sudo systemctl reload-or-restart zift
+```
 
 ## Rollback
 

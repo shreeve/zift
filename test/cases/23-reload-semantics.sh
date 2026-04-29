@@ -18,7 +18,7 @@ server
   log stderr
 
 user ally
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF
@@ -79,7 +79,7 @@ server
   log stderr
 
 user ally
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF
@@ -122,7 +122,7 @@ server
   log stderr
 
 user ally
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF
@@ -141,7 +141,7 @@ server
   log stderr
 
 user ally
-  password $hash
+  auth $hash
   root $TEST_TMP
   allow / read list
 EOF

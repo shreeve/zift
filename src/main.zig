@@ -106,7 +106,11 @@ fn validate(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
     config.validateSemantic(io, gpa, &cfg) catch return 1;
 
     const stdout = std.Io.File.stdout();
-    var buf: [128]u8 = undefined;
+    // 4 KiB upper bound is plenty for `path` (PATH_MAX) plus the
+    // small fixed envelope. Big enough that paths inside a deeply
+    // nested test scratch dir don't overflow; still small enough
+    // to live happily on the stack of the validate helper.
+    var buf: [4096]u8 = undefined;
     const summary = std.fmt.bufPrint(&buf, "ok: {s} ({d} user{s}, listen {s})\n", .{
         path,
         cfg.users.len,

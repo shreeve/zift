@@ -38,12 +38,12 @@ server
   host-key $HOST_KEY
 
 user alice
-  password $hash
+  auth $hash
   root $TEST_TMP/root_a
   allow / read list
 
 user bob
-  password $hash
+  auth $hash
   root $TEST_TMP/root_b
   allow / read list
 EOF
@@ -63,7 +63,7 @@ server
   host-key $HOST_KEY
 
 user alice
-  password $hash
+  auth $hash
   root $TEST_TMP/does-not-exist
   allow / read list
 EOF
@@ -85,7 +85,7 @@ server
   host-key $HOST_KEY
 
 user alice
-  password $hash
+  auth $hash
   root $TEST_TMP/file_not_dir
   allow / read list
 EOF
@@ -106,7 +106,7 @@ server
   host-key $TEST_TMP/no_such_host_key
 
 user alice
-  password $hash
+  auth $hash
   root $TEST_TMP/root_a
   allow / read list
 EOF
@@ -128,12 +128,12 @@ server
   host-key $HOST_KEY
 
 user outer
-  password $hash
+  auth $hash
   root $TEST_TMP/shared
   allow / read list
 
 user inner
-  password $hash
+  auth $hash
   root $TEST_TMP/shared/sub
   allow / read list
 EOF
@@ -154,12 +154,12 @@ server
   host-key $HOST_KEY
 
 user alice
-  password $hash
+  auth $hash
   root $TEST_TMP/shared
   allow / read list
 
 user bob
-  password $hash
+  auth $hash
   root $TEST_TMP/shared
   allow / read list
 EOF
@@ -182,7 +182,7 @@ server
   max-unauth-connections 16
 
 user alice
-  password $hash
+  auth $hash
   root $TEST_TMP/root_a
   allow / read list
 EOF
@@ -215,7 +215,7 @@ server
   max-unauth-connections 16
 
 user alice
-  password $hash
+  auth $hash
   root $TEST_TMP/root_a
   allow / read list
 EOF

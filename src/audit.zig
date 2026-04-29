@@ -314,9 +314,17 @@ fn formatLineImpl(
     ip: []const u8,
     truncated: bool,
 ) !void {
-    // PLAN §7.4 stable order: event, user, operation, result, path,
-    // detail, ip, [truncated].
-    try w.writeAll("{\"event\":\"zift.audit\"");
+    // v0.7.0 stable order: time, event, user, operation, result,
+    // path, detail, ip, [truncated]. `time` is required and emitted
+    // first so log readers can sort/filter by event time without
+    // parsing the rest of the line — and so off-host log shippers
+    // (rsyslog, vector, etc.) get a real timestamp instead of
+    // falling back on file mtime.
+    var time_buf: [time_buf_len]u8 = undefined;
+    const time_str = formatNowRfc3339Utc(&time_buf);
+    try w.writeAll("{\"time\":\"");
+    try w.writeAll(time_str);
+    try w.writeAll("\",\"event\":\"zift.audit\"");
     if (user) |value| {
         try w.writeAll(",\"user\":");
         try std.json.Stringify.encodeJsonString(value, .{}, w);
@@ -338,6 +346,119 @@ fn formatLineImpl(
     try std.json.Stringify.encodeJsonString(ip, .{}, w);
     if (truncated) try w.writeAll(",\"truncated\":true");
     try w.writeAll("}\n");
+}
+
+/// Length of an RFC 3339 UTC timestamp with millisecond precision:
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` is exactly 24 bytes.
+const time_buf_len: usize = 24;
+
+/// Format the current wall-clock time as RFC 3339 / ISO 8601 UTC
+/// with millisecond precision. Writes exactly `time_buf_len` bytes
+/// to `buf` and returns the same slice. The result is lexically
+/// sortable and used as the leading field of every audit line.
+///
+/// Reads `clock_gettime(CLOCK_REALTIME)` and falls back to the
+/// epoch sentinel `1970-01-01T00:00:00.000Z` if the syscall fails
+/// (extremely rare in practice — Linux/macOS guarantee `REALTIME`
+/// — but skipping the timestamp on failure would give us undefined
+/// stack bytes formatted as digits, which is worse).
+fn formatNowRfc3339Utc(buf: *[time_buf_len]u8) []const u8 {
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return formatRfc3339Utc(buf, ts.sec, ts.nsec);
+}
+
+/// Same as `formatNowRfc3339Utc` but takes the timestamp as input
+/// — pure (no `clock_gettime`), test-friendly. Production callers
+/// use the `Now` wrapper above.
+///
+/// Date math uses Howard Hinnant's `civil_from_days` algorithm
+/// (same one `listing.zig` uses for `breakTime` formatting). O(1),
+/// works for any `i64` second count we'll plausibly encounter.
+/// Year is clamped to `[0, 9999]` so the output stays at exactly
+/// 24 bytes even for absurd input — RFC 3339 doesn't define
+/// negative years and we'd rather emit `0000` or `9999` than
+/// silently produce a wrong-length line that breaks the field-
+/// position invariants the rest of the audit pipeline relies on.
+///
+/// The hand-rolled digit emission below is deliberate: by writing
+/// the exact 24-byte layout one field at a time, the buffer-size
+/// invariant becomes obvious by inspection and we don't depend on
+/// any quirks of `std.fmt`'s width handling in this hot audit path.
+fn formatRfc3339Utc(buf: *[time_buf_len]u8, sec: i64, nsec_in: i64) []const u8 {
+    // Normalize nsec into [0, 1_000_000_000) without panicking on
+    // negative nsec. `clock_gettime` shouldn't ever return that
+    // shape, but we accept it as a defensive measure for the
+    // test-friendly entry point.
+    var nsec: i64 = nsec_in;
+    if (nsec < 0) nsec = 0;
+    if (nsec >= std.time.ns_per_s) nsec = std.time.ns_per_s - 1;
+    const ms: u32 = @intCast(@divTrunc(nsec, std.time.ns_per_ms));
+
+    const civil = civilFromUnix(sec);
+    const sec_of_day: u32 = @intCast(@mod(sec, 86400));
+    const hour: u32 = @divTrunc(sec_of_day, 3600);
+    const minute: u32 = @divTrunc(@mod(sec_of_day, 3600), 60);
+    const second: u32 = @mod(sec_of_day, 60);
+
+    // Clamp the year into [0, 9999] so the output stays exactly
+    // 4 digits. For sane Unix timestamps this is a no-op.
+    const year_clamped: i32 = if (civil.year < 0) 0 else if (civil.year > 9999) 9999 else civil.year;
+    const year_u: u32 = @intCast(year_clamped);
+
+    writeFixedDigits(buf[0..4], year_u);
+    buf[4] = '-';
+    writeFixedDigits(buf[5..7], civil.month);
+    buf[7] = '-';
+    writeFixedDigits(buf[8..10], civil.day);
+    buf[10] = 'T';
+    writeFixedDigits(buf[11..13], hour);
+    buf[13] = ':';
+    writeFixedDigits(buf[14..16], minute);
+    buf[16] = ':';
+    writeFixedDigits(buf[17..19], second);
+    buf[19] = '.';
+    writeFixedDigits(buf[20..23], ms);
+    buf[23] = 'Z';
+    return buf;
+}
+
+/// Write a fixed-width zero-padded decimal into `dst`. Caller
+/// guarantees `value` fits in `dst.len` digits. Used by
+/// `formatNowRfc3339Utc` for the year/month/day/hour/min/sec/ms
+/// fields, all of which have known small ranges.
+fn writeFixedDigits(dst: []u8, value_in: u32) void {
+    var value = value_in;
+    var i: usize = dst.len;
+    while (i > 0) {
+        i -= 1;
+        dst[i] = @intCast('0' + (value % 10));
+        value /= 10;
+    }
+}
+
+const Civil = struct { year: i32, month: u8, day: u8 };
+
+/// Howard Hinnant's `civil_from_days` algorithm, adapted for Unix
+/// epoch input. Floor-division semantics handle pre-1970 input
+/// correctly. Same algorithm as `listing.breakTime`; duplicated here
+/// to avoid an audit-on-formatting cross-module dependency.
+fn civilFromUnix(unix_secs: i64) Civil {
+    const z: i64 = @divFloor(unix_secs, 86400) + 719468;
+    const era: i64 = if (z >= 0) @divTrunc(z, 146097) else @divTrunc(z - 146096, 146097);
+    const doe: u32 = @intCast(z - era * 146097);
+    const yoe: u32 = (doe -% (doe / 1460) -% (doe / 36524) +% (doe / 146096)) / 365;
+    const y: i64 = @as(i64, yoe) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u32 = (5 * doy + 2) / 153;
+    const day: u32 = doy - (153 * mp + 2) / 5 + 1;
+    const month: u32 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i64 = if (month <= 2) y + 1 else y;
+    return .{
+        .year = @intCast(year),
+        .month = @intCast(month),
+        .day = @intCast(day),
+    };
 }
 
 // ----- tests ---------------------------------------------------------------
@@ -363,7 +484,8 @@ test "audit line always includes ip" {
 test "audit line follows PLAN field order" {
     var buf: [256]u8 = undefined;
     const line = formatLine(&buf, "ally", "write", "/inbox/x", .ok, "size=10", "10.0.0.1");
-    // event must come first; ip must come after detail.
+    // time must be the leading field; event next; ip after detail.
+    const time_idx = std.mem.indexOf(u8, line, "\"time\"").?;
     const event_idx = std.mem.indexOf(u8, line, "\"event\"").?;
     const user_idx = std.mem.indexOf(u8, line, "\"user\"").?;
     const op_idx = std.mem.indexOf(u8, line, "\"operation\"").?;
@@ -371,12 +493,68 @@ test "audit line follows PLAN field order" {
     const path_idx = std.mem.indexOf(u8, line, "\"path\"").?;
     const detail_idx = std.mem.indexOf(u8, line, "\"detail\"").?;
     const ip_idx = std.mem.indexOf(u8, line, "\"ip\"").?;
+    try std.testing.expect(time_idx < event_idx);
     try std.testing.expect(event_idx < user_idx);
     try std.testing.expect(user_idx < op_idx);
     try std.testing.expect(op_idx < result_idx);
     try std.testing.expect(result_idx < path_idx);
     try std.testing.expect(path_idx < detail_idx);
     try std.testing.expect(detail_idx < ip_idx);
+    // The leading time field is exactly time_buf_len bytes between the quotes.
+    try std.testing.expect(std.mem.startsWith(u8, line, "{\"time\":\""));
+    // After `{"time":"` (9 bytes), the timestamp ends with `Z"`.
+    try std.testing.expectEqual(@as(u8, 'Z'), line[9 + time_buf_len - 1]);
+    try std.testing.expectEqual(@as(u8, '"'), line[9 + time_buf_len]);
+}
+
+test "audit time field is RFC 3339 UTC milliseconds (live)" {
+    var buf: [time_buf_len]u8 = undefined;
+    const ts = formatNowRfc3339Utc(&buf);
+    try std.testing.expectEqual(@as(usize, time_buf_len), ts.len);
+    try std.testing.expectEqual(@as(u8, '-'), ts[4]);
+    try std.testing.expectEqual(@as(u8, '-'), ts[7]);
+    try std.testing.expectEqual(@as(u8, 'T'), ts[10]);
+    try std.testing.expectEqual(@as(u8, ':'), ts[13]);
+    try std.testing.expectEqual(@as(u8, ':'), ts[16]);
+    try std.testing.expectEqual(@as(u8, '.'), ts[19]);
+    try std.testing.expectEqual(@as(u8, 'Z'), ts[23]);
+}
+
+test "formatRfc3339Utc fixed-input fixtures" {
+    const Fixture = struct { sec: i64, nsec: i64, want: []const u8 };
+    const fixtures = [_]Fixture{
+        .{ .sec = 0, .nsec = 0, .want = "1970-01-01T00:00:00.000Z" },
+        .{ .sec = 0, .nsec = 123_000_000, .want = "1970-01-01T00:00:00.123Z" },
+        .{ .sec = 951_782_400, .nsec = 0, .want = "2000-02-29T00:00:00.000Z" }, // leap day
+        .{ .sec = 1_709_251_200, .nsec = 999_000_000, .want = "2024-03-01T00:00:00.999Z" },
+        .{ .sec = 4_102_444_800, .nsec = 0, .want = "2100-01-01T00:00:00.000Z" }, // year 2100 not a leap
+        .{ .sec = -1, .nsec = 0, .want = "1969-12-31T23:59:59.000Z" },
+        // Year-clamp edge: a wildly distant timestamp lands at 9999.
+        .{ .sec = 253_402_300_799, .nsec = 0, .want = "9999-12-31T23:59:59.000Z" },
+    };
+    var buf: [time_buf_len]u8 = undefined;
+    for (fixtures) |f| {
+        const got = formatRfc3339Utc(&buf, f.sec, f.nsec);
+        try std.testing.expectEqualStrings(f.want, got);
+    }
+}
+
+test "civilFromUnix matches Howard Hinnant fixtures" {
+    const Fixture = struct { unix: i64, year: i32, month: u8, day: u8 };
+    const fixtures = [_]Fixture{
+        .{ .unix = 0, .year = 1970, .month = 1, .day = 1 },
+        .{ .unix = 951782400, .year = 2000, .month = 2, .day = 29 }, // leap day
+        .{ .unix = 1456704000, .year = 2016, .month = 2, .day = 29 }, // leap day
+        .{ .unix = 1709251200, .year = 2024, .month = 3, .day = 1 },
+        .{ .unix = 4102444800, .year = 2100, .month = 1, .day = 1 }, // not a leap year
+        .{ .unix = -86400, .year = 1969, .month = 12, .day = 31 },
+    };
+    for (fixtures) |f| {
+        const civil = civilFromUnix(f.unix);
+        try std.testing.expectEqual(f.year, civil.year);
+        try std.testing.expectEqual(f.month, civil.month);
+        try std.testing.expectEqual(f.day, civil.day);
+    }
 }
 
 test "audit line truncates detail when over the line cap" {

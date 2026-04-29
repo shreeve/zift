@@ -35,7 +35,7 @@ server
   log $TEST_TMP/audit.jsonl
 
 user runner
-  password $hash
+  auth $hash
   root $TEST_TMP/data
   allow / read list
 EOF

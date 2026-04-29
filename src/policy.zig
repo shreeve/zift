@@ -255,6 +255,7 @@ test "default deny and explicit allow" {
         .name = "ally",
         .password_hash = "hash",
         .keys = &.{},
+        .key_files = &.{},
         .root = "/tmp",
         .rules = &rules,
     };
@@ -281,6 +282,7 @@ test "deny overrides allow" {
         .name = "ally",
         .password_hash = "hash",
         .keys = &.{},
+        .key_files = &.{},
         .root = "/tmp",
         .rules = &rules,
     };
@@ -305,6 +307,7 @@ test "rename checks source and destination" {
         .name = "ally",
         .password_hash = "hash",
         .keys = &.{},
+        .key_files = &.{},
         .root = "/tmp",
         .rules = &rules,
     };
@@ -394,6 +397,7 @@ test "deny **.exe denies recursively" {
         .name = "ally",
         .password_hash = "hash",
         .keys = &.{},
+        .key_files = &.{},
         .root = "/tmp",
         .rules = &rules,
     };

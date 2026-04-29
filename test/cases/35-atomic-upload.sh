@@ -36,7 +36,7 @@ server
   log stderr
 
 user partner
-  password $hash
+  auth $hash
   root $TEST_TMP/data
   allow / read
   allow /pending read add

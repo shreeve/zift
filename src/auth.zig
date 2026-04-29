@@ -112,6 +112,7 @@ test "hash and verify password" {
         .name = "ally",
         .password_hash = hash,
         .keys = &.{},
+        .key_files = &.{},
         .root = "/tmp",
         .rules = &.{},
     };
@@ -125,6 +126,7 @@ test "verifyPassword returns false when user has no password" {
         .name = "key-only",
         .password_hash = null,
         .keys = &.{},
+        .key_files = &.{},
         .root = "/tmp",
         .rules = &.{},
     };

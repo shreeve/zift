@@ -38,7 +38,7 @@ server
   log stderr
 
 user runner
-  password $runner_hash
+  auth $runner_hash
   root $TEST_TMP/data
   allow / read write list mkdir remove rename
 EOF
@@ -75,12 +75,12 @@ server
   log stderr
 
 user runner
-  password $runner_hash
+  auth $runner_hash
   root $TEST_TMP/data
   allow / read write list mkdir remove rename
 
 user late
-  password $later_hash
+  auth $later_hash
   root $TEST_TMP/data2
   allow / read write list mkdir
 EOF

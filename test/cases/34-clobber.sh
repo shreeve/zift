@@ -44,7 +44,7 @@ server
   log stderr
 
 user dropper
-  password $hash
+  auth $hash
   root $TEST_TMP/data
   # add only — partner can drop NEW files but should not be able
   # to overwrite, modify in place, or append to existing files.
@@ -153,7 +153,7 @@ server
   log stderr
 
 user mutator
-  password $hash
+  auth $hash
   root $TEST_TMP/data
   # full = read + add + remove. All clobber paths now permitted.
   allow / full

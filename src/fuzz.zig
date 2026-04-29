@@ -28,7 +28,7 @@ test "fuzz config parser" {
         \\  host-key /tmp/key
         \\
         \\user ally
-        \\  password $argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth $argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy
         \\  root /tmp/a
         ,
     } });
@@ -112,7 +112,7 @@ fn fuzzPhc(_: void, smith: *Smith) !void {
 
     const text = std.fmt.allocPrint(
         std.testing.allocator,
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\nuser fuzz\n  password {s}\n  root /tmp/a\n",
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\nuser fuzz\n  auth {s}\n  root /tmp/a\n",
         .{phc},
     ) catch return;
     defer std.testing.allocator.free(text);
@@ -121,9 +121,11 @@ fn fuzzPhc(_: void, smith: *Smith) !void {
 }
 
 // ---------------------------------------------------------------------------
-// Public-key line validation fuzz — same shape as PHC: route the
-// fuzz bytes through the config parser so the full key-line gate
-// (algorithm allowlist, base64 blob check, line-length cap) runs.
+// Public-key line validation fuzz — drives `parsePublicKeyLine`
+// directly. v0.7.0 moved key parsing out of the config-line path
+// (the inline `key ...` directive is gone; keys come from
+// operator-managed files referenced by `auth /path/...`), so the
+// fuzz target moved with it.
 
 test "fuzz public key line validation" {
     return std.testing.fuzz({}, fuzzPubkeyLine, .{ .corpus = &.{
@@ -140,12 +142,7 @@ fn fuzzPubkeyLine(_: void, smith: *Smith) !void {
     const len = smith.sliceWithHash(&buf, 0xFEEDFACE);
     const line = buf[0..len];
 
-    const text = std.fmt.allocPrint(
-        std.testing.allocator,
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\nuser fuzz\n  key {s}\n  root /tmp/a\n",
-        .{line},
-    ) catch return;
-    defer std.testing.allocator.free(text);
-    var cfg = config.parse(std.testing.allocator, text) catch return;
-    cfg.deinit();
+    const pk = config.parsePublicKeyLine(std.testing.allocator, line) catch return;
+    std.testing.allocator.free(pk.algorithm);
+    std.testing.allocator.free(pk.blob);
 }

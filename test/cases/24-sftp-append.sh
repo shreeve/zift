@@ -34,7 +34,7 @@ server
   log stderr
 
 user user1
-  password $hash
+  auth $hash
   root $TEST_TMP/jail
   allow / read list
   # write+remove: append-on-existing is "clobber" under v0.4.0 (any
