@@ -1,0 +1,56 @@
+# Zift config — production starter for the /home/zift/ deploy layout.
+#
+# Install path: /home/zift/zift.conf
+# Owner/mode:   zift:zift, 0600
+#
+# Edit before going live:
+#   1. The Argon2id password hash (run `printf 'pw\n' | zift hash-password`
+#      to generate yours; paste the full $argon2id$... string here).
+#   2. The partner's username, root path, and allow/deny rules to match
+#      the workflow you've agreed with that partner.
+#   3. `listen` IP/port if you want to bind somewhere other than
+#      0.0.0.0:2222 (e.g. an internal interface only).
+#   4. `max-connections` — keep `max-connections * 256 MiB ≤ MemoryMax`
+#      from the systemd unit (default 4 GiB → ~14 concurrent verifications).
+#
+# After saving, validate before letting the running server pick it up:
+#
+#   sudo -u zift zift validate /home/zift/zift.conf
+#
+# Then either wait `reload-interval` (2 s default) for the mtime-based
+# reload, or force it: `sudo systemctl kill -s HUP zift`.
+
+server
+  listen 0.0.0.0:2222
+  host-key /home/zift/host_ed25519
+  idle-timeout 5m
+  max-connections 14
+  max-unauth-connections 4
+  reload-interval 2s
+  log /home/zift/audit.jsonl
+  # `virtual` (the v0.3.0+ default) shows the partner their own user
+  # name + a fixed group of "sftp" + policy-derived rwx bits. Set to
+  # `reality` if you want the on-disk owner/group/mode to leak through
+  # (rare; mostly useful for debugging).
+  listing-mode virtual
+
+user alice
+  password $argon2id$v=19$m=65536,t=3,p=1$REPLACE-WITH-REAL-SALT$REPLACE-WITH-REAL-HASH
+  root /home/zift/alice
+  # The four-verb model covers every SFTP wire op:
+  #   read    = stat + readdir + download (`read` includes `list` since v0.4.0)
+  #   add     = upload + mkdir + rename
+  #   remove  = unlink + rmdir + clobber authority
+  #   full    = read + add + remove (shorthand for "everything")
+  #
+  # Clobber rule (v0.4.0): any OPEN(write) on an existing file requires
+  # `remove` on that path. So `add` without `remove` lets the partner
+  # CREATE new files / new names but never modify or destroy existing
+  # entries. Same rule applies to rename-over-existing.
+  allow /inbox  read add
+  allow /outbox read
+  # `**` crosses path boundaries (gitignore-style); `*` does not.
+  # `**.exe`     → deny executables anywhere under the partner root.
+  # `**/.ssh/**` → deny anything inside a `.ssh` dir at any depth.
+  deny **.exe
+  deny **/.ssh/**
