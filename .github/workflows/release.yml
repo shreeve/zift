@@ -176,7 +176,7 @@ jobs:
           cp deploy/DEPLOY.md \
              deploy/zift.service \
              deploy/zift.conf.example \
-             deploy/fail2ban-zift.conf \
+             deploy/fail2ban-zift-filter.conf \
              deploy/fail2ban-zift-jail.conf \
              deploy/logrotate-zift.conf \
              "staging/zift-deploy-${version}/"
