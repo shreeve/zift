@@ -225,12 +225,22 @@ documented trade-off), or **FINDING** (actionable issue with recommended fix).
 | signals.zig | 0 |
 | reload | 0 |
 
-**Overall assessment**: The codebase is in good shape for public exposure
-on a port-2222-style deployment with partner IP allowlisting. No
-security defects remain in the runtime path. The one remaining P1 in
-`TODOS.md` — a static-link / signed-release pipeline — is an
-operational hardening for the build/release surface, not a runtime
-security item.
+**Overall assessment**: The codebase is in good shape for public
+exposure on a port-2222-style deployment with partner IP allowlisting.
+No security defects remain in the runtime path. As of v0.6.0,
+`TODOS.md` carries no remaining P0 or P1 items — the static-link /
+signed-release P1 closed in v0.2.x; the v0.4.0+ raw-syscall errno
+class closed in v0.5.3; the v0.6.0 production permission model
+(root-owned config + host key, group-rw partner data, 4-exception
+explicit posture) closes the last operational hardening gap that
+mattered for going live with real partner traffic.
+
+The remaining items in TODOS.md are all P2 hardening (hermetic
+`renameat2(RENAME_NOREPLACE)` clobber, `openat(O_DIRECTORY|O_NOFOLLOW)`
+for staging-dir, Linux-only errno regression test, ConfigRef stress
+test) or P3 polish (cross-restart staging orphan sweep, `ssh_key`
+handle cache). None of them are blockers; each is a documented
+follow-up worth picking up in v0.6.x or v0.7.0.
 
 **This audit is a snapshot.** It should be re-run before any release
 that touches `session.zig`, `vfs.zig`, `config.zig`, or `auth.zig`,

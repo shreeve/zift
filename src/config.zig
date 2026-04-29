@@ -76,6 +76,25 @@ pub const ServerConfig = struct {
     /// unchanged — including any setuid/setgid/sticky bits. PLAN
     /// §7.6 (default flipped between v0.2.x and v0.3.0).
     listing_mode: ListingMode,
+    /// Mode applied to atomically-published files (the result of
+    /// alice's `put report.csv`). v0.6.0 default `0o660` — group
+    /// `zift` can read+write, world has nothing. Confidentiality of
+    /// partial uploads during transfer is enforced by the
+    /// `<root>/.zift-staging/` directory being mode `0o700` regardless
+    /// of this setting; it only controls what the file lands at after
+    /// the atomic rename. Allowed values: `0o600`, `0o640`, `0o660`.
+    /// Anything else is rejected at parse time to prevent operators
+    /// from accidentally configuring world-readable or world-writable
+    /// modes. PLAN §6.2.
+    publish_mode: u32,
+    /// Mode applied to directories created via SFTP `MKDIR`. v0.6.0
+    /// default `0o2770` — setgid + group rwx + world none, matching
+    /// the partner-tree posture set up by the deploy. The setgid bit
+    /// ensures any subdirectories alice creates inside also inherit
+    /// `group=zift`, so operators in the `zift` group can manage the
+    /// whole subtree without UID gymnastics. Allowed values:
+    /// `0o2700`, `0o2750`, `0o2770`. PLAN §6.2.
+    mkdir_mode: u32,
 };
 
 pub const ListingMode = enum {
@@ -266,6 +285,8 @@ const ServerBuilder = struct {
     shutdown_grace_ms: u64 = 30_000,
     log: ?LogTarget = null,
     listing_mode: ListingMode = .virtual,
+    publish_mode: u32 = 0o660,
+    mkdir_mode: u32 = 0o2770,
 };
 
 const UserBuilder = struct {
@@ -590,6 +611,8 @@ pub fn parseWithDiag(
             .shutdown_grace_ms = server.shutdown_grace_ms,
             .log = server.log orelse .stderr,
             .listing_mode = server.listing_mode,
+            .publish_mode = server.publish_mode,
+            .mkdir_mode = server.mkdir_mode,
         },
         .users = final_users,
     };
@@ -635,9 +658,59 @@ fn parseServerProperty(
         } else {
             return error.InvalidConfig;
         }
+    } else if (std.mem.eql(u8, key, "publish-mode")) {
+        server.publish_mode = try parsePublishMode(value);
+    } else if (std.mem.eql(u8, key, "mkdir-mode")) {
+        server.mkdir_mode = try parseMkdirMode(value);
     } else {
         return error.UnknownKey;
     }
+}
+
+/// Parse `publish-mode` from a config value. Accepts an octal literal
+/// with optional `0o` or `0` prefix. The allowed-set is restricted to
+/// `0o600 | 0o640 | 0o660` so a config typo can't accidentally produce
+/// world-readable or world-writable partner data files. Operators who
+/// genuinely want a stricter mode (e.g., `0o600` to keep files
+/// daemon-private) can opt in; anything outside the set is rejected
+/// at parse time so a regression is caught at validation, not at
+/// publish time.
+fn parsePublishMode(value: []const u8) Error!u32 {
+    const mode = parseOctalMode(value) catch return error.InvalidConfig;
+    if (mode != 0o600 and mode != 0o640 and mode != 0o660) {
+        return error.InvalidConfig;
+    }
+    return mode;
+}
+
+/// Parse `mkdir-mode` from a config value. Same shape as
+/// `parsePublishMode` but for SFTP-created directories. The allowed
+/// set carries the setgid bit (`02000`) so child entries inherit
+/// `group=zift` automatically — matching the deploy posture where
+/// `<root>/<partner>/` itself is `2770`. Allowed: `0o2700 | 0o2750 |
+/// 0o2770`. Rejecting other values prevents operators from creating
+/// world-traversable directory trees by accident.
+fn parseMkdirMode(value: []const u8) Error!u32 {
+    const mode = parseOctalMode(value) catch return error.InvalidConfig;
+    if (mode != 0o2700 and mode != 0o2750 and mode != 0o2770) {
+        return error.InvalidConfig;
+    }
+    return mode;
+}
+
+/// Parse an octal mode literal. Accepts `0o660`, `0660`, and `660`
+/// — all three are equivalent. The `0o` prefix is the modern Zig-
+/// canonical form; bare values are interpreted as octal exactly the
+/// way `chmod` accepts them (`660` means `0o660`, not decimal 660).
+/// PLAN §6.2 octal-literal grammar.
+fn parseOctalMode(value: []const u8) !u32 {
+    if (value.len == 0) return error.InvalidConfig;
+    const slice = if (std.mem.startsWith(u8, value, "0o") or std.mem.startsWith(u8, value, "0O"))
+        value[2..]
+    else
+        value;
+    if (slice.len == 0) return error.InvalidConfig;
+    return std.fmt.parseUnsigned(u32, slice, 8);
 }
 
 fn parseUserProperty(
@@ -1048,6 +1121,91 @@ test "duplicate user is rejected" {
     try std.testing.expectError(error.DuplicateUser, parse(std.testing.allocator, text));
 }
 
+test "publish-mode: defaults to 0o660 when not specified" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 0o660), cfg.server.publish_mode);
+}
+
+test "publish-mode: accepts 0o600, 0o640, 0o660 — rejects everything else" {
+    const cases = .{
+        .{ "0o600", @as(?u32, 0o600) },
+        .{ "0o640", @as(?u32, 0o640) },
+        .{ "0o660", @as(?u32, 0o660) },
+        .{ "660", @as(?u32, 0o660) }, // bare-octal also accepted
+        .{ "0660", @as(?u32, 0o660) }, // leading-zero octal also accepted
+        // World-anything is rejected — protects against accidentally
+        // shipping world-readable or world-writable partner data.
+        .{ "0o666", @as(?u32, null) },
+        .{ "0o644", @as(?u32, null) },
+        // Execute bits are rejected — partner data files shouldn't
+        // ever be executable.
+        .{ "0o770", @as(?u32, null) },
+        // Special bits (setuid/setgid/sticky) on regular files are
+        // suspect; not in the allowed set.
+        .{ "0o2660", @as(?u32, null) },
+        // Owner-less is nonsensical for a file the daemon writes.
+        .{ "0o060", @as(?u32, null) },
+        // Decimal nonsense.
+        .{ "abc", @as(?u32, null) },
+        .{ "", @as(?u32, null) },
+    };
+    inline for (cases) |case| {
+        const text =
+            "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  publish-mode " ++ case.@"0" ++ "\n\n" ++
+            "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+        if (case.@"1") |expected| {
+            var cfg = try parse(std.testing.allocator, text);
+            defer cfg.deinit();
+            try std.testing.expectEqual(expected, cfg.server.publish_mode);
+        } else {
+            try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
+        }
+    }
+}
+
+test "mkdir-mode: defaults to 0o2770 when not specified" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 0o2770), cfg.server.mkdir_mode);
+}
+
+test "mkdir-mode: accepts 0o2700, 0o2750, 0o2770 — rejects everything else" {
+    const cases = .{
+        .{ "0o2700", @as(?u32, 0o2700) },
+        .{ "0o2750", @as(?u32, 0o2750) },
+        .{ "0o2770", @as(?u32, 0o2770) },
+        .{ "2770", @as(?u32, 0o2770) },
+        // No setgid (the leading 2) → rejected. Setgid is what makes
+        // child files inherit `group=zift`; without it the
+        // operator-group story breaks.
+        .{ "0o770", @as(?u32, null) },
+        // World-readable/traversable → rejected.
+        .{ "0o2775", @as(?u32, null) },
+        // Decimal nonsense.
+        .{ "xyz", @as(?u32, null) },
+        .{ "", @as(?u32, null) },
+    };
+    inline for (cases) |case| {
+        const text =
+            "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  mkdir-mode " ++ case.@"0" ++ "\n\n" ++
+            "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+        if (case.@"1") |expected| {
+            var cfg = try parse(std.testing.allocator, text);
+            defer cfg.deinit();
+            try std.testing.expectEqual(expected, cfg.server.mkdir_mode);
+        } else {
+            try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
+        }
+    }
+}
+
 test "unknown keys are rejected" {
     const text =
         \\server
@@ -1318,6 +1476,8 @@ fn makeNumericTestConfig(args: NumericTestArgs) Config {
             .shutdown_grace_ms = 0,
             .log = .stderr,
             .listing_mode = .virtual,
+            .publish_mode = 0o660,
+            .mkdir_mode = 0o2770,
         },
         .users = &.{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),

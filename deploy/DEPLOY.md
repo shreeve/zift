@@ -37,7 +37,7 @@ zift-deploy-X.Y.Z/
 ├── DEPLOY.md                  # this runbook
 ├── zift.conf.example          # → /home/zift/zift.conf
 ├── zift.service               # → /etc/systemd/system/zift.service
-├── fail2ban-zift.conf         # → /etc/fail2ban/filter.d/zift.conf
+├── fail2ban-zift-filter.conf  # → /etc/fail2ban/filter.d/zift.conf
 ├── fail2ban-zift-jail.conf    # → append to /etc/fail2ban/jail.local
 └── logrotate-zift.conf        # → /etc/logrotate.d/zift
 ```
@@ -46,11 +46,16 @@ Detailed mapping:
 
 | Source | Destination | Owner / mode | Required? |
 |---|---|---|---|
-| `zift.conf.example` | `/home/zift/zift.conf` | `zift:zift` `0600` | mandatory |
+| `zift.conf.example` | `/home/zift/zift.conf` | `root:zift` `0640` | mandatory |
 | `zift.service` | `/etc/systemd/system/zift.service` | `root:root` `0644` | mandatory |
-| `fail2ban-zift.conf` | `/etc/fail2ban/filter.d/zift.conf` | `root:root` `0644` | optional (fail2ban) |
+| `fail2ban-zift-filter.conf` | `/etc/fail2ban/filter.d/zift.conf` | `root:root` `0644` | optional (fail2ban) |
 | `fail2ban-zift-jail.conf` | append to `/etc/fail2ban/jail.local` | `root:root` `0644` | optional (fail2ban) |
 | `logrotate-zift.conf` | `/etc/logrotate.d/zift` | `root:root` `0644` | optional (logrotate) |
+
+(In v0.5.x and earlier the filter file was named `fail2ban-zift.conf`.
+v0.6.0 renamed it to `fail2ban-zift-filter.conf` to make the
+filter-vs-jail roles obvious at a glance. Old installs work unchanged
+— only the source file in the deploy bundle moved.)
 
 You can also clone the repo and use `deploy/<file>` directly — same
 files. Tarball is just the no-git-required option.
@@ -70,7 +75,7 @@ provenance verification, firewall, and health-check steps.
 
 ```bash
 # --- 0. Download the binary + deploy bundle. ----------------------
-ZIFT_VERSION=v0.5.3
+ZIFT_VERSION=v0.6.0
 ARCH=$(uname -m)
 cd /tmp
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/${ZIFT_VERSION}/zift-${ZIFT_VERSION#v}-${ARCH}-linux"
@@ -81,22 +86,46 @@ cd "zift-deploy-${ZIFT_VERSION#v}"
 # --- 1. Install the binary. ---------------------------------------
 sudo install -m 0755 "/tmp/zift-${ZIFT_VERSION#v}-${ARCH}-linux" /usr/local/bin/zift
 
-# --- 2. Service user with a real home. ----------------------------
+# --- 2. Service user. /home/zift is root-owned so a daemon -------
+#       compromise cannot replace top-level files (config, host key)
+#       via DAC. Daemon still has group `r-x` on the parent and can
+#       traverse + read.
 sudo useradd --system --create-home --home-dir /home/zift \
     --shell /usr/sbin/nologin zift
+sudo chown root:zift /home/zift
 sudo chmod 0750 /home/zift
 
-# --- 3. Host key. -------------------------------------------------
-sudo -u zift ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N ""
+# --- 2.5. Pre-create audit.jsonl. Daemon can no longer create
+#         top-level files in /home/zift since we just made it root-
+#         owned, so the audit file has to exist before zift starts.
+sudo touch /home/zift/audit.jsonl
+sudo chown zift:zift /home/zift/audit.jsonl
+sudo chmod 0640 /home/zift/audit.jsonl
 
-# --- 4. zift config (edit before service starts). -----------------
-sudo install -o zift -g zift -m 0600 zift.conf.example /home/zift/zift.conf
+# --- 3. Host key. /home/zift is root-owned now, so we generate as
+#       root rather than as user `zift` (which has only group r-x on
+#       the parent and cannot create files there). Final ownership
+#       is root:zift 0640 — daemon reads, daemon-compromise cannot
+#       rewrite the server's identity.
+sudo ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N ""
+sudo chown root:zift /home/zift/host_ed25519 /home/zift/host_ed25519.pub
+sudo chmod 0640 /home/zift/host_ed25519
+sudo chmod 0644 /home/zift/host_ed25519.pub
+
+# --- 4. zift config (edit before service starts). Owned by
+#       root:zift, mode 0640 — daemon reads, daemon cannot rewrite.
+sudo install -o root -g zift -m 0640 zift.conf.example /home/zift/zift.conf
 # Generate a real Argon2id hash for your partner:
 printf '%s\n' 'alice-secret' | zift hash-password
-# Paste the resulting $argon2id$... string into /home/zift/zift.conf
-# (replacing REPLACE-WITH-REAL-SALT$REPLACE-WITH-REAL-HASH).
-sudo -u zift "${EDITOR:-nano}" /home/zift/zift.conf
-sudo -u zift mkdir -p /home/zift/alice/inbox /home/zift/alice/outbox
+# Edit /home/zift/zift.conf with sudoedit, paste the $argon2id$... hash:
+sudo -e /home/zift/zift.conf
+
+# --- 4.5. Create the partner's data tree. /home/zift is root-owned
+#         so `sudo -u zift mkdir` would fail; create as root, then
+#         chown to zift and apply the 2770 mode (setgid + group rwx).
+sudo mkdir -p /home/zift/alice/inbox /home/zift/alice/outbox
+sudo chown -R zift:zift /home/zift/alice
+sudo find /home/zift/alice -type d -exec chmod 2770 {} +
 sudo -u zift zift validate /home/zift/zift.conf
 
 # --- 5. systemd unit. ---------------------------------------------
@@ -107,7 +136,7 @@ sudo systemctl enable --now zift
 sudo systemctl status zift
 
 # --- 6. fail2ban (optional). --------------------------------------
-sudo install -m 0644 fail2ban-zift.conf /etc/fail2ban/filter.d/zift.conf
+sudo install -m 0644 fail2ban-zift-filter.conf /etc/fail2ban/filter.d/zift.conf
 if [ -f /etc/fail2ban/jail.local ]; then
     sudo tee -a /etc/fail2ban/jail.local < fail2ban-zift-jail.conf
 else
@@ -122,7 +151,12 @@ sudo fail2ban-client status zift   # expect: File list: /home/zift/audit.jsonl
 sudo install -m 0644 logrotate-zift.conf /etc/logrotate.d/zift
 sudo logrotate -d /etc/logrotate.d/zift   # dry-run, no errors
 
-# --- 8. Smoke test + cleanup. -------------------------------------
+# --- 8. Operator group (optional but recommended). Add yourself
+#       to group `zift` for read+write access to partner data + the
+#       audit log without sudo. Log out + back in after.
+sudo usermod -aG zift "$USER"
+
+# --- 9. Smoke test + cleanup. -------------------------------------
 nc -z -w2 127.0.0.1 2222 && echo "tcp:2222 reachable"
 sudo systemctl is-active zift
 sudo fail2ban-client status zift 2>/dev/null | grep 'File list'
@@ -149,7 +183,7 @@ identity (cosign keyless via Sigstore). Pick the artifact for your
 host's architecture.
 
 ```bash
-ZIFT_VERSION=v0.5.3
+ZIFT_VERSION=v0.6.0
 ARCH=$(uname -m)        # x86_64 or aarch64
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/${ZIFT_VERSION}/zift-${ZIFT_VERSION#v}-${ARCH}-linux"
@@ -164,7 +198,7 @@ produced the manifest. Verify before installing on any host you care
 about:
 
 ```bash
-ZIFT_VERSION=v0.5.3
+ZIFT_VERSION=v0.6.0
 gh release download "$ZIFT_VERSION" \
     --repo shreeve/zift \
     --pattern 'SHA256SUMS' \
@@ -289,16 +323,143 @@ Edit the config, save, and the running server picks it up within
 sudo systemctl kill -s HUP zift
 ```
 
-The config is owned by `zift:zift` with mode `0600`. Edit through
-sudo:
+The config is owned by `root:zift` with mode `0640` (daemon reads but
+cannot rewrite). Edit through `sudoedit`:
 
 ```bash
-sudo -u zift "${EDITOR:-nano}" /home/zift/zift.conf
+sudo -e /home/zift/zift.conf            # opens in $EDITOR as your user
 sudo -u zift zift validate /home/zift/zift.conf
+sudo systemctl kill -s HUP zift         # force-reload (or wait reload-interval)
 ```
 
-Validating BEFORE saving over a known-good config protects against
-typos that would crash a reload.
+`sudoedit` (also written `sudo -e`) is the right tool because it
+opens a copy in your editor as your user, then writes back the
+result with `sudo` privileges — you don't need to `sudo $EDITOR`
+and inherit root's editor environment. Validation BEFORE the HUP
+keeps a typo'd config from interrupting service: zift's reload path
+keeps the previous config if validation fails, but it's better to
+fail validation explicitly than to discover the issue at reload time.
+
+If you want bulletproof atomic config replacement (the daemon's
+mtime watcher never sees a half-written intermediate), use a staging
+file:
+
+```bash
+sudo cp -a /home/zift/zift.conf /home/zift/zift.conf.new
+sudo -e /home/zift/zift.conf.new
+sudo -u zift zift validate /home/zift/zift.conf.new
+sudo mv /home/zift/zift.conf.new /home/zift/zift.conf  # atomic rename
+sudo systemctl kill -s HUP zift
+```
+
+## 6.5 Operator group (recommended)
+
+The deploy ships with a host-level group `zift` that operators can
+join to gain read+write access to partner data and read access to
+the audit log without `sudo`. Two layers compose:
+
+- **POSIX layer (host-side)**: group `zift` reads + writes anything
+  partner-data-related; world has nothing.
+- **SFTP layer (wire-side)**: partners (alice et al.) see only what
+  their `allow`/`deny` rules grant. The on-disk POSIX mode does not
+  leak into alice's view — virtual listing mode hides it.
+
+To add yourself to the group:
+
+```bash
+sudo usermod -aG zift "$USER"
+# Log out + back in (or `newgrp zift` in a single shell).
+groups   # should now include zift
+```
+
+After re-login, you can:
+
+```bash
+ls -la /home/zift/                    # works, no sudo
+cat /home/zift/audit.jsonl            # works (group reads)
+ls /home/zift/alice/inbox/            # works
+cp report.csv /home/zift/alice/outbox/  # works (drop a file for alice)
+```
+
+**Operator umask gotcha.** Host-side file drops inside the partner
+tree inherit `group=zift` (thanks to setgid on the `2770` parent),
+but the *mode* depends on your umask:
+
+- `umask 022` (typical default) → new files land at `0644`
+  (group reads only — alice can't fetch them via SFTP if she has
+  `read` access).
+- `umask 002` → `0664` (group r+w, world reads — too loose for the
+  "world none" policy).
+- `umask 007` → `0660` (group r+w, world none — the right answer).
+
+When doing host-side partner-data work, set `umask 007` first or
+use `install` with explicit mode:
+
+```bash
+umask 007                                                # session-wide
+cp report.csv /home/zift/alice/outbox/
+
+# Or per-file:
+install -m 0660 -g zift report.csv /home/zift/alice/outbox/report.csv
+```
+
+This only affects manual operator workflows. SFTP-uploaded files
+(via partners' clients) always land at the configured `publish-mode`
+regardless of umask.
+
+Three host-side files are deliberately NOT group-writable, with
+specific reasoning:
+
+| File | Mode | Owner | Why this exception |
+|---|---|---|---|
+| `audit.jsonl` | `0640` | `zift:zift` | Group **reads** for forensics; only the daemon writes. Group write would defeat audit integrity. |
+| `zift.conf` | `0640` | `root:zift` | `root`-owned so a daemon compromise cannot self-modify the config. Edit via `sudoedit`. |
+| `host_ed25519` | `0640` | `root:zift` | Same hardening as the config: daemon cannot rewrite its own SSH identity. |
+
+Plus one fourth, hidden-by-design exception: `/<partner>/.zift-staging/`
+is `0700 zift:zift` even though the partner directories above it are
+`2770`. Group operators cannot inspect partial uploads in transit
+without `sudo -u zift`. The directory is invisible to partners
+entirely (path-validator reserves the name; listing-renderer filters
+it out).
+
+### Filesystem permissions cheat sheet
+
+```
+/home/zift/                       0750 root:zift   parent (daemon r-x)
+/home/zift/<partner>/             2770 zift:zift   setgid; group rwx, world none
+/home/zift/<partner>/**/*         0660 zift:zift   group rw, world none
+/home/zift/<partner>/.zift-staging  0700 zift:zift  daemon-only (partial uploads)
+/home/zift/audit.jsonl            0640 zift:zift   group reads only
+/home/zift/zift.conf              0640 root:zift   daemon r-only (sudoedit)
+/home/zift/host_ed25519           0640 root:zift   daemon r-only (sudo to rotate)
+/home/zift/host_ed25519.pub       0644 root:zift   public, world readable
+```
+
+The mode applied to partner uploads is configurable via the
+`publish-mode` directive (allowed: `0o600`, `0o640`, `0o660`;
+default `0o660`). The mode applied to SFTP-created directories is
+configurable via `mkdir-mode` (allowed: `0o2700`, `0o2750`, `0o2770`;
+default `0o2770`).
+
+### Honest framing of what each protection covers
+
+- The config + host-key hardening protects against a daemon
+  compromise pivoting to "self-edit my own config" persistence. It
+  does **not** protect against a `root` privesc — anything that gets
+  root can rewrite anything. That's outside the threat model.
+- The audit-log read-only-for-group protects against accidental
+  operator writes (a typo in a redirect, a scripted log-cleanup that
+  hits the wrong file). It does **not** protect against a daemon
+  compromise — the daemon owns the file and can rewrite arbitrary
+  content via its existing fd. Stronger audit integrity (off-host
+  log shipping, `chattr +a`) is documented as a follow-up; not on by
+  default in v0.6.0.
+- World-denied across the entire tree means other unprivileged users
+  on the host cannot enumerate partner data or read partial uploads
+  via the filesystem. They also can't read the audit log. The only
+  way to reach partner data without group `zift` membership is via
+  the SFTP wire — which is policy-mediated.
 
 ## 7. fail2ban (optional)
 
@@ -308,13 +469,13 @@ pre-written; install and restart fail2ban.
 
 ```bash
 # Filter: regex that matches zift's auth-failure JSON.
-sudo install -m 0644 deploy/fail2ban-zift.conf /etc/fail2ban/filter.d/zift.conf
+sudo install -m 0644 fail2ban-zift-filter.conf /etc/fail2ban/filter.d/zift.conf
 
 # Jail: append to /etc/fail2ban/jail.local (or create it if absent).
 if [ -f /etc/fail2ban/jail.local ]; then
-    sudo tee -a /etc/fail2ban/jail.local < deploy/fail2ban-zift-jail.conf
+    sudo tee -a /etc/fail2ban/jail.local < fail2ban-zift-jail.conf
 else
-    sudo install -m 0644 deploy/fail2ban-zift-jail.conf /etc/fail2ban/jail.local
+    sudo install -m 0644 fail2ban-zift-jail.conf /etc/fail2ban/jail.local
 fi
 
 # Verify + restart.

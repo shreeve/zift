@@ -1,7 +1,10 @@
 # Zift config — production starter for the /home/zift/ deploy layout.
 #
 # Install path: /home/zift/zift.conf
-# Owner/mode:   zift:zift, 0600
+# Owner/mode:   root:zift, 0640
+#               (root-owned so a daemon compromise cannot self-modify
+#                the config; group `zift` reads only. Edit via
+#                `sudoedit /home/zift/zift.conf`.)
 #
 # Edit before going live:
 #   1. The Argon2id password hash (run `printf 'pw\n' | zift hash-password`
@@ -33,6 +36,16 @@ server
   # `reality` if you want the on-disk owner/group/mode to leak through
   # (rare; mostly useful for debugging).
   listing-mode virtual
+  # v0.6.0+: mode applied to atomically-published partner uploads.
+  # Default 0o660 (group `zift` rw, world none) matches the deploy
+  # layout where operators in group `zift` can manage partner data
+  # via the host. Allowed values: 0o600, 0o640, 0o660.
+  publish-mode 0o660
+  # v0.6.0+: mode applied to directories alice creates via SFTP
+  # MKDIR. Default 0o2770 (setgid + group rwx + world none) so
+  # subdirectories inherit `group=zift`. Allowed: 0o2700, 0o2750,
+  # 0o2770.
+  mkdir-mode 0o2770
 
 user alice
   password $argon2id$v=19$m=65536,t=3,p=1$REPLACE-WITH-REAL-SALT$REPLACE-WITH-REAL-HASH

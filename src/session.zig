@@ -539,7 +539,7 @@ fn handleSession(
 
     const channel = try acceptSftpSubsystem(session);
 
-    try runSftp(io, allocator, channel, user, cfg.server.idle_timeout_ms, cfg.server.listing_mode, peer_ip);
+    try runSftp(io, allocator, channel, user, cfg.server, peer_ip);
     c.ssh_disconnect(session);
 }
 
@@ -882,8 +882,7 @@ fn runSftp(
     allocator: std.mem.Allocator,
     channel: c.ssh_channel,
     user: *const config.UserConfig,
-    idle_timeout_ms: u64,
-    listing_mode: config.ListingMode,
+    server_cfg: config.ServerConfig,
     peer_ip: ?[]const u8,
 ) !void {
     var jail = try vfs_mod.Vfs.init(io, allocator, user.root);
@@ -897,8 +896,10 @@ fn runSftp(
         .user = user,
         .peer_ip = peer_ip,
         .vfs = jail,
-        .idle_timeout_ms = idle_timeout_ms,
-        .listing_mode = listing_mode,
+        .idle_timeout_ms = server_cfg.idle_timeout_ms,
+        .listing_mode = server_cfg.listing_mode,
+        .publish_mode = server_cfg.publish_mode,
+        .mkdir_mode = server_cfg.mkdir_mode,
         .last_activity_ms = start_ms,
         .session_started_ms = start_ms,
     };
@@ -1087,6 +1088,16 @@ const SftpState = struct {
     /// `reality` shows the real uid/gid/mode for operators who
     /// want the on-disk view.
     listing_mode: config.ListingMode = .virtual,
+    /// `publish-mode` from the server config (v0.6.0+). Mode applied
+    /// to atomically-published files at OPEN time; preserved by
+    /// rename(2) so this is also the on-disk mode partners' uploads
+    /// land at after CLOSE. Default `0o660`.
+    publish_mode: u32 = 0o660,
+    /// `mkdir-mode` from the server config (v0.6.0+). Mode applied
+    /// to directories created via SFTP `MKDIR`. Carries the setgid
+    /// bit so subdirectories inherit the partner-tree's group
+    /// ownership. Default `0o2770`.
+    mkdir_mode: u32 = 0o2770,
     /// v0.5.0 staging-rename: open Dir fd to `<root>/.zift-staging/`,
     /// shared across all handles in this session. Lazily opened the
     /// first time a partner does an OPEN(write+CREAT) on a
@@ -1633,23 +1644,28 @@ const SftpState = struct {
                 };
                 const staging_name = staging_name_buf[0..];
 
+                // The staging file is created with the configured
+                // `publish-mode` (default 0o660) so it lands at the
+                // target with the right mode after the atomic rename
+                // — POSIX rename(2) preserves the inode and its mode.
+                // Confidentiality of partial uploads during transfer
+                // is enforced by `<root>/.zift-staging/` itself being
+                // mode 0o700 (only the zift UID can traverse it),
+                // independent of the file's own mode. The explicit
+                // `setPermissions` after `createFile` is required to
+                // defeat the daemon's umask, which would otherwise
+                // mask the requested mode bits.
+                const publish_mode = self.publish_mode;
                 const created = staging.createFile(self.io, staging_name, .{
                     .read = want_read,
                     .truncate = false,
                     .exclusive = true,
-                    // Confidentiality: partial-upload bytes must
-                    // not be readable by other local users on the
-                    // host. The `permissions` field is the requested
-                    // create mode but is masked by the process's
-                    // umask, so we ALSO `setPermissions` after open
-                    // to pin the actual on-disk mode at 0o600
-                    // regardless of umask.
-                    .permissions = .fromMode(0o600),
+                    .permissions = .fromMode(@intCast(publish_mode)),
                 }) catch {
                     defer self.auditFailed(op_label, path.value, "staging create failed");
                     return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
-                created.setPermissions(self.io, .fromMode(0o600)) catch {
+                created.setPermissions(self.io, .fromMode(@intCast(publish_mode))) catch {
                     var f = created;
                     f.close(self.io);
                     staging.deleteFile(self.io, staging_name) catch {};
@@ -1732,7 +1748,7 @@ const SftpState = struct {
                 self.channel,
                 request_id,
                 c.SSH_FX_PERMISSION_DENIED,
-                "would clobber an existing entry; partner lacks remove",
+                "permission denied",
             );
         }
 
@@ -1861,7 +1877,7 @@ const SftpState = struct {
                         self.closeHandle(handle);
                         _ = self.handles.swapRemove(i);
                         self.auditFailed("close", audit_target, @errorName(err));
-                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "publish failed");
+                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "failure");
                     };
                     // publishStagedHandle clears staging_basename
                     // on success so closeHandle doesn't unlink the
@@ -1875,11 +1891,18 @@ const SftpState = struct {
                     // literal "ok" for every status; that confused
                     // operators reading audit lines for a denied or
                     // failed publish.
+                    // Wire-facing reply messages use SFTP-standard
+                    // terminology only — partners should not see
+                    // zift-internal vocabulary like "publish",
+                    // "staging", "clobber", or "partner". The audit
+                    // log keeps the full diagnostic detail server-
+                    // side; the wire reply just maps each SSH_FX
+                    // status to its standard human-readable phrase.
                     const reply_msg: []const u8 = switch (close_status) {
                         c.SSH_FX_OK => "ok",
-                        c.SSH_FX_PERMISSION_DENIED => "publish denied: target appeared and partner lacks remove",
-                        c.SSH_FX_FAILURE => "publish failed: target appeared with EXCL set",
-                        else => "publish status",
+                        c.SSH_FX_PERMISSION_DENIED => "permission denied",
+                        c.SSH_FX_FAILURE => "file exists",
+                        else => "failure",
                     };
                     if (close_status == c.SSH_FX_OK) {
                         self.auditOk("publish", audit_target, "");
@@ -1987,10 +2010,40 @@ const SftpState = struct {
         };
         defer parent.deinit(self.io, self.allocator);
 
-        parent.parent.createDir(self.io, parent.base, .default_dir) catch {
+        // Mode is the configured `mkdir-mode` (default 0o2770). The
+        // setgid bit propagates `group=zift` to descendants so any
+        // subdirectories alice creates within get the same operator-
+        // group ownership as the partner-tree root, without zift
+        // having to chmod after creation.
+        const dir_mode = std.Io.File.Permissions.fromMode(@intCast(self.mkdir_mode));
+        parent.parent.createDir(self.io, parent.base, dir_mode) catch {
             defer self.auditFailed("mkdir", path.value, "createDir failed");
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
         };
+        // `createDir` honors umask, so the on-disk mode at this
+        // moment may be more restrictive than `mkdir-mode`. Reopen +
+        // setPermissions to pin the exact mode regardless of umask.
+        // If either step fails we roll back the createDir so the
+        // partner sees a clean failure and an honest result code —
+        // returning SSH_FX_OK on a directory whose mode doesn't match
+        // the configured `mkdir-mode` would be a silent contract
+        // violation.
+        var created_dir = parent.parent.openDir(self.io, parent.base, .{}) catch {
+            parent.parent.deleteDir(self.io, parent.base) catch {};
+            defer self.auditFailed("mkdir", path.value, "openDir-after-create failed");
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
+        };
+        created_dir.setPermissions(self.io, dir_mode) catch {
+            created_dir.close(self.io);
+            // Best-effort rollback. deleteDir naturally fails if
+            // something raced and populated the dir between create
+            // and rollback; that's fine — leave whatever's there
+            // and report failure.
+            parent.parent.deleteDir(self.io, parent.base) catch {};
+            defer self.auditFailed("mkdir", path.value, "setPermissions failed");
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
+        };
+        created_dir.close(self.io);
         defer self.auditOk("mkdir", path.value, "");
         try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
@@ -2119,7 +2172,7 @@ const SftpState = struct {
                 self.channel,
                 request_id,
                 c.SSH_FX_PERMISSION_DENIED,
-                "rename would overwrite an existing entry; partner lacks remove on destination",
+                "permission denied",
             );
         }
 
