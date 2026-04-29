@@ -9,7 +9,7 @@ Type=simple
 User=zift
 Group=zift
 
-ExecStart=/usr/local/bin/zift serve /etc/zift/zift.conf
+ExecStart=/usr/local/bin/zift serve /home/zift/zift.conf
 
 Restart=on-failure
 RestartSec=5
@@ -39,7 +39,14 @@ RemoveIPC=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-ProtectHome=true
+# /home/zift/ is the entire deploy tree (config + host key + partner
+# data + audit log). `ProtectHome=tmpfs` replaces /home/ with an empty
+# tmpfs in the unit's mount namespace, hiding every other user's home
+# directory from zift. `BindPaths=/home/zift` bind-mounts just zift's
+# own home back over that tmpfs at the same path. Net effect: zift
+# can see /home/zift/ and nothing else under /home/.
+ProtectHome=tmpfs
+BindPaths=/home/zift
 ProtectProc=invisible
 ProcSubset=pid
 
@@ -79,12 +86,11 @@ SystemCallArchitectures=native
 # Kernel keyring. Zift does not use the keyring; isolate it.
 KeyringMode=private
 
-# Only the partner roots, the config, and the audit log need to be writable.
-# Adjust these paths to match your layout.
-ReadWritePaths=/zfs/sftp /var/log/zift
-
-# The host key and config are read-only after startup.
-ReadOnlyPaths=/etc/zift
+# The single deploy tree under /home/zift contains the config, host
+# key, partner roots (each user's `root` lives at /home/zift/<user>/),
+# and the audit log. ProtectSystem=strict makes the rest of the
+# filesystem read-only.
+ReadWritePaths=/home/zift
 
 # Resource limits: bound Argon2id memory pressure from auth storms.
 # Argon2id worst-case memory at the upper envelope is 256 MiB per
