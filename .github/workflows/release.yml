@@ -29,6 +29,21 @@ name: Release
 # musl libc + static link path, giving us a binary that runs on any
 # Linux 3.x+ kernel regardless of distro.
 #
+# Release artifacts:
+#   zift-X.Y.Z-x86_64-linux       static-musl Linux x86_64 binary
+#   zift-X.Y.Z-aarch64-linux      static-musl Linux aarch64 binary
+#   zift-X.Y.Z-x86_64-macos       libSystem-only macOS x86_64 binary
+#   zift-X.Y.Z-aarch64-macos      libSystem-only macOS aarch64 binary
+#   zift-deploy-X.Y.Z.tar.gz      platform-agnostic deploy bundle:
+#                                   - DEPLOY.md (runbook)
+#                                   - zift.service (systemd unit)
+#                                   - zift.conf.example (starter config)
+#                                   - fail2ban-zift.conf (filter)
+#                                   - fail2ban-zift-jail.conf (jail)
+#                                   - logrotate-zift.conf (rotation rule)
+#   SHA256SUMS                    sha256 of every artifact above
+#   SHA256SUMS.bundle             cosign keyless signature over SHA256SUMS
+#
 # Verification by partners:
 #   gh release download vX.Y.Z --pattern 'zift-*' --pattern 'SHA256SUMS*'
 #   cosign verify-blob \
@@ -139,6 +154,11 @@ jobs:
       - name: Stage release directory + unified SHA256SUMS
         id: stage
         run: |
+          # Tag was validated `vX.Y.Z[-prerelease]` by the build job;
+          # strip the leading `v` for use in artifact filenames.
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version"
+
           mkdir -p release
           # Pull every binary into one directory; concatenate the
           # per-target SHA256SUMS-{target} files into one canonical
@@ -147,7 +167,28 @@ jobs:
           # Glob matches both v0.1.x's `SHA256SUMS` and v0.2.0+'s
           # `SHA256SUMS-{target}` per-target files.
           cp dist/release-*/zift-* release/
+
+          # Platform-agnostic deploy bundle — every config file an
+          # operator needs to install zift, plus the runbook itself.
+          # Conventional `tar xzf` shape: extracts into a per-version
+          # directory rather than dumping six files into cwd.
+          mkdir -p "staging/zift-deploy-${version}"
+          cp deploy/DEPLOY.md \
+             deploy/zift.service \
+             deploy/zift.conf.example \
+             deploy/fail2ban-zift.conf \
+             deploy/fail2ban-zift-jail.conf \
+             deploy/logrotate-zift.conf \
+             "staging/zift-deploy-${version}/"
+          tar -C staging -czf "release/zift-deploy-${version}.tar.gz" "zift-deploy-${version}"
+
+          # Build the unified SHA256SUMS. Per-target binary checksums
+          # come from the build matrix; the deploy tarball is computed
+          # here in the publish job since it's platform-agnostic.
           cat dist/release-*/SHA256SUMS* | sort -u > release/SHA256SUMS
+          ( cd release && shasum -a 256 "zift-deploy-${version}.tar.gz" ) \
+              >> release/SHA256SUMS
+
           echo "=== release/ contents ==="
           ls -la release/
           echo "=== SHA256SUMS ==="
@@ -189,3 +230,6 @@ jobs:
             --generate-notes \
             $prerelease_flag \
             zift-* SHA256SUMS SHA256SUMS.bundle
+          # `zift-*` glob covers both the per-target binaries
+          # (`zift-X.Y.Z-{x86_64,aarch64}-{linux,macos}`) and the
+          # platform-agnostic deploy bundle (`zift-deploy-X.Y.Z.tar.gz`).
