@@ -173,7 +173,9 @@ jobs:
           # Conventional `tar xzf` shape: extracts into a per-version
           # directory rather than dumping six files into cwd.
           mkdir -p "staging/zift-deploy-${version}"
-          cp packaging/deploy/DEPLOY.md \
+          cp LICENSE \
+             THIRD_PARTY_LICENSES.md \
+             packaging/deploy/DEPLOY.md \
              packaging/deploy/zift.conf.example \
              packaging/systemd/zift.service \
              "staging/zift-deploy-${version}/"

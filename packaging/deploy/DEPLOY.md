@@ -8,6 +8,8 @@ are the short production path for the bundled `/home/zift` layout.
 
 ```text
 zift-deploy-X.Y.Z/
+├── LICENSE
+├── THIRD_PARTY_LICENSES.md
 ├── DEPLOY.md
 ├── zift.conf.example
 ├── zift.service

@@ -160,3 +160,18 @@ Configuration details are in [`docs/configure.md`](docs/configure.md).
 - [`docs/develop.md`](docs/develop.md): source layout, build system,
   tests, CI, release workflow, and maintenance notes.
 
+## License
+
+Zift is released under the [MIT License](LICENSE).
+
+Release binaries statically link libssh (LGPL-2.1), mbedTLS (Apache-2.0),
+and zlib (zlib license). See
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for attribution and
+license texts.
+
+## Security
+
+To report a suspected vulnerability privately, see
+[`SECURITY.md`](SECURITY.md). For deployment hardening and threat model,
+see [`docs/security.md`](docs/security.md).
+
