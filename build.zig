@@ -75,7 +75,7 @@ fn buildLinkage(
     // grabbing that LazyPath gives us the same headers the linker
     // will resolve symbols against.
     const libssh_translate = b.addTranslateC(.{
-        .root_source_file = b.path("src/libssh_root.h"),
+        .root_source_file = b.path("src/zift/ssh/libssh_root.h"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -528,7 +528,7 @@ pub fn build(b: *std.Build) void {
 
     // ----- `zig build test` --------------------------------------------------
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
+        .root_source_file = b.path("src/zift/tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -554,7 +554,7 @@ pub fn build(b: *std.Build) void {
     // Dev/test/release all use the SAME vendored libssh + mbedTLS +
     // zlib (the shared `buildLinkage` helper). No partner ever needs
     // `apt install libssh-4`; every release artifact is self-contained
-    // (`verify-release.sh` confirms zero `DT_NEEDED` on Linux, only
+    // (`src/verify.zig` confirms zero `DT_NEEDED` on Linux, only
     // `libSystem` on macOS).
     const release = buildLinkage(b, target, .ReleaseSafe, zift_version, target_triple, @tagName(.ReleaseSafe));
 
@@ -600,10 +600,23 @@ pub fn build(b: *std.Build) void {
     ));
     checksum_cmd.step.dependOn(&install_release.step);
 
-    const verify_cmd = b.addSystemCommand(&.{
-        "build/verify-release.sh",
-        b.fmt("release/{s}", .{artifact_name}),
+    // `src/verify.zig` is a small standalone Zig program that parses
+    // the just-installed release artifact's ELF (Linux) or Mach-O
+    // (macOS) and asserts the dynamic-deps surface matches what we
+    // promised. Build it for the HOST so cross-compile release jobs
+    // still produce a runnable verifier; reads the target artifact
+    // by file path, not by symbol resolution.
+    const host_target = b.graph.host;
+    const verify_exe = b.addExecutable(.{
+        .name = "verify",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/verify.zig"),
+            .target = host_target,
+            .optimize = .ReleaseSafe,
+        }),
     });
+    const verify_cmd = b.addRunArtifact(verify_exe);
+    verify_cmd.addArg(b.fmt("release/{s}", .{artifact_name}));
     verify_cmd.step.dependOn(&install_release.step);
 
     const release_step = b.step("release", "Build a versioned, fully-static release binary into ./release/");

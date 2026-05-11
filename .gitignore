@@ -3,7 +3,5 @@ zig-out/
 zig-pkg/
 bin/
 release/
-test/.venv/
-test/tmp/
-core
-qemu_*.core
+tests/.venv/
+tests/tmp/

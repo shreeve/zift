@@ -1,11 +1,11 @@
 const std = @import("std");
 const c = @import("libssh");
 const build_options = @import("build_options");
-const audit = @import("audit.zig");
-const auth = @import("auth.zig");
-const config = @import("config.zig");
-const session = @import("session.zig");
-const signals = @import("signals.zig");
+const audit = @import("zift/audit.zig");
+const auth = @import("zift/auth.zig");
+const config = @import("zift/config.zig");
+const session = @import("zift/session.zig");
+const signals = @import("zift/signals.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;

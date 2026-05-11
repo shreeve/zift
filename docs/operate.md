@@ -160,7 +160,7 @@ is readable by group `zift`, but only the daemon should write it.
 Install the starter config:
 
 ```sh
-sudo install -o root -g zift -m 0640 deploy/zift.conf.example /home/zift/zift.conf
+sudo install -o root -g zift -m 0640 packaging/deploy/zift.conf.example /home/zift/zift.conf
 sudo -e /home/zift/zift.conf
 ```
 
@@ -209,11 +209,11 @@ Validation checks syntax plus live filesystem invariants:
 
 ## Install systemd Unit
 
-The repository ships `deploy/zift.service`, configured for
+The repository ships `packaging/systemd/zift.service`, configured for
 `/home/zift`.
 
 ```sh
-sudo install -m 0644 deploy/zift.service /etc/systemd/system/zift.service
+sudo install -m 0644 packaging/systemd/zift.service /etc/systemd/system/zift.service
 sudo systemd-analyze verify /etc/systemd/system/zift.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now zift
@@ -353,7 +353,7 @@ jq -c 'select(.result=="denied")' /home/zift/audit.jsonl
 Install the shipped logrotate rule:
 
 ```sh
-sudo install -m 0644 deploy/logrotate-zift.conf /etc/logrotate.d/zift
+sudo install -m 0644 packaging/logrotate/zift.conf /etc/logrotate.d/zift
 sudo logrotate -d /etc/logrotate.d/zift
 ```
 
@@ -365,12 +365,12 @@ file.
 Install the shipped filter and jail:
 
 ```sh
-sudo install -m 0644 deploy/fail2ban-zift-filter.conf /etc/fail2ban/filter.d/zift.conf
+sudo install -m 0644 packaging/fail2ban/zift-filter.conf /etc/fail2ban/filter.d/zift.conf
 
 if [ -f /etc/fail2ban/jail.local ]; then
-  sudo tee -a /etc/fail2ban/jail.local < deploy/fail2ban-zift-jail.conf
+  sudo tee -a /etc/fail2ban/jail.local < packaging/fail2ban/zift-jail.conf
 else
-  sudo install -m 0644 deploy/fail2ban-zift-jail.conf /etc/fail2ban/jail.local
+  sudo install -m 0644 packaging/fail2ban/zift-jail.conf /etc/fail2ban/jail.local
 fi
 
 sudo fail2ban-client -t
@@ -510,7 +510,7 @@ Adjust:
 - `server.host-key`
 - `server.log`
 - `server.partner-root` or per-user `root`
-- `deploy/zift.service` `ExecStart`
+- `packaging/systemd/zift.service` `ExecStart`
 - systemd `ReadWritePaths`
 - systemd `ReadOnlyPaths`
 

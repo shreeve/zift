@@ -28,30 +28,39 @@ sudo apt-get install -y expect openssh-client python3-venv lsof
 
 ```text
 src/
-├── main.zig      # CLI: serve, validate, hash-password, version
-├── session.zig   # libssh accept loop, auth, SFTP v3 handlers
-├── config.zig    # config parser, semantic validation, key-file loading
-├── policy.zig    # allow/deny engine and glob matching
-├── vfs.zig       # virtual path normalization and jail verification
-├── auth.zig      # Argon2id password hashing and verification
-├── audit.zig     # JSON audit sink
-├── listing.zig   # virtual/reality directory listing renderer
-├── signals.zig   # signal flags, session fd registry, forced close
-├── fuzz.zig      # fuzz harnesses
-└── tests.zig     # unit-test root
+├── main.zig              # CLI: serve, validate, hash-password, version
+├── verify.zig            # release-artifact dep-surface verifier (build helper)
+└── zift/
+    ├── session.zig       # libssh accept loop, auth, SFTP v3 handlers
+    ├── config.zig        # config parser, semantic validation, key-file loading
+    ├── policy.zig        # allow/deny engine and glob matching
+    ├── vfs.zig           # virtual path normalization and jail verification
+    ├── auth.zig          # Argon2id password hashing and verification
+    ├── audit.zig         # JSON audit sink
+    ├── listing.zig       # virtual/reality directory listing renderer
+    ├── signals.zig       # signal flags, session fd registry, forced close
+    ├── tests.zig         # unit-test root
+    ├── fuzz.zig          # fuzz harnesses
+    └── ssh/
+        └── libssh_root.h
 ```
 
 Other important paths:
 
 ```text
-build.zig                 # build graph, vendored C dependency build
-build.zig.zon             # pinned dependency graph
-example.zift              # local example config
-deploy/                   # systemd, fail2ban, logrotate, deploy bundle files
-test/run.sh               # integration-test runner
-test/cases/*.sh           # integration cases
-test/lib/*.py             # Paramiko/raw protocol probes
-.github/workflows/ci.yml  # CI
+build.zig                           # build graph, vendored C dependency build
+build.zig.zon                       # pinned dependency graph
+packaging/                          # systemd, fail2ban, logrotate, deploy bundle
+  deploy/DEPLOY.md
+  deploy/zift.conf.example
+  systemd/zift.service
+  fail2ban/zift-filter.conf
+  fail2ban/zift-jail.conf
+  logrotate/zift.conf
+tests/run.sh                        # integration-test runner
+tests/cases/*.sh                    # integration cases
+tests/lib/*.py                      # Paramiko/raw protocol probes
+.github/workflows/ci.yml            # CI
 .github/workflows/release.yml
 ```
 
@@ -88,25 +97,25 @@ pure or mostly-pure logic.
 Run all integration tests:
 
 ```sh
-test/run.sh
+tests/run.sh
 ```
 
 List cases:
 
 ```sh
-test/run.sh --list
+tests/run.sh --list
 ```
 
 Run selected cases:
 
 ```sh
-test/run.sh 00-smoke 34-clobber 35-atomic-upload
+tests/run.sh 00-smoke 34-clobber 35-atomic-upload
 ```
 
 Keep a passing case's scratch directory:
 
 ```sh
-test/run.sh --keep 00-smoke
+tests/run.sh --keep 00-smoke
 ```
 
 Each case gets:
@@ -127,8 +136,8 @@ migrations.
 
 ## Fuzzing
 
-Fuzz harnesses live in `src/fuzz.zig` and are imported into the test
-build.
+Fuzz harnesses live in `src/zift/fuzz.zig` and are imported into the
+test build.
 
 They cover:
 
@@ -194,7 +203,7 @@ Jobs:
 - `build-release-safe`: build the static `x86_64-linux-musl`
   ReleaseSafe binary, assert zero ELF `DT_NEEDED` entries, verify the
   systemd unit, and run smoke commands.
-- `integration-tests`: run `test/run.sh` against the binary built by
+- `integration-tests`: run `tests/run.sh` against the binary built by
   the ReleaseSafe job.
 - `fuzz-short`: present but disabled pending the Zig fuzz-runner issue.
 
@@ -222,7 +231,7 @@ The workflow:
    - `aarch64-linux-musl`
    - `x86_64-macos`
    - `aarch64-macos`
-4. Builds the deploy bundle from `deploy/`.
+4. Builds the deploy bundle from `packaging/`.
 5. Aggregates checksums into `SHA256SUMS`.
 6. Signs `SHA256SUMS` with cosign keyless using GitHub Actions OIDC.
 7. Publishes a GitHub Release.
@@ -336,7 +345,7 @@ Current docs are:
 - `docs/configure.md`
 - `docs/security.md`
 - `docs/develop.md`
-- `deploy/DEPLOY.md`
+- `packaging/deploy/DEPLOY.md`
 
 When changing config grammar, release behavior, deployment posture,
 security invariants, or SFTP protocol behavior, update docs in the same
@@ -355,14 +364,10 @@ bin/zift version
 zig build test
 
 # integration tests
-test/run.sh
+tests/run.sh
 
 # list integration tests
-test/run.sh --list
-
-# validate example config after creating its host key/root
-# and replacing the auth hash
-bin/zift validate example.zift
+tests/run.sh --list
 
 # local release artifact
 zig build release -Dtarget=x86_64-linux-musl -Dversion=0.7.1-dev

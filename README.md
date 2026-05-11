@@ -88,7 +88,7 @@ Integration tests require Python 3, Paramiko, OpenSSH client tools,
 `expect`, and `lsof`:
 
 ```sh
-test/run.sh
+tests/run.sh
 ```
 
 Contributor details are in [`docs/develop.md`](docs/develop.md).

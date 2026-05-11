@@ -8,7 +8,7 @@ name: Release
 # Why cosign keyless: zero secret management, signature is bound to
 # THIS workflow running in shreeve/zift via the OIDC certificate, and
 # the verification command for partners is one well-documented call
-# (see deploy/DEPLOY.md). A traditional GPG flow can be added later
+# (see packaging/deploy/DEPLOY.md). A traditional GPG flow can be added later
 # as additive without disturbing this one.
 #
 # Coverage (v0.2.0+):
@@ -173,13 +173,16 @@ jobs:
           # Conventional `tar xzf` shape: extracts into a per-version
           # directory rather than dumping six files into cwd.
           mkdir -p "staging/zift-deploy-${version}"
-          cp deploy/DEPLOY.md \
-             deploy/zift.service \
-             deploy/zift.conf.example \
-             deploy/fail2ban-zift-filter.conf \
-             deploy/fail2ban-zift-jail.conf \
-             deploy/logrotate-zift.conf \
+          cp packaging/deploy/DEPLOY.md \
+             packaging/deploy/zift.conf.example \
+             packaging/systemd/zift.service \
              "staging/zift-deploy-${version}/"
+          cp packaging/fail2ban/zift-filter.conf \
+             "staging/zift-deploy-${version}/fail2ban-zift-filter.conf"
+          cp packaging/fail2ban/zift-jail.conf \
+             "staging/zift-deploy-${version}/fail2ban-zift-jail.conf"
+          cp packaging/logrotate/zift.conf \
+             "staging/zift-deploy-${version}/logrotate-zift.conf"
           tar -C staging -czf "release/zift-deploy-${version}.tar.gz" "zift-deploy-${version}"
 
           # Build the unified SHA256SUMS. Per-target binary checksums

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for Zift integration tests.
 #
-# A test case is a bash script under test/cases/. The runner exports
+# A test case is a bash script under tests/cases/. The runner exports
 # these env vars before sourcing this file:
 #
 #   ZIFT_BIN     absolute path to the built zift binary

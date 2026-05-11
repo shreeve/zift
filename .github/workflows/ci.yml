@@ -103,7 +103,7 @@ jobs:
           # etc.), not the deployment-specific binary path.
           tmpdir=$(mktemp -d)
           trap 'rm -rf "$tmpdir"' EXIT
-          sed 's|^ExecStart=.*|ExecStart=/bin/true|' deploy/zift.service > "$tmpdir/zift.service"
+          sed 's|^ExecStart=.*|ExecStart=/bin/true|' packaging/systemd/zift.service > "$tmpdir/zift.service"
 
           set +e
           out=$(systemd-analyze verify "$tmpdir/zift.service" 2>&1)
@@ -168,20 +168,20 @@ jobs:
           # vendored in. Test harnesses still need expect/openssh/python.
           sudo apt-get update
           sudo apt-get install -y expect openssh-client python3-venv lsof
-          python3 -m venv test/.venv
-          test/.venv/bin/pip install paramiko
+          python3 -m venv tests/.venv
+          tests/.venv/bin/pip install paramiko
 
       - name: Run integration tests
         run: |
           export PATH="$PWD/bin:$PATH"
-          bash test/run.sh
+          bash tests/run.sh
 
       - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: integration-test-logs
-          path: test/tmp/
+          path: tests/tmp/
           if-no-files-found: ignore
 
   fuzz-short:

@@ -2,10 +2,10 @@
 # Zift integration test runner.
 #
 # Usage:
-#   test/run.sh                    run every case under test/cases/
-#   test/run.sh <name>...          run named cases (e.g. 02-max-connections)
-#   test/run.sh --list             print every case + its first-line description
-#   test/run.sh --keep             do not delete TEST_TMP after a passing run
+#   tests/run.sh                    run every case
+#   tests/run.sh <name>...          run named cases
+#   tests/run.sh --list             print every case + description
+#   tests/run.sh --keep             do not delete TEST_TMP after pass
 #
 # Each case script gets its own:
 #   TEST_TMP    scratch dir (deleted after pass unless --keep)
@@ -13,7 +13,7 @@
 #   TEST_NAME   filename without .sh
 #   ZIFT_BIN    absolute path to the built zift
 #
-# Cases must source test/lib/common.sh and exit 0 on success.
+# Cases must source tests/lib/common.sh and exit 0 on success.
 
 set -uo pipefail
 

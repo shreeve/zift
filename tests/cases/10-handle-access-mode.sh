@@ -10,7 +10,7 @@ VENV="$(dirname "$0")/../.venv"
 PY="$VENV/bin/python3"
 
 if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV (run 'python3 -m venv test/.venv && test/.venv/bin/pip install paramiko')"
+    echo "skip: paramiko venv missing at $VENV (run 'python3 -m venv tests/.venv && tests/.venv/bin/pip install paramiko')"
     exit 0
 fi
 
