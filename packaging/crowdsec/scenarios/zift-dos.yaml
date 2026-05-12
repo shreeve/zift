@@ -1,0 +1,47 @@
+# Pre-auth connection-failure scenario for Zift.
+#
+# Install path: /etc/crowdsec/scenarios/zift-dos.yaml
+#
+# Fires when one IP causes a high rate of accept.rejected or
+# handshake.failed events. The parser groups both as
+# log_type=zift_conn_fail.
+#
+# ALERT-ONLY BY DEFAULT (`remediation: false`):
+#
+# accept.rejected can be produced by an entirely legitimate partner
+# whose concurrent-upload count temporarily exceeds `max-connections`
+# / `max-unauth-connections`. Banning that partner makes an overload
+# worse instead of better. handshake.failed can come from a
+# misconfigured client (wrong host key fingerprint, bad ssh client
+# version) — diagnostically interesting, not always hostile.
+#
+# Operators who want this to actually ban can either:
+#   1. flip `remediation: true` in this file, or
+#   2. add a profile rule in /etc/crowdsec/profiles.yaml that
+#      promotes alerts with `scenario: shreeve/zift-dos` to a
+#      decision.
+#
+# Threshold: ~30 connection failures per minute (capacity 30,
+# leakspeed 2s).
+
+type: leaky
+name: shreeve/zift-dos
+description: "Detect high rate of Zift pre-auth connection failures"
+
+filter: |
+  evt.Meta.log_type == "zift_conn_fail" &&
+  evt.Meta.source_ip != ""
+
+groupby: evt.Meta.source_ip
+distinct: evt.Meta.source_ip
+
+capacity: 30
+leakspeed: 2s
+blackhole: 10m
+
+labels:
+  service: zift
+  type: dos
+  remediation: false
+  classification:
+    - attack.T1499

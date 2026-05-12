@@ -387,6 +387,19 @@ to journald. The shipped filter also has a `datepattern` for Zift's RFC
 3339 audit timestamps; if an older fail2ban cannot parse it, comment
 that line out and fail2ban will fall back to file mtime.
 
+## CrowdSec
+
+CrowdSec is an alternative to fail2ban. The same audit log is the
+input; the difference is that CrowdSec uses leaky-bucket scenarios
+that decay over time and can optionally share decisions across a
+fleet via the CrowdSec Console.
+
+The integration ships in `packaging/crowdsec/` (parser, three
+scenarios, collection manifest, acquisition config) with its own
+`README.md` for install and tuning. Pick one of fail2ban or CrowdSec
+— running both on the same audit log produces duplicate bans in two
+different state stores.
+
 ## Health Checks
 
 Zift intentionally has no HTTP health endpoint.

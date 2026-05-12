@@ -137,6 +137,14 @@ sudo systemctl restart fail2ban
 sudo fail2ban-client status zift
 ```
 
+## Optional CrowdSec
+
+The source tree ships a CrowdSec equivalent of the fail2ban bundle
+in `packaging/crowdsec/` (parser, three scenarios, collection,
+acquisition config). See `packaging/crowdsec/README.md` for install
+steps. Pick one of fail2ban or CrowdSec — not both on the same
+audit log.
+
 ## Optional logrotate
 
 ```sh
