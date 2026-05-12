@@ -7,18 +7,24 @@ pub const Error = error{
     OutOfMemory,
     PathTooLong,
     PathTraversal,
-    /// `.zift-staging` exists at a partner root but is not a
+    /// `<root>/.zift` exists at a partner root but is not a
     /// real directory (could be a symlink, file, FIFO, etc.).
-    /// Operators must `rm -f <root>/.zift-staging` to clear and
-    /// let zift create the real directory on next session.
+    /// Operators must `rm -rf <root>/.zift` to clear and let
+    /// zift create the real directory on next session.
+    NamespaceDirCorrupt,
+    /// `<root>/.zift/staging` exists at a partner root but is
+    /// not a real directory (could be a symlink, file, FIFO,
+    /// etc.). Operators must `rm -rf <root>/.zift/staging` to
+    /// clear and let zift create the real directory on next
+    /// session.
     StagingDirCorrupt,
-    /// `.zift-staging` is a real directory but has group or
-    /// other access bits set. Loose perms let local users
-    /// observe in-flight upload names and (if writable) tamper
-    /// with staging files between zift's rename-by-path and
-    /// the kernel rename syscall. Operators must `chmod 0700
-    /// <root>/.zift-staging` (or delete it and let zift
-    /// recreate at 0700) before uploads will succeed.
+    /// `<root>/.zift/staging` is a real directory but has
+    /// group or other access bits set. Loose perms let local
+    /// users observe in-flight upload names and (if writable)
+    /// tamper with staging files between zift's rename-by-path
+    /// and the kernel rename syscall. Operators must
+    /// `chmod 0700 <root>/.zift/staging` (or delete it and
+    /// let zift recreate at 0700) before uploads will succeed.
     StagingDirUnsafe,
 } || std.Io.Dir.RealPathFileAllocError;
 
@@ -44,77 +50,86 @@ pub const Vfs = struct {
     }
 
     /// Open (creating if needed) the partner-root's staging directory
-    /// `<root>/.zift-staging/`. v0.5.0+ uses this for atomic-upload
-    /// staging — every OPEN(write+CREAT) on a non-existent target
-    /// goes to a randomly-named staging file here, then atomically
-    /// renames to the real target at CLOSE. The directory name is
-    /// reserved by `normalizeVirtualPath` so partners can never
-    /// reach staging files via the SFTP wire surface.
+    /// at `<root>/.zift/staging/`. v0.5.0+ uses this for atomic-upload
+    /// staging — every OPEN(write+CREAT) on a non-existent target goes
+    /// to a randomly-named staging file here, then atomically renames
+    /// to the real target at CLOSE.
     ///
-    /// **Hardening (v0.5.1)**:
+    /// **Layout (v0.8.0+, two-tier)**:
     ///
-    ///  - In v0.4.0 and earlier, `.zift-staging` was a legal partner-
-    ///    creatable name. A partner with `add` could have planted a
-    ///    SYMLINK with that name pointing OUTSIDE the jail before
-    ///    upgrading. Without verification, the upgraded server would
-    ///    happily follow that symlink and write upload bytes to the
-    ///    attacker-controlled location. We refuse to proceed if
-    ///    `.zift-staging` exists and is not a real directory: lstat
-    ///    via `statAt` (AT_SYMLINK_NOFOLLOW semantics), reject
-    ///    anything whose `S_IFMT` is not `S_IFDIR`. Operators hit by
-    ///    this hardening on upgrade should
-    ///    `rm -f <root>/.zift-staging` to clear the bad entry.
+    /// The parent directory `<root>/.zift/` is zift's reserved per-
+    /// partner *namespace*. It is reserved at `normalizeVirtualPath`
+    /// (any virtual path crossing `.zift/` is rejected with
+    /// `error.InvalidPath`), so partners can never reach anything
+    /// under it via the SFTP wire surface. Within that namespace:
     ///
-    ///  - Created with mode `0o700`, then `fchmod`'d to pin the bits
-    ///    against umask. `createDir` honors the partner's umask
-    ///    (a `022` umask leaves the dir at `0o755`, world-listable).
-    ///    Pinning is necessary because partial-upload bytes must
-    ///    not be browsable by other local users — and because test
-    ///    35 stat-asserts the exact mode bits.
-    ///    Pre-existing directories are intentionally NOT chmodded
-    ///    (won't silently change operator-customized state) but ARE
-    ///    rejected if they grant any group or other access bits
-    ///    (`(mode & 0o077) != 0`). A loose-perms staging dir would
-    ///    let local users observe in-flight upload names AND, if
-    ///    group/other-writable, replace staging files between zift's
-    ///    rename-by-path and the kernel's rename syscall — turning a
-    ///    confidentiality issue into an integrity one. Operators who
-    ///    hit this on upgrade from a v0.5.0 install (which created
-    ///    the dir without an explicit mode) should:
+    ///   `<root>/.zift/staging/`  daemon-owned, mode 0o700, lazy-
+    ///                            created here on first upload, the
+    ///                            same hardening rules as v0.5.0+
+    ///                            (symlink rejection, loose-perms
+    ///                            rejection) still apply.
+    ///   `<root>/.zift/<any>`     operator-managed. Notes, contract
+    ///                            documents, per-partner scripts —
+    ///                            anything an operator wants to keep
+    ///                            alongside the partner's data tree
+    ///                            without exposing it via SFTP.
+    ///                            Zift never reads or writes any
+    ///                            file at this level.
     ///
-    ///        chmod 0700 <root>/.zift-staging
+    /// On v0.8.0 upgrade from v0.5.x–v0.7.x, an operator with leftover
+    /// `<root>/.zift-staging/` content (typically crash-time orphans)
+    /// should manually move what they care about elsewhere and
+    /// `rm -rf <root>/.zift-staging`. The v0.8.0 daemon never looks
+    /// at the old path; the path-validator still reserves the legacy
+    /// name (belt-and-suspenders) so partners can't `mkdir` it via
+    /// SFTP either.
     ///
-    ///    or delete it and let zift recreate at `0o700`.
+    /// **Hardening invariants**:
+    ///
+    ///  - Pre-existing `<root>/.zift/` is accepted at *any* mode and
+    ///    *any* ownership the operator chose, with one exception: it
+    ///    MUST be a real directory (not a symlink, FIFO, regular
+    ///    file, etc.). A symlink with that name pointing outside the
+    ///    jail would let the daemon create `staging/` outside its
+    ///    intended location. We lstat via `statAt`
+    ///    (AT_SYMLINK_NOFOLLOW) and reject anything whose `S_IFMT`
+    ///    is not `S_IFDIR`.
+    ///
+    ///  - Pre-existing `<root>/.zift/staging/` is held to a stricter
+    ///    bar: must be a real directory AND must not grant any group
+    ///    or other access bits (`mode & 0o077 != 0` is fatal). The
+    ///    staging dir holds in-flight partial uploads; loose perms
+    ///    let local users observe upload names and (if writable)
+    ///    swap staging files between zift's rename-by-path and the
+    ///    kernel rename syscall — turning a confidentiality issue
+    ///    into an integrity one.
+    ///
+    ///  - Newly-created `<root>/.zift/` lands at mode `0o750`
+    ///    (group-traversable so operators in group `zift` can write
+    ///    notes alongside without sudo each time). Newly-created
+    ///    `<root>/.zift/staging/` lands at `0o700` regardless of
+    ///    umask. Both are `fchmod`'d after `createDir` because
+    ///    `createDir` honors the calling process's umask (a `022`
+    ///    umask would leave them at `0o755`, world-listable).
     ///
     /// Caller owns the returned `Dir` and must close it.
     pub fn openStagingDir(self: Vfs, io: std.Io) !std.Io.Dir {
         var root = try std.Io.Dir.openDirAbsolute(io, self.root, .{});
         defer root.close(io);
 
-        const private_dir = std.Io.File.Permissions.fromMode(0o700);
-        const create_status = root.createDir(io, staging_dir_name, private_dir);
-        if (create_status) |_| {
-            // We just created it. Open, fchmod to pin the mode
-            // against umask, and return.
-            var dir = try root.openDir(io, staging_dir_name, .{ .iterate = true });
-            errdefer dir.close(io);
-            try dir.setPermissions(io, private_dir);
-            return dir;
-        } else |err| switch (err) {
-            error.PathAlreadyExists => {
-                // Pre-existing entry. lstat it: must be a real
-                // directory (not a symlink, FIFO, etc.) AND must
-                // not grant group or other access. statAt has
-                // AT_SYMLINK_NOFOLLOW semantics so a symlink
-                // returns its OWN metadata, not the target's.
-                const info = try @import("listing.zig").statAt(root.handle, staging_dir_name);
-                const file_type = info.mode & 0o170000;
-                if (file_type != 0o040000) return error.StagingDirCorrupt;
-                if ((info.mode & 0o077) != 0) return error.StagingDirUnsafe;
-                return try root.openDir(io, staging_dir_name, .{ .iterate = true });
-            },
-            else => return err,
-        }
+        // Step 1: open (creating if needed) `<root>/.zift/`. Mode and
+        // ownership of a pre-existing namespace dir are left alone so
+        // operators can pre-create it with their preferred policy
+        // (typically `install -d -o root -g zift -m 0750`).
+        var ns_dir = try openOrCreateNamespaceDir(io, root);
+        errdefer ns_dir.close(io);
+
+        // Step 2: open (creating if needed) `<root>/.zift/staging/`.
+        // This one is daemon-managed and the strict hardening rules
+        // apply.
+        const staging = try openOrCreateStagingSubdir(io, ns_dir);
+        ns_dir.close(io);
+        return staging;
     }
 
     pub fn resolveExisting(
@@ -301,12 +316,73 @@ pub const ParentResolution = struct {
     }
 };
 
-/// Reserved directory name (top-level under each partner's root)
-/// that zift uses for staging atomic uploads (v0.5.0+). The wire-
-/// surface validator rejects any virtual path containing this segment
-/// so partners cannot reach staging files via the SFTP protocol —
-/// belt-and-suspenders alongside the listing renderer's filter.
-pub const staging_dir_name: []const u8 = ".zift-staging";
+/// Reserved per-partner namespace dir under each partner's root
+/// (v0.8.0+). The wire-surface validator rejects any virtual path
+/// containing this segment so partners cannot reach anything inside
+/// `<root>/.zift/` via the SFTP protocol — staging files, operator
+/// notes, future per-partner state, all hidden by the same single
+/// reservation.
+pub const namespace_dir_name: []const u8 = ".zift";
+
+/// Subdir of `namespace_dir_name` where atomic-upload staging files
+/// live. The combined path is `<root>/.zift/staging/`.
+const staging_subdir_name: []const u8 = "staging";
+
+/// Legacy v0.5.0–v0.7.x staging dir name. Still reserved at the
+/// path-validator level on v0.8.0+ so a partner can't `mkdir` it via
+/// SFTP and confuse operators who upgraded but haven't yet swept the
+/// old path. The daemon itself never reads or writes here on v0.8.0+
+/// — `openStagingDir` uses `<root>/.zift/staging/` exclusively.
+const legacy_staging_dir_name: []const u8 = ".zift-staging";
+
+fn openOrCreateNamespaceDir(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
+    const namespace_perm = std.Io.File.Permissions.fromMode(0o750);
+    const create_status = root.createDir(io, namespace_dir_name, namespace_perm);
+    if (create_status) |_| {
+        // We just created it. Open and pin the mode against umask.
+        var dir = try root.openDir(io, namespace_dir_name, .{ .iterate = true });
+        errdefer dir.close(io);
+        try dir.setPermissions(io, namespace_perm);
+        return dir;
+    } else |err| switch (err) {
+        error.PathAlreadyExists => {
+            // Operator may have pre-created the namespace dir with
+            // their own ownership + mode (e.g. root:zift 0750 for an
+            // operator-managed notes drawer). Accept whatever's
+            // there as long as it's a real directory. statAt has
+            // AT_SYMLINK_NOFOLLOW semantics so a symlink returns
+            // its OWN metadata, not the target's.
+            const info = try @import("listing.zig").statAt(root.handle, namespace_dir_name);
+            const file_type = info.mode & 0o170000;
+            if (file_type != 0o040000) return error.NamespaceDirCorrupt;
+            return try root.openDir(io, namespace_dir_name, .{ .iterate = true });
+        },
+        else => return err,
+    }
+}
+
+fn openOrCreateStagingSubdir(io: std.Io, ns_dir: std.Io.Dir) !std.Io.Dir {
+    const private_dir = std.Io.File.Permissions.fromMode(0o700);
+    const create_status = ns_dir.createDir(io, staging_subdir_name, private_dir);
+    if (create_status) |_| {
+        var dir = try ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true });
+        errdefer dir.close(io);
+        try dir.setPermissions(io, private_dir);
+        return dir;
+    } else |err| switch (err) {
+        error.PathAlreadyExists => {
+            // Strict hardening rules apply at the staging level
+            // (unlike the namespace dir above): must be a real
+            // directory, must not grant group or other access.
+            const info = try @import("listing.zig").statAt(ns_dir.handle, staging_subdir_name);
+            const file_type = info.mode & 0o170000;
+            if (file_type != 0o040000) return error.StagingDirCorrupt;
+            if ((info.mode & 0o077) != 0) return error.StagingDirUnsafe;
+            return try ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true });
+        },
+        else => return err,
+    }
+}
 
 fn normalizeVirtualPath(allocator: std.mem.Allocator, virtual_path: []const u8) Error![]u8 {
     // PLAN §7.6 max length, §8.3 byte-set restrictions.
@@ -331,15 +407,21 @@ fn normalizeVirtualPath(allocator: std.mem.Allocator, virtual_path: []const u8) 
             _ = parts.pop();
             continue;
         }
-        // v0.5.0: reserve `.zift-staging` as a path component name
-        // ANYWHERE in the virtual path. This is the directory zift
-        // uses for atomic-upload staging files, which partners must
-        // never reach through the SFTP wire surface — neither to
-        // read other partners' in-flight uploads, nor to plant
+        // v0.8.0: reserve `.zift` (the namespace) AND the legacy
+        // `.zift-staging` (v0.5.0–v0.7.x) as path component names
+        // ANYWHERE in the virtual path. The namespace dir holds
+        // zift's atomic-upload staging files and any operator-
+        // managed metadata an operator drops alongside; partners
+        // must never reach inside via the SFTP wire surface,
+        // neither to observe in-flight uploads, nor to plant
         // entries that the rename-from-staging step would later
-        // pick up. Rejecting here, before any policy or filesystem
-        // resolution, is the cheapest correct check.
-        if (std.mem.eql(u8, part, staging_dir_name)) return error.InvalidPath;
+        // pick up. Reserving the legacy name keeps an opportunist
+        // partner from `mkdir`'ing it under a freshly-upgraded
+        // root and confusing operators who haven't yet swept the
+        // old path. Rejecting here, before any policy or
+        // filesystem resolution, is the cheapest correct check.
+        if (std.mem.eql(u8, part, namespace_dir_name)) return error.InvalidPath;
+        if (std.mem.eql(u8, part, legacy_staging_dir_name)) return error.InvalidPath;
         try parts.append(allocator, part);
     }
 
@@ -396,25 +478,39 @@ test "normalize rejects nul byte" {
     );
 }
 
-test "normalize rejects /.zift-staging anywhere in path (v0.5.0)" {
+test "normalize rejects /.zift namespace anywhere in path (v0.8.0)" {
     // Top-level: never reachable.
+    try std.testing.expectError(
+        error.InvalidPath,
+        Vfs.normalizeVirtual(std.testing.allocator, "/.zift"),
+    );
+    // Any descent into the namespace.
+    try std.testing.expectError(
+        error.InvalidPath,
+        Vfs.normalizeVirtual(std.testing.allocator, "/.zift/staging/abc123"),
+    );
+    try std.testing.expectError(
+        error.InvalidPath,
+        Vfs.normalizeVirtual(std.testing.allocator, "/.zift/notes.md"),
+    );
+    // Even mid-path (an operator might have an unrelated `.zift`
+    // dir somewhere; the validator rejects it consistently so the
+    // namespace contract is the same regardless of depth).
+    try std.testing.expectError(
+        error.InvalidPath,
+        Vfs.normalizeVirtual(std.testing.allocator, "/pending/.zift/something"),
+    );
+    // Legacy `.zift-staging` is still reserved post-rename so a
+    // partner can't `mkdir` it under a freshly-upgraded root.
     try std.testing.expectError(
         error.InvalidPath,
         Vfs.normalizeVirtual(std.testing.allocator, "/.zift-staging"),
     );
-    // Any descent into the staging dir.
     try std.testing.expectError(
         error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/.zift-staging/abc123"),
+        Vfs.normalizeVirtual(std.testing.allocator, "/.zift-staging/legacy.dat"),
     );
-    // Even if it appears mid-path (e.g. operator misconfigured a
-    // partner root that contains a `.zift-staging` subdir for some
-    // unrelated reason).
-    try std.testing.expectError(
-        error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/pending/.zift-staging/something"),
-    );
-    // Non-staging dotfiles are fine.
+    // Non-reserved dotfiles are fine.
     const ok = try Vfs.normalizeVirtual(std.testing.allocator, "/pending/.cache/foo");
     defer std.testing.allocator.free(ok);
     try std.testing.expectEqualStrings("/pending/.cache/foo", ok);

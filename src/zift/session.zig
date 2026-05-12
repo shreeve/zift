@@ -1093,7 +1093,7 @@ const Handle = struct {
     is_append: bool = false,
     /// v0.5.0 staging-rename: when this handle was opened with
     /// CREAT against a non-existent target, the actual fd points at
-    /// `<root>/.zift-staging/<staging_basename>` instead of the
+    /// `<root>/.zift/staging/<staging_basename>` instead of the
     /// target path. At CLOSE we atomically rename the staging file
     /// to `staging_target_vpath`. Until that rename succeeds, the
     /// target path doesn't exist on the operator-visible filesystem
@@ -1160,7 +1160,7 @@ const SftpState = struct {
     /// bit so subdirectories inherit the partner-tree's group
     /// ownership. Default `0o2770`.
     mkdir_mode: u32 = 0o2770,
-    /// v0.5.0 staging-rename: open Dir fd to `<root>/.zift-staging/`,
+    /// v0.5.0 staging-rename: open Dir fd to `<root>/.zift/staging/`,
     /// shared across all handles in this session. Lazily opened the
     /// first time a partner does an OPEN(write+CREAT) on a
     /// non-existent target — most sessions never need it, so we
@@ -1181,7 +1181,7 @@ const SftpState = struct {
         // currently sweep them at startup (tracked as a P3 follow-
         // up). Operators with a hard zift crash can manually clear:
         //
-        //     rm -f <root>/.zift-staging/*
+        //     rm -f <root>/.zift/staging/*
         //
         // Safe to do anytime — partners can never reach those paths
         // via the SFTP wire surface (path-validator rejects them).
@@ -1478,17 +1478,25 @@ const SftpState = struct {
                 break;
             };
 
-            // v0.5.0: hide the staging directory from listings. Every
-            // partner root has `<root>/.zift-staging/` (created lazily
-            // on first upload). The path-validator already rejects
-            // any virtual path containing this segment, so a partner
-            // can't OPEN/REMOVE/STAT the staging dir or its contents.
-            // But READDIR walks the real filesystem and would surface
-            // the entry as "exists with no permissions" — leaking
-            // the implementation detail and cluttering listings.
-            // Skip it here, before the stat call, so it never reaches
-            // the partner's view at all.
-            if (std.mem.eql(u8, entry.name, vfs_mod.staging_dir_name)) continue;
+            // v0.8.0: hide the zift namespace dir from listings. Every
+            // partner root has a `<root>/.zift/` once a session has
+            // uploaded (lazy-created by openStagingDir; may also be
+            // pre-created by the operator to hold notes alongside).
+            // The path-validator already rejects any virtual path
+            // containing `.zift` (or the legacy `.zift-staging`), so a
+            // partner can't OPEN/REMOVE/STAT anything inside via the
+            // SFTP wire surface. But READDIR walks the real filesystem
+            // and would surface the entry as "exists with no
+            // permissions" — leaking the implementation detail and
+            // cluttering listings. Skip it here, before the stat call,
+            // so it never reaches the partner's view at all.
+            //
+            // Also hide a stray legacy `.zift-staging` directory left
+            // behind by an unswept v0.5.x–v0.7.x install. The validator
+            // already rejects it as a path component; this just keeps
+            // it out of READDIR results during the transition.
+            if (std.mem.eql(u8, entry.name, vfs_mod.namespace_dir_name)) continue;
+            if (std.mem.eql(u8, entry.name, ".zift-staging")) continue;
 
             // `fstatat(dir_fd, name, AT_SYMLINK_NOFOLLOW)`. Stays inside
             // the path-jail because `dir_fd` was opened through the
@@ -1673,7 +1681,7 @@ const SftpState = struct {
                     return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
                 }
                 // v0.5.0 atomic-upload: create-on-non-existent goes
-                // through a staging file in `<root>/.zift-staging/`,
+                // through a staging file in `<root>/.zift/staging/`,
                 // not the target path. The fd we hand back to the
                 // partner is the staging file's; partner's WRITE
                 // requests land there. At CLOSE time, we atomically
@@ -1711,7 +1719,7 @@ const SftpState = struct {
                 // target with the right mode after the atomic rename
                 // — POSIX rename(2) preserves the inode and its mode.
                 // Confidentiality of partial uploads during transfer
-                // is enforced by `<root>/.zift-staging/` itself being
+                // is enforced by `<root>/.zift/staging/` itself being
                 // mode 0o700 (only the zift UID can traverse it),
                 // independent of the file's own mode. The explicit
                 // `setPermissions` after `createFile` is required to
@@ -1980,7 +1988,7 @@ const SftpState = struct {
         try replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
     }
 
-    /// Rename a staged file from `<root>/.zift-staging/<basename>`
+    /// Rename a staged file from `<root>/.zift/staging/<basename>`
     /// to its target virtual path. Called from `handleClose`. On
     /// success, clears `staging_basename` so the subsequent
     /// `closeHandle` won't try to unlink the (now-renamed) file.
@@ -2298,7 +2306,7 @@ const SftpState = struct {
     }
 
     /// v0.5.0 staging-rename: register a write handle whose underlying
-    /// fd points at a randomly-named file in `<root>/.zift-staging/`,
+    /// fd points at a randomly-named file in `<root>/.zift/staging/`,
     /// not at the target path. The Handle remembers the target so
     /// CLOSE can atomically rename staging → target. If the partner
     /// disconnects before CLOSE, `closeHandle` will unlink the
@@ -2336,7 +2344,7 @@ const SftpState = struct {
         return id;
     }
 
-    /// Lazily open `<root>/.zift-staging/`, creating it if needed.
+    /// Lazily open `<root>/.zift/staging/`, creating it if needed.
     /// First call per-session pays the mkdir+open cost; subsequent
     /// calls just return the cached handle. Sessions that never
     /// stage anything (read-only partners, all uploads-to-existing-

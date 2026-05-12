@@ -86,7 +86,7 @@ pub const ServerConfig = struct {
     /// alice's `put report.csv`). v0.6.0 default `0o660` — group
     /// `zift` can read+write, world has nothing. Confidentiality of
     /// partial uploads during transfer is enforced by the
-    /// `<root>/.zift-staging/` directory being mode `0o700` regardless
+    /// `<root>/.zift/staging/` directory being mode `0o700` regardless
     /// of this setting; it only controls what the file lands at after
     /// the atomic rename. Allowed values: `0o600`, `0o640`, `0o660`.
     /// Anything else is rejected at parse time to prevent operators

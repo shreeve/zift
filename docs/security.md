@@ -98,7 +98,7 @@ Zift validates client-supplied virtual paths before policy or audit:
 - no DEL byte
 - no traversal above virtual root
 - normalized `.` and `..`
-- reserved `.zift-staging` path component rejected
+- reserved `.zift` path component rejected (and legacy `.zift-staging` for upgrade safety)
 
 Policy is checked against the normalized virtual path, not against the
 host filesystem path.
@@ -231,13 +231,17 @@ authority to destroy existing entries.
 
 ## Atomic Uploads
 
-New uploads are written into `<root>/.zift-staging/` and published to
-the final path when the client closes the file handle.
+New uploads are written into `<root>/.zift/staging/` and published to
+the final path when the client closes the file handle. The parent
+`<root>/.zift/` is zift's reserved per-partner namespace (see
+"Per-Partner Namespace" below).
 
 Security properties:
 
-- partners cannot list `.zift-staging`
-- partners cannot reference `.zift-staging` through SFTP paths
+- partners cannot list `.zift` (or anything inside it)
+- partners cannot reference `.zift` through SFTP paths (the legacy
+  `.zift-staging` name from v0.5.0–v0.7.x is still reserved for
+  upgrade-safety)
 - fresh staging directories are mode `0o700`
 - staging files are private while in flight
 - disconnect cleanup removes unfinished staging files
@@ -259,6 +263,61 @@ Operational caveats:
   window. Closing it completely requires platform no-replace rename
   primitives: `renameat2(RENAME_NOREPLACE)` on Linux and
   `renamex_np(RENAME_EXCL)` on macOS.
+
+## Per-Partner Namespace
+
+Every partner root has a reserved per-partner namespace directory at
+`<root>/.zift/`. This is zift's hidden drawer for the partner: a
+place to store both daemon-managed state and operator-managed notes
+without exposing any of it through the SFTP wire surface.
+
+Layout:
+
+```text
+<root>/.zift/                       reserved per-partner namespace
+├── staging/                        daemon-owned, mode 0700
+│                                   atomic-upload in-flight files
+└── (operator-managed)              notes.md, contracts, scripts,
+                                    audit reviews — anything the
+                                    operator wants alongside the
+                                    partner's data tree
+```
+
+Security properties:
+
+- `.zift` is rejected as a virtual-path component by the path
+  validator. Every SFTP operation (OPENDIR, STAT, OPEN, MKDIR,
+  REMOVE, RMDIR, RENAME, ...) on any path crossing `.zift/`
+  returns `permission denied` to the partner.
+- The listing renderer also skips `.zift` (and the legacy
+  `.zift-staging`) when emitting READDIR results — partners
+  never observe the entry exists.
+- The daemon writes only to `<root>/.zift/staging/`. The namespace
+  parent and any other path inside it are operator-managed; the
+  daemon traverses them but does not read or write their contents.
+
+Recommended operator workflow for per-partner metadata:
+
+```sh
+# Pre-create with operator ownership so the daemon can traverse
+# (group zift) but cannot modify (root-owned parent).
+sudo install -d -o root -g zift -m 0750 /home/zift/<partner>/.zift
+
+# Drop notes, contracts, anything you want hidden from the partner.
+sudoedit /home/zift/<partner>/.zift/notes.md
+```
+
+If the operator does not pre-create `.zift/`, the daemon creates it
+at mode `0o750 zift:zift` on first upload — operators in group zift
+can still add files later. The mode of a pre-existing `.zift/` is
+left alone; the daemon only enforces that it is a real directory,
+not a symlink (which could redirect the staging area outside the
+jail).
+
+This namespace is forward-extensible: future per-partner state that
+zift might add (staging-orphan sweep queues, resume indexes, etc.)
+would land in `<root>/.zift/<subdir>/` without any further
+path-validator changes.
 
 ## Audit Logging
 
@@ -306,7 +365,8 @@ Recommended top-level modes:
 /home/zift/keys/                    0750 root:zift
 /home/zift/keys/<partner>.pub       0640 root:zift
 /home/zift/<partner>/               2770 zift:zift
-/home/zift/<partner>/.zift-staging  0700 zift:zift
+/home/zift/<partner>/.zift/         0750 zift:zift  (or root:zift if operator pre-creates)
+/home/zift/<partner>/.zift/staging  0700 zift:zift
 ```
 
 ## Network Posture
@@ -365,10 +425,11 @@ promises:
 - Publish-time no-clobber is not yet hermetic against a target that
   appears between the destination stat and rename. Platform no-replace
   rename primitives should close this.
-- `openStagingDir` verifies existing `.zift-staging` with lstat before
-  opening it. A local attacker with write access to the partner root
-  could theoretically race that check. SFTP clients cannot create or
-  access `.zift-staging`; this is a local filesystem hardening issue.
+- `openStagingDir` verifies existing `.zift/` and `.zift/staging/`
+  with lstat before opening them. A local attacker with write access
+  to the partner root could theoretically race that check. SFTP
+  clients cannot create or access `.zift/` or its contents; this is
+  a local filesystem hardening issue.
 - Crash-time staging orphans are not automatically swept at startup.
 - Glob matching supports `**`, which is useful but recursive. Patterns
   are operator-controlled, not remote-client-controlled.

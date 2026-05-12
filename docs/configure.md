@@ -497,8 +497,10 @@ deny **.exe
 
 ## Atomic Uploads
 
-New file uploads are staged under `<root>/.zift-staging/` and published
-with an atomic rename when the client closes the file handle.
+New file uploads are staged under `<root>/.zift/staging/` and published
+with an atomic rename when the client closes the file handle. The
+parent `<root>/.zift/` is zift's reserved per-partner namespace
+(see `docs/security.md` for the full model).
 
 This means processors watching a partner-visible directory do not see
 half-uploaded files. The target path appears only after the upload is
@@ -506,9 +508,11 @@ complete.
 
 Important details:
 
-- `.zift-staging` is hidden from partner listings.
-- Any virtual path containing `.zift-staging` is rejected.
-- Fresh staging directories are created mode `0o700`.
+- `.zift` is hidden from partner listings (and so is the legacy
+  `.zift-staging` if it's still on disk from a pre-v0.8.0 install).
+- Any virtual path containing `.zift` (or `.zift-staging`) is rejected.
+- Fresh namespace directories are created mode `0o750` and fresh
+  staging subdirectories are created mode `0o700`.
 - Staging files are private while uploads are in flight.
 - Staging happens under the partner root, not the target parent. Default
   ACLs or setgid behavior on a subdirectory such as `/pending` do not

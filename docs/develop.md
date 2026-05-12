@@ -327,11 +327,12 @@ tests, or polish:
 - Close publish-time no-clobber races with
   `renameat2(RENAME_NOREPLACE)` on Linux and `renamex_np(RENAME_EXCL)`
   on macOS.
-- Harden `.zift-staging` open with an open-no-follow plus fstat pattern
+- Harden `.zift/staging/` open with an open-no-follow plus fstat pattern
   where the platform APIs make that practical.
 - Add a Linux-only regression test for raw-syscall errno handling around
   missing files.
-- Consider sweeping orphaned `.zift-staging` files at startup.
+- Consider sweeping orphaned files under `<root>/.zift/staging/` (and
+  the legacy `<root>/.zift-staging/`) at startup.
 - Consider per-session parsed public-key handle caching, but only if the
   configured-key and dummy-key auth paths keep matching timing behavior.
 

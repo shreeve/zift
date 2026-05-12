@@ -2,17 +2,17 @@
 # Test: v0.5.0 server-side staging-rename for atomic uploads.
 #
 # Every OPEN(write+CREAT) on a non-existent target goes through a
-# random-name staging file in <root>/.zift-staging/. The target path
+# random-name staging file in <root>/.zift/staging/. The target path
 # only appears on the operator-visible filesystem when the partner
 # sends SSH_FXP_CLOSE — at which point an atomic rename publishes
 # the file. Operators who watch the partner directory never see a
 # partial upload.
 #
-# Covers:  src/vfs.zig openStagingDir + staging_dir_name reservation
+# Covers:  src/vfs.zig openStagingDir + namespace_dir_name reservation
 #          in normalizeVirtualPath; src/session.zig staged Handle
 #          flow (handleOpen create-new path, handleClose
 #          publishStagedHandle, closeHandle orphan cleanup); the
-#          listing renderer's .zift-staging filter.
+#          listing renderer's .zift filter (v0.8.0+).
 
 source "$(dirname "$0")/../lib/common.sh"
 
@@ -69,8 +69,15 @@ print("ok: target absent from operator's view during upload")
 # the inode's mode. Confidentiality of partial uploads is enforced
 # by the staging directory itself being 0o700 (only the daemon UID
 # can traverse it), independent of the file's own mode.
+# v0.8.0: staging lives at <root>/.zift/staging/ (was .zift-staging/
+# in v0.5.0–v0.7.x). The namespace dir <root>/.zift/ is mode 0o750
+# (group-traversable so operators in group zift can put notes
+# alongside); only the staging subdir inside is mode 0o700.
 import stat
-staging_dir = "$TEST_TMP/data/.zift-staging"
+namespace_dir = "$TEST_TMP/data/.zift"
+ns_mode = stat.S_IMODE(os.stat(namespace_dir).st_mode)
+assert ns_mode == 0o750, f"namespace dir mode should be 0o750, got 0o{ns_mode:o}"
+staging_dir = "$TEST_TMP/data/.zift/staging"
 dir_mode = stat.S_IMODE(os.stat(staging_dir).st_mode)
 assert dir_mode == 0o700, f"staging dir mode should be 0o700, got 0o{dir_mode:o}"
 staging_files = os.listdir(staging_dir)
@@ -78,7 +85,7 @@ assert len(staging_files) == 1, f"expected 1 staging file mid-upload, got {stagi
 sf_path = os.path.join(staging_dir, staging_files[0])
 file_mode = stat.S_IMODE(os.stat(sf_path).st_mode)
 assert file_mode == 0o660, f"staging file mode should be 0o660 (publish-mode default), got 0o{file_mode:o}"
-print(f"ok: staging dir is 0o{dir_mode:o} and staging file is 0o{file_mode:o} mid-upload")
+print(f"ok: namespace dir 0o{ns_mode:o}, staging dir 0o{dir_mode:o}, staging file 0o{file_mode:o} mid-upload")
 
 # Write more, then CLOSE.
 f.write(b"Y" * 4096)
@@ -98,33 +105,36 @@ target_mode = stat.S_IMODE(os.stat(target_path).st_mode)
 assert target_mode == 0o660, f"published file mode should be 0o660, got 0o{target_mode:o}"
 print(f"ok: published file mode is 0o{target_mode:o} (publish-mode default)")
 
-# --- 2. STAGING DIR INVISIBLE TO PARTNER -------------------------------
-# /.zift-staging is reserved by the path-validator AND filtered from
-# listings. Confirm both layers.
+# --- 2. NAMESPACE DIR INVISIBLE TO PARTNER -----------------------------
+# v0.8.0: /.zift is reserved by the path-validator AND filtered from
+# listings. Confirm both layers. The legacy /.zift-staging is also
+# still reserved at the validator level (defense-in-depth against an
+# unswept upgrade).
 listing = sftp.listdir("/")
-assert ".zift-staging" not in listing, \
-    f"staging dir leaked into / listing: {listing}"
-print(f"ok: .zift-staging hidden from listing of / (sees {listing})")
+assert ".zift"         not in listing, f".zift leaked into / listing: {listing}"
+assert ".zift-staging" not in listing, f".zift-staging leaked into / listing: {listing}"
+print(f"ok: .zift / .zift-staging hidden from listing of / (sees {listing})")
 
-# Direct OPENDIR/STAT/OPEN attempts on the staging path must fail.
+# Direct OPENDIR/STAT/OPEN attempts on the namespace path must fail.
+for path in ("/.zift", "/.zift/staging", "/.zift/notes.md", "/.zift-staging"):
+    try:
+        sftp.listdir(path)
+        print(f"FAIL: partner could OPENDIR {path}")
+        sys.exit(1)
+    except IOError as exc:
+        print(f"ok: OPENDIR {path} denied: {exc}")
+    try:
+        sftp.stat(path)
+        print(f"FAIL: partner could STAT {path}")
+        sys.exit(1)
+    except IOError as exc:
+        print(f"ok: STAT {path} denied: {exc}")
 try:
-    sftp.listdir("/.zift-staging")
-    print("FAIL: partner could OPENDIR /.zift-staging")
+    sftp.file("/.zift/anything", "rb")
+    print("FAIL: partner could OPEN under /.zift")
     sys.exit(1)
 except IOError as exc:
-    print(f"ok: OPENDIR /.zift-staging denied: {exc}")
-try:
-    sftp.stat("/.zift-staging")
-    print("FAIL: partner could STAT /.zift-staging")
-    sys.exit(1)
-except IOError as exc:
-    print(f"ok: STAT /.zift-staging denied: {exc}")
-try:
-    sftp.file("/.zift-staging/anything", "rb")
-    print("FAIL: partner could OPEN under /.zift-staging")
-    sys.exit(1)
-except IOError as exc:
-    print(f"ok: OPEN under /.zift-staging denied: {exc}")
+    print(f"ok: OPEN under /.zift denied: {exc}")
 
 # --- 3. ORPHAN CLEANUP: disconnect mid-upload removes staging file ----
 # Open a write handle, write some data, but DON'T close — just drop
@@ -145,7 +155,7 @@ time.sleep(0.5)
 assert not os.path.exists("$TEST_TMP/data/pending/orphaned.bin"), \
     "orphaned target should not exist on disk"
 # And the staging dir should not have leftover files.
-staging_dir = "$TEST_TMP/data/.zift-staging"
+staging_dir = "$TEST_TMP/data/.zift/staging"
 if os.path.isdir(staging_dir):
     leftover = os.listdir(staging_dir)
     assert leftover == [], f"orphaned staging files leaked: {leftover}"

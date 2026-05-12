@@ -15,7 +15,9 @@ The recommended layout keeps all Zift runtime state under one tree:
 ├── ally/
 │   ├── pending/
 │   ├── archive/
-│   └── .zift-staging/
+│   └── .zift/
+│       ├── staging/                (daemon-owned upload staging)
+│       └── notes.md                (optional operator-managed; partner-invisible)
 └── other-partner/
     └── ...
 ```
@@ -503,7 +505,7 @@ Common failures:
 | reload warning | edited config is invalid; previous config is still active |
 | auth denied | wrong credential, missing key file, unsupported key type |
 | upload fails at close | target collision, policy denial, cross-filesystem publish |
-| uploads fail after crash | orphaned files under `<root>/.zift-staging/`; inspect and clear when no sessions are active |
+| uploads fail after crash | orphaned files under `<root>/.zift/staging/` (or legacy `<root>/.zift-staging/` on pre-v0.8.0 installs); inspect and clear when no sessions are active |
 | no audit file writes | file missing, permissions wrong, filesystem full |
 | partners see unexpected `ls -l` owner/mode | `listing-mode reality` is enabled |
 
