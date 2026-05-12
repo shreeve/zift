@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/shreeve/zift/main/docs/zift-social.png" alt="Logo" width="640">
+</p>
+
 # Zift
 
-Zift is a single-binary SFTP server for partner file transfer.
+> Zift is a single-binary SFTP server for partner file transfer.
 
 It is built for the common B2B case where OpenSSH `internal-sftp` plus
 OS users has become awkward, but a managed file transfer platform is too
@@ -174,4 +178,3 @@ license texts.
 To report a suspected vulnerability privately, see
 [`SECURITY.md`](SECURITY.md). For deployment hardening and threat model,
 see [`docs/security.md`](docs/security.md).
-
