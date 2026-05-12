@@ -4,7 +4,7 @@
 
 # Zift
 
-> Zift is a single-binary SFTP server for partner file transfer.
+> Zift is a small SFTP server for partner file transfer.
 
 It is built for the common B2B case where OpenSSH `internal-sftp` plus
 OS users has become awkward, but a managed file transfer platform is too
