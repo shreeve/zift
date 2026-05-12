@@ -357,6 +357,26 @@ const staging_subdir_name: []const u8 = "staging";
 /// using the same constant the validator reserves.
 pub const legacy_staging_dir_name: []const u8 = ".zift-staging";
 
+/// Returns true if `<root_path>/.zift-staging` exists as ANY filesystem
+/// entry (real dir, symlink, regular file, FIFO, ...). Used by the
+/// startup-time legacy-dir scan in `main.zig` to warn operators who
+/// upgraded from v0.5.0–v0.7.x but haven't yet swept the old path.
+///
+/// Side-effect-free except for an open/close of `root_path` and an
+/// lstat. Returns false on any error — a partner root that fails to
+/// open here will surface elsewhere (validateSemantic already
+/// guarantees root_path exists by the time we reach this).
+///
+/// Uses `statAt` (AT_SYMLINK_NOFOLLOW), so a symlink with the
+/// legacy name returns true regardless of what it points at; the
+/// operator should know the entry is there either way.
+pub fn legacyStagingDirExists(io: std.Io, root_path: []const u8) bool {
+    var root = std.Io.Dir.openDirAbsolute(io, root_path, .{}) catch return false;
+    defer root.close(io);
+    _ = @import("listing.zig").statAt(root.handle, legacy_staging_dir_name) catch return false;
+    return true;
+}
+
 fn openOrCreateNamespaceDir(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
     const namespace_perm = std.Io.File.Permissions.fromMode(0o750);
     const create_status = root.createDir(io, namespace_dir_name, namespace_perm);
@@ -570,6 +590,51 @@ test "resolve blocks symlink escape" {
         error.PathTraversal,
         vfs.resolveExisting(std.testing.io, std.testing.allocator, "/outside/passwd"),
     );
+}
+
+test "legacyStagingDirExists detects each entry type the operator might find" {
+    // We test the upgrade-time warning helper across the four file
+    // types a real-world deployment might land on:
+    //   - missing                 (clean v0.8.0+ install, no legacy)
+    //   - real directory          (typical v0.5.0–v0.7.x leftover)
+    //   - symlink                 (worst case — operator should know)
+    //   - regular file            (rare, but a malformed cleanup might
+    //                              `touch` it; the WARN still fires)
+    // All four cases should report the SAME signal so the operator
+    // gets a consistent prompt to investigate.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPathFile(std.testing.io, ".", &root_buf);
+    const root_path = root_buf[0..root_len];
+
+    // Case 1: missing — no entry at the legacy name.
+    try std.testing.expect(!legacyStagingDirExists(std.testing.io, root_path));
+
+    // Case 2: real directory.
+    try tmp.dir.createDir(std.testing.io, ".zift-staging", .default_dir);
+    try std.testing.expect(legacyStagingDirExists(std.testing.io, root_path));
+    try tmp.dir.deleteDir(std.testing.io, ".zift-staging");
+
+    // Case 3: symlink pointing anywhere (target need not exist for
+    // lstat to surface the entry).
+    try tmp.dir.symLink(std.testing.io, "/tmp/somewhere", ".zift-staging", .{});
+    try std.testing.expect(legacyStagingDirExists(std.testing.io, root_path));
+    try tmp.dir.deleteFile(std.testing.io, ".zift-staging");
+
+    // Case 4: regular file (operator-created marker, malformed sweep
+    // residue, etc.).
+    {
+        const f = try tmp.dir.createFile(std.testing.io, ".zift-staging", .{});
+        f.close(std.testing.io);
+    }
+    try std.testing.expect(legacyStagingDirExists(std.testing.io, root_path));
+    try tmp.dir.deleteFile(std.testing.io, ".zift-staging");
+
+    // Back to missing — verify the helper returns false again so the
+    // test isn't accidentally a positive-only fixture.
+    try std.testing.expect(!legacyStagingDirExists(std.testing.io, root_path));
 }
 
 test "openVerifiedParent blocks parent-symlink escape" {

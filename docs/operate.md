@@ -485,12 +485,23 @@ Two consequences for an upgrade in place:
 2. The v0.8.0 daemon never reads or writes `<root>/.zift-staging/`.
    Any orphaned staging files left behind by v0.5.0–v0.7.x crash
    recovery (or by partners who disconnected mid-upload right
-   before the upgrade) will sit at the old path indefinitely.
+   before the upgrade) will sit at the old path indefinitely. To
+   help operators notice, v0.8.0 logs a one-line stderr WARN at
+   startup for each partner root that still has a `.zift-staging`
+   entry — any file type (real dir, symlink, regular file) trips
+   it. Look in the journal:
+
+   ```text
+   zift: warning: legacy staging dir at /home/zift/ally/.zift-staging
+     is ignored by v0.8.0+; sweep with `rm -rf` once no in-flight
+     sessions need it
+   ```
+
    Sweep them manually once you've confirmed no in-flight sessions
    need them:
 
    ```sh
-   sudo find /home/zift -type d -name .zift-staging
+   sudo find /home/zift -mindepth 2 -maxdepth 2 -name .zift-staging
    sudo rm -rf /home/zift/<partner>/.zift-staging
    ```
 

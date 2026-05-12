@@ -488,7 +488,13 @@ fn formatSize(out: []u8, mode: u32, size: u64) []const u8 {
 fn formatMtime(out: []u8, mtime_secs: i64, now_secs: i64) []const u8 {
     const broken = breakTime(mtime_secs);
     const six_months_secs: i64 = 6 * 30 * 24 * 60 * 60;
-    const recent = (now_secs - mtime_secs) < six_months_secs and (now_secs - mtime_secs) > -(six_months_secs / 2);
+    // Compare in i128 so an mtime read from a corrupted inode (e.g.
+    // i64.min) doesn't overflow the subtraction. The "recent" window
+    // only cares about coarse months — the i128 widening is purely
+    // defensive and free at this scale.
+    const diff: i128 = @as(i128, now_secs) - @as(i128, mtime_secs);
+    const recent = diff < @as(i128, six_months_secs) and
+        diff > -@as(i128, six_months_secs / 2);
 
     const month = month_abbrev[@min(broken.month, 11)];
 
@@ -539,7 +545,15 @@ const BrokenTime = struct {
 fn breakTime(secs: i64) BrokenTime {
     const seconds_per_day: i64 = 86400;
     const day = @divFloor(secs, seconds_per_day);
-    const seconds_in_day = secs - day * seconds_per_day; // [0, 86399]
+    // `@mod` gives mathematical modulo (always non-negative when the
+    // divisor is positive), so the result is in [0, 86399] regardless
+    // of `secs`'s sign. The earlier `secs - day * seconds_per_day`
+    // form was equivalent in math but overflowed `day * 86400` at
+    // extreme negative timestamps (e.g. `i64.min + 1` near the
+    // proleptic Gregorian boundary). `audit.zig`'s `formatRfc3339Utc`
+    // already used the @mod form; this brings `listing.zig` back
+    // into agreement.
+    const seconds_in_day: i64 = @mod(secs, seconds_per_day); // [0, 86399]
 
     // Shift epoch from 1970-01-01 to 0000-03-01 (the "March 1, year 0"
     // origin Hinnant's algorithm uses). 719468 = days from 0000-03-01
@@ -645,8 +659,17 @@ test "breakTime: known epoch -> 1970-01-01 00:00" {
 }
 
 test "breakTime: 2026-04-27 14:35 UTC" {
-    // 2026-04-27T14:35:00Z = 1777905300
-    const b = breakTime(1777905300);
+    // 2026-04-27T14:35:00Z = 1777300500.
+    //
+    // (The prior fixture value of 1777905300 was actually 2026-05-04
+    // 14:35 UTC — off by exactly 7 days. The implementation has
+    // always been correct; the test fixture was wrong. Re-derive
+    // independently: 1970→2026 = 56 years × 365 = 20440 days, plus
+    // 14 leap years between 1972 and 2024 inclusive = 20454 days
+    // from epoch to 2026-01-01; Jan 31 + Feb 28 + Mar 31 + 26 = 116
+    // days from 2026-01-01 to 2026-04-27; 20570 × 86400 + 14×3600
+    // + 35×60 = 1777300500.)
+    const b = breakTime(1777300500);
     try std.testing.expectEqual(@as(i32, 2026), b.year);
     try std.testing.expectEqual(@as(u4, 3), b.month); // April (0-indexed)
     try std.testing.expectEqual(@as(u8, 27), b.day);
@@ -740,6 +763,17 @@ test "formatMtime: old uses YYYY" {
     try std.testing.expect(std.mem.indexOf(u8, out, ":") == null);
 }
 
+test "formatMtime: extreme mtime from corrupted inode does not overflow" {
+    // A partner-managed tree should never crash the SFTP session
+    // because `stat` returned a junk timestamp. Used to overflow
+    // `now_secs - mtime_secs`. The output need not be meaningful;
+    // what matters is that the function returns without panicking.
+    var buf: [20]u8 = undefined;
+    const now: i64 = 1777300500;
+    _ = formatMtime(&buf, std.math.minInt(i64), now);
+    _ = formatMtime(&buf, std.math.maxInt(i64), now);
+}
+
 test "formatLongname: directory line" {
     var out: [256]u8 = undefined;
     const info: EntryInfo = .{
@@ -748,7 +782,7 @@ test "formatLongname: directory line" {
         .uid = 1000,
         .gid = 1000,
         .size = 4096,
-        .mtime_secs = 1777905300, // 2026-04-04 ~
+        .mtime_secs = 1777905300, // 2026-05-04 ~
     };
     const line = formatLongname(&out, info, "shreeve", "trust", "alice", 1777905300);
     try std.testing.expect(std.mem.indexOf(u8, line, "drwxr-s---") != null);

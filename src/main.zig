@@ -6,6 +6,7 @@ const auth = @import("zift/auth.zig");
 const config = @import("zift/config.zig");
 const session = @import("zift/session.zig");
 const signals = @import("zift/signals.zig");
+const vfs = @import("zift/vfs.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -160,6 +161,21 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
         cfg.deinit();
         return err;
     };
+
+    // v0.8.0 upgrade UX: warn (one stderr line per partner root) if a
+    // legacy `<root>/.zift-staging/` directory is still on disk from a
+    // v0.5.0–v0.7.x install. The v0.8.0 daemon never reads or writes
+    // it, but operators who upgraded without cleaning up should know.
+    // This is informational only — does not affect startup or partner
+    // traffic.
+    for (cfg.users) |*user| {
+        if (vfs.legacyStagingDirExists(io, user.root)) {
+            try stderr.writeStreamingAll(io, "zift: warning: legacy staging dir at ");
+            try stderr.writeStreamingAll(io, user.root);
+            try stderr.writeStreamingAll(io, "/.zift-staging is ignored by v0.8.0+; ");
+            try stderr.writeStreamingAll(io, "sweep with `rm -rf` once no in-flight sessions need it\n");
+        }
+    }
 
     // Audit destination is determined by `server.log` (default stderr,
     // or an absolute path that is opened O_APPEND and reopened on
