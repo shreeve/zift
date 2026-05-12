@@ -285,10 +285,16 @@ Layout:
 
 Security properties:
 
-- `.zift` is rejected as a virtual-path component by the path
-  validator. Every SFTP operation (OPENDIR, STAT, OPEN, MKDIR,
-  REMOVE, RMDIR, RENAME, ...) on any path crossing `.zift/`
-  returns `permission denied` to the partner.
+- `.zift` (and the legacy `.zift-staging` from v0.5.0–v0.7.x) is
+  rejected as a virtual-path component by the path validator
+  **anywhere in the path, not just at the partner root**. Every
+  SFTP operation (OPENDIR, STAT, OPEN, MKDIR, REMOVE, RMDIR,
+  RENAME, ...) on any path containing `.zift` as a component
+  returns `permission denied` to the partner. An operator
+  migrating from a non-zift SFTP service should scan partner
+  roots for pre-existing `.zift`/`.zift-staging` directories
+  before going live — see `docs/operate.md` "Upgrading to
+  v0.8.0".
 - The listing renderer also skips `.zift` (and the legacy
   `.zift-staging`) when emitting READDIR results — partners
   never observe the entry exists.

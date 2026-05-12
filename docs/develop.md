@@ -159,16 +159,16 @@ the toolchain is updated or patched, re-enable the `fuzz-short` job in
 Build one release artifact:
 
 ```sh
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.7.1-dev
+zig build release -Dtarget=x86_64-linux-musl -Dversion=0.8.0-dev
 ```
 
 Supported release targets:
 
 ```sh
-zig build release -Dtarget=x86_64-linux-musl  -Dversion=0.7.1-dev
-zig build release -Dtarget=aarch64-linux-musl -Dversion=0.7.1-dev
-zig build release -Dtarget=x86_64-macos       -Dversion=0.7.1-dev
-zig build release -Dtarget=aarch64-macos      -Dversion=0.7.1-dev
+zig build release -Dtarget=x86_64-linux-musl  -Dversion=0.8.0-dev
+zig build release -Dtarget=aarch64-linux-musl -Dversion=0.8.0-dev
+zig build release -Dtarget=x86_64-macos       -Dversion=0.8.0-dev
+zig build release -Dtarget=aarch64-macos      -Dversion=0.8.0-dev
 ```
 
 Output lands under `release/`.
@@ -371,7 +371,7 @@ tests/run.sh
 tests/run.sh --list
 
 # local release artifact
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.7.1-dev
+zig build release -Dtarget=x86_64-linux-musl -Dversion=0.8.0-dev
 
 # inspect release output
 ls -la release/

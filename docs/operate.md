@@ -450,6 +450,54 @@ sudo tar czf zift-backup.tgz /usr/local/bin/zift /home/zift
 Filesystem snapshots, `rsync`, `restic`, `borg`, ZFS, btrfs, and LVM
 all work because Zift state is just files.
 
+## Upgrading to v0.8.0
+
+v0.8.0 reshapes the reserved per-partner directory from
+`<root>/.zift-staging/` (a single-purpose staging dir, v0.5.0–v0.7.x)
+into the namespace `<root>/.zift/` with `staging/` as a subdirectory.
+See `docs/security.md` "Per-Partner Namespace" for the full model.
+
+Two consequences for an upgrade in place:
+
+1. The path-validator now reserves `.zift` AND legacy `.zift-staging`
+   as virtual-path components **anywhere** in a partner-visible path,
+   not just at the partner root. After upgrade, any pre-existing
+   partner-visible file or directory crossing one of those names is
+   denied by the SFTP wire surface and hidden from directory
+   listings. Examples that would have worked on v0.7.1 but lose
+   partner access on v0.8.0:
+
+   ```text
+   /archive/vendor/.zift/state.json
+   /pending/.zift-staging/tmp.dat
+   ```
+
+   Before upgrading, scan partner roots for reserved names:
+
+   ```sh
+   sudo find /home/zift -name .zift -o -name .zift-staging
+   ```
+
+   Anything that surfaces and isn't zift's own staging dir is
+   pre-existing partner data that needs renaming before v0.8.0
+   takes effect.
+
+2. The v0.8.0 daemon never reads or writes `<root>/.zift-staging/`.
+   Any orphaned staging files left behind by v0.5.0–v0.7.x crash
+   recovery (or by partners who disconnected mid-upload right
+   before the upgrade) will sit at the old path indefinitely.
+   Sweep them manually once you've confirmed no in-flight sessions
+   need them:
+
+   ```sh
+   sudo find /home/zift -type d -name .zift-staging
+   sudo rm -rf /home/zift/<partner>/.zift-staging
+   ```
+
+   The validator's continued reservation of the legacy name means
+   partners can't re-create the old path via SFTP, so the
+   operator-side cleanup window is unbounded.
+
 ## Rollback
 
 Keep the previous binary:
