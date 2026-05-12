@@ -21,7 +21,7 @@ zift-deploy-X.Y.Z/
 ## Install Binary
 
 ```sh
-ZIFT_VERSION=0.7.1
+ZIFT_VERSION=0.8.0
 ARCH=$(uname -m)
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-${ARCH}-linux"

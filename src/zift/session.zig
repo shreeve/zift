@@ -1496,7 +1496,7 @@ const SftpState = struct {
             // already rejects it as a path component; this just keeps
             // it out of READDIR results during the transition.
             if (std.mem.eql(u8, entry.name, vfs_mod.namespace_dir_name)) continue;
-            if (std.mem.eql(u8, entry.name, ".zift-staging")) continue;
+            if (std.mem.eql(u8, entry.name, vfs_mod.legacy_staging_dir_name)) continue;
 
             // `fstatat(dir_fd, name, AT_SYMLINK_NOFOLLOW)`. Stays inside
             // the path-jail because `dir_fd` was opened through the

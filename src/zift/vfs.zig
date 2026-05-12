@@ -12,6 +12,16 @@ pub const Error = error{
     /// Operators must `rm -rf <root>/.zift` to clear and let
     /// zift create the real directory on next session.
     NamespaceDirCorrupt,
+    /// `<root>/.zift` is a real directory but its mode grants
+    /// either group-write or any "other" access. Both put the
+    /// namespace (operator notes + daemon staging subdir) at
+    /// risk: group-write lets a member of group `zift` rename
+    /// or replace the `staging` entry between zift's open and
+    /// rename; other-* exposes operator metadata to anyone on
+    /// the host. Operators must `chmod 0750 <root>/.zift` (or
+    /// stricter — `0o700` if zift owns it) before uploads
+    /// will succeed.
+    NamespaceDirUnsafe,
     /// `<root>/.zift/staging` exists at a partner root but is
     /// not a real directory (could be a symlink, file, FIFO,
     /// etc.). Operators must `rm -rf <root>/.zift/staging` to
@@ -86,27 +96,36 @@ pub const Vfs = struct {
     ///
     /// **Hardening invariants**:
     ///
-    ///  - Pre-existing `<root>/.zift/` is accepted at *any* mode and
-    ///    *any* ownership the operator chose, with one exception: it
-    ///    MUST be a real directory (not a symlink, FIFO, regular
-    ///    file, etc.). A symlink with that name pointing outside the
-    ///    jail would let the daemon create `staging/` outside its
-    ///    intended location. We lstat via `statAt`
-    ///    (AT_SYMLINK_NOFOLLOW) and reject anything whose `S_IFMT`
-    ///    is not `S_IFDIR`.
+    ///  - Pre-existing `<root>/.zift/` must be a real directory
+    ///    (not a symlink, FIFO, regular file, etc.). A symlink with
+    ///    that name pointing outside the jail would let the daemon
+    ///    create `staging/` outside its intended location. We lstat
+    ///    via `statAt` (AT_SYMLINK_NOFOLLOW) and reject anything
+    ///    whose `S_IFMT` is not `S_IFDIR`.
     ///
-    ///  - Pre-existing `<root>/.zift/staging/` is held to a stricter
-    ///    bar: must be a real directory AND must not grant any group
-    ///    or other access bits (`mode & 0o077 != 0` is fatal). The
-    ///    staging dir holds in-flight partial uploads; loose perms
-    ///    let local users observe upload names and (if writable)
-    ///    swap staging files between zift's rename-by-path and the
-    ///    kernel rename syscall — turning a confidentiality issue
-    ///    into an integrity one.
+    ///  - Pre-existing `<root>/.zift/` must not grant group-write
+    ///    or any "other" access (`mode & 0o027 != 0` is fatal).
+    ///    Group-write would let a member of group `zift` rename or
+    ///    replace the `staging` entry between zift's open and
+    ///    rename; other-* exposes operator-managed metadata to
+    ///    anyone on the host. Acceptable modes are `0o700` (zift-
+    ///    only) or `0o750` (zift + group-traversable; operators in
+    ///    group `zift` can read but not write — adding files
+    ///    requires sudo). Mode of a pre-existing namespace dir is
+    ///    otherwise left alone; we only enforce the upper bound.
+    ///
+    ///  - Pre-existing `<root>/.zift/staging/` is held to the
+    ///    strictest bar: must be a real directory AND must not
+    ///    grant ANY group or other access bits (`mode & 0o077 != 0`
+    ///    is fatal). The staging dir holds in-flight partial
+    ///    uploads; loose perms let local users observe upload names
+    ///    and (if writable) swap staging files between zift's
+    ///    rename-by-path and the kernel rename syscall — turning a
+    ///    confidentiality issue into an integrity one.
     ///
     ///  - Newly-created `<root>/.zift/` lands at mode `0o750`
-    ///    (group-traversable so operators in group `zift` can write
-    ///    notes alongside without sudo each time). Newly-created
+    ///    (zift-only write, group-traversable so operators in group
+    ///    `zift` can inspect contents). Newly-created
     ///    `<root>/.zift/staging/` lands at `0o700` regardless of
     ///    umask. Both are `fchmod`'d after `createDir` because
     ///    `createDir` honors the calling process's umask (a `022`
@@ -333,7 +352,10 @@ const staging_subdir_name: []const u8 = "staging";
 /// SFTP and confuse operators who upgraded but haven't yet swept the
 /// old path. The daemon itself never reads or writes here on v0.8.0+
 /// — `openStagingDir` uses `<root>/.zift/staging/` exclusively.
-const legacy_staging_dir_name: []const u8 = ".zift-staging";
+/// Exported so the listings renderer in `session.zig` can keep a
+/// stray legacy dir out of READDIR results during the transition,
+/// using the same constant the validator reserves.
+pub const legacy_staging_dir_name: []const u8 = ".zift-staging";
 
 fn openOrCreateNamespaceDir(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
     const namespace_perm = std.Io.File.Permissions.fromMode(0o750);
@@ -347,14 +369,22 @@ fn openOrCreateNamespaceDir(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
     } else |err| switch (err) {
         error.PathAlreadyExists => {
             // Operator may have pre-created the namespace dir with
-            // their own ownership + mode (e.g. root:zift 0750 for an
-            // operator-managed notes drawer). Accept whatever's
-            // there as long as it's a real directory. statAt has
+            // their own ownership + mode (e.g. root:zift 0750 for
+            // an operator-managed notes drawer). Accept the pre-
+            // existing dir BUT enforce two invariants: (a) it must
+            // be a real directory, not a symlink that could redirect
+            // staging outside the jail; (b) it must not grant
+            // group-write (would let group `zift` race the staging
+            // entry) or ANY "other" access (would expose operator
+            // metadata to local non-zift users). statAt has
             // AT_SYMLINK_NOFOLLOW semantics so a symlink returns
             // its OWN metadata, not the target's.
             const info = try @import("listing.zig").statAt(root.handle, namespace_dir_name);
             const file_type = info.mode & 0o170000;
             if (file_type != 0o040000) return error.NamespaceDirCorrupt;
+            // Mask: 0o027 catches group-write, other-read, other-
+            // write, other-execute. Allows 0o700 and 0o750.
+            if ((info.mode & 0o027) != 0) return error.NamespaceDirUnsafe;
             return try root.openDir(io, namespace_dir_name, .{ .iterate = true });
         },
         else => return err,
@@ -509,6 +539,13 @@ test "normalize rejects /.zift namespace anywhere in path (v0.8.0)" {
     try std.testing.expectError(
         error.InvalidPath,
         Vfs.normalizeVirtual(std.testing.allocator, "/.zift-staging/legacy.dat"),
+    );
+    // Mid-path legacy reservation: an operator who had a
+    // `<partner-root>/pending/.zift-staging/` planted somehow before
+    // the upgrade should still have that path rejected for partners.
+    try std.testing.expectError(
+        error.InvalidPath,
+        Vfs.normalizeVirtual(std.testing.allocator, "/pending/.zift-staging/something"),
     );
     // Non-reserved dotfiles are fine.
     const ok = try Vfs.normalizeVirtual(std.testing.allocator, "/pending/.cache/foo");

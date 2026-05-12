@@ -19,10 +19,13 @@
 #     staging directory creation outside the jail).
 #  2. Pre-existing `<root>/.zift/staging/` as a symlink → StagingDirCorrupt
 #     (same threat, one level deeper).
-#  3. Pre-existing `<root>/.zift/staging/` with group/other access bits
+#  3. Pre-existing `<root>/.zift/` with group-write or any "other"
+#     access → NamespaceDirUnsafe (group members could race the
+#     staging entry; "other" access exposes operator metadata).
+#  4. Pre-existing `<root>/.zift/staging/` with group/other access bits
 #     → StagingDirUnsafe (loose perms let local users observe in-flight
 #     upload names and tamper with staging files mid-rename).
-#  4. Reserved-path coverage: every SFTP op on `/.zift/*` AND legacy
+#  5. Reserved-path coverage: every SFTP op on `/.zift/*` AND legacy
 #     `/.zift-staging/*` must be rejected — partners must never reach
 #     anything inside the namespace via the SFTP wire surface.
 #
@@ -127,7 +130,36 @@ stop_zift TERM
 wait "$ZIFT_PID" 2>/dev/null || true
 rm -rf "$TEST_TMP/data/.zift"
 
-# --- 3. UNSAFE-PERMS staging subdir is rejected ----------------------
+# --- 3. UNSAFE-PERMS namespace dir is rejected -----------------------
+# Plant a real `.zift/` at 0o770 (group-writable). Group members
+# could rename or replace the daemon-managed `staging` entry between
+# zift's open and rename, so we reject any pre-existing namespace
+# dir whose mode grants group-write or any "other" access.
+mkdir -m 0770 "$TEST_TMP/data/.zift"
+
+start_zift
+"$PY" - <<EOF
+import paramiko, socket, sys
+sock = socket.create_connection(("127.0.0.1", $TEST_PORT), timeout=15)
+t = paramiko.Transport(sock)
+t.connect(username="partner", password="secret")
+sftp = paramiko.SFTPClient.from_transport(t)
+try:
+    f = sftp.file("/pending/should-fail-ns-perms.bin", "wb")
+    f.write(b"x")
+    f.close()
+    print("FAIL: upload succeeded with 0o770 namespace dir")
+    sys.exit(1)
+except IOError as exc:
+    print(f"ok: upload refused with 0o770 namespace dir: {exc}")
+sftp.close()
+t.close()
+EOF
+stop_zift TERM
+wait "$ZIFT_PID" 2>/dev/null || true
+rm -rf "$TEST_TMP/data/.zift"
+
+# --- 4. UNSAFE-PERMS staging subdir is rejected ----------------------
 # Plant a real `.zift/staging` directory at 0o755 (world-listable).
 # openOrCreateStagingSubdir refuses any pre-existing dir whose mode
 # grants group or other access bits — partial uploads would otherwise
@@ -157,7 +189,7 @@ stop_zift TERM
 wait "$ZIFT_PID" 2>/dev/null || true
 rm -rf "$TEST_TMP/data/.zift"
 
-# --- 4. Reserved-path coverage: every op on /.zift/* and /.zift-staging/* ---
+# --- 5. Reserved-path coverage: every op on /.zift/* and /.zift-staging/* ---
 # Let zift create the namespace + staging dirs cleanly via a first
 # upload, then plant a real file inside `.zift/staging/` from the
 # harness side (so REMOVE/RENAME-from can't pass via NotFound).

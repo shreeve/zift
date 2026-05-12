@@ -308,11 +308,31 @@ sudoedit /home/zift/<partner>/.zift/notes.md
 ```
 
 If the operator does not pre-create `.zift/`, the daemon creates it
-at mode `0o750 zift:zift` on first upload — operators in group zift
-can still add files later. The mode of a pre-existing `.zift/` is
-left alone; the daemon only enforces that it is a real directory,
-not a symlink (which could redirect the staging area outside the
-jail).
+at mode `0o750 zift:zift` on first upload. At `0o750`, operators in
+group `zift` can read+traverse the namespace but cannot write to it
+without elevating to root (or to the `zift` user) — adding notes or
+other operator-managed files still goes through `sudo`/`sudoedit`.
+
+A pre-existing `.zift/` is enforced to be a real directory (not a
+symlink — which could redirect the staging area outside the jail)
+AND to have a sane mode: `mode & 0o027 != 0` is fatal. That means
+the daemon refuses to start a session if it finds a namespace dir
+that grants group-write (`0o770`, `0o777`) or any "other" access
+(`0o755`, `0o751`, etc.). The acceptable shapes are:
+
+```text
+0o700 zift:zift            (daemon-only)
+0o750 zift:zift            (daemon owns, operators in group zift read)
+0o750 root:zift            (root owns, operators in group zift read)
+```
+
+Reject:
+
+```text
+0o770   group-writable — a group member could race the staging entry
+0o755   world-readable — exposes operator metadata to local users
+0o777   no.
+```
 
 This namespace is forward-extensible: future per-partner state that
 zift might add (staging-orphan sweep queues, resume indexes, etc.)
