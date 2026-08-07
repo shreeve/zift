@@ -80,8 +80,9 @@ pub fn validate(blob: []const u8) Error!void {
 pub fn decode(blob: []const u8) Error![raw_len]u8 {
     if (blob.len == 0) return error.MissingPrefix;
     if (blob.len != blob_len) {
-        // Legacy `g1…` or future letter versions (`b`…).
-        if (std.mem.startsWith(u8, blob, "g1") or (blob[0] >= 'b' and blob[0] <= 'z')) {
+        // Future letter versions (`b`…). Digits/other lengths are
+        // plain wrong-size, not a new version.
+        if (blob[0] >= 'b' and blob[0] <= 'z') {
             return error.UnknownVersionTag;
         }
         return error.WrongLength;
@@ -168,7 +169,7 @@ test "mint and verify round-trip" {
 
 test "validate rejects legacy and bad shapes" {
     try std.testing.expectError(error.MissingPrefix, validate(""));
-    try std.testing.expectError(error.UnknownVersionTag, validate("g1" ++ ("0" ** 30)));
+    try std.testing.expectError(error.UnknownVersionTag, validate("zAAAA"));
     try std.testing.expectError(error.UnknownVersionTag, validate("b" ++ ("0" ** 31)));
     try std.testing.expectError(error.WrongLength, validate("aAAAA"));
     try std.testing.expectError(error.InvalidAlphabet, validate("a" ++ "A" ** 30 ++ "_"));

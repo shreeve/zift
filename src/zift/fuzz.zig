@@ -97,7 +97,7 @@ fn fuzzPolicyGlob(_: void, smith: *Smith) !void {
 test "fuzz passhash credential validation" {
     return std.testing.fuzz({}, fuzzPasshash, .{ .corpus = &.{
         "a0000000000000000000000000000000",
-        "g1AAAA", // legacy tag
+        "zAAAA", // unknown version letter
         "$argon2id$v=19$m=65536,t=2,p=1$aa$bb",
         "a!!!!",
         "b0000000000000000000000000000000", // future version
