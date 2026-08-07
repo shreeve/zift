@@ -1,9 +1,11 @@
 const std = @import("std");
 const c = @import("libssh");
+const abuse = @import("abuse.zig");
 const audit = @import("audit.zig");
 const auth = @import("auth.zig");
 const config = @import("config.zig");
 const listing = @import("listing.zig");
+const netmatch = @import("netmatch.zig");
 const policy = @import("policy.zig");
 const signals = @import("signals.zig");
 const vfs_mod = @import("vfs.zig");
@@ -55,7 +57,7 @@ fn nowUnixSecs() i64 {
 /// socket, getpeername fails, unknown family). The returned slice
 /// contains only the address — no port, no brackets — so the audit
 /// schema's `ip` field is consistent across IPv4/IPv6 and lookup-able
-/// by composition tools (fail2ban, awk, etc.).
+/// by jq/awk and Zift's own source policy.
 fn capturePeerIp(session: c.ssh_session, buf: []u8) ?[]const u8 {
     const fd = c.ssh_get_fd(session);
     if (fd < 0) return null;
@@ -187,10 +189,20 @@ pub fn run(
             continue :accept_loop;
         }
 
+        var ip_buf: [64]u8 = undefined;
+        const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
+
+        // Built-in abuse floor: temporarily refuse sources that recently
+        // burned through auth failures. No external ban daemon required.
+        if (abuse.isSuppressed(io, peer_ip, nowMs())) {
+            audit.log(io, null, "accept.rejected", null, .denied, "source suppressed", peer_ip);
+            c.ssh_disconnect(session);
+            c.ssh_free(session);
+            continue :accept_loop;
+        }
+
         const max = active.current.config.server.max_connections;
         if (signals.active_sessions.load(.acquire) >= max) {
-            var ip_buf: [64]u8 = undefined;
-            const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
             audit.log(io, null, "accept.rejected", null, .denied, "max-connections reached", peer_ip);
             c.ssh_disconnect(session);
             c.ssh_free(session);
@@ -206,8 +218,6 @@ pub fn run(
         if (max_unauth_cfg != 0 and
             signals.unauth_sessions.load(.acquire) >= max_unauth_cfg)
         {
-            var ip_buf: [64]u8 = undefined;
-            const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
             audit.log(io, null, "accept.rejected", null, .denied, "max-unauth-connections reached", peer_ip);
             c.ssh_disconnect(session);
             c.ssh_free(session);
@@ -630,6 +640,7 @@ fn authenticate(
     // happens. Only a `denied` outcome consumes an attempt.
     const max_auth_attempts: u32 = 6;
     var failed_attempts: u32 = 0;
+    const ip_str = peer_ip orelse "";
 
     while (true) {
         const msg = c.ssh_message_get(session) orelse return error.LibsshFailure;
@@ -673,21 +684,28 @@ fn authenticate(
                 const username = std.mem.span(username_ptr);
                 const password = std.mem.span(password_ptr);
                 if (cfg.findUser(username)) |user| {
-                    if (auth.verifyPassword(io, allocator, user, password)) {
+                    if (!netmatch.allowed(user.from, ip_str)) {
+                        audit.log(io, username, "auth.password", null, .denied, "source not allowed", ip_str);
+                    } else if (auth.verifyPassword(io, allocator, user, password)) {
                         _ = c.ssh_message_auth_reply_success(msg, 0);
-                        audit.log(io, username, "auth.password", null, .ok, "", peer_ip orelse "");
+                        audit.log(io, username, "auth.password", null, .ok, "", ip_str);
+                        abuse.recordSuccess(io, ip_str);
                         return user;
+                    } else {
+                        audit.log(io, username, "auth.password", null, .denied, "bad password", ip_str);
                     }
-                    audit.log(io, username, "auth.password", null, .denied, "bad password", peer_ip orelse "");
                 } else {
                     _ = auth.verifyLogin(io, allocator, cfg, username, password);
-                    audit.log(io, username, "auth.password", null, .denied, "unknown user", peer_ip orelse "");
+                    audit.log(io, username, "auth.password", null, .denied, "unknown user", ip_str);
                 }
             }
         } else if (subtype == c.SSH_AUTH_METHOD_PUBLICKEY) {
             const decision = handlePublicKeyMessage(io, allocator, cfg, msg, peer_ip);
             switch (decision) {
-                .accepted => |user| return user,
+                .accepted => |user| {
+                    abuse.recordSuccess(io, ip_str);
+                    return user;
+                },
                 .offered => continue,
                 .denied => {},
             }
@@ -695,10 +713,14 @@ fn authenticate(
 
         // Reaching here means this attempt failed (or the message
         // wasn't a recognized auth method). Count it; disconnect when
-        // the ceiling is hit.
+        // the ceiling is hit. Auth backoff slows password spraying
+        // without an external ban daemon.
         failed_attempts += 1;
+        abuse.recordFailure(io, ip_str, nowMs());
+        const delay_ms = @min(failed_attempts * 250, 2000);
+        std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
         if (failed_attempts >= max_auth_attempts) {
-            audit.log(io, null, "auth.too_many_attempts", null, .denied, "", peer_ip orelse "");
+            audit.log(io, null, "auth.too_many_attempts", null, .denied, "", ip_str);
             return error.LibsshFailure;
         }
 
@@ -729,8 +751,8 @@ fn authenticate(
 ///     the partner-deploy threat model where partner usernames are
 ///     known to the partner anyway, and the operational pain of
 ///     the wider bitmask is real (clients try every key in the
-///     agent before the password prompt, drowning the audit log
-///     and burning fail2ban budget), that leak is the right trade.
+///     agent before the password prompt, drowning the audit log),
+///     that leak is the right trade.
 ///     Operators with a stricter posture configure both methods on
 ///     every user so the response stays at the default.
 ///   - User exists with keys only               → `PASSWORD|PUBLICKEY`
@@ -789,6 +811,12 @@ fn handlePublicKeyMessage(
         audit.log(io, username, "auth.publickey", null, .denied, "unknown user", ip_str);
         return .denied;
     };
+
+    if (!netmatch.allowed(user.from, ip_str)) {
+        _ = matchAgainstDummyKey(allocator, presented);
+        audit.log(io, username, "auth.publickey", null, .denied, "source not allowed", ip_str);
+        return .denied;
+    }
 
     if (user.keys.len == 0) {
         // Known user, password-only. Same dummy work so the timing

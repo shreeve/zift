@@ -18,9 +18,12 @@ Zift has:
 - no chroot setup
 - no plugin system
 - no telemetry
+- no CrowdSec / fail2ban requirement
 - one reloadable config file
 - one SFTP listener
 - virtual users with path-scoped policy
+- optional per-user source IP (`from`) policy
+- built-in auth backoff and temporary source suppression
 - structured JSON audit logs
 - static Linux release binaries
 
@@ -128,6 +131,7 @@ server
   log stderr
 
 user ally
+  from 127.0.0.1
   auth $argon2id$v=19$m=65536,t=3,p=1$...
   allow / read
   allow /pending read add remove

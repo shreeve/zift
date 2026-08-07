@@ -80,6 +80,7 @@ This is the central policy invariant:
 ```zift
 user ally
   auth $argon2id$...
+  from 203.0.113.40
   allow /pending read add
   deny **.exe
 ```
@@ -397,24 +398,21 @@ Recommended top-level modes:
 
 ## Network Posture
 
-Zift listens on the configured TCP address. It does not implement:
+Zift listens on the configured TCP address. Built-in controls cover
+the normal Internet-facing partner case:
 
-- IP allowlists
-- rate limiting
-- bans
-- geo rules
-- TLS termination
-- HTTP health endpoints
+- per-user `from` CIDR source policy (optional, recommended for B2B)
+- connection caps (`max-connections`, `max-unauth-connections`)
+- idle timeout
+- per-session auth attempt ceiling (6)
+- auth backoff after failures (up to 2s)
+- temporary source suppression after 10 failures in 10 minutes
+  (15-minute suppress window; cleared on successful auth)
 
-Use:
-
-- cloud firewall rules
-- host firewall rules
-- fail2ban on audit logs
-- supervisor health checks
-- TCP probes
-
-Prefer partner IP allowlists for public deployments.
+Zift does not implement geo rules, threat feeds, TLS termination, or
+HTTP health endpoints. A host/cloud firewall remains optional
+defense-in-depth. Prefer `from` in the user block so source policy
+lives with credentials and path rules.
 
 ## SFTP Protocol Surface
 
@@ -477,10 +475,9 @@ Before exposing a deployment:
 - Partner roots that receive staged uploads are on a single filesystem.
 - `max-connections`, `max-unauth-connections`, and systemd `MemoryMax`
   are consistent with Argon2id memory settings.
-- Firewall allows only expected partner IPs to reach the SFTP port.
-- Audit logs are shipped, rotated, or monitored according to your
-  retention requirements.
-- fail2ban or equivalent is configured if public auth attempts are
-  expected.
+- Partner users with stable egress use `from` CIDRs when possible.
+- Auth throttling / source suppression remain enabled (built-in;
+  no external ban daemon required).
+- Audit logs go to stderr (preferred) or a monitored file.
 - Rollback binary and config backup are available.
 

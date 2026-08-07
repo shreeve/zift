@@ -1,4 +1,5 @@
 const std = @import("std");
+const netmatch = @import("netmatch.zig");
 const vfs = @import("vfs.zig");
 
 /// Errors produced by `validateSemantic` for cross-cutting checks that
@@ -145,6 +146,11 @@ pub const UserConfig = struct {
     /// added or removed a key file even when `zift.conf` itself
     /// was unchanged.
     key_files: []const []const u8,
+    /// Optional source CIDRs from `from` lines. Empty means any
+    /// source IP may attempt auth for this user (still subject to
+    /// credentials + built-in abuse suppression). When non-empty,
+    /// the peer must match at least one entry.
+    from: []const netmatch.Cidr,
     root: []const u8,
     rules: []const Rule,
 };
@@ -325,7 +331,7 @@ pub fn validateSemantic(
 /// non-regular file (so symlinks pointing at attacker-controlled
 /// paths can't slip past the parent-dir mode). Parent-directory
 /// writability is the operator's responsibility (documented in
-/// `deploy/DEPLOY.md`); enforcing it here would conflict with
+/// operate.md); enforcing it here would conflict with
 /// reasonable layouts like `/home/zift/keys/` group-rwx.
 fn resolveAuthKeyFiles(
     io: std.Io,
@@ -528,6 +534,7 @@ const UserBuilder = struct {
     /// public key, and merges the result into `keys`. See
     /// `resolveAuthKeyFiles`.
     key_files: std.ArrayList([]const u8) = .empty,
+    from: std.ArrayList(netmatch.Cidr) = .empty,
     root: ?[]const u8 = null,
     rules: std.ArrayList(Rule) = .empty,
 };
@@ -572,6 +579,7 @@ pub const Error = error{
     UnknownKey,
     UnknownSection,
     UnsupportedKeyAlgorithm,
+    InvalidFrom,
 };
 
 /// PLAN §7.6 fixed implementation limits. Reject at parse time so a
@@ -860,6 +868,7 @@ pub fn parseWithDiag(
             .password_hash = builder.password_hash,
             .keys = try builder.keys.toOwnedSlice(allocator),
             .key_files = try builder.key_files.toOwnedSlice(allocator),
+            .from = try builder.from.toOwnedSlice(allocator),
             .root = root_value,
             .rules = try builder.rules.toOwnedSlice(allocator),
         };
@@ -1004,6 +1013,8 @@ fn parseUserProperty(
         try parseAuth(allocator, user, value);
     } else if (std.mem.eql(u8, key, "root")) {
         user.root = try dupNonEmpty(allocator, value);
+    } else if (std.mem.eql(u8, key, "from")) {
+        try parseFrom(allocator, user, value);
     } else if (std.mem.eql(u8, key, "allow")) {
         try parseAllowRule(allocator, user, value);
     } else if (std.mem.eql(u8, key, "deny")) {
@@ -1128,6 +1139,17 @@ fn isValidPhcBase64(data: []const u8) bool {
         if (!ok) return false;
     }
     return true;
+}
+
+/// Parse one `from <ip-or-cidr>` line. Multiple lines accumulate.
+/// Value must be a single token (no spaces); use one directive per
+/// source network.
+fn parseFrom(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
+    const token = std.mem.trim(u8, value, " \t");
+    if (token.len == 0) return error.InvalidFrom;
+    if (std.mem.indexOfAny(u8, token, " \t") != null) return error.InvalidFrom;
+    const cidr = netmatch.parseCidr(token) catch return error.InvalidFrom;
+    try user.from.append(allocator, cidr);
 }
 
 fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
@@ -1724,6 +1746,32 @@ test "user with no auth lines rejected" {
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
         "user empty\n  root /tmp/a\n";
     try std.testing.expectError(error.MissingCredentials, parse(std.testing.allocator, text));
+}
+
+test "from cidr lines accumulate" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n" ++
+        "  auth " ++ valid_test_phc ++ "\n" ++
+        "  from 203.0.113.40\n" ++
+        "  from 198.51.100.0/28\n" ++
+        "  root /tmp/a\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg.users[0].from.len);
+    try std.testing.expect(netmatch.allowed(cfg.users[0].from, "203.0.113.40"));
+    try std.testing.expect(netmatch.allowed(cfg.users[0].from, "198.51.100.7"));
+    try std.testing.expect(!netmatch.allowed(cfg.users[0].from, "198.51.100.16"));
+}
+
+test "from rejects malformed cidr" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n" ++
+        "  auth " ++ valid_test_phc ++ "\n" ++
+        "  from 10.0.0.0/99\n" ++
+        "  root /tmp/a\n";
+    try std.testing.expectError(error.InvalidFrom, parse(std.testing.allocator, text));
 }
 
 test "two PHC auth lines for one user are rejected" {

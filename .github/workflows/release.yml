@@ -8,7 +8,7 @@ name: Release
 # Why cosign keyless: zero secret management, signature is bound to
 # THIS workflow running in shreeve/zift via the OIDC certificate, and
 # the verification command for partners is one well-documented call
-# (see packaging/deploy/DEPLOY.md). A traditional GPG flow can be added later
+# (see docs/operate.md). A traditional GPG flow can be added later
 # as additive without disturbing this one.
 #
 # Coverage (v0.2.0+):
@@ -34,13 +34,8 @@ name: Release
 #   zift-X.Y.Z-aarch64-linux      static-musl Linux aarch64 binary
 #   zift-X.Y.Z-x86_64-macos       libSystem-only macOS x86_64 binary
 #   zift-X.Y.Z-aarch64-macos      libSystem-only macOS aarch64 binary
-#   zift-deploy-X.Y.Z.tar.gz      platform-agnostic deploy bundle:
-#                                   - DEPLOY.md (runbook)
-#                                   - zift.service (systemd unit)
-#                                   - zift.conf.example (starter config)
-#                                   - fail2ban-zift.conf (filter)
-#                                   - fail2ban-zift-jail.conf (jail)
-#                                   - logrotate-zift.conf (rotation rule)
+#   zift-deploy-X.Y.Z.tar.gz      optional systemd unit bundle:
+#                                   - zift.service
 #   SHA256SUMS                    sha256 of every artifact above
 #   SHA256SUMS.bundle             cosign keyless signature over SHA256SUMS
 #
@@ -168,23 +163,11 @@ jobs:
           # `SHA256SUMS-{target}` per-target files.
           cp dist/release-*/zift-* release/
 
-          # Platform-agnostic deploy bundle — every config file an
-          # operator needs to install zift, plus the runbook itself.
-          # Conventional `tar xzf` shape: extracts into a per-version
-          # directory rather than dumping six files into cwd.
+          # Optional systemd unit only. Security and config live in the
+          # binary + docs — no fail2ban/CrowdSec/logrotate bundle.
           mkdir -p "staging/zift-deploy-${version}"
-          cp LICENSE \
-             THIRD_PARTY_LICENSES.md \
-             packaging/deploy/DEPLOY.md \
-             packaging/deploy/zift.conf.example \
-             packaging/systemd/zift.service \
+          cp packaging/systemd/zift.service \
              "staging/zift-deploy-${version}/"
-          cp packaging/fail2ban/zift-filter.conf \
-             "staging/zift-deploy-${version}/fail2ban-zift-filter.conf"
-          cp packaging/fail2ban/zift-jail.conf \
-             "staging/zift-deploy-${version}/fail2ban-zift-jail.conf"
-          cp packaging/logrotate/zift.conf \
-             "staging/zift-deploy-${version}/logrotate-zift.conf"
           tar -C staging -czf "release/zift-deploy-${version}.tar.gz" "zift-deploy-${version}"
 
           # Build the unified SHA256SUMS. Per-target binary checksums

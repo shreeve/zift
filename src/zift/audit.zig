@@ -5,7 +5,7 @@
 //! path may be configured (`server.log`) and is reopened on SIGUSR1.
 //!
 //! Schema and field order are FIXED by PLAN §7.4. The composition
-//! recipes in PLAN §11 (fail2ban, awk, jq) anchor on this order:
+//! recipes in PLAN §11 (awk, jq, log shippers) anchor on this order:
 //!
 //!   {"event":"zift.audit",
 //!    "user":      "<virtual-user>",        -- when known (post-auth)
@@ -17,7 +17,7 @@
 //!    "truncated": true                     -- iff line was clipped to 4096 B
 //!   }
 //!
-//! `ip` is mandatory in every line so fail2ban-style anchored regexes
+//! `ip` is mandatory in every line so source-policy and log tools
 //! always match. The only path that legitimately emits an empty `ip`
 //! is the catch-all formatter fallback when the line is too long even
 //! after truncation.
@@ -286,7 +286,7 @@ fn formatLine(
     }
 
     // Fourth attempt: minimal line preserving only the required fields
-    // PLAN §7.4 mandates. `ip` is preserved so fail2ban-style anchored
+    // PLAN §7.4 mandates. `ip` is preserved so source-aware tools and
     // regexes still match an over-budget line.
     {
         var w = std.Io.Writer.fixed(buf);

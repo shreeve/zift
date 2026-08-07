@@ -159,11 +159,13 @@ is readable by group `zift`, but only the daemon should write it.
 
 ## Write The Config
 
-Install the starter config:
+Create `/home/zift/zift.conf` (see [`configure.md`](configure.md) for
+the full grammar):
 
 ```sh
-sudo install -o root -g zift -m 0640 packaging/deploy/zift.conf.example /home/zift/zift.conf
 sudo -e /home/zift/zift.conf
+sudo chown root:zift /home/zift/zift.conf
+sudo chmod 0640 /home/zift/zift.conf
 ```
 
 Minimal production shape:
@@ -177,13 +179,13 @@ server
   idle-timeout 5m
   max-connections 14
   max-unauth-connections 4
-  log /home/zift/audit.jsonl
+  log stderr
   listing-mode virtual
   publish-mode 0o660
   mkdir-mode 0o2770
 
 user ally
-  auth $argon2id$v=19$m=65536,t=3,p=1$...
+  from 203.0.113.40
   auth /home/zift/keys/ally.pub
   allow / read
   allow /pending read add remove
@@ -191,6 +193,9 @@ user ally
   deny **.exe
   deny **/.ssh/**
 ```
+
+Prefer `log stderr` so journald (or Docker/Kubernetes) owns retention.
+Use a file path only when you already have a log-shipping preference.
 
 Validate:
 
@@ -236,22 +241,22 @@ password verification may use 256 MiB per in-flight verification.
 The starter config keeps `max-connections * 256 MiB` below the unit's
 4G memory limit.
 
-## Firewall
+## Source Policy
 
-Zift does not implement IP allowlists. Use your host or cloud firewall.
+Prefer per-user `from` lines in `zift.conf` over a separate firewall
+rule set. That keeps partner network identity next to credentials and
+path policy.
 
-UFW example:
+Zift also applies built-in abuse controls for unrestricted users and
+unknown scanners:
 
-```sh
-sudo ufw allow from PARTNER_IP_1 to any port 2222 proto tcp
-sudo ufw allow from PARTNER_IP_2 to any port 2222 proto tcp
-sudo ufw deny 2222/tcp
-```
+- per-session auth attempt ceiling (6)
+- short backoff after failed attempts
+- temporary source suppression after a burst of failures
+- `max-connections` / `max-unauth-connections`
 
-UFW processes these rules in order; the earlier partner `allow` rules
-win before the final deny.
-
-Keep SSH admin access separate from the Zift SFTP port.
+A host or cloud firewall is optional defense-in-depth for hostile
+networks. Keep SSH admin access on a different port from Zift.
 
 ## Start, Stop, Reload
 
@@ -350,57 +355,14 @@ tail -F /home/zift/audit.jsonl
 jq -c 'select(.result=="denied")' /home/zift/audit.jsonl
 ```
 
-## Log Rotation
+## Log Retention
 
-Install the shipped logrotate rule:
+Default and preferred: `log stderr` and let the supervisor retain
+logs (journald, Docker, Kubernetes).
 
-```sh
-sudo install -m 0644 packaging/logrotate/zift.conf /etc/logrotate.d/zift
-sudo logrotate -d /etc/logrotate.d/zift
-```
-
-The postrotate hook sends `SIGUSR1`, which tells Zift to reopen the log
-file.
-
-## fail2ban
-
-Install the shipped filter and jail:
-
-```sh
-sudo install -m 0644 packaging/fail2ban/zift-filter.conf /etc/fail2ban/filter.d/zift.conf
-
-if [ -f /etc/fail2ban/jail.local ]; then
-  sudo tee -a /etc/fail2ban/jail.local < packaging/fail2ban/zift-jail.conf
-else
-  sudo install -m 0644 packaging/fail2ban/zift-jail.conf /etc/fail2ban/jail.local
-fi
-
-sudo fail2ban-client -t
-sudo systemctl restart fail2ban
-sudo fail2ban-client status zift
-```
-
-The filter is for auth-layer failures and accept rejections, not normal
-policy denials by authenticated partners.
-
-The shipped jail uses `backend = polling` so fail2ban tails
-`/home/zift/audit.jsonl` directly on systems where `auto` would default
-to journald. The shipped filter also has a `datepattern` for Zift's RFC
-3339 audit timestamps; if an older fail2ban cannot parse it, comment
-that line out and fail2ban will fall back to file mtime.
-
-## CrowdSec
-
-CrowdSec is an alternative to fail2ban. The same audit log is the
-input; the difference is that CrowdSec uses leaky-bucket scenarios
-that decay over time and can optionally share decisions across a
-fleet via the CrowdSec Console.
-
-The integration ships in `packaging/crowdsec/` (parser, three
-scenarios, collection manifest, acquisition config) with its own
-`README.md` for install and tuning. Pick one of fail2ban or CrowdSec
-— running both on the same audit log produces duplicate bans in two
-different state stores.
+If you log to a file, rotate it yourself and send `SIGUSR1` after
+renaming so Zift reopens the path. Zift does not ship a logrotate
+rule or a ban-tool integration — abuse protection is in the binary.
 
 ## Health Checks
 
@@ -421,9 +383,11 @@ echo | timeout 5 ssh \
   -p 2222 nobody@127.0.0.1
 ```
 
-The SSH probe intentionally reaches the auth path. It creates auth
-failure audit entries and may trip fail2ban if run frequently without an
-allowlist; use the TCP probe for quiet liveness checks.
+The SSH probe intentionally reaches the auth path and creates auth
+failure audit entries. Frequent probes from a monitor IP can trip
+built-in source suppression; use the TCP probe for quiet liveness
+checks, or put the monitor IP in a `from` line for a dedicated probe
+user.
 
 Deep SFTP probes require a real configured user. Use them only if the
 monitor can safely store that credential.

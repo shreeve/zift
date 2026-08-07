@@ -36,6 +36,8 @@ src/
     ├── policy.zig        # allow/deny engine and glob matching
     ├── vfs.zig           # virtual path normalization and jail verification
     ├── auth.zig          # Argon2id password hashing and verification
+    ├── abuse.zig         # auth backoff + temporary source suppression
+    ├── netmatch.zig      # IP/CIDR matching for per-user `from`
     ├── audit.zig         # JSON audit sink
     ├── listing.zig       # virtual/reality directory listing renderer
     ├── signals.zig       # signal flags, session fd registry, forced close
@@ -50,13 +52,7 @@ Other important paths:
 ```text
 build.zig                           # build graph, vendored C dependency build
 build.zig.zon                       # pinned dependency graph
-packaging/                          # systemd, fail2ban, logrotate, deploy bundle
-  deploy/DEPLOY.md
-  deploy/zift.conf.example
-  systemd/zift.service
-  fail2ban/zift-filter.conf
-  fail2ban/zift-jail.conf
-  logrotate/zift.conf
+packaging/systemd/zift.service      # optional systemd unit
 tests/run.sh                        # integration-test runner
 tests/cases/*.sh                    # integration cases
 tests/lib/*.py                      # Paramiko/raw protocol probes
@@ -231,7 +227,7 @@ The workflow:
    - `aarch64-linux-musl`
    - `x86_64-macos`
    - `aarch64-macos`
-4. Builds the deploy bundle from `packaging/`.
+4. Bundles the optional `packaging/systemd/zift.service` unit.
 5. Aggregates checksums into `SHA256SUMS`.
 6. Signs `SHA256SUMS` with cosign keyless using GitHub Actions OIDC.
 7. Publishes a GitHub Release.
@@ -280,35 +276,40 @@ Prefer:
 
 - explicit invariants over permissive fallback behavior
 - small config surface over convenience knobs
-- filesystem and supervisor composition over built-in subsystems
+- built-in abuse floor over external ban daemons
+- supervisor + stderr logs over a Zift logging platform
 - structured errors that tell operators what to fix
 - tests that discriminate the bug, not just cover the happy path
 - release artifacts that match what CI tested
 
 Avoid:
 
-- new runtime state locations
+- new runtime state locations (databases, Redis, ban DBs on disk)
 - background coordination
 - embedded scripting
 - HTTP control planes
 - plugin interfaces
+- CrowdSec/fail2ban/threat-feed integrations as product surface
 - unbounded parsing
 - accepting malformed config with warnings
 - hidden compatibility shims for unreleased branch behavior
 
 ## Adding Features
 
-Most feature requests should be solved outside Zift.
+Most feature requests should be solved outside Zift — unless they are
+the boring necessities that make “launch and relax” true (source
+policy, connection caps, auth backoff, temporary suppress).
 
 Before adding anything to the daemon, ask:
 
-1. Can this be done with a wrapper, cron, log shipper, firewall,
-   fail2ban, filesystem ACL, inotify/fswatch, supervisor, or downstream
-   processor?
-2. Does this require new persistent state?
-3. Does this add a new config concept?
-4. Does this broaden the remote attack surface?
-5. Does this make failure modes harder to explain with `ls`, `ss`,
+1. Does this make “I need an SFTP server” easier without becoming an
+   MFT platform?
+2. Can this be done with a wrapper, cron, log shipper, filesystem ACL,
+   inotify/fswatch, or downstream processor instead?
+3. Does this require new persistent state?
+4. Does this add a new config concept?
+5. Does this broaden the remote attack surface?
+6. Does this make failure modes harder to explain with `ls`, `ss`,
    `tail`, and `jq`?
 
 If the answer points outside Zift, keep it outside Zift.
@@ -346,7 +347,6 @@ Current docs are:
 - `docs/configure.md`
 - `docs/security.md`
 - `docs/develop.md`
-- `packaging/deploy/DEPLOY.md`
 
 When changing config grammar, release behavior, deployment posture,
 security invariants, or SFTP protocol behavior, update docs in the same

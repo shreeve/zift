@@ -153,10 +153,13 @@ Zift does not contain:
 - Automatic updates.
 - Telemetry.
 
-The intended composition model is Unix-shaped. Use OS firewalls for IP
-allowlists, fail2ban for bans, log shippers for audit transport,
-logrotate for file rotation, filesystem snapshots for backups, and
-external watchers for post-upload processing.
+The intended model is self-contained for the normal case: one binary,
+one config, built-in connection caps, auth backoff, temporary source
+suppression, and optional per-user `from` CIDRs. Use a process
+supervisor (systemd) if you want autostart. Pipe JSON audit logs
+wherever you already ship logs. Filesystem snapshots cover backups;
+external watchers handle post-upload processing. Zift does not require
+fail2ban, CrowdSec, or a separate ban daemon.
 
 ## Why The Narrowness Is A Feature
 

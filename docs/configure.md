@@ -25,6 +25,8 @@ server
   mkdir-mode 0o2770
 
 user ally
+  from 203.0.113.40
+  from 198.51.100.0/28
   auth $argon2id$v=19$m=65536,t=3,p=1$...
   auth /home/zift/keys/ally.pub
   allow / read
@@ -78,8 +80,8 @@ listen 127.0.0.1:2222
 listen 0.0.0.0:2222
 ```
 
-Use host firewall or cloud firewall rules for IP allowlists. Zift does
-not implement per-IP policy in its config.
+Prefer per-user `from` source policy in the user block (see below).
+A host or cloud firewall is optional defense-in-depth, not required.
 
 ### `host-key`
 
@@ -219,7 +221,7 @@ log /home/zift/audit.jsonl
 
 File paths must be absolute. File destinations are opened append-only
 by the process and reopened on `SIGUSR1`, which supports ordinary
-logrotate workflows.
+external rotation workflows (send `SIGUSR1` after renaming the file).
 
 ### `listing-mode`
 
@@ -325,6 +327,27 @@ Public-key files:
   `ecdsa-sha2-nistp384`, and `ecdsa-sha2-nistp521`
 
 RSA and DSA keys are not accepted.
+
+### `from`
+
+Optional. Repeatable.
+
+Restrict which source IPs may authenticate as this user:
+
+```zift
+from 203.0.113.40
+from 198.51.100.0/28
+from 2001:db8::/32
+```
+
+Each line is a single IPv4/IPv6 address or CIDR. When one or more
+`from` lines are present, the peer must match at least one of them
+before password or public-key auth can succeed. When omitted, any
+source may attempt auth (still subject to credentials and Zift's
+built-in abuse suppression).
+
+This is the preferred B2B hardening: partner identity + partner
+network + path policy in one reviewable file.
 
 ### `root`
 
