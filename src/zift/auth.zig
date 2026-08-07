@@ -1,37 +1,15 @@
 const std = @import("std");
 const config = @import("config.zig");
+const passhash = @import("passhash.zig");
 
-const argon2 = std.crypto.pwhash.argon2;
-
-/// Parameters used by `zift hash-password`. Inside the policy envelope
-/// (PLAN.md §8.4) at the lower end so onboarding is fast.
-pub const hash_params = argon2.Params{
-    .t = 3,
-    .m = 64 * 1024,
-    .p = 1,
-};
-
-/// Upper bound of the policy envelope. The unknown-user dummy hash uses
-/// these parameters so its verification timing matches or exceeds any
-/// real user's hash, regardless of where in the envelope a real user
-/// sits. See PLAN.md §8.4 "Unknown-user timing."
-pub const dummy_params = argon2.Params{
-    .t = 8,
-    .m = 256 * 1024,
-    .p = 4,
-};
-
+/// Mint a Janus-identical `a…` password credential (fixed argon2id).
 pub fn hashPassword(
     io: std.Io,
     allocator: std.mem.Allocator,
     password: []const u8,
     out: []u8,
 ) ![]const u8 {
-    return argon2.strHash(password, .{
-        .allocator = allocator,
-        .params = hash_params,
-        .mode = .argon2id,
-    }, out, io);
+    return passhash.mint(io, allocator, password, out);
 }
 
 pub fn verifyPassword(
@@ -41,8 +19,7 @@ pub fn verifyPassword(
     password: []const u8,
 ) bool {
     const hash = user.password_hash orelse return false;
-    argon2.strVerify(hash, password, .{ .allocator = allocator }, io) catch return false;
-    return true;
+    return passhash.verify(io, allocator, password, hash);
 }
 
 pub fn verifyLogin(
@@ -56,56 +33,38 @@ pub fn verifyLogin(
         return verifyPassword(io, allocator, user, password);
     }
 
-    // Unknown user. Run a real Argon2id verification against a cached
-    // dummy hash so the latency of an unknown-user attempt matches the
-    // slowest real user's verification. PLAN.md §8.4. The hash itself
-    // is computed once at first use and reused for every subsequent
-    // unknown-user attempt; the *verification* work is the security
-    // property, and that runs on every call. `max-connections`
-    // (PLAN.md §6.2) bounds the worst-case concurrent memory cost of
-    // an auth-storm.
-    const dummy = ensureDummyHash(io, allocator) orelse return false;
-    argon2.strVerify(dummy, password, .{ .allocator = allocator }, io) catch {};
+    // Unknown user: same argon2id work as a real verify (identical
+    // params), against a lazily minted dummy credential — timing does
+    // not enumerate the user list.
+    ensureDummy(io, allocator);
+    _ = passhash.verify(io, allocator, password, dummy_blob[0..passhash.blob_len]);
     return false;
 }
 
-// ----- cached dummy hash --------------------------------------------------
-//
-// A dummy Argon2id PHC string used to give unknown-user auth attempts the
-// same latency as a real user's `strVerify`. Computed once at first use,
-// then read by every subsequent unknown-user verifyLogin / pubkey-fallback
-// call. Lazy init under a mutex; the produced PHC string lives in a
-// process-static buffer for the lifetime of the program.
+// ----- cached dummy passhash blob ------------------------------------------
 
-var dummy_buf: [256]u8 = undefined;
+var dummy_blob: [passhash.blob_len]u8 = undefined;
 var dummy_ready: std.atomic.Value(bool) = .init(false);
 var dummy_mutex: std.Io.Mutex = .init;
-var dummy_slice: []const u8 = &.{};
 
-pub fn ensureDummyHash(io: std.Io, allocator: std.mem.Allocator) ?[]const u8 {
-    // Fast path: already initialized.
-    if (dummy_ready.load(.acquire)) return dummy_slice;
+fn ensureDummy(io: std.Io, allocator: std.mem.Allocator) void {
+    if (dummy_ready.load(.acquire)) return;
 
     dummy_mutex.lockUncancelable(io);
     defer dummy_mutex.unlock(io);
+    if (dummy_ready.load(.acquire)) return;
 
-    // Re-check under the lock: another thread may have initialized
-    // while we were waiting.
-    if (dummy_ready.load(.acquire)) return dummy_slice;
-
-    const computed = argon2.strHash("zift-dummy-password", .{
-        .allocator = allocator,
-        .params = dummy_params,
-        .mode = .argon2id,
-    }, &dummy_buf, io) catch return null;
-
-    dummy_slice = computed;
+    _ = passhash.mint(io, allocator, "zift-dummy-password", &dummy_blob) catch {
+        // Fall back to a structurally valid but unverifiable blob so
+        // the verify path still runs KDF work against a real salt.
+        @memcpy(dummy_blob[0..passhash.prefix.len], passhash.prefix);
+        @memset(dummy_blob[passhash.prefix.len..], '0');
+    };
     dummy_ready.store(true, .release);
-    return dummy_slice;
 }
 
 test "hash and verify password" {
-    var out: [256]u8 = undefined;
+    var out: [passhash.blob_len]u8 = undefined;
     const hash = try hashPassword(std.testing.io, std.testing.allocator, "correct horse", &out);
 
     const user: config.UserConfig = .{

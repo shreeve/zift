@@ -236,10 +236,9 @@ the path changes, restart Zift, and notify partners that the host
 fingerprint changed. `SIGHUP` reloads config for new sessions but does
 not rotate the running host key.
 
-Pair `MemoryMax` with config values. At the top Argon2id envelope,
-password verification may use 256 MiB per in-flight verification.
-The starter config keeps `max-connections * 256 MiB` below the unit's
-4G memory limit.
+Pair `MemoryMax` with config values. Each password verification uses
+fixed passhash argon2id params (64 MiB). Keep concurrent pre-auth work
+bounded with `max-unauth-connections`.
 
 ## Source Policy
 

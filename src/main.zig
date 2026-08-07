@@ -185,7 +185,7 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     defer audit.deinitGlobal(gpa);
 
     // Operational status goes to stderr (PLAN §7.4); stdout is
-    // reserved for things a script genuinely consumes (the PHC string
+    // reserved for things a script genuinely consumes (the passhash
     // from `zift hash-password`, the `version` output).
     try stderr.writeStreamingAll(io, "zift: libssh initialized\n");
     try stderr.writeStreamingAll(io, "zift: config path: ");
@@ -198,11 +198,9 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !void {
-    // Pipeline-friendly: read the password from stdin, write the PHC
-    // string + newline to stdout, no prompt or framing of any kind.
-    // PLAN §11.3: `zift hash-password` should be cleanly scriptable
-    // ("printf '%s\n' "$pw" | zift hash-password" rather than
-    // requiring expect-style interaction).
+    // Pipeline-friendly: read the password from stdin, write the
+    // passhash + newline to stdout, no prompt or framing of any kind.
+    // ("printf '%s\n' "$pw" | zift hash-password").
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
 
@@ -212,7 +210,7 @@ fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !void {
     defer gpa.free(input);
 
     const password = std.mem.trimEnd(u8, input, "\r\n");
-    var hash_buffer: [256]u8 = undefined;
+    var hash_buffer: [128]u8 = undefined;
     const hash = try auth.hashPassword(io, gpa, password, &hash_buffer);
     try stdout.writeStreamingAll(io, hash);
     try stdout.writeStreamingAll(io, "\n");

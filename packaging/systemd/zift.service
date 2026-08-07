@@ -93,14 +93,10 @@ KeyringMode=private
 ReadWritePaths=/home/zift
 
 # Resource limits: bound Argon2id memory pressure from auth storms.
-# Argon2id worst-case memory at the upper envelope is 256 MiB per
-# in-flight verification. With MemoryMax=4G the host can safely run
-# ~14 concurrent password verifications before the cgroup OOMs Zift,
-# which is the right order of magnitude for a 16-connection partner
-# install. Pair this with `max-connections` in zift.conf — keep the
-# product `max-connections * 256 MiB` strictly below MemoryMax. For
-# larger deployments, lower the Argon2id `m` parameter or raise
-# MemoryMax (and ensure the host has the headroom).
+# passhash credentials use fixed argon2id params (64 MiB per verification).
+# With MemoryMax=4G the host can safely run many concurrent verifies;
+# still pair with `max-connections` / `max-unauth-connections` so a
+# handshake storm cannot pin every worker on KDF work.
 LimitNOFILE=4096
 MemoryMax=4G
 

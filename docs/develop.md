@@ -35,7 +35,8 @@ src/
     ├── config.zig        # config parser, semantic validation, key-file loading
     ├── policy.zig        # allow/deny engine and glob matching
     ├── vfs.zig           # virtual path normalization and jail verification
-    ├── auth.zig          # Argon2id password hashing and verification
+    ├── auth.zig          # password verify (wraps passhash)
+    ├── passhash.zig      # versioned password credential codec (a…)
     ├── abuse.zig         # auth backoff + temporary source suppression
     ├── netmatch.zig      # IP/CIDR matching for per-user `from`
     ├── audit.zig         # JSON audit sink
@@ -140,7 +141,7 @@ They cover:
 - config parser
 - virtual path normalization
 - policy glob matching
-- Argon2id PHC validation via parser paths
+- passhash credential validation via parser paths
 - public-key line validation
 
 The harnesses compile and run once during ordinary `zig build test`.

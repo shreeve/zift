@@ -12,7 +12,7 @@
 # The case script then sources this file and uses:
 #
 #   make_host_key
-#   make_password_hash <plaintext>     -> PHC string on stdout
+#   make_password_hash <plaintext>     -> a… credential on stdout
 #   write_config <heredoc-body>        -> writes $TEST_TMP/zift.conf
 #   start_zift [extra-config-args]     -> launches server, exports $ZIFT_PID
 #   stop_zift [SIGNAL]                 -> sends signal, waits for exit

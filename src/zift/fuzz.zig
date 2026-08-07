@@ -28,7 +28,7 @@ test "fuzz config parser" {
         \\  host-key /tmp/key
         \\
         \\user ally
-        \\  auth $argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth a0000000000000000000000000000000
         \\  root /tmp/a
         ,
     } });
@@ -91,29 +91,28 @@ fn fuzzPolicyGlob(_: void, smith: *Smith) !void {
 }
 
 // ---------------------------------------------------------------------------
-// Argon2id PHC validation fuzz — drives parsing through the config
-// parser so the full validation chain runs (length, segment count,
-// version literal, base64 of salt+hash, parameter envelope).
+// passhash credential validation fuzz — drives parsing through the
+// config parser (version letter, alphabet, exact length).
 
-test "fuzz argon2id phc validation" {
-    return std.testing.fuzz({}, fuzzPhc, .{ .corpus = &.{
-        "$argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy",
-        "$argon2id$v=19$m=262144,t=8,p=4$salt$hash",
-        "$bcrypt$something",
-        "$argon2id$broken",
-        "$argon2id$v=19$m=4096,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy",
+test "fuzz passhash credential validation" {
+    return std.testing.fuzz({}, fuzzPasshash, .{ .corpus = &.{
+        "a0000000000000000000000000000000",
+        "g1AAAA", // legacy tag
+        "$argon2id$v=19$m=65536,t=2,p=1$aa$bb",
+        "a!!!!",
+        "b0000000000000000000000000000000", // future version
     } });
 }
 
-fn fuzzPhc(_: void, smith: *Smith) !void {
+fn fuzzPasshash(_: void, smith: *Smith) !void {
     var buf: [1024]u8 = undefined;
     const len = smith.sliceWithHash(&buf, 0xABADCAFE);
-    const phc = buf[0..len];
+    const cred = buf[0..len];
 
     const text = std.fmt.allocPrint(
         std.testing.allocator,
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\nuser fuzz\n  auth {s}\n  root /tmp/a\n",
-        .{phc},
+        .{cred},
     ) catch return;
     defer std.testing.allocator.free(text);
     var cfg = config.parse(std.testing.allocator, text) catch return;

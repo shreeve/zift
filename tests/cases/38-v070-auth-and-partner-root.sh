@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test: v0.7.0 ergonomic config — `auth` directive (PHC + key-file)
+# Test: v0.7.0 ergonomic config — `auth` directive (passhash + key-file)
 #       and server-level `partner-root` default for user roots.
 # Covers: config.zig parser changes (auth dispatch, partner-root,
 #         password→auth migration) + validateSemantic key-file
@@ -206,9 +206,9 @@ set -e
     || fail "duplicate password auth: expected exit 1, got $rc"
 grep -q 'DuplicatePassword' "$TEST_TMP/d.err" \
     || fail "expected DuplicatePassword in stderr, got: $(cat "$TEST_TMP/d.err")"
-ok "two PHC \`auth\` lines for one user rejected with DuplicatePassword"
+ok "two passhash \`auth\` lines for one user rejected with DuplicatePassword"
 
-# Sanity: a stray non-`$`/non-`/` auth value is rejected with InvalidAuth.
+# Sanity: letter-leading junk is attempted as a passhash and rejected.
 cat > "$TEST_TMP/badval.conf" <<EOF
 server
   listen 127.0.0.1:$TEST_PORT
@@ -229,9 +229,9 @@ set -e
 
 [[ "$rc" == "1" ]] \
     || fail "auth bad value: expected exit 1, got $rc"
-grep -q 'InvalidAuth' "$TEST_TMP/v.err" \
-    || fail "expected InvalidAuth in stderr, got: $(cat "$TEST_TMP/v.err")"
-ok "auth value with neither \$ nor / leading byte rejected with InvalidAuth"
+grep -q 'InvalidPasshash' "$TEST_TMP/v.err" \
+    || fail "expected InvalidPasshash in stderr, got: $(cat "$TEST_TMP/v.err")"
+ok "letter-leading junk auth value rejected with InvalidPasshash"
 
 # ---------- (9) world-writable key file rejected ----------
 # Operators who chmod 0666 a key file (or leave it world-writable

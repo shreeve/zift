@@ -79,7 +79,7 @@ This is the central policy invariant:
 
 ```zift
 user ally
-  auth $argon2id$...
+  auth a…
   from 203.0.113.40
   allow /pending read add
   deny **.exe
@@ -139,10 +139,11 @@ filesystems for partner roots.
 
 ### Passwords
 
-Passwords are stored as Argon2id PHC strings:
+Passwords are stored as Janus-identical `a…` passhashes (argon2id
+with fixed module constants; `a` + 31 base62 chars — always 32 chars):
 
 ```zift
-auth $argon2id$v=19$m=65536,t=3,p=1$...
+auth a…
 ```
 
 Generate with:
@@ -151,18 +152,15 @@ Generate with:
 printf '%s\n' 'secret' | zift hash-password
 ```
 
-Accepted Argon2id parameters are bounded:
+Parameters are fixed (not stored in the blob), matching Janus:
 
-- memory: 64 MiB to 256 MiB
-- passes: 2 to 8
-- parallelism: 1 to 4
-- version: `v=19`
+- argon2id, memory 64 MiB, time 2, parallelism 1
+- 8-byte salt, 15-byte key
 
-Plaintext passwords are never accepted in config.
+Plaintext passwords and legacy `$argon2id$…` PHC strings are rejected.
 
-Unknown-user password attempts run a dummy Argon2id verification so the
-password path does not trivially reveal whether a username exists by
-timing alone.
+Unknown-user password attempts run the same passhash argon2id work against a
+dummy credential so timing does not enumerate usernames.
 
 ### Public Keys
 

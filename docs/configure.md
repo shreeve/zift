@@ -27,7 +27,7 @@ server
 user ally
   from 203.0.113.40
   from 198.51.100.0/28
-  auth $argon2id$v=19$m=65536,t=3,p=1$...
+  auth a…
   auth /home/zift/keys/ally.pub
   allow / read
   allow /pending read add remove
@@ -117,7 +117,7 @@ With this setting:
 
 ```zift
 user ally
-  auth $argon2id$...
+  auth a…
 ```
 
 defaults to:
@@ -172,11 +172,11 @@ Maximum total concurrent sessions:
 max-connections 14
 ```
 
-This should be sized with Argon2id memory in mind. Password
-verification can use up to 256 MiB per in-flight verification when
-hashes are configured at the top of the accepted parameter envelope.
-The shipped systemd unit sets `MemoryMax=4G`, so the production starter
-uses `14` to keep worst-case verification memory below that limit.
+Size this with password-verify memory in mind. Each passhash verification
+uses a fixed 64 MiB argon2id profile. The shipped systemd unit sets
+`MemoryMax=4G`; production configs typically keep
+`max-connections` / `max-unauth-connections` modest so a handshake
+storm cannot pin every worker on KDF work.
 
 ### `max-unauth-connections`
 
@@ -288,10 +288,11 @@ Required: each user needs at least one credential.
 `auth` accepts either a password hash or an absolute path to a public
 key file.
 
-Password:
+Password (Janus-identical `a…` passhash — argon2id with fixed
+params, `a` + 31 base62 chars — always 32 chars, alphabet `[0-9A-Za-z]`):
 
 ```zift
-auth $argon2id$v=19$m=65536,t=3,p=1$...
+auth a…
 ```
 
 Generate it with:
@@ -299,6 +300,9 @@ Generate it with:
 ```sh
 printf '%s\n' 'secret' | zift hash-password
 ```
+
+Legacy `$argon2id$…` PHC strings are rejected; remint with
+`zift hash-password`.
 
 Public-key file:
 

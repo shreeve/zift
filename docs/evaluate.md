@@ -118,7 +118,7 @@ Zift provides:
 
 - SFTP version 3 service over SSH.
 - Virtual users defined in a text config file.
-- Password auth using Argon2id PHC strings.
+- Password auth using Janus-identical `a…` passhash (argon2id) credentials.
 - Public-key auth using operator-managed key files.
 - Per-user filesystem roots.
 - Optional `partner-root` shorthand for `/home/zift/<user>` style

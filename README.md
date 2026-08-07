@@ -115,9 +115,9 @@ Create a partner root:
 mkdir -p /tmp/zift/ally/{pending,archive}
 ```
 
-Write a config to `/tmp/zift/example.zift`. Paste the full Argon2id hash
+Write a config to `/tmp/zift/example.zift`. Paste the full passhash
 printed by `bin/zift hash-password` in place of the abbreviated
-`$argon2id$...` line:
+`a…` line:
 
 ```zift
 server
@@ -132,7 +132,7 @@ server
 
 user ally
   from 127.0.0.1
-  auth $argon2id$v=19$m=65536,t=3,p=1$...
+  auth a…
   allow / read
   allow /pending read add remove
   allow /archive read

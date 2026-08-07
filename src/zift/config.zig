@@ -1,4 +1,5 @@
 const std = @import("std");
+const passhash = @import("passhash.zig");
 const netmatch = @import("netmatch.zig");
 const vfs = @import("vfs.zig");
 
@@ -130,7 +131,8 @@ pub const PublicKey = struct {
 
 pub const UserConfig = struct {
     name: []const u8,
-    /// Argon2id PHC string when password auth is provisioned, else null.
+    /// Janus-identical `a…` passhash credential when password auth is
+    /// provisioned, else null.
     password_hash: ?[]const u8,
     /// Public keys authorized for this user. Empty after `parse`
     /// because v0.7.0 removed inline keys (the `key ssh-ed25519 ...`
@@ -180,7 +182,7 @@ pub const Config = struct {
 /// Cross-cutting semantic validation against the live filesystem.
 ///
 /// `parse` only proves the config is *syntactically* well-formed and
-/// internally consistent (Argon2id parameter envelope, accepted key
+/// internally consistent (valid passhash credentials, accepted key
 /// algorithms, no users without credentials). PLAN.md §6.2 also
 /// requires that, before a config is allowed to take effect:
 ///
@@ -570,11 +572,8 @@ pub const Error = error{
     MissingServerSection,
     OutOfMemory,
     PasswordDirectiveRemoved,
-    PasswordHashNotArgon2id,
-    PasswordHashMalformed,
-    PasswordMemoryOutOfPolicy,
-    PasswordPassesOutOfPolicy,
-    PasswordParallelismOutOfPolicy,
+    PasswordPhcRemoved,
+    InvalidPasshash,
     PropertyOutsideSection,
     UnknownKey,
     UnknownSection,
@@ -666,68 +665,6 @@ fn isAcceptedKeyAlgorithm(algo: []const u8) bool {
         if (std.mem.eql(u8, algo, accepted)) return true;
     }
     return false;
-}
-
-/// Accepted Argon2id parameter envelope per PLAN.md §8.4. Password property
-/// values whose embedded parameters fall outside this envelope are rejected
-/// at parse time so the unknown-user dummy hash (PLAN.md §8.4) can use a
-/// single upper-bound profile and still time-match every real user.
-pub const argon2id_policy = Argon2idPolicy{
-    .m_min = 65536, // 64 MiB
-    .m_max = 262144, // 256 MiB
-    .t_min = 2,
-    .t_max = 8,
-    .p_min = 1,
-    .p_max = 4,
-};
-
-pub const Argon2idPolicy = struct {
-    m_min: u32,
-    m_max: u32,
-    t_min: u32,
-    t_max: u32,
-    p_min: u32,
-    p_max: u32,
-};
-
-/// Validate a `password` property value: it must be an Argon2id PHC string
-/// whose embedded `m`, `t`, and `p` parameters fall inside the envelope.
-fn checkArgon2idPolicy(phc: []const u8, policy: Argon2idPolicy) Error!void {
-    const prefix = "$argon2id$";
-    if (!std.mem.startsWith(u8, phc, prefix)) return error.PasswordHashNotArgon2id;
-
-    var iter = std.mem.splitScalar(u8, phc, '$');
-    _ = iter.next(); // leading empty segment
-    _ = iter.next(); // "argon2id"
-    const version_field = iter.next() orelse return error.PasswordHashMalformed;
-    if (!std.mem.eql(u8, version_field, "v=19")) return error.PasswordHashMalformed;
-    const params = iter.next() orelse return error.PasswordHashMalformed; // m=...,t=...,p=...
-    const salt_field = iter.next() orelse return error.PasswordHashMalformed;
-    const hash_field = iter.next() orelse return error.PasswordHashMalformed;
-    if (iter.next() != null) return error.PasswordHashMalformed;
-    if (salt_field.len == 0 or hash_field.len == 0) return error.PasswordHashMalformed;
-    if (!isValidPhcBase64(salt_field) or !isValidPhcBase64(hash_field)) return error.PasswordHashMalformed;
-
-    var m: ?u32 = null;
-    var t: ?u32 = null;
-    var p: ?u32 = null;
-    var pairs = std.mem.splitScalar(u8, params, ',');
-    while (pairs.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return error.PasswordHashMalformed;
-        const k = pair[0..eq];
-        const v = std.fmt.parseUnsigned(u32, pair[eq + 1 ..], 10) catch return error.PasswordHashMalformed;
-        if (std.mem.eql(u8, k, "m")) m = v;
-        if (std.mem.eql(u8, k, "t")) t = v;
-        if (std.mem.eql(u8, k, "p")) p = v;
-    }
-
-    const m_val = m orelse return error.PasswordHashMalformed;
-    const t_val = t orelse return error.PasswordHashMalformed;
-    const p_val = p orelse return error.PasswordHashMalformed;
-
-    if (m_val < policy.m_min or m_val > policy.m_max) return error.PasswordMemoryOutOfPolicy;
-    if (t_val < policy.t_min or t_val > policy.t_max) return error.PasswordPassesOutOfPolicy;
-    if (p_val < policy.p_min or p_val > policy.p_max) return error.PasswordParallelismOutOfPolicy;
 }
 
 pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
@@ -835,9 +772,8 @@ pub fn parseWithDiag(
     const final_users = try allocator.alloc(UserConfig, users.items.len);
     for (users.items, 0..) |*builder, i| {
         // A user must declare at least one credential: either a
-        // password (PHC string in an `auth $...` line) or a public
-        // key file (`auth /...` line). Pure key-only and pure
-        // password-only users remain valid. PLAN §6.2 (v0.7.0).
+        // password (`auth a…`) or a public-key file (`auth /…`).
+        // Pure key-only and pure password-only users remain valid.
         if (builder.password_hash == null and
             builder.keys.items.len == 0 and
             builder.key_files.items.len == 0)
@@ -1033,52 +969,36 @@ fn parseUserProperty(
     }
 }
 
-/// Dispatch a single `auth <value>` line. v0.7.0 unifies the two
-/// previous credential directives (`password` and `key`) under a
-/// single name; the value's first byte selects which kind:
+/// Dispatch a single `auth <value>` line:
 ///
-///   - `$` → Argon2id PHC string. Validated against the parameter
-///     envelope at parse time (same checks the v0.6.x `password`
-///     directive ran). At most one PHC `auth` line per user is
-///     accepted; a second is rejected as `error.DuplicatePassword`
-///     because the runtime stores a single `password_hash`.
-///   - `/` → absolute filesystem path to a public-key file. The
-///     path is recorded but NOT opened at parse time — that's
-///     `validateSemantic`'s job. Path-shape only is validated
-///     here (absolute, length cap); the file's *contents* are
-///     parsed when `validateSemantic` reads it.
-///   - anything else → `error.InvalidAuth`. We don't try to be
-///     clever about distinguishing what the operator meant; the
-///     two valid leading bytes (`$`, `/`) are unambiguous.
-///
-/// Multiple `auth /path/to/key.pub` lines accumulate (multiple
-/// authorized public keys), matching the v0.6.x behavior where
-/// multiple `key` lines were allowed.
+///   - `a…` → Janus-identical password credential (fixed argon2id).
+///     At most one per user (`error.DuplicatePassword` on a second).
+///   - `$…` → legacy PHC string. Rejected with `PasswordPhcRemoved`
+///     so operators remint via `zift hash-password`.
+///   - `/…` → absolute path to a public-key file (opened by
+///     `validateSemantic`). Multiple lines accumulate.
+///   - anything else → `error.InvalidAuth`.
 fn parseAuth(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
     if (value.len == 0) return error.InvalidAuth;
-    switch (value[0]) {
-        '$' => {
-            // Check duplicate-password BEFORE running PHC validation
-            // — otherwise a second `auth $bcrypt$...` line gets
-            // rejected with `PasswordHashNotArgon2id`, when the real
-            // operator error is "you wrote two password lines for
-            // the same user." The duplicate diagnostic is more
-            // actionable.
-            if (user.password_hash != null) return error.DuplicatePassword;
-            try checkArgon2idPolicy(value, argon2id_policy);
-            user.password_hash = try dupNonEmpty(allocator, value);
-        },
-        '/' => {
-            // PLAN §7.6 length cap. The same upper bound that
-            // protected the inline `key` directive now protects the
-            // path field — a 4 KiB path is plenty (PATH_MAX is
-            // typically 4096 on Linux); anything longer is almost
-            // certainly an attack surface or a typo.
-            if (value.len > max_keyline_bytes) return error.KeyLineTooLong;
-            try user.key_files.append(allocator, try allocator.dupe(u8, value));
-        },
-        else => return error.InvalidAuth,
+    // Versioned passhash: leading `a`–`z` (currently only `a` is defined).
+    if (value.len > 0 and value[0] >= 'a' and value[0] <= 'z') {
+        if (user.password_hash != null) return error.DuplicatePassword;
+        passhash.validate(value) catch return error.InvalidPasshash;
+        user.password_hash = try dupNonEmpty(allocator, value);
+        return;
     }
+    if (value[0] == '$') {
+        // Prefer DuplicatePassword when a passhash credential is already
+        // present — more actionable than "PHC removed".
+        if (user.password_hash != null) return error.DuplicatePassword;
+        return error.PasswordPhcRemoved;
+    }
+    if (value[0] == '/') {
+        if (value.len > max_keyline_bytes) return error.KeyLineTooLong;
+        try user.key_files.append(allocator, try allocator.dupe(u8, value));
+        return;
+    }
+    return error.InvalidAuth;
 }
 
 /// Parse a single OpenSSH public-key line — `<algorithm> <blob>
@@ -1121,23 +1041,6 @@ fn isValidStandardBase64(data: []const u8) bool {
     var buf: [8192]u8 = undefined;
     if (decoded_len > buf.len) return false;
     decoder.decode(buf[0..decoded_len], data) catch return false;
-    return true;
-}
-
-/// PHC base64: same alphabet as RFC 4648 standard, but no `=` padding
-/// is allowed and the length is therefore not required to be %4==0.
-/// PHC §B encodes 16-byte salts as 22 chars, 32-byte hashes as 43 chars,
-/// etc. — all with `len % 4 != 0` after the padding is stripped. Used
-/// for the `salt` and `hash` fields of an Argon2id PHC string.
-fn isValidPhcBase64(data: []const u8) bool {
-    if (data.len == 0) return false;
-    for (data) |ch| {
-        const ok = (ch >= 'A' and ch <= 'Z') or
-            (ch >= 'a' and ch <= 'z') or
-            (ch >= '0' and ch <= '9') or
-            ch == '+' or ch == '/';
-        if (!ok) return false;
-    }
     return true;
 }
 
@@ -1327,7 +1230,7 @@ test "parse valid config" {
         \\  log stderr
         \\
         \\user ally
-        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/ally
         \\  allow /pending read write list mkdir remove rename
         \\  allow /archive read list
@@ -1355,7 +1258,7 @@ test "parse: 'add' verb expands to write+mkdir+rename" {
         \\  log stderr
         \\
         \\user alice
-        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/alice
         \\  allow /pending read list add remove
         \\
@@ -1392,7 +1295,7 @@ test "parse: 'read' is now a superset of 'list' (v0.4.0)" {
         \\  log stderr
         \\
         \\user alice
-        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/alice
         \\  allow /pending read
         \\
@@ -1424,7 +1327,7 @@ test "parse: bare 'list' keeps its narrow v0.3.x meaning" {
         \\  log stderr
         \\
         \\user alice
-        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/alice
         \\  allow /pending list
         \\
@@ -1445,7 +1348,7 @@ test "parse: 'full' grants every permission" {
         \\  log stderr
         \\
         \\user alice
-        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/alice
         \\  allow /workspace full
         \\
@@ -1473,7 +1376,7 @@ test "parse: 'add' alongside granular verbs is idempotent" {
         \\  log stderr
         \\
         \\user alice
-        \\  auth $argon2id$v=19$m=65536,t=3,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy
+        \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/alice
         \\  allow /pending read list add write rename
         \\
@@ -1487,23 +1390,21 @@ test "parse: 'add' alongside granular verbs is idempotent" {
     try std.testing.expect(rule.permissions.contains(.rename));
 }
 
-// Reused fixture for tests below: a syntactically valid PHC string with
-// parameters inside the policy envelope. The salt and hash bodies are not
-// real Argon2id outputs; the parser only validates structure, not crypto.
-const valid_test_phc = "$argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy";
+// Structurally valid passhash (23 zero bytes). Parser checks shape only.
+const valid_test_passhash = "a" ++ ("0" ** 31);
 
 test "duplicate user is rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/b\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n  root /tmp/a\n\n" ++
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n  root /tmp/b\n";
     try std.testing.expectError(error.DuplicateUser, parse(std.testing.allocator, text));
 }
 
 test "publish-mode: defaults to 0o660 when not specified" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n  root /tmp/a\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u32, 0o660), cfg.server.publish_mode);
@@ -1535,7 +1436,7 @@ test "publish-mode: accepts 0o600, 0o640, 0o660 — rejects everything else" {
     inline for (cases) |case| {
         const text =
             "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  publish-mode " ++ case.@"0" ++ "\n\n" ++
-            "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+            "user ally\n  auth " ++ valid_test_passhash ++ "\n  root /tmp/a\n";
         if (case.@"1") |expected| {
             var cfg = try parse(std.testing.allocator, text);
             defer cfg.deinit();
@@ -1549,7 +1450,7 @@ test "publish-mode: accepts 0o600, 0o640, 0o660 — rejects everything else" {
 test "mkdir-mode: defaults to 0o2770 when not specified" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n  root /tmp/a\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u32, 0o2770), cfg.server.mkdir_mode);
@@ -1574,7 +1475,7 @@ test "mkdir-mode: accepts 0o2700, 0o2750, 0o2770 — rejects everything else" {
     inline for (cases) |case| {
         const text =
             "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  mkdir-mode " ++ case.@"0" ++ "\n\n" ++
-            "user ally\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+            "user ally\n  auth " ++ valid_test_passhash ++ "\n  root /tmp/a\n";
         if (case.@"1") |expected| {
             var cfg = try parse(std.testing.allocator, text);
             defer cfg.deinit();
@@ -1597,54 +1498,27 @@ test "unknown keys are rejected" {
     try std.testing.expectError(error.UnknownKey, parse(std.testing.allocator, text));
 }
 
-test "auth $... rejected when not argon2id" {
+test "auth $... phc rejected with PasswordPhcRemoved" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $bcrypt$something\n  root /tmp/a\n";
-    try std.testing.expectError(error.PasswordHashNotArgon2id, parse(std.testing.allocator, text));
+        "user ally\n  auth $argon2id$v=19$m=65536,t=2,p=1$aa$bb\n  root /tmp/a\n";
+    try std.testing.expectError(error.PasswordPhcRemoved, parse(std.testing.allocator, text));
 }
 
-test "auth $... rejected when phc malformed" {
+test "auth passhash accepted" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $argon2id$broken\n  root /tmp/a\n";
-    try std.testing.expectError(error.PasswordHashMalformed, parse(std.testing.allocator, text));
-}
-
-test "auth $... rejected when memory below envelope" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $argon2id$v=19$m=4096,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
-    try std.testing.expectError(error.PasswordMemoryOutOfPolicy, parse(std.testing.allocator, text));
-}
-
-test "auth $... rejected when memory above envelope" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $argon2id$v=19$m=524288,t=3,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
-    try std.testing.expectError(error.PasswordMemoryOutOfPolicy, parse(std.testing.allocator, text));
-}
-
-test "auth $... rejected when passes below envelope" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $argon2id$v=19$m=65536,t=1,p=1$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
-    try std.testing.expectError(error.PasswordPassesOutOfPolicy, parse(std.testing.allocator, text));
-}
-
-test "auth $... rejected when parallelism above envelope" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $argon2id$v=19$m=65536,t=3,p=8$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
-    try std.testing.expectError(error.PasswordParallelismOutOfPolicy, parse(std.testing.allocator, text));
-}
-
-test "auth $... accepted at envelope boundaries" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $argon2id$v=19$m=262144,t=8,p=4$xxxxxxxxxxxx$yyyyyyyyyyyy\n  root /tmp/a\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n  root /tmp/a\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
+    try std.testing.expectEqualStrings(valid_test_passhash, cfg.users[0].password_hash.?);
+}
+
+test "auth passhash rejected when truncated" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  auth aAAAA\n  root /tmp/a\n";
+    try std.testing.expectError(error.InvalidPasshash, parse(std.testing.allocator, text));
 }
 
 // Real-shape OpenSSH ed25519 wire blob: 32-byte length-prefixed
@@ -1680,36 +1554,6 @@ test "parsePublicKeyLine: bad base64 length rejected" {
     // 29 chars — strict base64 rejects because length is not a multiple of 4.
     const line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBLAH oops";
     try std.testing.expectError(error.InvalidKeyLine, parsePublicKeyLine(std.testing.allocator, line));
-}
-
-test "auth $... real argon2id phc accepted (PHC base64 has no padding)" {
-    // 22-char salt + 43-char hash — both `len % 4 != 0`, neither has
-    // `=` padding. RFC 9106 / PHC §B explicitly forbids padding so the
-    // strict OpenSSH-style validator must NOT be applied here.
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $argon2id$v=19$m=65536,t=3,p=1" ++
-        "$bSki6LMKgGqnScrLG0fo/2hpMLj8InvvY+irrZKEsS4" ++
-        "$0HMWjuvAdHzgT2+GA1DdgQL5fdDrC4X0GEezlPDjimQ\n" ++
-        "  root /tmp/a\n";
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-}
-
-test "auth $... phc with `=` padding in salt rejected" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $argon2id$v=19$m=65536,t=3,p=1$xxxx==xx$yyyyyyyyyyyy\n" ++
-        "  root /tmp/a\n";
-    try std.testing.expectError(error.PasswordHashMalformed, parse(std.testing.allocator, text));
-}
-
-test "auth $... phc with non-alphabet char in hash rejected" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth $argon2id$v=19$m=65536,t=3,p=1$xxxxxxxxxxxx$yyyy!yyyyyyy\n" ++
-        "  root /tmp/a\n";
-    try std.testing.expectError(error.PasswordHashMalformed, parse(std.testing.allocator, text));
 }
 
 test "parsePublicKeyLine: rsa key rejected" {
@@ -1752,7 +1596,7 @@ test "from cidr lines accumulate" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
         "user ally\n" ++
-        "  auth " ++ valid_test_phc ++ "\n" ++
+        "  auth " ++ valid_test_passhash ++ "\n" ++
         "  from 203.0.113.40\n" ++
         "  from 198.51.100.0/28\n" ++
         "  root /tmp/a\n";
@@ -1768,32 +1612,29 @@ test "from rejects malformed cidr" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
         "user ally\n" ++
-        "  auth " ++ valid_test_phc ++ "\n" ++
+        "  auth " ++ valid_test_passhash ++ "\n" ++
         "  from 10.0.0.0/99\n" ++
         "  root /tmp/a\n";
     try std.testing.expectError(error.InvalidFrom, parse(std.testing.allocator, text));
 }
 
-test "two PHC auth lines for one user are rejected" {
+test "two passhash auth lines for one user are rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
         "user ally\n" ++
-        "  auth " ++ valid_test_phc ++ "\n" ++
-        "  auth " ++ valid_test_phc ++ "\n" ++
+        "  auth " ++ valid_test_passhash ++ "\n" ++
+        "  auth " ++ valid_test_passhash ++ "\n" ++
         "  root /tmp/a\n";
     try std.testing.expectError(error.DuplicatePassword, parse(std.testing.allocator, text));
 }
 
-test "duplicate-password check fires before PHC validation" {
-    // A second `$...` auth line with malformed-or-non-argon2id PHC
-    // should still report `DuplicatePassword`, not the PHC-shape
-    // error. The duplicate is the more actionable operator
-    // diagnostic; the malformed-second-line is a downstream
-    // consequence of the duplicate.
+test "duplicate-password check fires before PasswordPhcRemoved" {
+    // A second `$...` line after a valid passhash credential reports
+    // DuplicatePassword, not PasswordPhcRemoved.
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
         "user ally\n" ++
-        "  auth " ++ valid_test_phc ++ "\n" ++
+        "  auth " ++ valid_test_passhash ++ "\n" ++
         "  auth $bcrypt$something\n" ++
         "  root /tmp/a\n";
     try std.testing.expectError(error.DuplicatePassword, parse(std.testing.allocator, text));
@@ -1806,26 +1647,14 @@ test "partner-root '/' derives single-slash user root (POSIX-safe)" {
     // depending on that. Joiner special-cases this.
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqualStrings("/ally", cfg.findUser("ally").?.root);
     try std.testing.expectEqualStrings("/", cfg.server.partner_root.?);
 }
 
-test "auth value with neither $ nor / leading byte rejected" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth wat\n  root /tmp/a\n";
-    try std.testing.expectError(error.InvalidAuth, parse(std.testing.allocator, text));
-}
-
-test "auth value with leading byte other than '$' or '/' rejected" {
-    // The dispatch byte must be one of the two well-known leading
-    // bytes; anything else hits the catch-all `error.InvalidAuth`
-    // arm in `parseAuth` regardless of how plausible the rest of
-    // the value looks. Tests `./relative`, plus a bare token, plus
-    // an empty value.
+test "auth value that is neither valid passhash nor /path rejected" {
     const inputs = [_][]const u8{
         "./relative",
         "wat",
@@ -1840,49 +1669,51 @@ test "auth value with leading byte other than '$' or '/' rejected" {
         );
         defer std.testing.allocator.free(text);
         const got = parse(std.testing.allocator, text);
-        try std.testing.expect(got == error.InvalidAuth or got == error.InvalidConfig);
+        // Letter-leading junk is attempted as a passhash (InvalidPasshash);
+        // anything else is InvalidAuth / InvalidConfig.
+        try std.testing.expect(got == error.InvalidAuth or got == error.InvalidConfig or got == error.InvalidPasshash);
     }
 }
 
 test "username '..' rejected (partner-root path-traversal defense)" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
-        "user ..\n  auth " ++ valid_test_phc ++ "\n";
+        "user ..\n  auth " ++ valid_test_passhash ++ "\n";
     try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
 }
 
 test "username '.' rejected (partner-root path-traversal defense)" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
-        "user .\n  auth " ++ valid_test_phc ++ "\n";
+        "user .\n  auth " ++ valid_test_passhash ++ "\n";
     try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
 }
 
 test "username with leading dot rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user .hidden\n  auth " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+        "user .hidden\n  auth " ++ valid_test_passhash ++ "\n  root /tmp/a\n";
     try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
 }
 
 test "password directive removed: clear migration error" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password " ++ valid_test_phc ++ "\n  root /tmp/a\n";
+        "user ally\n  password " ++ valid_test_passhash ++ "\n  root /tmp/a\n";
     try std.testing.expectError(error.PasswordDirectiveRemoved, parse(std.testing.allocator, text));
 }
 
 test "key directive removed: clear migration error" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n  key ssh-ed25519 " ++ valid_ed25519_blob ++ "\n  root /tmp/a\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n  key ssh-ed25519 " ++ valid_ed25519_blob ++ "\n  root /tmp/a\n";
     try std.testing.expectError(error.KeyDirectiveRemoved, parse(std.testing.allocator, text));
 }
 
 test "partner-root: trailing slash trimmed before deriving user root" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift/\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     // Trimmed `partner-root` stored as `/home/zift`; user root joined
@@ -1909,7 +1740,7 @@ test "auth /path records path; key file resolved later" {
 test "partner-root: explicit user root overrides default" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
-        "user override\n  auth " ++ valid_test_phc ++ "\n  root /custom/path\n";
+        "user override\n  auth " ++ valid_test_passhash ++ "\n  root /custom/path\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqualStrings("/custom/path", cfg.findUser("override").?.root);
@@ -1918,7 +1749,7 @@ test "partner-root: explicit user root overrides default" {
 test "partner-root: missing user root defaults to <partner-root>/<user>" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqualStrings("/home/zift/ally", cfg.findUser("ally").?.root);
@@ -1928,14 +1759,14 @@ test "partner-root: missing user root defaults to <partner-root>/<user>" {
 test "partner-root: unset, missing user root still rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
     try std.testing.expectError(error.MissingRoot, parse(std.testing.allocator, text));
 }
 
 test "partner-root: relative path rejected at parse time" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root home/zift\n\n" ++
-        "user ally\n  auth " ++ valid_test_phc ++ "\n";
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
     try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
 }
 
