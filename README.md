@@ -102,22 +102,20 @@ Contributor details are in [`docs/develop.md`](docs/develop.md).
 
 ## Minimal Example
 
-Generate a host key and a partner password hash:
+Add a partner `foo` with password `bar` and the usual B2B path
+policy: browse `/`, upload under `/pending`, read `/archive`.
 
 ```sh
+# host key + partner directories (partner-root /tmp/zift => root /tmp/zift/foo)
 ssh-keygen -t ed25519 -f /tmp/zift_host_ed25519 -N ""
-printf '%s\n' 'partner-secret' | bin/zift hash-password
+mkdir -p /tmp/zift/foo/{pending,archive}
+
+# password hash — paste the full a… line into the config below
+printf '%s\n' 'bar' | bin/zift hash-password
 ```
 
-Create a partner root:
-
-```sh
-mkdir -p /tmp/zift/ally/{pending,archive}
-```
-
-Write a config to `/tmp/zift/example.zift`. Paste the full passhash
-printed by `bin/zift hash-password` in place of the abbreviated
-`a…` line:
+Write `/tmp/zift/example.zift` (replace `a…` with the hash you just
+printed):
 
 ```zift
 server
@@ -126,11 +124,11 @@ server
   partner-root /tmp/zift
   reload-interval 2s
   idle-timeout 5m
-  max-connections 128
-  max-unauth-connections 32
+  max-connections 14
+  max-unauth-connections 4
   log stderr
 
-user ally
+user foo
   from 127.0.0.1
   auth a…
   allow / read
@@ -140,20 +138,22 @@ user ally
   deny **/.ssh/**
 ```
 
-Run it:
+Validate and serve:
 
 ```sh
 bin/zift validate /tmp/zift/example.zift
 bin/zift serve /tmp/zift/example.zift
 ```
 
-Connect with any normal SFTP client:
+Connect with any normal SFTP client (password `bar`):
 
 ```sh
-sftp -P 2222 ally@127.0.0.1
+sftp -P 2222 foo@127.0.0.1
 ```
 
-Configuration details are in [`docs/configure.md`](docs/configure.md).
+For production onboarding (service user, directory modes, reload),
+see [`docs/operate.md`](docs/operate.md). Full grammar is in
+[`docs/configure.md`](docs/configure.md).
 
 ## Documentation
 
