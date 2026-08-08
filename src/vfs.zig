@@ -151,6 +151,24 @@ pub const Vfs = struct {
         return staging;
     }
 
+    /// Open an existing staging directory without creating it. Returns
+    /// null when `.zift` or `.zift/staging` is absent. Used for the
+    /// post-auth orphan sweep so read-only sessions do not create the
+    /// staging tree.
+    pub fn tryOpenExistingStagingDir(self: Vfs, io: std.Io) ?std.Io.Dir {
+        var root = std.Io.Dir.openDirAbsolute(io, self.root, .{}) catch return null;
+        defer root.close(io);
+        var ns_dir = root.openDir(io, namespace_dir_name, .{ .iterate = true, .follow_symlinks = false }) catch return null;
+        defer ns_dir.close(io);
+        assertOpenedDirMode(ns_dir, 0o027, error.NamespaceDirCorrupt, error.NamespaceDirUnsafe) catch return null;
+        var staging = ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true, .follow_symlinks = false }) catch return null;
+        assertOpenedDirMode(staging, 0o077, error.StagingDirCorrupt, error.StagingDirUnsafe) catch {
+            staging.close(io);
+            return null;
+        };
+        return staging;
+    }
+
     pub fn resolveExisting(
         self: Vfs,
         io: std.Io,
@@ -382,9 +400,10 @@ fn openOrCreateNamespaceDir(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
     const create_status = root.createDir(io, namespace_dir_name, namespace_perm);
     if (create_status) |_| {
         // We just created it. Open and pin the mode against umask.
-        var dir = try root.openDir(io, namespace_dir_name, .{ .iterate = true });
+        var dir = try root.openDir(io, namespace_dir_name, .{ .iterate = true, .follow_symlinks = false });
         errdefer dir.close(io);
         try dir.setPermissions(io, namespace_perm);
+        try assertOpenedDirMode(dir, 0o027, error.NamespaceDirCorrupt, error.NamespaceDirUnsafe);
         return dir;
     } else |err| switch (err) {
         error.PathAlreadyExists => {
@@ -396,16 +415,19 @@ fn openOrCreateNamespaceDir(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
             // staging outside the jail; (b) it must not grant
             // group-write (would let group `zift` race the staging
             // entry) or ANY "other" access (would expose operator
-            // metadata to local non-zift users). statAt has
-            // AT_SYMLINK_NOFOLLOW semantics so a symlink returns
-            // its OWN metadata, not the target's.
+            // metadata to local non-zift users).
+            //
+            // Open with NOFOLLOW, then fstat the FD so a TOCTOU
+            // replace-with-symlink between lstat and open cannot
+            // redirect the namespace outside the jail.
             const info = try @import("listing.zig").statAt(root.handle, namespace_dir_name);
             const file_type = info.mode & 0o170000;
             if (file_type != 0o040000) return error.NamespaceDirCorrupt;
-            // Mask: 0o027 catches group-write, other-read, other-
-            // write, other-execute. Allows 0o700 and 0o750.
             if ((info.mode & 0o027) != 0) return error.NamespaceDirUnsafe;
-            return try root.openDir(io, namespace_dir_name, .{ .iterate = true });
+            var dir = try root.openDir(io, namespace_dir_name, .{ .iterate = true, .follow_symlinks = false });
+            errdefer dir.close(io);
+            try assertOpenedDirMode(dir, 0o027, error.NamespaceDirCorrupt, error.NamespaceDirUnsafe);
+            return dir;
         },
         else => return err,
     }
@@ -415,23 +437,41 @@ fn openOrCreateStagingSubdir(io: std.Io, ns_dir: std.Io.Dir) !std.Io.Dir {
     const private_dir = std.Io.File.Permissions.fromMode(0o700);
     const create_status = ns_dir.createDir(io, staging_subdir_name, private_dir);
     if (create_status) |_| {
-        var dir = try ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true });
+        var dir = try ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true, .follow_symlinks = false });
         errdefer dir.close(io);
         try dir.setPermissions(io, private_dir);
+        try assertOpenedDirMode(dir, 0o077, error.StagingDirCorrupt, error.StagingDirUnsafe);
         return dir;
     } else |err| switch (err) {
         error.PathAlreadyExists => {
-            // Strict hardening rules apply at the staging level
-            // (unlike the namespace dir above): must be a real
-            // directory, must not grant group or other access.
+            // Strict hardening: real directory, no group/other bits.
+            // NOFOLLOW open + fstat closes the lstat→open TOCTOU.
             const info = try @import("listing.zig").statAt(ns_dir.handle, staging_subdir_name);
             const file_type = info.mode & 0o170000;
             if (file_type != 0o040000) return error.StagingDirCorrupt;
             if ((info.mode & 0o077) != 0) return error.StagingDirUnsafe;
-            return try ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true });
+            var dir = try ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true, .follow_symlinks = false });
+            errdefer dir.close(io);
+            try assertOpenedDirMode(dir, 0o077, error.StagingDirCorrupt, error.StagingDirUnsafe);
+            return dir;
         },
         else => return err,
     }
+}
+
+/// After opening a namespace/staging dir with NOFOLLOW, re-check the
+/// FD: must still be a directory and must not grant the forbidden
+/// mode bits. Closes the TOCTOU between the pre-open lstat and open.
+fn assertOpenedDirMode(
+    dir: std.Io.Dir,
+    forbidden_mask: u32,
+    corrupt: anyerror,
+    unsafe: anyerror,
+) !void {
+    const info = try @import("listing.zig").statFd(dir.handle);
+    const file_type = info.mode & 0o170000;
+    if (file_type != 0o040000) return corrupt;
+    if ((info.mode & forbidden_mask) != 0) return unsafe;
 }
 
 fn normalizeVirtualPath(allocator: std.mem.Allocator, virtual_path: []const u8) Error![]u8 {

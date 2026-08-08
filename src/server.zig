@@ -13,6 +13,17 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Live count of in-flight session worker threads. Bumped by accept,
+/// decremented when each detached worker exits. Enforces
+/// `max-connections` and graceful drain.
+pub var active_sessions: std.atomic.Value(u32) = .init(0);
+
+/// Live count of pre-auth workers. Bumped at accept; decremented at
+/// successful auth or session exit. Enforces `max-unauth-connections`
+/// independently so handshake storms cannot starve authenticated
+/// partners (PLAN §8.4).
+pub var unauth_sessions: std.atomic.Value(u32) = .init(0);
+
 /// Format the peer IP of `session`'s underlying TCP socket into `buf`.
 /// Returns a slice into `buf` on success, `null` on any error (no
 /// socket, getpeername fails, unknown family). The returned slice
@@ -163,7 +174,7 @@ pub fn run(
         }
 
         const max = active.current.config.server.max_connections;
-        if (signals.active_sessions.load(.acquire) >= max) {
+        if (active_sessions.load(.acquire) >= max) {
             audit.log(io, null, "accept.rejected", null, .denied, "max-connections reached", peer_ip);
             c.ssh_disconnect(session);
             c.ssh_free(session);
@@ -177,7 +188,7 @@ pub fn run(
         // behavior operators see when they don't tune this knob.
         const max_unauth_cfg = active.current.config.server.max_unauth_connections;
         if (max_unauth_cfg != 0 and
-            signals.unauth_sessions.load(.acquire) >= max_unauth_cfg)
+            unauth_sessions.load(.acquire) >= max_unauth_cfg)
         {
             audit.log(io, null, "accept.rejected", null, .denied, "max-unauth-connections reached", peer_ip);
             c.ssh_disconnect(session);
@@ -202,12 +213,12 @@ pub fn run(
         // them. Pre-auth slot is released at successful auth (or at
         // session exit if auth never completes); total slot is
         // released at session exit unconditionally.
-        _ = signals.active_sessions.fetchAdd(1, .acq_rel);
-        _ = signals.unauth_sessions.fetchAdd(1, .acq_rel);
+        _ = active_sessions.fetchAdd(1, .acq_rel);
+        _ = unauth_sessions.fetchAdd(1, .acq_rel);
 
         const thread = std.Thread.spawn(.{}, sessionThread, .{args}) catch |err| {
-            _ = signals.active_sessions.fetchSub(1, .acq_rel);
-            _ = signals.unauth_sessions.fetchSub(1, .acq_rel);
+            _ = active_sessions.fetchSub(1, .acq_rel);
+            _ = unauth_sessions.fetchSub(1, .acq_rel);
             ref.release(allocator);
             c.ssh_free(session);
             allocator.destroy(args);
@@ -235,11 +246,11 @@ pub fn run(
 
     const grace_ms: i64 = @intCast(active.current.config.server.shutdown_grace_ms);
     const drain_deadline = audit.nowMonotonicMs() + grace_ms;
-    while (signals.active_sessions.load(.acquire) != 0 and audit.nowMonotonicMs() < drain_deadline) {
+    while (active_sessions.load(.acquire) != 0 and audit.nowMonotonicMs() < drain_deadline) {
         std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
     }
 
-    if (signals.active_sessions.load(.acquire) == 0) {
+    if (active_sessions.load(.acquire) == 0) {
         try stderr.writeStreamingAll(io, "zift: all sessions drained, exiting\n");
     } else {
         // Force-close path. Snapshot the count, shut down every
@@ -258,11 +269,11 @@ pub fn run(
         // returns immediately; the worker's deferred decrement is one
         // mutex acquisition + atomic op away.
         const final_deadline = audit.nowMonotonicMs() + 500;
-        while (signals.active_sessions.load(.acquire) != 0 and audit.nowMonotonicMs() < final_deadline) {
+        while (active_sessions.load(.acquire) != 0 and audit.nowMonotonicMs() < final_deadline) {
             std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
         }
 
-        const stragglers = signals.active_sessions.load(.acquire);
+        const stragglers = active_sessions.load(.acquire);
         if (stragglers == 0) {
             try stderr.writeStreamingAll(io, "zift: all sessions drained after force-close, exiting\n");
         } else {
@@ -455,10 +466,10 @@ fn sessionThread(args: *SessionArgs) void {
     var auth_completed = false;
 
     defer {
-        if (!auth_completed) _ = signals.unauth_sessions.fetchSub(1, .acq_rel);
+        if (!auth_completed) _ = unauth_sessions.fetchSub(1, .acq_rel);
         if (registered) signals.unregisterSessionFd(io, session_fd);
         ref.release(allocator);
-        _ = signals.active_sessions.fetchSub(1, .acq_rel);
+        _ = active_sessions.fetchSub(1, .acq_rel);
     }
     handleSession(io, allocator, ref.config, ssh_session, &auth_completed) catch |err| {
         logLibsshError(io, @errorName(err), ssh_session) catch {};
@@ -506,11 +517,14 @@ fn handleSession(
     // decrement so a defer in sessionThread that unwinds via panic
     // (Zig's `defer` runs on panic too) does not double-decrement.
     auth_completed.* = true;
-    _ = signals.unauth_sessions.fetchSub(1, .acq_rel);
+    _ = unauth_sessions.fetchSub(1, .acq_rel);
 
     const channel = try sftp.acceptSftpSubsystem(session);
 
     try sftp.runSftp(io, allocator, channel, user, cfg.server, peer_ip);
+    // ssh_disconnect sends SSH2_MSG_DISCONNECT (clients log "disconnect").
+    // Channel lifetime is owned by the session — ssh_free below frees it.
+    // Explicit channel_free here would double-free and abort.
     c.ssh_disconnect(session);
 }
 

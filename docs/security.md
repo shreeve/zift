@@ -239,12 +239,11 @@ Operational caveats:
 - Partner root and target directory must be on the same filesystem.
   Cross-filesystem rename returns `EXDEV`; Zift refuses the publish
   rather than copy bytes non-atomically.
-- A process crash can leave orphaned staging files. Operators may remove
-  them when no upload session is active.
-- The current publish-time no-clobber guard has a known stat-then-rename
-  window. Closing it completely requires platform no-replace rename
-  primitives: `renameat2(RENAME_NOREPLACE)` on Linux and
-  `renamex_np(RENAME_EXCL)` on macOS.
+- Crash orphans under `<root>/.zift/staging/` are swept on the next
+  login for that partner when older than `max(idle-timeout, 15m)`.
+  Partners never see each other's staging — each jail is separate.
+  Concurrent sessions for the same partner are protected by the age
+  floor.
 
 ## Per-Partner Namespace
 
@@ -427,19 +426,8 @@ artifacts when provenance matters.
 These are accepted limitations or follow-up hardening items, not hidden
 promises:
 
-- Publish-time no-clobber is not yet hermetic against a target that
-  appears between the destination stat and rename. Platform no-replace
-  rename primitives should close this.
-- `openStagingDir` verifies existing `.zift/` and `.zift/staging/`
-  with lstat before opening them. A local attacker with write access
-  to the partner root could theoretically race that check. SFTP
-  clients cannot create or access `.zift/` or its contents; this is
-  a local filesystem hardening issue.
-- Crash-time staging orphans are not automatically swept at startup.
 - Glob matching supports `**`, which is useful but recursive. Patterns
   are operator-controlled, not remote-client-controlled.
-- Fuzz harnesses exist, but the CI random fuzz job is disabled until the
-  pinned Zig toolchain's fuzz runner issue is resolved.
 - Audit is not fail-closed.
 - Quotas and disk-full behavior are delegated to the OS.
 

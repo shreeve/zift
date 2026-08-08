@@ -148,10 +148,9 @@ They cover:
 
 The harnesses compile and run once during ordinary `zig build test`.
 
-The CI random fuzz job is currently disabled because the pinned Zig
-`0.16.0` test runner has an upstream fuzz-runner type mismatch. When
-the toolchain is updated or patched, re-enable the `fuzz-short` job in
-`.github/workflows/ci.yml`.
+CI's `fuzz-short` job runs `zig build test -Doptimize=ReleaseSafe --fuzz`
+for 60s. ReleaseSafe avoids a Zig 0.16.0 Debug `--fuzz` StackTrace type
+mismatch; switch back to Debug fuzz when a patched Zig is pinned.
 
 ## Local Release Builds
 
@@ -204,7 +203,7 @@ Jobs:
   systemd unit, and run smoke commands.
 - `integration-tests`: run `tests/run.sh` against the binary built by
   the ReleaseSafe job.
-- `fuzz-short`: present but disabled pending the Zig fuzz-runner issue.
+- `fuzz-short`: `zig build test -Doptimize=ReleaseSafe --fuzz` for 60s.
 
 The important CI design choice is that integration tests run against
 the same static-musl shape users run in production, not a dynamic glibc
@@ -319,24 +318,12 @@ If the answer points outside Zift, keep it outside Zift.
 
 ## Maintenance Backlog
 
-No known P0 or P1 items are open. Current follow-ups are hardening,
-tests, or polish:
+No known P0 or P1 items are open. Current follow-ups are polish:
 
 - Add a reload lifetime stress test with many active sessions while the
   config is reloaded repeatedly.
-- Consider moving session counters out of `signals.zig` into server
-  state.
-- Revisit explicit libssh channel EOF/close/free cleanup order on
-  session exit.
-- Close publish-time no-clobber races with
-  `renameat2(RENAME_NOREPLACE)` on Linux and `renamex_np(RENAME_EXCL)`
-  on macOS.
-- Harden `.zift/staging/` open with an open-no-follow plus fstat pattern
-  where the platform APIs make that practical.
 - Add a Linux-only regression test for raw-syscall errno handling around
   missing files.
-- Consider sweeping orphaned files under `<root>/.zift/staging/` (and
-  the legacy `<root>/.zift-staging/`) at startup.
 - Consider per-session parsed public-key handle caching, but only if the
   configured-key and dummy-key auth paths keep matching timing behavior.
 

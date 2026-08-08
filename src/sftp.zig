@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("libssh");
 const audit = @import("audit.zig");
 const config = @import("config.zig");
@@ -6,6 +7,15 @@ const listing = @import("listing.zig");
 const policy = @import("policy.zig");
 const vfs_mod = @import("vfs.zig");
 const wire = @import("wire.zig");
+
+/// Floor for staging-orphan age before unlink. Concurrent sessions for
+/// the same partner may still be writing; never delete files younger
+/// than this even when idle-timeout is short or disabled.
+const staging_orphan_min_age_ms: i64 = 15 * 60 * 1000;
+
+/// macOS exclusive rename (same role as Linux renameat2 NOREPLACE).
+const RENAME_EXCL: c_uint = 0x00000004;
+extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c_int;
 
 const sftp_max_packet_bytes = wire.sftp_max_packet_bytes;
 const DirEntry = wire.DirEntry;
@@ -94,6 +104,11 @@ pub fn runSftp(
         .session_started_ms = start_ms,
     };
     defer state.deinit();
+
+    // Post-login sweep of crash orphans under this partner's staging
+    // dir only. Other partners' roots are never touched; in-flight
+    // files younger than the age floor are left alone.
+    state.sweepStagingOrphans();
 
     // PLAN §7.6: maximum SFTP packet size is 256 KiB. Allocate on the
     // heap so we don't push the worker thread stack past Zig's default
@@ -304,15 +319,9 @@ const SftpState = struct {
         // itself stays around — if other concurrent sessions for
         // this partner are still running, they'd be using it.
         //
-        // CROSS-RESTART ORPHANS: if zift itself crashes mid-upload,
-        // the staging files persist after restart. zift does NOT
-        // currently sweep them at startup (tracked as a P3 follow-
-        // up). Operators with a hard zift crash can manually clear:
-        //
-        //     rm -f <root>/.zift/staging/*
-        //
-        // Safe to do anytime — partners can never reach those paths
-        // via the SFTP wire surface (path-validator rejects them).
+        // Crash orphans are also swept at next login for this partner
+        // (see sweepStagingOrphans). Per-handle unlink covers clean
+        // disconnect mid-upload.
         for (self.handles.items) |*handle| {
             self.closeHandle(handle);
         }
@@ -682,20 +691,21 @@ const SftpState = struct {
                     // 256-char name truncated to 255 chars might no
                     // longer match a literal prefix).
                     //
-                    // On overflow (vpath > PATH_MAX, vanishingly
-                    // unlikely after VFS validation but possible at
-                    // the end of legal VFS path lengths) we fall back
-                    // to the parent dir's vpath. This is INACCURATE:
-                    // a child-specific deny rule (`deny **.exe`) could
-                    // be lost. For now we accept the inaccuracy on
-                    // the display side rather than allocating a
-                    // fallback string at every entry. Tracked as a
-                    // P3 follow-up — if real partners ever hit this
-                    // path the fix is a heap allocation here.
+                    // Overflow (legal but very long paths) heap-
+                    // allocates so child-specific deny rules stay
+                    // accurate in virtual listings.
                     const sep: []const u8 = if (std.mem.endsWith(u8, dir_vpath, "/")) "" else "/";
-                    const vpath = std.fmt.bufPrint(&vpath_buf, "{s}{s}{s}", .{
+                    const stacked = std.fmt.bufPrint(&vpath_buf, "{s}{s}{s}", .{
                         dir_vpath, sep, entry.name,
-                    }) catch dir_vpath;
+                    });
+                    var heap_vpath: ?[]u8 = null;
+                    defer if (heap_vpath) |p| self.allocator.free(p);
+                    const vpath: []const u8 = stacked catch blk: {
+                        heap_vpath = std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
+                            dir_vpath, sep, entry.name,
+                        }) catch break :blk dir_vpath;
+                        break :blk heap_vpath.?;
+                    };
                     display_info.mode = policy.policyDerivedMode(self.user, vpath, info.mode);
                     display_info.uid = 0;
                     display_info.gid = 0;
@@ -1162,26 +1172,49 @@ const SftpState = struct {
             break :blk true;
         };
 
-        if (dest_exists) {
+        const may_replace = !handle.staging_excl and
+            policy.check(self.user, .remove, target_vpath) == .allow;
+
+        if (dest_exists and !may_replace) {
             if (handle.staging_excl) {
-                // EXCL was set at OPEN — fail if target appeared.
                 self.auditDenied("close", target_vpath);
                 return c.SSH_FX_FAILURE;
             }
-            if (policy.check(self.user, .remove, target_vpath) == .deny) {
-                self.auditDenied("close", target_vpath);
-                return c.SSH_FX_PERMISSION_DENIED;
-            }
+            self.auditDenied("close", target_vpath);
+            return c.SSH_FX_PERMISSION_DENIED;
         }
 
-        // The atomic publish step.
-        std.Io.Dir.rename(
-            staging,
-            staging_basename,
-            to_parent.parent,
-            to_parent.base,
-            self.io,
-        ) catch |err| return err;
+        // Atomic publish. When the partner must not clobber, use the
+        // platform no-replace rename so a create-between-stat-and-
+        // rename race cannot overwrite. When replace is authorized,
+        // POSIX rename replaces atomically.
+        if (may_replace) {
+            std.Io.Dir.rename(
+                staging,
+                staging_basename,
+                to_parent.parent,
+                to_parent.base,
+                self.io,
+            ) catch |err| return err;
+        } else {
+            renameNoReplace(
+                staging,
+                staging_basename,
+                to_parent.parent,
+                to_parent.base,
+                self.io,
+            ) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    if (handle.staging_excl) {
+                        self.auditDenied("close", target_vpath);
+                        return c.SSH_FX_FAILURE;
+                    }
+                    self.auditDenied("close", target_vpath);
+                    return c.SSH_FX_PERMISSION_DENIED;
+                },
+                else => return err,
+            };
+        }
 
         // Rename succeeded — clear staging_basename so closeHandle
         // doesn't unlink the file we just published.
@@ -1340,44 +1373,33 @@ const SftpState = struct {
         // destination exists in any form, require `.remove`
         // permission on the destination path.
         //
-        // Bounded TOCTOU: this stat-then-rename window is racy. Two
-        // SFTP sessions from the same partner (or two pipelined
-        // requests on one session) could exploit it: session A stats
-        // and finds dest absent, session B creates dest, session A
-        // proceeds with rename and overwrites B's entry. The race
-        // is closed hermetically only by Linux's `renameat2(...,
-        // RENAME_NOREPLACE)` and macOS's `renamex_np(...,
-        // RENAME_EXCL)`. We use the portable check today and accept
-        // the bounded race. Tracked as a P2 follow-up to switch to
-        // the platform-specific no-replace primitives.
-        const dest_exists = blk: {
-            _ = listing.statAt(to_parent.parent.handle, to_parent.base) catch |err| switch (err) {
-                error.NotFound => break :blk false,
+        // Overwrite requires `.remove` on the destination. When the
+        // partner lacks it, use a no-replace rename so a create-
+        // between-check-and-rename race cannot clobber. When replace
+        // is authorized, POSIX rename replaces atomically.
+        const may_replace = policy.check(self.user, .remove, to.value) == .allow;
+        if (may_replace) {
+            std.Io.Dir.rename(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch {
+                defer self.auditFailed("rename", from.value, "rename failed");
+                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename failed");
+            };
+        } else {
+            renameNoReplace(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    defer self.auditDenied("rename", to.value);
+                    return replyStatus(
+                        self.channel,
+                        request_id,
+                        c.SSH_FX_PERMISSION_DENIED,
+                        "permission denied",
+                    );
+                },
                 else => {
-                    defer self.auditFailed("rename", to.value, "stat dest failed");
-                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "stat dest failed");
+                    defer self.auditFailed("rename", from.value, "rename failed");
+                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename failed");
                 },
             };
-            break :blk true;
-        };
-        if (dest_exists and policy.check(self.user, .remove, to.value) == .deny) {
-            // Audit against the DESTINATION path — that's where the
-            // policy denied us (overwrite requires `remove` on dest).
-            // Auditing the source would mislead operators reading
-            // logs into thinking the source rule was wrong.
-            defer self.auditDenied("rename", to.value);
-            return replyStatus(
-                self.channel,
-                request_id,
-                c.SSH_FX_PERMISSION_DENIED,
-                "permission denied",
-            );
         }
-
-        std.Io.Dir.rename(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch {
-            defer self.auditFailed("rename", from.value, "rename failed");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename failed");
-        };
         defer self.auditOk("rename", from.value, to.value);
         try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
@@ -1482,6 +1504,72 @@ const SftpState = struct {
         const dir = try self.vfs.openStagingDir(self.io);
         self.staging_dir = dir;
         return dir;
+    }
+
+    /// Unlink crash orphans under this partner's `<root>/.zift/staging/`.
+    /// Safe across partners (each jail is separate). Safe with concurrent
+    /// sessions for the same partner by only deleting files older than
+    /// `max(idle_timeout, 15m)`.
+    fn sweepStagingOrphans(self: *SftpState) void {
+        var dir = self.vfs.tryOpenExistingStagingDir(self.io) orelse return;
+        defer dir.close(self.io);
+
+        const age_floor_ms: i64 = @max(@as(i64, @intCast(self.idle_timeout_ms)), staging_orphan_min_age_ms);
+        const now_secs = nowUnixSecs();
+        const min_age_secs: i64 = @divTrunc(age_floor_ms + 999, 1000);
+
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const info = listing.statAt(dir.handle, entry.name) catch continue;
+            if (now_secs - info.mtime_secs < min_age_secs) continue;
+            dir.deleteFile(self.io, entry.name) catch {};
+        }
+    }
+
+    /// Rename that fails with PathAlreadyExists instead of replacing.
+    /// Linux: renameat2(NOREPLACE). macOS: renameatx_np(RENAME_EXCL).
+    fn renameNoReplace(
+        old_dir: std.Io.Dir,
+        old_sub_path: []const u8,
+        new_dir: std.Io.Dir,
+        new_sub_path: []const u8,
+        io: std.Io,
+    ) !void {
+        if (builtin.os.tag == .linux) {
+            try std.Io.Dir.renamePreserve(old_dir, old_sub_path, new_dir, new_sub_path, io);
+            return;
+        }
+        if (builtin.os.tag == .macos) {
+            var old_buf: [std.fs.max_name_bytes + 1]u8 = undefined;
+            var new_buf: [std.fs.max_name_bytes + 1]u8 = undefined;
+            if (old_sub_path.len >= old_buf.len or new_sub_path.len >= new_buf.len)
+                return error.NameTooLong;
+            @memcpy(old_buf[0..old_sub_path.len], old_sub_path);
+            old_buf[old_sub_path.len] = 0;
+            @memcpy(new_buf[0..new_sub_path.len], new_sub_path);
+            new_buf[new_sub_path.len] = 0;
+            const rc = renameatx_np(
+                old_dir.handle,
+                @ptrCast(&old_buf),
+                new_dir.handle,
+                @ptrCast(&new_buf),
+                RENAME_EXCL,
+            );
+            if (rc == 0) return;
+            return switch (std.posix.errno(rc)) {
+                .EXIST => error.PathAlreadyExists,
+                .NOENT => error.FileNotFound,
+                .ACCES, .PERM => error.AccessDenied,
+                .NOTDIR => error.NotDir,
+                .ISDIR => error.IsDir,
+                .INVAL => error.Unexpected,
+                else => error.Unexpected,
+            };
+        }
+        // Other platforms: Zig's renamePreserve falls back to
+        // hardlink+unlink, which is still no-replace for files.
+        try std.Io.Dir.renamePreserve(old_dir, old_sub_path, new_dir, new_sub_path, io);
     }
 
     /// Generate a stage-unique filename: 32 hex chars from the OS's

@@ -29,22 +29,9 @@ pub var reload_requested: std.atomic.Value(bool) = .init(false);
 /// next write. No-op when logging to stderr (default).
 pub var log_reopen_requested: std.atomic.Value(bool) = .init(false);
 
-/// Live count of in-flight session worker threads. Bumped by accept,
-/// decremented when each detached worker exits. Read by the accept loop
-/// to enforce `max-connections` and to wait for graceful drain.
-pub var active_sessions: std.atomic.Value(u32) = .init(0);
-
-/// Live count of pre-auth session worker threads (handshake done OR
-/// pending, but no successful auth yet). Bumped at accept, decremented
-/// either at successful auth (the slot is freed for the next pre-auth
-/// attempt) OR at session exit if auth never completed. Always less
-/// than or equal to `active_sessions`. Read by the accept loop to
-/// enforce `max-unauth-connections` independently of the global cap,
-/// so a handshake-storm cannot consume the entire `max-connections`
-/// pool and DoS authenticated partner sessions (PLAN §8.4).
-pub var unauth_sessions: std.atomic.Value(u32) = .init(0);
-
 /// Registry of underlying TCP socket FDs for every in-flight session.
+/// Session counters (`active_sessions` / `unauth_sessions`) live in
+/// `server.zig` next to the accept loop that owns them.
 /// On graceful-shutdown grace expiration the accept thread iterates
 /// this list and calls `shutdown(fd, SHUT_RDWR)` on each entry: the
 /// worker's blocked libssh read returns, the worker tears down its
@@ -84,7 +71,7 @@ pub fn unregisterSessionFd(io: std.Io, fd: c_int) void {
 /// directions. Called once, by the accept thread, after the graceful
 /// drain deadline expires. Workers still alive at that point will
 /// observe their next libssh read return error, run their normal
-/// cleanup paths, and decrement `active_sessions`.
+/// cleanup paths, and decrement `server.active_sessions`.
 pub fn forceCloseAll(io: std.Io) usize {
     sessions_mutex.lockUncancelable(io);
     defer sessions_mutex.unlock(io);

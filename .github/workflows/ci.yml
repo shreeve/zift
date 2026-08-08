@@ -187,22 +187,9 @@ jobs:
   fuzz-short:
     name: Short fuzz run
     runs-on: ubuntu-latest
-    # Disabled pending an upstream Zig fix.
-    #
-    # Zig 0.16.0's `compiler/test_runner.zig` mixes two distinct
-    # `StackTrace` types (`std.builtin.StackTrace` vs.
-    # `std.debug.StackTrace`) when invoked with `--fuzz`. The compile
-    # fails with:
-    #     test_runner.zig:566: error: expected type
-    #     '*const debug.StackTrace', found '*builtin.StackTrace'
-    # …and the fuzz binary can't be built at all, regardless of our
-    # harness code. The harnesses themselves run fine in non-fuzz
-    # mode (each runs once with empty input) and are exercised by
-    # the `unit-tests` job above. Only the random-input generation
-    # pass is missing until Zig ships a stdlib fix; track upstream
-    # and flip this back to `if: true` (or remove the gate) when a
-    # patched Zig release is pinned in `ZIG_VERSION`.
-    if: false
+    # Zig 0.16.0's Debug `--fuzz` test runner hits a StackTrace type
+    # mismatch upstream. ReleaseSafe uses the LLVM fuzz path and
+    # builds cleanly — keep that until a patched Zig is pinned.
     steps:
       - uses: actions/checkout@v4
 
@@ -220,7 +207,7 @@ jobs:
           # we want to swallow. Any other non-zero (compile error, real
           # crash, fuzz finding) must fail the job.
           set +e
-          timeout 60 zig build test --fuzz
+          timeout 60 zig build test -Doptimize=ReleaseSafe --fuzz
           rc=$?
           set -e
           if [ "$rc" -eq 0 ] || [ "$rc" -eq 124 ]; then
