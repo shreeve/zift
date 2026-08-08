@@ -157,16 +157,16 @@ mismatch; switch back to Debug fuzz when a patched Zig is pinned.
 Build one release artifact:
 
 ```sh
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.8.0-dev
+zig build release -Dtarget=x86_64-linux-musl -Dversion=0.9.0-dev
 ```
 
 Supported release targets:
 
 ```sh
-zig build release -Dtarget=x86_64-linux-musl  -Dversion=0.8.0-dev
-zig build release -Dtarget=aarch64-linux-musl -Dversion=0.8.0-dev
-zig build release -Dtarget=x86_64-macos       -Dversion=0.8.0-dev
-zig build release -Dtarget=aarch64-macos      -Dversion=0.8.0-dev
+zig build release -Dtarget=x86_64-linux-musl  -Dversion=0.9.0-dev
+zig build release -Dtarget=aarch64-linux-musl -Dversion=0.9.0-dev
+zig build release -Dtarget=x86_64-macos       -Dversion=0.9.0-dev
+zig build release -Dtarget=aarch64-macos      -Dversion=0.9.0-dev
 ```
 
 Output lands under `release/`.
@@ -266,8 +266,8 @@ Before tagging a release:
 Example:
 
 ```sh
-git tag -a v0.8.0 -m "Zift 0.8.0"
-git push origin v0.8.0
+git tag -a v0.9.0 -m "Zift 0.9.0"
+git push origin v0.9.0
 ```
 
 ## Coding Principles
@@ -361,7 +361,7 @@ tests/run.sh
 tests/run.sh --list
 
 # local release artifact
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.8.0-dev
+zig build release -Dtarget=x86_64-linux-musl -Dversion=0.9.0-dev
 
 # inspect release output
 ls -la release/
