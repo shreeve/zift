@@ -11,7 +11,7 @@
 # v0.7.0 baseline: at least one such line per session — the
 # (unwanted) noise this patch removes.
 #
-# Covers: src/session.zig `methodsForUser` + per-user
+# Covers: src/ssh.zig `methodsForUser` + per-user
 # `ssh_message_auth_set_methods` call in `authenticate`.
 
 source "$(dirname "$0")/../lib/common.sh"
@@ -87,7 +87,7 @@ ok "v0.7.1 narrowing: no publickey attempts for password-only user (was: ≥1 in
 # v0.7.0 default (PASSWORD|PUBLICKEY). This is the upper bound on
 # the anti-enumeration leak the v0.7.1 narrowing introduces:
 # password-only known users ARE intentionally distinguishable from
-# unknown users (see methodsForUser doc comment in session.zig),
+# unknown users (see methodsForUser doc comment in ssh.zig),
 # but the unknown-user shape itself stays at the historical
 # default. If a future refactor accidentally narrowed the
 # unknown-user response, an attacker could probe valid usernames

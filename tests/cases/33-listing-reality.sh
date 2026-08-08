@@ -4,7 +4,7 @@
 # group / mode (rare; mostly debugging) can opt back in by adding
 # `listing-mode reality` to the server block.
 #
-# Covers:  src/config.zig listing-mode parser, src/session.zig
+# Covers:  src/config.zig listing-mode parser, src/sftp.zig
 #          applyListingMode `.reality => return real` branch,
 #          src/listing.zig NameResolver still honored when reality
 #          mode dispatches through it.

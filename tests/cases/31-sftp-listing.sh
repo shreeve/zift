@@ -6,7 +6,7 @@
 #
 # Covers:  PLAN §7.6 READDIR/STAT attrs encoding, src/listing.zig
 #          longname formatter, src/policy.zig policyDerivedMode,
-#          src/session.zig handleReaddir virtual-mode dispatch.
+#          src/sftp.zig handleReaddir virtual-mode dispatch.
 # Oracle:  paramiko's SFTPAttributes.longname matches the
 #          virtual-mode promise (alice/sftp/policy-rwx/world=---).
 

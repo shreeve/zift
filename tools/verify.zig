@@ -209,7 +209,7 @@ fn verifyMachO(io: std.Io, path: []const u8, data: []const u8) !u8 {
         try stderr.writeStreamingAll(io, report_w.buffered());
         try stderr.writeStreamingAll(io,
             \\  Either the build picked up a non-system dylib (regression)
-            \\  or src/verify.zig's allowlist needs updating to match a
+            \\  or tools/verify.zig's allowlist needs updating to match a
             \\  deliberate change in our dependency surface.
             \\
         );

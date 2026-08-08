@@ -247,12 +247,9 @@ rule set. That keeps partner network identity next to credentials and
 path policy.
 
 Zift also applies built-in abuse controls for unrestricted users and
-unknown scanners:
-
-- per-session auth attempt ceiling (6)
-- short backoff after failed attempts
-- temporary source suppression after a burst of failures
-- `max-connections` / `max-unauth-connections`
+unknown scanners: per-session auth attempt ceiling, backoff after
+failures, temporary source suppression, and the connection caps above.
+Full numbers and threat-model notes are in [`security.md`](security.md).
 
 A host or cloud firewall is optional defense-in-depth for hostile
 networks. Keep SSH admin access on a different port from Zift.

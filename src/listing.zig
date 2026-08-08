@@ -30,7 +30,7 @@
 //!
 //! All POSIX shape calls (`statx` on Linux, `fstatat` on macOS,
 //! `getpwuid_r`/`getgrgid_r` for name resolution) are kept in this
-//! module so session.zig stays focused on the SFTP wire protocol.
+//! module so sftp.zig stays focused on request handling.
 
 const std = @import("std");
 const builtin = @import("builtin");

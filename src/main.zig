@@ -1,12 +1,12 @@
 const std = @import("std");
 const c = @import("libssh");
 const build_options = @import("build_options");
-const audit = @import("zift/audit.zig");
-const auth = @import("zift/auth.zig");
-const config = @import("zift/config.zig");
-const session = @import("zift/session.zig");
-const signals = @import("zift/signals.zig");
-const vfs = @import("zift/vfs.zig");
+const audit = @import("audit.zig");
+const auth = @import("auth.zig");
+const config = @import("config.zig");
+const server = @import("server.zig");
+const signals = @import("signals.zig");
+const vfs = @import("vfs.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -180,7 +180,7 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     // Audit destination is determined by `server.log` (default stderr,
     // or an absolute path that is opened O_APPEND and reopened on
     // SIGUSR1). PLAN §7.4. Initialized AFTER semantic validation but
-    // BEFORE session.run starts spawning worker threads.
+    // BEFORE server.run starts spawning worker threads.
     try audit.initGlobal(gpa, cfg.server.log);
     defer audit.deinitGlobal(gpa);
 
@@ -194,7 +194,7 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     try stderr.writeStreamingAll(io, "zift: listen: ");
     try stderr.writeStreamingAll(io, cfg.server.listen);
     try stderr.writeStreamingAll(io, "\n");
-    try session.run(io, gpa, args[2], cfg);
+    try server.run(io, gpa, args[2], cfg);
 }
 
 fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !void {

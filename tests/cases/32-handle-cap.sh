@@ -6,7 +6,7 @@
 # could grow its own handle list to gigabytes before idle-timeout
 # fired).
 #
-# Covers:  PLAN §8.4 DoS hardening, src/session.zig
+# Covers:  PLAN §8.4 DoS hardening, src/sftp.zig
 #          `max_handles_per_session`, swapRemove on close.
 # Oracle:  open N files, expect first 256 to succeed, 257th to fail
 #          with the SFTP protocol error; close one, verify the next

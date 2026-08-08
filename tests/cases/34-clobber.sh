@@ -11,8 +11,8 @@
 # Granting `remove` in addition to `add` (or using `full`) restores
 # all clobber capabilities — verifies the rule isn't a one-way trap.
 #
-# Covers:  PLAN §6.3 v0.4.0 clobber rule, src/session.zig handleOpen
-#          existing-file branch, src/session.zig handleRename
+# Covers:  PLAN §6.3 v0.4.0 clobber rule, src/sftp.zig handleOpen
+#          existing-file branch, src/sftp.zig handleRename
 #          v0.3.0 destination-existence probe.
 # Oracle:  SFTP_FXP_OPEN denied with PERMISSION_DENIED for each
 #          attack; granting `remove` makes them succeed.

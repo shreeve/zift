@@ -146,12 +146,7 @@ with fixed module constants; `a` + 31 base62 chars — always 32 chars):
 auth a…
 ```
 
-Generate with:
-
-```sh
-printf '%s\n' 'secret' | zift hash-password
-```
-
+Mint with `zift hash-password` (see [`configure.md`](configure.md)).
 Parameters are fixed (not stored in the blob), matching Janus:
 
 - argon2id, memory 64 MiB, time 2, parallelism 1
@@ -211,22 +206,10 @@ shapes stay less distinguishable.
 
 ## Permission Safety
 
-The important destructive-operation rule is:
-
-Any operation that modifies or replaces an existing entry requires
-`remove` permission on that entry's path.
-
-This applies to:
-
-- overwriting a file
-- truncating a file
-- appending to an existing file
-- renaming over an existing destination
-- deleting a file
-- removing a directory
-
-`add` by itself allows creation of new entries. It does not grant
-authority to destroy existing entries.
+Authorization verbs and the clobber rule (`add` creates; modifying or
+replacing an existing entry also needs `remove`) are defined in
+[`configure.md`](configure.md). The security-relevant invariant is the
+same: `add` alone is not destructive write access.
 
 ## Atomic Uploads
 

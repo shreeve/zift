@@ -352,7 +352,7 @@ const staging_subdir_name: []const u8 = "staging";
 /// SFTP and confuse operators who upgraded but haven't yet swept the
 /// old path. The daemon itself never reads or writes here on v0.8.0+
 /// — `openStagingDir` uses `<root>/.zift/staging/` exclusively.
-/// Exported so the listings renderer in `session.zig` can keep a
+/// Exported so the listings renderer in `sftp.zig` can keep a
 /// stray legacy dir out of READDIR results during the transition,
 /// using the same constant the validator reserves.
 pub const legacy_staging_dir_name: []const u8 = ".zift-staging";

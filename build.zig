@@ -75,7 +75,7 @@ fn buildLinkage(
     // grabbing that LazyPath gives us the same headers the linker
     // will resolve symbols against.
     const libssh_translate = b.addTranslateC(.{
-        .root_source_file = b.path("src/zift/ssh/libssh_root.h"),
+        .root_source_file = b.path("src/ext/libssh_root.h"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -528,7 +528,7 @@ pub fn build(b: *std.Build) void {
 
     // ----- `zig build test` --------------------------------------------------
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/zift/tests.zig"),
+        .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -554,7 +554,7 @@ pub fn build(b: *std.Build) void {
     // Dev/test/release all use the SAME vendored libssh + mbedTLS +
     // zlib (the shared `buildLinkage` helper). No partner ever needs
     // `apt install libssh-4`; every release artifact is self-contained
-    // (`src/verify.zig` confirms zero `DT_NEEDED` on Linux, only
+    // (`tools/verify.zig` confirms zero `DT_NEEDED` on Linux, only
     // `libSystem` on macOS).
     const release = buildLinkage(b, target, .ReleaseSafe, zift_version, target_triple, @tagName(.ReleaseSafe));
 
@@ -600,7 +600,7 @@ pub fn build(b: *std.Build) void {
     ));
     checksum_cmd.step.dependOn(&install_release.step);
 
-    // `src/verify.zig` is a small standalone Zig program that parses
+    // `tools/verify.zig` is a small standalone Zig program that parses
     // the just-installed release artifact's ELF (Linux) or Mach-O
     // (macOS) and asserts the dynamic-deps surface matches what we
     // promised. Build it for the HOST so cross-compile release jobs
@@ -610,7 +610,7 @@ pub fn build(b: *std.Build) void {
     const verify_exe = b.addExecutable(.{
         .name = "verify",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/verify.zig"),
+            .root_source_file = b.path("tools/verify.zig"),
             .target = host_target,
             .optimize = .ReleaseSafe,
         }),

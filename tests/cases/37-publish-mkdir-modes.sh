@@ -14,7 +14,7 @@
 #     "would clobber an existing entry; partner lacks remove".
 #
 # Covers:  src/config.zig parsePublishMode + parseMkdirMode;
-#          src/session.zig publish_mode/mkdir_mode threading through
+#          src/sftp.zig publish_mode/mkdir_mode threading through
 #          handleOpen + handleMkdir; the v0.6.0 error-message scrub.
 
 source "$(dirname "$0")/../lib/common.sh"

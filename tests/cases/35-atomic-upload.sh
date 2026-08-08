@@ -9,7 +9,7 @@
 # partial upload.
 #
 # Covers:  src/vfs.zig openStagingDir + namespace_dir_name reservation
-#          in normalizeVirtualPath; src/session.zig staged Handle
+#          in normalizeVirtualPath; src/sftp.zig staged Handle
 #          flow (handleOpen create-new path, handleClose
 #          publishStagedHandle, closeHandle orphan cleanup); the
 #          listing renderer's .zift filter (v0.8.0+).

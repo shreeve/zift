@@ -19,7 +19,7 @@ server
   max-connections 14
   max-unauth-connections 4
   shutdown-grace 30s
-  log /home/zift/audit.jsonl
+  log stderr
   listing-mode virtual
   publish-mode 0o660
   mkdir-mode 0o2770
@@ -141,14 +141,8 @@ reload-interval 2s
 
 Set to `0` to disable polling. `SIGHUP` still forces a reload.
 
-Reload behavior:
-
-- Valid new configs apply to new sessions.
-- Existing sessions keep the config snapshot they authenticated with.
-- Invalid new configs are rejected and the previous config keeps
-  serving.
-- The host key is loaded at startup; changing `host-key` requires a
-  restart.
+Valid reloads apply to new sessions only; see [Reloads](#reloads) below
+and [`operate.md`](operate.md). Changing `host-key` requires a restart.
 
 ### `idle-timeout`
 
@@ -219,10 +213,12 @@ log stderr
 log /home/zift/audit.jsonl
 ```
 
-File paths must be absolute. File destinations are opened append-only
-by the process and reopened on `SIGUSR1`, which supports ordinary
-external rotation workflows (send `SIGUSR1` after renaming the file).
-
+Prefer `stderr` in production so the supervisor (journald, Docker,
+Kubernetes) owns retention. Use a file path only when you already have
+a log-shipping preference. File paths must be absolute. File
+destinations are opened append-only by the process and reopened on
+`SIGUSR1`, which supports ordinary external rotation workflows (send
+`SIGUSR1` after renaming the file).
 ### `listing-mode`
 
 Optional. Default: `virtual`.
@@ -525,33 +521,18 @@ deny **.exe
 ## Atomic Uploads
 
 New file uploads are staged under `<root>/.zift/staging/` and published
-with an atomic rename when the client closes the file handle. The
-parent `<root>/.zift/` is zift's reserved per-partner namespace
-(see `docs/security.md` for the full model).
+with an atomic rename when the client closes the file handle.
+Processors watching a partner-visible directory therefore do not see
+half-uploaded files.
 
-This means processors watching a partner-visible directory do not see
-half-uploaded files. The target path appears only after the upload is
-complete.
+`.zift` (and legacy `.zift-staging`) is reserved: hidden from listings
+and rejected in virtual paths. Use `publish-mode` for the final file
+mode after publish. Partner root and target directory must share one
+filesystem.
 
-Important details:
-
-- `.zift` is hidden from partner listings (and so is the legacy
-  `.zift-staging` if it's still on disk from a pre-v0.8.0 install).
-- Any virtual path containing `.zift` (or `.zift-staging`) is rejected.
-- Fresh namespace directories are created mode `0o750` and fresh
-  staging subdirectories are created mode `0o700`.
-- Staging files are private while uploads are in flight.
-- Staging happens under the partner root, not the target parent. Default
-  ACLs or setgid behavior on a subdirectory such as `/pending` do not
-  apply at staging-file create time; use `publish-mode`, put defaults on
-  the root, or do host-side fixup if processors depend on them.
-- If the client disconnects mid-upload, the staging file is removed
-  during session cleanup.
-- If Zift crashes mid-upload, an orphaned staging file may remain and
-  can be removed by the operator before restart or after inspection.
-- The partner root and target directories must be on the same
-  filesystem. Cross-filesystem publish would require copy-and-unlink,
-  which is not atomic and is not used.
+Full namespace model, hardening, and caveats:
+[`security.md`](security.md). Upgrade notes for the v0.8.0 path change:
+[`operate.md`](operate.md).
 
 ## SFTP Surface
 
@@ -572,28 +553,11 @@ features rather than transfer failures.
 
 ## Reloads
 
-Zift reloads configuration for new sessions when the config file mtime
-moves forward. Send `SIGHUP` to force a reload:
+Zift reloads for new sessions when the config mtime moves forward, or
+immediately on `SIGHUP`. Existing sessions keep the snapshot they
+authenticated with. Invalid reloads are rejected; the previous config
+keeps serving. Changing `host-key` still requires a restart.
 
-```sh
-systemctl kill -s HUP zift
-```
-
-Reload success swaps in the new config for future sessions. Existing
-sessions keep their old config snapshot. Reload failure logs a warning
-and keeps the previous config serving.
-
-mtime polling only notices config files whose timestamp moves forward.
-If your deployment tool preserves or rewinds mtimes, send `SIGHUP` after
-placing the file.
-
-For careful deployments:
-
-```sh
-sudo cp -a /home/zift/zift.conf /home/zift/zift.conf.new
-sudo -e /home/zift/zift.conf.new
-sudo -u zift zift validate /home/zift/zift.conf.new
-sudo mv /home/zift/zift.conf.new /home/zift/zift.conf
-sudo systemctl kill -s HUP zift
-```
+Operator runbook (validate-then-HUP, mtime caveats, partner add/remove):
+[`operate.md`](operate.md).
 

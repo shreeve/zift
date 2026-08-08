@@ -181,7 +181,10 @@ fn warnWriteFailure(name: []const u8) void {
     writeStderrRaw("\n");
 }
 
-fn nowMonotonicMs() i64 {
+/// Monotonic-clock milliseconds. Shared by accept/reload, auth backoff,
+/// and SFTP idle timing — CLOCK_MONOTONIC is unaffected by wall-clock
+/// changes.
+pub fn nowMonotonicMs() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);

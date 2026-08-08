@@ -29,23 +29,24 @@ sudo apt-get install -y expect openssh-client python3-venv lsof
 ```text
 src/
 ├── main.zig              # CLI: serve, validate, hash-password, version
-├── verify.zig            # release-artifact dep-surface verifier (build helper)
-└── zift/
-    ├── session.zig       # libssh accept loop, auth, SFTP v3 handlers
-    ├── config.zig        # config parser, semantic validation, key-file loading
-    ├── policy.zig        # allow/deny engine and glob matching
-    ├── vfs.zig           # virtual path normalization and jail verification
-    ├── auth.zig          # password verify (wraps passhash)
-    ├── passhash.zig      # versioned password credential codec (a…)
-    ├── abuse.zig         # auth backoff + temporary source suppression
-    ├── netmatch.zig      # IP/CIDR matching for per-user `from`
-    ├── audit.zig         # JSON audit sink
-    ├── listing.zig       # virtual/reality directory listing renderer
-    ├── signals.zig       # signal flags, session fd registry, forced close
-    ├── tests.zig         # unit-test root
-    ├── fuzz.zig          # fuzz harnesses
-    └── ssh/
-        └── libssh_root.h
+├── server.zig            # accept loop, reload, session threads, bind
+├── ssh.zig               # SSH userauth (password / public key)
+├── sftp.zig              # SFTP v3 state and request handlers
+├── wire.zig              # SFTP packet codec
+├── config.zig            # config parser, semantic validation, key-file loading
+├── policy.zig            # allow/deny engine and glob matching
+├── vfs.zig               # virtual path normalization and jail verification
+├── auth.zig              # password verify (wraps passhash)
+├── passhash.zig          # versioned password credential codec (a…)
+├── abuse.zig             # auth backoff + temporary source suppression
+├── netmatch.zig          # IP/CIDR matching for per-user `from`
+├── audit.zig             # JSON audit sink (+ shared monotonic clock)
+├── listing.zig           # virtual/reality directory listing renderer
+├── signals.zig           # signal flags, session fd registry, forced close
+├── tests.zig             # unit-test root
+├── fuzz.zig              # fuzz harnesses
+└── ext/
+    └── libssh_root.h     # translate-c tip for @import("libssh")
 ```
 
 Other important paths:
@@ -53,6 +54,7 @@ Other important paths:
 ```text
 build.zig                           # build graph, vendored C dependency build
 build.zig.zon                       # pinned dependency graph
+tools/verify.zig                    # release-artifact dep-surface verifier
 packaging/systemd/zift.service      # optional systemd unit
 tests/run.sh                        # integration-test runner
 tests/cases/*.sh                    # integration cases
@@ -133,7 +135,7 @@ migrations.
 
 ## Fuzzing
 
-Fuzz harnesses live in `src/zift/fuzz.zig` and are imported into the
+Fuzz harnesses live in `src/fuzz.zig` and are imported into the
 test build.
 
 They cover:
@@ -265,8 +267,8 @@ Before tagging a release:
 Example:
 
 ```sh
-git tag -a v0.7.2 -m "Zift 0.7.2"
-git push origin v0.7.2
+git tag -a v0.8.0 -m "Zift 0.8.0"
+git push origin v0.8.0
 ```
 
 ## Coding Principles
