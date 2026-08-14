@@ -467,20 +467,26 @@ const ActiveConfig = struct {
         known_mtime: *std.Io.Timestamp,
     ) !void {
         const stderr = std.Io.File.stderr();
-        // Advance `known_mtime` to the file's current mtime up front, so
-        // a config that keeps failing to parse (a saved typo) is not
-        // re-read, re-parsed, and re-logged every `reload-interval`
-        // forever. The next genuine edit moves mtime forward again and
-        // triggers a fresh attempt. SIGHUP always retries regardless.
-        known_mtime.* = mtime;
 
         const contents = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1 << 20)) catch |err| {
+            // A *read* failure may be transient (EMFILE/EACCES/transient
+            // I/O). Do NOT advance `known_mtime` here: a later `chmod
+            // 000`->`644` (which does not bump mtime) or easing fd
+            // pressure must be retried on the next `reload-interval`.
             try stderr.writeStreamingAll(self.io, "zift: config reload read failed: ");
             try stderr.writeStreamingAll(self.io, @errorName(err));
             try stderr.writeStreamingAll(self.io, "\n");
             return;
         };
         defer self.allocator.free(contents);
+
+        // The read succeeded, so from here on advance `known_mtime` to the
+        // file's current mtime: a config that keeps failing to *parse* (a
+        // saved typo) must not be re-read, re-parsed, and re-logged every
+        // `reload-interval` forever. The next genuine edit moves mtime
+        // forward again and triggers a fresh attempt. SIGHUP always
+        // retries regardless.
+        known_mtime.* = mtime;
 
         var diag: config.ParseDiag = .{};
         var next_config = config.parseWithDiag(self.allocator, contents, &diag) catch |err| {

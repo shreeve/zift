@@ -1122,13 +1122,18 @@ const SftpState = struct {
                     // or a different handle (swapRemove relocated
                     // a sibling slot into this index). v0.5.0
                     // shipped this UAF; v0.5.1 fixes it. Buffer
-                    // sized to the path validator's 4096-byte
-                    // ceiling. Hard-asserting `tv.len` is within
-                    // bounds (rather than silently truncating) so
-                    // a path-validator regression that let a longer
-                    // path through can't make two attacker-
-                    // controlled prefixes collide in the audit log.
-                    var audit_target_buf: [vfs_mod.max_virtual_path_bytes]u8 = undefined;
+                    // sized to the normalizer's output ceiling. The
+                    // stored target is the *normalized* virtual path,
+                    // and normalizeVirtualInto can emit one byte more
+                    // than its input (a bare `a` gains a leading `/`),
+                    // so the bound is max_virtual_path_bytes + 1, not
+                    // the raw validator's 4096. Hard-asserting `tv.len`
+                    // is within bounds (rather than silently
+                    // truncating) so a path-validator regression that
+                    // let a longer path through can't make two
+                    // attacker-controlled prefixes collide in the
+                    // audit log.
+                    var audit_target_buf: [vfs_mod.max_virtual_path_bytes + 1]u8 = undefined;
                     const audit_target = blk: {
                         const tv = handle.staging_target_vpath.?;
                         std.debug.assert(tv.len <= audit_target_buf.len);
