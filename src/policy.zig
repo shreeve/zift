@@ -136,7 +136,7 @@ fn permissionFor(operation: Operation) config.Permission {
         .open_write => .write,
         .readdir => .list,
         .mkdir => .mkdir,
-        .remove, .rmdir => .remove,
+        .remove, .rmdir => .delete,
         .update => .update,
         .rename => .rename,
     };

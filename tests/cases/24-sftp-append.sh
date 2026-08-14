@@ -37,12 +37,12 @@ user user1
   auth $hash
   root $TEST_TMP/jail
   allow / read list
-  # write+remove: append-on-existing is "clobber" under v0.4.0 (any
-  # OPEN(write) of an existing file requires `remove`). This test
-  # exercises append semantics, not clobber authorization, so grant
-  # both. A real partner workflow would use `add remove` (or `full`)
-  # for the same effect.
-  allow /inbox read write list remove
+  # write+update: append-on-existing is "clobber" (any OPEN(write)
+  # of an existing file requires `update`); `delete` rounds out the
+  # old `remove` grant. This test exercises append semantics, not
+  # clobber authorization, so grant them. A real partner workflow
+  # would use `write update` (or `full`) for the same effect.
+  allow /inbox read write list delete update
 EOF
 
 start_zift

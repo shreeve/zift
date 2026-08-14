@@ -11,7 +11,7 @@
 #     preserved so subdirectories inherit `group=...`).
 #  3. Wire-facing error messages are scrubbed of zift-internal
 #     vocabulary. A clobber denial says "permission denied", not
-#     "would clobber an existing entry; partner lacks remove".
+#     "would clobber an existing entry; partner lacks update".
 #
 # Covers:  src/config.zig parsePublishMode + parseMkdirMode;
 #          src/sftp.zig publish_mode/mkdir_mode threading through
@@ -45,8 +45,8 @@ server
 user partner
   auth $hash
   root $TEST_TMP/data
-  # add-only — no remove. So clobber attempts return permission denied.
-  allow / read add
+  # create-new + mkdir, no update. So clobber attempts return permission denied.
+  allow / read write mkdir
 EOF
 
 start_zift
@@ -95,7 +95,7 @@ except IOError as exc:
         "clobber", "publish", "partner",
         "staged", "staging",
         "zift", "target appeared",
-        "lacks remove",
+        "lacks update",
     ]
     leaked = [w for w in forbidden if w in msg]
     if leaked:

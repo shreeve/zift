@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Test: v0.4.0 unified clobber rule. An `add`-only partner cannot
-# destroy or modify an existing entry via OPEN(write). All four
+# Test: v0.4.0 unified clobber rule. A `write`-only (create-new) partner
+# cannot destroy or modify an existing entry via OPEN(write). All four
 # clobber attack vectors are blocked:
 #
 #   1. OPEN(write+CREAT+TRUNC) on existing path  (B3 in the threat model)
@@ -8,14 +8,14 @@
 #   3. OPEN(write+APPEND) on existing path  (B5)
 #   4. RENAME to an existing destination  (B2 — already guarded in v0.3.0)
 #
-# Granting `remove` in addition to `add` (or using `full`) restores
+# Granting `update` in addition to `write` (or using `full`) restores
 # all clobber capabilities — verifies the rule isn't a one-way trap.
 #
 # Covers:  PLAN §6.3 v0.4.0 clobber rule, src/sftp.zig handleOpen
 #          existing-file branch, src/sftp.zig handleRename
 #          v0.3.0 destination-existence probe.
 # Oracle:  SFTP_FXP_OPEN denied with PERMISSION_DENIED for each
-#          attack; granting `remove` makes them succeed.
+#          attack; granting `update` makes them succeed.
 
 source "$(dirname "$0")/../lib/common.sh"
 
@@ -46,9 +46,10 @@ server
 user dropper
   auth $hash
   root $TEST_TMP/data
-  # add only — partner can drop NEW files but should not be able
-  # to overwrite, modify in place, or append to existing files.
-  allow / read list add
+  # write only (create-new) — partner can drop NEW files but should
+  # not be able to overwrite, modify in place, or append to existing
+  # files.
+  allow / read list write
 EOF
 
 start_zift
@@ -125,7 +126,7 @@ sftp.putfo(__import__("io").BytesIO(b"new file from partner"), "/new-upload.csv"
 print("ok: creating new files (no existing target) is permitted")
 
 # --- Cleanup the new file before testing remove path -------------------
-# The partner has add but no remove, so they can't even clean up their
+# The partner has write but no delete, so they can't even clean up their
 # own new uploads. Operator does it for the next phase.
 sftp.close()
 t.close()
@@ -135,8 +136,8 @@ EOF
 # attack staging file so the next phase starts clean.
 rm -f "$TEST_TMP/data/new-upload.csv" "$TEST_TMP/data/attack.csv"
 
-# --- Phase 2: with `remove` granted, all clobber paths work ------------
-# Restart with a config that grants `add remove` (= full mutate). All
+# --- Phase 2: with `update` granted, all clobber paths work ------------
+# Restart with a config that grants `full` (= full mutate). All
 # the previously-denied attacks now succeed — confirms the clobber rule
 # isn't a one-way trap.
 stop_zift TERM
@@ -155,7 +156,8 @@ server
 user mutator
   auth $hash
   root $TEST_TMP/data
-  # full = read + add + remove. All clobber paths now permitted.
+  # full = read + list + write + update + delete + mkdir + rename.
+  # All clobber paths now permitted (update enables overwrite/append).
   allow / full
 EOF
 

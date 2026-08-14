@@ -65,7 +65,7 @@ user partner
 EOF
 
 # --- 1. Pre-existing namespace dir as a SYMLINK is rejected -----------
-# Simulates a v0.4.0-then-upgrade scenario where the partner's `add`
+# Simulates a v0.4.0-then-upgrade scenario where the partner's `write`
 # permission planted a symlink with this name before v0.8.0 reserved
 # `.zift` as a path component. v0.8.0's openOrCreateNamespaceDir
 # lstat-verifies the entry.

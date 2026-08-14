@@ -48,7 +48,7 @@ Pick the binary for your host from a GitHub release.
 
 ```sh
 # Linux x86_64
-ZIFT_VERSION=0.9.0
+ZIFT_VERSION=0.10.0
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-x86_64-linux"
 chmod +x "zift-${ZIFT_VERSION}-x86_64-linux"
 sudo install -m 0755 "zift-${ZIFT_VERSION}-x86_64-linux" /usr/local/bin/zift
@@ -132,7 +132,7 @@ user foo
   from 127.0.0.1
   auth a…
   allow / read
-  allow /pending create read update delete
+  allow /pending write read update delete
   allow /archive read
   deny **.exe
   deny **/.ssh/**
@@ -168,7 +168,7 @@ There are exactly two kinds of rule:
 
 **`deny` always wins.** Order does not matter, and neither does
 specificity: the first matching `deny` ends the decision, so a broad
-`deny **.exe` overrides a narrow `allow /incoming create`. Use `allow` to
+`deny **.exe` overrides a narrow `allow /incoming write`. Use `allow` to
 describe the shape of the job and `deny` to carve out what must never
 happen regardless.
 
@@ -176,37 +176,36 @@ Four verbs cover almost every policy:
 
 | Verb | Grants |
 | --- | --- |
-| `create` | bring a **new** file or directory into existence |
 | `read` | stat, list, and download |
+| `write` | bring a **new** file into existence |
 | `update` | replace, truncate, or append to an entry that **already exists** |
 | `delete` | remove an entry |
 
-`full` is shorthand for `create read update delete rename`.
+`full` is shorthand for `read list write update delete mkdir rename`.
 
-Four granular verbs exist for narrower policies. Reach for them only
+Three granular verbs exist for narrower policies. Reach for them only
 when the four above cannot say what you mean:
 
 | Verb | Grants |
 | --- | --- |
 | `list` | stat and listing, without download |
-| `write` | file upload only — no mkdir, no rename |
 | `mkdir` | directory creation only |
 | `rename` | rename only, checked on both source and destination |
 
 `rename` is not one of the everyday verbs because it is not one
 operation: it destroys a name and creates another. Granting it means
-granting both halves, which is why `create` alone never implies it — a
-create-only partner could otherwise hide a file by renaming it.
+granting both halves, which is why `write` alone never implies it — a
+write-only partner could otherwise hide a file by renaming it.
 
-### `create` is not `update`
+### `write` is not `update`
 
-`create` brings a **new** name into existence. Replacing something that
+`write` brings a **new** name into existence. Replacing something that
 already exists is `update`. That includes overwriting, truncating,
 appending, and renaming over an existing file.
 
 ```zift
-allow /pending read create          # upload new files; cannot touch existing ones
-allow /pending read create update   # ...and may replace their own files
+allow /pending read write           # upload new files; cannot touch existing ones
+allow /pending read write update    # ...and may replace their own files
 allow /pending full                 # ...and may delete them too
 ```
 
@@ -215,9 +214,10 @@ expressible: a partner who re-sends `daily.csv` every morning needs
 `update`, and should almost never need `delete`.
 
 Before v0.9.2 these were one verb (`remove`), so overwriting required
-granting deletion. `add` and `remove` still parse as exact aliases for
-the old behaviour — `add` = `create`, `remove` = `delete update` — so
-existing configs are unchanged. New configs should say what they mean.
+granting deletion. The `add`, `create`, and `remove` verbs were retired
+in 0.10.0 and are now rejected outright — configs that used them must
+migrate to the CRUD verbs (`add` and `create` become `write`; `remove`
+becomes `delete`). New configs should say what they mean.
 
 ### Patterns
 
@@ -240,19 +240,19 @@ Prefer explicit patterns over clever ones.
 
 ```zift
 # blind drop: send files, cannot see or retrieve anything
-allow /incoming create
+allow /incoming write
 
 # drop zone: browse, upload new files, never modify or delete
 allow / read
-allow /incoming create
+allow /incoming write
 
 # recurring feed: may replace their own file, may never delete
 allow / read
-allow /feed create update
+allow /feed write update
 
 # drop zone they can fully manage
 allow / read
-allow /incoming create update delete
+allow /incoming write update delete
 
 # pickup: download and clean up after collection
 allow / read
@@ -263,7 +263,7 @@ allow / read
 
 # two-way exchange
 allow / read
-allow /incoming create
+allow /incoming write
 allow /outgoing read delete
 
 # mutable workspace
@@ -292,7 +292,7 @@ user ally
   from 198.51.100.0/28
   auth a…
   allow / read
-  allow /incoming create
+  allow /incoming write
 ```
 
 Each line is one IPv4/IPv6 address or CIDR. With any `from` present, a

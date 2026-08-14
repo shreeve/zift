@@ -81,12 +81,13 @@ This is the central policy invariant:
 user ally
   auth a…
   from 203.0.113.40
-  allow /pending read add
+  allow /pending read write
   deny **.exe
 ```
 
 The user may create new non-`.exe` files under `/pending`, but may not
-delete or overwrite existing files because `remove` was not granted.
+delete or overwrite existing files because neither `delete` nor `update`
+was granted.
 
 ## Path Validation
 
@@ -209,10 +210,10 @@ shapes stay less distinguishable.
 
 ## Permission Safety
 
-Authorization verbs and the clobber rule (`add` creates; modifying or
-replacing an existing entry also needs `remove`) are defined in
+Authorization verbs and the clobber rule (`write` creates; modifying or
+replacing an existing entry also needs `update`) are defined in
 [`configure.md`](configure.md). The security-relevant invariant is the
-same: `add` alone is not destructive write access.
+same: `write` alone is not destructive write access.
 
 ## Atomic Uploads
 

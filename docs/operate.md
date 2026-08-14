@@ -30,7 +30,7 @@ paths in its config.
 Download the binary for your host:
 
 ```sh
-ZIFT_VERSION=0.9.0
+ZIFT_VERSION=0.10.0
 ARCH=$(uname -m)
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-${ARCH}-linux"
@@ -54,7 +54,7 @@ Production installs should verify both the signed checksum manifest and
 the binary hash.
 
 ```sh
-ZIFT_VERSION=0.9.0
+ZIFT_VERSION=0.10.0
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS"
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS.bundle"
@@ -188,7 +188,7 @@ user ally
   from 203.0.113.40
   auth /home/zift/keys/ally.pub
   allow / read
-  allow /pending read add remove
+  allow /pending full
   allow /archive read
   deny **.exe
   deny **/.ssh/**

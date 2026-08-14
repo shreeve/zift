@@ -31,7 +31,7 @@ user user1
   auth $hash
   root $TEST_TMP/jail
   allow / read list
-  allow /inbox read write list mkdir remove rename
+  allow /inbox read write list mkdir delete update rename
 EOF
 
 start_zift

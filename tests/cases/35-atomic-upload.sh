@@ -39,7 +39,7 @@ user partner
   auth $hash
   root $TEST_TMP/data
   allow / read
-  allow /pending read add
+  allow /pending read write
 EOF
 
 start_zift
@@ -162,8 +162,8 @@ if os.path.isdir(staging_dir):
 print("ok: disconnect mid-upload cleaned up staging file (no orphan)")
 
 # --- 4. CLOBBER PROTECTION AT CLOSE: target appearing during upload ---
-# Even without partner-supplied EXCL, an add-only partner cannot
-# clobber an existing target. Open a staged upload, race a second
+# Even without partner-supplied EXCL, a write-only (create-new) partner
+# cannot clobber an existing target. Open a staged upload, race a second
 # entity (we use direct disk write here, simulating a second SFTP
 # session or operator process) creating the target, then send CLOSE.
 # The publish-step re-checks the clobber rule and refuses to
@@ -181,7 +181,7 @@ f4 = sftp4.file("/pending/race-test.bin", "wb")
 f4.write(b"FROM-PARTNER")
 with open("$TEST_TMP/data/pending/race-test.bin", "wb") as comp:
     comp.write(b"FROM-RACER")
-f4.close()  # publish step: lstat finds racer's file, no remove perm, denied
+f4.close()  # publish step: lstat finds racer's file, no update perm, denied
 sftp4.close()
 t4.close()
 # Give the server a moment to finalize cleanup.

@@ -82,8 +82,8 @@ Prefer OpenSSH if:
 
 Zift becomes interesting when that setup stops being simple. Zift users
 are virtual. A partner is a block in `zift.conf`, not an entry in
-`/etc/passwd`. Policy is expressed in SFTP terms such as `read`, `add`,
-and `remove`, scoped to virtual paths. Reloading the config affects new
+`/etc/passwd`. Policy is expressed in SFTP terms such as `read`, `write`,
+`update`, and `delete`, scoped to virtual paths. Reloading the config affects new
 sessions without restarting `sshd` or changing OS account state.
 
 ## Why Not SFTPGo Or MFT?
@@ -124,8 +124,8 @@ Zift provides:
 - Optional `partner-root` shorthand for `/home/zift/<user>` style
   layouts.
 - Path-scoped allow/deny rules.
-- A small permission vocabulary: `read`, `add`, `remove`, `full`, plus
-  granular `list`, `write`, `mkdir`, and `rename`.
+- A small permission vocabulary: `read`, `write`, `update`, `delete`,
+  `full`, plus granular `list`, `mkdir`, and `rename`.
 - Default-deny authorization.
 - Structured JSON audit logs.
 - Hot config reload for new sessions.

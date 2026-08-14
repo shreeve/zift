@@ -30,7 +30,7 @@ user ally
   auth a…
   auth /home/zift/keys/ally.pub
   allow / read
-  allow /pending read add remove
+  allow /pending full
   allow /archive read
   deny **.exe
   deny **/.ssh/**
@@ -373,7 +373,7 @@ Grants permissions on matching virtual paths:
 
 ```zift
 allow / read
-allow /pending read add remove
+allow /pending full
 allow /archive read
 ```
 
@@ -393,66 +393,63 @@ deny **/.ssh/**
 
 ## Permission Model
 
-Zift has three primary verbs:
+Zift's everyday vocabulary is CRUD plus one bundle:
 
 | Verb | Grants |
 | --- | --- |
-| `create` | create new files and create directories |
-| `read` | stat, list, and download |
-| `update` | replace, truncate, or append to an entry that already exists |
+| `read` | download **and** list (stat, directory listing, download) |
+| `write` | create a **new** file (no overwrite, no directory creation) |
+| `update` | overwrite, truncate, or append to a file that **already exists** |
 | `delete` | delete files and directories |
+| `full` | everything: read, write, update, delete, plus `mkdir` and `rename` |
 
-Before v0.9.2, `create` was spelled `add`, and `update` and `delete`
-were a single verb `remove`. Both old spellings still parse as exact
-aliases (`add` = `create`, `remove` = `delete update`), so existing
-configs behave identically.
+Those five cover almost every real policy. `read` and `full` are the two
+you reach for most; `write` / `update` / `delete` are the individual CRUD
+letters for finer control. `full` is exactly `read write update delete
+mkdir rename`.
 
-`add` grants only non-destructive creation. It does **not** grant
-`rename`: a rename removes the source name, so bundling it into `add`
-would let an `add`-only partner destroy or hide an existing file. Grant
-renames explicitly with the granular `rename` verb (below) or with
-`full`.
-
-`full` is shorthand for `create read update delete rename`.
-
-There are also granular verbs for unusual policies:
+Three granular verbs exist for unusual policies:
 
 | Verb | Grants |
 | --- | --- |
-| `list` | stat and directory listing without download |
-| `write` | file upload/open-for-write without mkdir or rename |
+| `list` | directory listing without download (the rare inverse of `read`) |
 | `mkdir` | directory creation only |
 | `rename` | rename only, checked on both source and destination |
 
+There are no aliases and no legacy spellings — every verb names exactly
+one capability, or (for `read` and `full`) one obvious bundle. In
+particular, `write` never silently grants directory creation: say
+`mkdir` or `full` when you want that.
+
 ### The Clobber Rule
 
-`add` is intentionally not the same as destructive write access.
+`write` creates; `update` modifies. They are deliberately separate.
 
-Any operation that modifies or replaces an existing entry requires
-`remove` on that path in addition to the verb that authorizes the
-operation itself.
-
-With:
-
-```zift
-allow /pending read add
-```
-
-a partner can create new files under `/pending`, but cannot:
-
-- overwrite an existing file
-- truncate an existing file
-- append to an existing file
-- rename over an existing file
-- delete anything
+Creating a **new** file needs `write`. Overwriting, truncating, or
+appending to a file that **already exists** additionally needs `update`
+— the "clobber" right. Splitting them lets you express two opposite
+intents a single write verb cannot.
 
 With:
 
 ```zift
-allow /pending read add remove
+allow /pending read write
 ```
 
-the partner has full mutate authority under `/pending`.
+a partner can create new files under `/pending`, but cannot overwrite,
+truncate, append to, rename over, or delete an existing one — an
+append-only submit box (a claim, once dropped, cannot be quietly
+retracted).
+
+With:
+
+```zift
+allow /pending read write update
+```
+
+the partner can also replace their own files (the daily-resend case),
+but still cannot delete. Add `delete` for that, or use `full` for
+complete control of the subtree.
 
 ## Pattern Matching
 
@@ -500,14 +497,15 @@ Drop zone: partner can upload new files but not overwrite or delete.
 
 ```zift
 allow / read
-allow /incoming add
+allow /incoming write
 ```
 
-Pickup directory: partner can download and delete after pickup.
+Pickup directory: partner can download and delete after pickup, but not
+overwrite in place.
 
 ```zift
 allow / read
-allow /reports read remove
+allow /reports read delete
 ```
 
 Archive: partner can browse and download only.

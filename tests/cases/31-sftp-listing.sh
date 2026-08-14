@@ -27,7 +27,7 @@ mkdir -p "$TEST_TMP/data/pending" "$TEST_TMP/data/archive"
 echo "hello world" > "$TEST_TMP/data/notes.txt"
 dd if=/dev/zero of="$TEST_TMP/data/large.bin" bs=1024 count=42 2>/dev/null
 
-# Use the new `add` verb on /pending (full r/w/list/add/remove).
+# Grant full mutate on /pending (r/list/write/delete/update).
 # /archive stays read-only. Top-level files are visible via `allow /
 # read list`.
 write_config <<EOF
@@ -40,7 +40,7 @@ user runner
   auth $hash
   root $TEST_TMP/data
   allow / read list
-  allow /pending read list add remove
+  allow /pending read list write delete update
   allow /archive read list
 EOF
 
@@ -106,17 +106,17 @@ for name, a in attrs_by_name.items():
 print("ok: every entry shows world bits as '---'")
 
 # --- 5. policy-derived owner bits ---------------------------------------
-# /pending has add+remove → directory mode bits should be rwx for owner.
+# /pending has write+delete+update → directory mode bits should be rwx for owner.
 # /archive has only read+list → r-x.
 pending = attrs_by_name["pending"]
 pending_owner = pending.longname.split()[0][1:4]
-assert pending_owner == "rwx", f"/pending should show rwx (read+list+add+remove), got {pending_owner!r}"
-print(f"ok: /pending owner bits = rwx (allow read list add remove)")
+assert pending_owner == "rwx", f"/pending should show rwx (read+list+write+delete+update), got {pending_owner!r}"
+print(f"ok: /pending owner bits = rwx (allow read list write delete update)")
 
 archive = attrs_by_name["archive"]
 archive_owner = archive.longname.split()[0][1:4]
 assert archive_owner == "r-x", f"/archive should show r-x (read+list, no mutation), got {archive_owner!r}"
-print(f"ok: /archive owner bits = r-x (allow read list, no add/remove)")
+print(f"ok: /archive owner bits = r-x (allow read list, no mutation verbs)")
 
 # Top-level file: alice has `allow / read list` only. So a file at /
 # should show r-- (read but no write/remove).

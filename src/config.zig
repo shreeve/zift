@@ -28,15 +28,15 @@ pub const Permission = enum {
     write,
     list,
     mkdir,
-    remove,
+    delete,
     rename,
-    // v0.9.2: `update` splits "may destroy an existing entry" into its
-    // two distinct intents. Before this, `remove` meant BOTH "delete an
-    // entry" and "may overwrite an existing one", which made a common
+    // `update` splits "may destroy an existing entry" into its two
+    // distinct intents. Without it, one verb would mean BOTH "delete an
+    // entry" and "overwrite an existing one" — which makes a common
     // policy unwritable: a partner who re-sends `daily.csv` every
-    // morning needed `remove`, and thereby also gained the right to
-    // delete everything in the directory. `update` now gates the
-    // clobber rule; `remove` gates only deletion.
+    // morning must replace it, and would thereby also gain the right to
+    // delete everything in the directory. `update` gates the clobber
+    // rule; `delete` gates only removal.
     update,
 };
 
@@ -1073,66 +1073,32 @@ fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []con
     var saw_permission = false;
     while (parts.next()) |token| {
         if (std.mem.eql(u8, token, "read")) {
-            // v0.4.0 simplification: `read` is now a superset of
-            // `list`. The asymmetry it replaced was confusing —
-            // `allow X read` without `list` meant "can download
-            // known names but can't `ls`," which is a
-            // security-through-obscurity-coded pattern that real
-            // partner workflows almost never want. So the
-            // recommended `read` verb now grants both
-            // SSH_FXP_OPEN(read)/STAT/LSTAT AND OPENDIR/READDIR
-            // — what most operators meant when they wrote `read`
-            // anyway. The narrower `list` verb still exists
-            // (advanced/legacy use case: enumeration without
-            // download) but is no longer needed in everyday configs.
+            // `read` grants both download and directory listing. There is
+            // deliberately no download-without-listing verb — that
+            // asymmetry ("can `get` a known name but can't `ls`") is a
+            // security-through-obscurity footgun real partner workflows
+            // never want. The narrow `list` verb (browse without
+            // download) still exists for the rare inverse case.
             permissions.insert(.read);
             permissions.insert(.list);
-        } else if (std.mem.eql(u8, token, "create") or std.mem.eql(u8, token, "add")) {
-            // `create` grants the non-destructive create operations:
-            // file upload and directory creation. It intentionally does
-            // NOT grant `rename`.
-            //
-            // A rename removes the source name — so if `create` implied
-            // `rename`, a create-only partner could destroy or hide an
-            // operator's existing file by renaming it (the clobber rule
-            // only protects the DESTINATION, never the source). That
-            // directly contradicts the documented guarantee that
-            // `read create` "cannot delete anything." Operators who want
-            // rename grant it explicitly via the granular `rename`
-            // verb or via `full`.
-            //
-            // `add` is the pre-0.9.2 spelling, kept as an exact alias so
-            // existing configs keep working unchanged.
-            permissions.insert(.write);
-            permissions.insert(.mkdir);
-        } else if (std.mem.eql(u8, token, "delete")) {
-            // Deletion ONLY. This is the half of the old `remove` verb
-            // that actually destroys entries; it does not confer the
-            // right to overwrite (see `update`).
-            permissions.insert(.remove);
-        } else if (std.mem.eql(u8, token, "remove")) {
-            // Legacy spelling, kept as an exact behavioural alias for
-            // what `remove` meant before 0.9.2: delete AND clobber.
-            // Splitting it without this alias would silently narrow
-            // every existing config. New configs should say `delete`,
-            // `update`, or both — whichever they actually mean.
-            permissions.insert(.remove);
-            permissions.insert(.update);
         } else if (std.mem.eql(u8, token, "full")) {
-            // `full` = create + read + update + delete (+ rename).
-            // Collapses the everyday verbs to a single word for
-            // operators who want partners to have complete access to a
-            // directory subtree. NOT a default — operators must opt in
-            // explicitly per path; the deny-by-default floor is
-            // unchanged.
+            // `full` = the complete CRUD set plus directory structure:
+            // read + list + write (create) + update (overwrite) +
+            // delete + mkdir + rename. Opt-in per path; the
+            // deny-by-default floor is unchanged.
             permissions.insert(.read);
             permissions.insert(.list);
             permissions.insert(.write);
+            permissions.insert(.update);
+            permissions.insert(.delete);
             permissions.insert(.mkdir);
             permissions.insert(.rename);
-            permissions.insert(.remove);
-            permissions.insert(.update);
         } else {
+            // Every other verb is a single granular capability whose
+            // token matches its name: write (create a new file), update
+            // (overwrite an existing one), delete, list, mkdir, rename.
+            // `read` and `full` above are the only multi-capability
+            // words — there are no aliases.
             permissions.insert(parsePermission(token) orelse return error.InvalidPermission);
         }
         saw_permission = true;
@@ -1306,7 +1272,7 @@ test "parse valid config" {
         \\user ally
         \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/ally
-        \\  allow /pending read write list mkdir remove rename
+        \\  allow /pending read write list mkdir delete rename update
         \\  allow /archive read list
         \\  deny *
         \\
@@ -1324,7 +1290,7 @@ test "parse valid config" {
     try std.testing.expect(ally.rules[0].permissions.contains(.write));
 }
 
-test "parse: 'add' verb expands to write+mkdir (NOT rename)" {
+test "parse: 'write' is create-only — no mkdir, update, delete, or rename" {
     const text =
         \\server
         \\  listen 127.0.0.1:2222
@@ -1334,7 +1300,7 @@ test "parse: 'add' verb expands to write+mkdir (NOT rename)" {
         \\user alice
         \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/alice
-        \\  allow /pending read list add remove
+        \\  allow /pending read write
         \\
     ;
     var cfg = try parse(std.testing.allocator, text);
@@ -1344,17 +1310,17 @@ test "parse: 'add' verb expands to write+mkdir (NOT rename)" {
     try std.testing.expectEqual(@as(usize, 1), alice.rules.len);
     const rule = alice.rules[0];
     try std.testing.expectEqualStrings("/pending", rule.pattern);
-    // `add` unfolds to {write, mkdir} only. It intentionally does NOT
-    // grant `rename`: a rename removes the source name, so bundling it
-    // into `add` would let an `add`-only partner destroy an existing
-    // file, contradicting the "read add cannot delete anything"
-    // guarantee. `rename` is only reachable via the granular `rename`
-    // verb or via `full`.
+    // `write` grants ONLY new-file creation. It does not silently bundle
+    // directory creation (that's `mkdir`/`full`), overwrite of an
+    // existing file (that's `update` — the clobber rule), deletion, or
+    // rename. This is the append-only drop-box the retired `add` verb
+    // could not express cleanly, because `add` always bundled `mkdir`.
     try std.testing.expect(rule.permissions.contains(.read));
     try std.testing.expect(rule.permissions.contains(.list));
     try std.testing.expect(rule.permissions.contains(.write));
-    try std.testing.expect(rule.permissions.contains(.mkdir));
-    try std.testing.expect(rule.permissions.contains(.remove));
+    try std.testing.expect(!rule.permissions.contains(.mkdir));
+    try std.testing.expect(!rule.permissions.contains(.update));
+    try std.testing.expect(!rule.permissions.contains(.delete));
     try std.testing.expect(!rule.permissions.contains(.rename));
 }
 
@@ -1406,10 +1372,10 @@ test "parse: legitimate listen forms still accepted (v0.9.4)" {
     }
 }
 
-test "parse: 'update' grants clobber without granting deletion (v0.9.2)" {
-    // The policy that was unwritable before the split: a partner who
-    // re-sends the same filename on a schedule may replace their own
-    // file, and may never delete anything.
+test "parse: 'update' grants clobber without granting deletion" {
+    // The policy that was unwritable before the create/update/delete
+    // split: a partner who re-sends the same filename on a schedule may
+    // replace their own file, and may never delete anything.
     const text =
         \\server
         \\  listen 127.0.0.1:2222
@@ -1419,7 +1385,7 @@ test "parse: 'update' grants clobber without granting deletion (v0.9.2)" {
         \\user feeder
         \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/feeder
-        \\  allow /feed read create update
+        \\  allow /feed read write update
         \\
     ;
     var cfg = try parse(std.testing.allocator, text);
@@ -1428,14 +1394,15 @@ test "parse: 'update' grants clobber without granting deletion (v0.9.2)" {
     const rule = cfg.findUser("feeder").?.rules[0];
     try std.testing.expect(rule.permissions.contains(.read));
     try std.testing.expect(rule.permissions.contains(.write));
-    try std.testing.expect(rule.permissions.contains(.mkdir));
     try std.testing.expect(rule.permissions.contains(.update));
-    // The whole point: no deletion, and no rename (which deletes a name).
-    try std.testing.expect(!rule.permissions.contains(.remove));
+    // The whole point: create + overwrite, but no deletion, no rename
+    // (which destroys a name), and no directory creation.
+    try std.testing.expect(!rule.permissions.contains(.delete));
     try std.testing.expect(!rule.permissions.contains(.rename));
+    try std.testing.expect(!rule.permissions.contains(.mkdir));
 }
 
-test "parse: 'delete' grants deletion without granting clobber (v0.9.2)" {
+test "parse: 'delete' grants deletion without granting clobber" {
     const text =
         \\server
         \\  listen 127.0.0.1:2222
@@ -1452,52 +1419,34 @@ test "parse: 'delete' grants deletion without granting clobber (v0.9.2)" {
     defer cfg.deinit();
 
     const rule = cfg.findUser("picker").?.rules[0];
-    try std.testing.expect(rule.permissions.contains(.remove));
+    try std.testing.expect(rule.permissions.contains(.delete));
     try std.testing.expect(!rule.permissions.contains(.update));
     try std.testing.expect(!rule.permissions.contains(.write));
 }
 
-test "parse: legacy 'remove' still means delete AND clobber (v0.9.2 compat)" {
-    // Splitting the verb must not silently narrow existing configs.
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user legacy
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/legacy
-        \\  allow /pending read add remove
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-
-    const rule = cfg.findUser("legacy").?.rules[0];
-    try std.testing.expect(rule.permissions.contains(.remove));
-    try std.testing.expect(rule.permissions.contains(.update));
-}
-
-test "parse: 'create' is an exact alias for 'add' (v0.9.2)" {
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user a
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/a
-        \\  allow /x create
-        \\  allow /y add
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-
-    const u = cfg.findUser("a").?;
-    try std.testing.expect(u.rules[0].permissions.eql(u.rules[1].permissions));
+test "parse: retired verbs add/create/remove are rejected" {
+    // These were pre-CRUD aliases (`add`/`create` = write+mkdir,
+    // `remove` = delete+update). They were confusing — `add` silently
+    // bundled `mkdir`, and `remove` was a near-synonym of `delete` — so
+    // they were retired in favor of the CRUD verbs. There is no
+    // back-compat mode: a config using them is a hard error, never a
+    // silent reinterpretation.
+    for ([_][]const u8{ "add", "create", "remove" }) |verb| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf,
+            \\server
+            \\  listen 127.0.0.1:2222
+            \\  host-key /tmp/zift_host_ed25519
+            \\  log stderr
+            \\
+            \\user u
+            \\  auth a0000000000000000000000000000000
+            \\  root /tmp/zift/u
+            \\  allow /pending read {s}
+            \\
+        , .{verb});
+        try std.testing.expectError(error.InvalidPermission, parse(std.testing.allocator, text));
+    }
 }
 
 test "parse: 'full' includes update (v0.9.2)" {
@@ -1517,7 +1466,7 @@ test "parse: 'full' includes update (v0.9.2)" {
     defer cfg.deinit();
 
     const rule = cfg.findUser("w").?.rules[0];
-    inline for (.{ .read, .list, .write, .mkdir, .rename, .remove, .update }) |p| {
+    inline for (.{ .read, .list, .write, .mkdir, .rename, .delete, .update }) |p| {
         try std.testing.expect(rule.permissions.contains(p));
     }
 }
@@ -1550,7 +1499,7 @@ test "parse: 'read' is now a superset of 'list' (v0.4.0)" {
     try std.testing.expect(!rule.permissions.contains(.write));
     try std.testing.expect(!rule.permissions.contains(.mkdir));
     try std.testing.expect(!rule.permissions.contains(.rename));
-    try std.testing.expect(!rule.permissions.contains(.remove));
+    try std.testing.expect(!rule.permissions.contains(.delete));
 }
 
 test "parse: bare 'list' keeps its narrow v0.3.x meaning" {
@@ -1603,12 +1552,12 @@ test "parse: 'full' grants every permission" {
     try std.testing.expect(rule.permissions.contains(.write));
     try std.testing.expect(rule.permissions.contains(.mkdir));
     try std.testing.expect(rule.permissions.contains(.rename));
-    try std.testing.expect(rule.permissions.contains(.remove));
+    try std.testing.expect(rule.permissions.contains(.delete));
 }
 
-test "parse: 'add' alongside granular verbs is idempotent" {
-    // `add` + a granular verb that's already in `add`'s expansion should
-    // just OR cleanly — no error, no surprise.
+test "parse: a composite alongside its own granular verbs is idempotent" {
+    // `full` + granular verbs already inside `full`'s expansion should
+    // just OR cleanly — no error, no surprise, no double-counting.
     const text =
         \\server
         \\  listen 127.0.0.1:2222
@@ -1618,7 +1567,7 @@ test "parse: 'add' alongside granular verbs is idempotent" {
         \\user alice
         \\  auth a0000000000000000000000000000000
         \\  root /tmp/zift/alice
-        \\  allow /pending read list add write rename
+        \\  allow /pending full write rename mkdir
         \\
     ;
     var cfg = try parse(std.testing.allocator, text);

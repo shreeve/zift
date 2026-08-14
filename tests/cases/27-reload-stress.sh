@@ -40,7 +40,7 @@ server
 user runner
   auth $runner_hash
   root $TEST_TMP/data
-  allow / read write list mkdir remove rename
+  allow / read write list mkdir delete update rename
 EOF
 
 start_zift
@@ -77,7 +77,7 @@ server
 user runner
   auth $runner_hash
   root $TEST_TMP/data
-  allow / read write list mkdir remove rename
+  allow / read write list mkdir delete update rename
 
 user late
   auth $later_hash
