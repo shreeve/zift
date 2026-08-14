@@ -393,6 +393,13 @@ const ActiveConfig = struct {
     /// config file. Set on first failure (warning emitted), cleared
     /// when the file becomes readable again. PLAN §7.3.
     stat_warned: bool = false,
+    /// True while the on-disk config has been rejected and the daemon is
+    /// serving the PREVIOUS (in-memory) config instead — i.e. on-disk and
+    /// in-memory have diverged. Set at every reject site, cleared when a
+    /// good config finally loads (which announces recovery). Makes the
+    /// divergence a tracked state rather than a single log line that
+    /// scrolls past, so `is-active` staying green can't hide it.
+    reload_degraded: bool = false,
     /// The `listen`, `host-key`, and `log` values actually in force —
     /// bound once at startup and never re-applied on reload. Owned
     /// copies (the startup config's arena may be freed once its last
@@ -492,21 +499,19 @@ const ActiveConfig = struct {
         var next_config = config.parseWithDiag(self.allocator, contents, &diag) catch |err| {
             var msg_buf: [512]u8 = undefined;
             var w = std.Io.Writer.fixed(&msg_buf);
-            w.writeAll("zift: config reload rejected: ") catch {};
-            w.writeAll(path) catch {};
-            w.writeAll(": ") catch {};
             diag.format(err, &w) catch {};
-            w.writeAll("\n") catch {};
-            try stderr.writeStreamingAll(self.io, w.buffered());
+            self.noteReloadRejected(stderr, path, w.buffered());
             return;
         };
         errdefer next_config.deinit();
 
         // Cross-cutting semantic checks (PLAN.md §6.2). On failure, the
-        // running config keeps serving; diagnostics already on stderr.
+        // running config keeps serving; validateSemantic has already
+        // written the specific diagnostic (e.g. "host-key unreadable")
+        // to stderr, so the audit detail here is the generic reason.
         config.validateSemantic(self.io, self.allocator, &next_config) catch {
             next_config.deinit();
-            try stderr.writeStreamingAll(self.io, "zift: config reload rejected (kept previous)\n");
+            self.noteReloadRejected(stderr, path, "semantic validation failed (see preceding diagnostic)");
             return;
         };
 
@@ -529,7 +534,53 @@ const ActiveConfig = struct {
         self.mutex.unlock(self.io);
 
         old_ref.release(self.allocator);
+
+        // If we were serving a stale config because earlier edits were
+        // rejected, this successful load ends the divergence. Announce the
+        // recovery loudly and in the audit stream so the degraded window
+        // has a visible close, then clear the flag.
+        if (self.reload_degraded) {
+            self.reload_degraded = false;
+            try stderr.writeStreamingAll(self.io, "zift: config reload recovered — on-disk config valid again; now serving it\n");
+            audit.log(self.io, null, "config.reload", path, .ok, "recovered; on-disk config now serving", "");
+        }
+
         try stderr.writeStreamingAll(self.io, "zift: config reloaded (users/rules/timeouts applied to new sessions)\n");
+    }
+
+    /// Emit the loud, monitorable signal for a rejected reload and mark
+    /// the running config degraded (on-disk differs from what's served).
+    /// Called from every reject site. Keeps the `config reload rejected`
+    /// substring existing tooling/tests grep for, while making the
+    /// divergence explicit, and lands a structured `config.reload` event
+    /// in the JSON audit stream operators already pipe to jq. The daemon
+    /// stays degraded (see the applyReload success path) until a good
+    /// config loads, so a rejected reload can't quietly scroll past while
+    /// `systemctl is-active` still reports active.
+    fn noteReloadRejected(
+        self: *ActiveConfig,
+        stderr: std.Io.File,
+        path: []const u8,
+        detail: []const u8,
+    ) void {
+        self.reload_degraded = true;
+        stderr.writeStreamingAll(self.io, "zift: config reload rejected — SERVING PREVIOUS CONFIG; fix ") catch {};
+        stderr.writeStreamingAll(self.io, path) catch {};
+        stderr.writeStreamingAll(self.io, " and it will auto-apply") catch {};
+        if (detail.len != 0) {
+            stderr.writeStreamingAll(self.io, ": ") catch {};
+            stderr.writeStreamingAll(self.io, detail) catch {};
+        }
+        stderr.writeStreamingAll(self.io, "\n") catch {};
+        audit.log(
+            self.io,
+            null,
+            "config.reload",
+            path,
+            .failed,
+            if (detail.len != 0) detail else "rejected; serving previous config",
+            "",
+        );
     }
 
     fn warnRestartOnly(

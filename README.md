@@ -48,7 +48,7 @@ Pick the binary for your host from a GitHub release.
 
 ```sh
 # Linux x86_64
-ZIFT_VERSION=0.10.0
+ZIFT_VERSION=0.10.1
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-x86_64-linux"
 chmod +x "zift-${ZIFT_VERSION}-x86_64-linux"
 sudo install -m 0755 "zift-${ZIFT_VERSION}-x86_64-linux" /usr/local/bin/zift

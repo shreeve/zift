@@ -30,7 +30,7 @@ paths in its config.
 Download the binary for your host:
 
 ```sh
-ZIFT_VERSION=0.10.0
+ZIFT_VERSION=0.10.1
 ARCH=$(uname -m)
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-${ARCH}-linux"
@@ -54,7 +54,7 @@ Production installs should verify both the signed checksum manifest and
 the binary hash.
 
 ```sh
-ZIFT_VERSION=0.10.0
+ZIFT_VERSION=0.10.1
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS"
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS.bundle"
@@ -277,8 +277,15 @@ sudo systemctl restart zift
 Force config reload:
 
 ```sh
+sudo systemctl reload zift          # validates first, then SIGHUPs
+# or, low-level:
 sudo systemctl kill -s HUP zift
 ```
+
+Prefer `systemctl reload`: the unit runs `zift validate` on the on-disk
+config **before** signalling, so an invalid config makes the reload
+command **fail** (non-zero, shown in `systemctl status` and the journal)
+and the daemon is never HUPed. `systemctl kill -s HUP` skips that guard.
 
 Zift also watches the config mtime according to `reload-interval`.
 Reloads affect new sessions only. Existing sessions keep their current
@@ -287,6 +294,27 @@ config snapshot until disconnect.
 mtime polling only notices config files whose timestamp moves forward.
 If your deploy tool preserves or rewinds mtimes, send `SIGHUP` after the
 file is in place.
+
+### A rejected reload is loud (0.10.1)
+
+If the daemon rejects a reloaded config (parse error, or a semantic check
+like an unreadable host-key), it keeps serving the **previous** config —
+but it does not do so silently. It logs `config reload rejected — SERVING
+PREVIOUS CONFIG` and emits a `config.reload` audit event with
+`result:"failed"`; it stays in this degraded (on-disk ≠ in-memory) state
+until a valid config loads, then logs `config reload recovered` and emits
+a `config.reload` `result:"ok"` event. Watch for the failure event:
+
+```sh
+journalctl -u zift -o cat | grep '"operation":"config.reload"'
+```
+
+Because the process stays up, `systemctl is-active` still reports
+`active` while degraded. The definitive point-in-time probe is: **service
+active AND `zift validate` of the on-disk config fails ⇒ the daemon is
+serving stale rules a restart would fail to reload.** The host-zift
+runbook's `verify` checks exactly this ("on-disk config in sync with
+running daemon").
 
 ## Add A Partner
 
@@ -521,7 +549,7 @@ Common failures:
 | Symptom | Likely cause |
 | --- | --- |
 | startup fails | bad config, unreadable host key, missing root, port in use |
-| reload warning | edited config is invalid; previous config is still active |
+| `config reload rejected` / degraded | edited config is invalid; previous config is still serving. Fix the file (reload auto-recovers) or run `systemctl reload` to see the validation error |
 | auth denied | wrong credential, missing key file, unsupported key type |
 | upload fails at close | target collision, policy denial, cross-filesystem publish |
 | uploads fail after crash | orphaned files under `<root>/.zift/staging/` (or legacy `<root>/.zift-staging/` on pre-v0.8.0 installs); inspect and clear when no sessions are active |

@@ -10,9 +10,19 @@ User=zift
 Group=zift
 
 ExecStart=/usr/local/bin/zift serve /home/zift/zift.conf
-# Zift reloads its config on SIGHUP, so `systemctl reload zift` should
-# deliver one. Without ExecReload the verb fails outright and operators
-# fall back to `systemctl kill -s HUP`.
+
+# Reload validates BEFORE it signals. `systemctl reload zift` first runs
+# `zift validate` on the on-disk config; if that fails, the reload job
+# fails (non-zero — shown in `systemctl status` and the journal) and the
+# daemon is never HUPed. This is what makes a bad edit LOUD at the moment
+# you reload, instead of the daemon quietly rejecting the new config on
+# the next SIGHUP/mtime poll and continuing to serve the previous one.
+# Only on a clean validate does the second line deliver SIGHUP, which
+# tells the already-running daemon to re-read and swap in the new config.
+# (systemd runs multiple ExecReload lines in order and aborts on the
+# first non-zero exit.) The daemon still re-validates on its own reload,
+# so this is belt-and-suspenders, not the sole check.
+ExecReload=/usr/local/bin/zift validate /home/zift/zift.conf
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=on-failure

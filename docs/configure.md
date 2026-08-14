@@ -568,6 +568,19 @@ immediately on `SIGHUP`. Existing sessions keep the snapshot they
 authenticated with. Invalid reloads are rejected; the previous config
 keeps serving.
 
+A rejected reload is **loud**, not silent (0.10.1). The daemon marks
+itself degraded, logs `config reload rejected — SERVING PREVIOUS CONFIG`,
+and emits a structured `config.reload` audit event with `result:"failed"`
+into the audit stream — so a monitor watching the JSON log sees the
+divergence even though the process stays up and `systemctl is-active`
+still reports `active`. It stays degraded (on-disk and in-memory
+diverged) until a valid config loads, at which point it logs
+`config reload recovered` and emits a `config.reload` event with
+`result:"ok"`. The shipped systemd unit reinforces this on the manual
+path: `systemctl reload` runs `zift validate` first and **fails** if the
+on-disk config is invalid, so a bad edit is caught at reload time instead
+of on the next restart.
+
 `listen`, `host-key`, and `log` are bound once at startup and are
 **not** re-applied by a reload. If a reload changes one of them, Zift
 logs a warning naming the setting and keeps the value it started with —
