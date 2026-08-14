@@ -40,8 +40,26 @@ NoNewPrivileges=true
 LockPersonality=true
 RestrictNamespaces=true
 RestrictRealtime=true
-RestrictSUIDSGID=true
 RemoveIPC=true
+
+# RestrictSUIDSGID is deliberately NOT set, and must not be re-added.
+#
+# It blocks the setgid bit, and every value `mkdir-mode` accepts
+# (0o2700, 0o2750, 0o2770) carries setgid. With it enabled, MKDIR fails
+# for every partner under every policy -- the audit log shows
+# `"operation":"mkdir","result":"failed","detail":"createDir failed"`,
+# i.e. the policy check passed and the syscall was refused. Verified by
+# running the same mkdir as `zift` with and without the restriction.
+#
+# The setgid bit is load-bearing, not incidental: it is what keeps new
+# directories in group `zift` so host-side operators retain access
+# without re-chowning (see docs/operate.md, "Operator Access").
+#
+# What RestrictSUIDSGID would defend against -- this process creating a
+# setuid/setgid binary for later escalation -- is already covered:
+# NoNewPrivileges=true stops this process gaining privileges, and
+# NoExecPaths=/home/zift means nothing in the only writable tree can be
+# executed in the first place.
 
 # Filesystem visibility.
 # `PrivateDevices=true` exposes only /dev/null, /dev/zero, /dev/full,
