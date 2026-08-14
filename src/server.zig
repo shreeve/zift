@@ -122,7 +122,7 @@ pub fn run(
     try setBindOption(bind, c.SSH_BIND_OPTIONS_HOSTKEY, host_key.ptr);
 
     if (c.ssh_bind_listen(bind) != c.SSH_OK) {
-        try logLibsshError(io, "ssh_bind_listen", bind);
+        try logLibsshError(io, "ssh_bind_listen", bind, .note);
         return error.LibsshFailure;
     }
 
@@ -178,7 +178,7 @@ pub fn run(
         const session = c.ssh_new() orelse return error.LibsshFailure;
         const accept_rc = c.ssh_bind_accept(bind, session);
         if (accept_rc != c.SSH_OK) {
-            try logLibsshError(io, "ssh_bind_accept", bind);
+            try logLibsshError(io, "ssh_bind_accept", bind, .note);
             c.ssh_free(session);
             continue :accept_loop;
         }
@@ -244,7 +244,7 @@ pub fn run(
             ref.release(allocator);
             c.ssh_free(session);
             allocator.destroy(args);
-            try logLibsshError(io, @errorName(err), session);
+            try logLibsshError(io, @errorName(err), session, .note);
             continue :accept_loop;
         };
         thread.detach();
@@ -570,7 +570,7 @@ fn sessionThread(args: *SessionArgs) void {
     var registered = false;
     if (session_fd >= 0) {
         signals.registerSessionFd(io, allocator, session_fd) catch |err| {
-            logLibsshError(io, @errorName(err), ssh_session) catch {};
+            logLibsshError(io, @errorName(err), ssh_session, .note) catch {};
         };
         registered = true;
 
@@ -591,7 +591,7 @@ fn sessionThread(args: *SessionArgs) void {
         _ = active_sessions.fetchSub(1, .acq_rel);
     }
     handleSession(io, allocator, ref.config, ssh_session, &auth_completed) catch |err| {
-        logLibsshError(io, @errorName(err), ssh_session) catch {};
+        logLibsshError(io, @errorName(err), ssh_session, .skip) catch {};
     };
 }
 
@@ -747,16 +747,39 @@ fn setBindOption(bind: c.ssh_bind, option: c.enum_ssh_bind_options_e, value: [*:
     if (c.ssh_bind_options_set(bind, option, value) != c.SSH_OK) return error.LibsshFailure;
 }
 
-fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque) !void {
+/// What to do when libssh has no error text to contribute.
+const NoDetail = enum {
+    /// Log anyway, with a placeholder. For failures that are fatal or
+    /// otherwise have no audit record of their own -- the stderr line
+    /// is the only evidence they happened, so silence would lose them.
+    note,
+    /// Emit nothing at all. For per-session failures, which already
+    /// produce a structured audit record carrying operation, result,
+    /// and peer IP.
+    ///
+    /// This is not tidiness. An internet-facing port is probed
+    /// continuously; each scanner that opens a connection and walks
+    /// away mid-handshake produced `zift: LibsshFailure:` -- a line
+    /// whose entire informational content was "something failed",
+    /// which the audit record already said, with the IP attached.
+    /// libssh legitimately has no message for a peer that simply
+    /// disconnected, so the empty string is the normal case here, not
+    /// an anomaly. Logging it buried real failures in noise.
+    skip,
+};
+
+fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail: NoDetail) !void {
+    // A non-null pointer to an EMPTY string is the common case, so
+    // checking only for null (as this did) emitted a line that ended at
+    // the colon with nothing after it.
+    const raw = c.ssh_get_error(handle);
+    const detail: []const u8 = if (raw != null) std.mem.span(raw) else "";
+    if (detail.len == 0 and no_detail == .skip) return;
+
     const stderr = std.Io.File.stderr();
     try stderr.writeStreamingAll(io, "zift: ");
     try stderr.writeStreamingAll(io, where);
     try stderr.writeStreamingAll(io, ": ");
-    const err = c.ssh_get_error(handle);
-    if (err != null) {
-        try stderr.writeStreamingAll(io, std.mem.span(err));
-    } else {
-        try stderr.writeStreamingAll(io, "unknown libssh error");
-    }
+    try stderr.writeStreamingAll(io, if (detail.len > 0) detail else "no detail from libssh");
     try stderr.writeStreamingAll(io, "\n");
 }
