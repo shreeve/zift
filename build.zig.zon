@@ -1,6 +1,6 @@
 .{
     .name = .zift,
-    .version = "0.9.2",
+    .version = "0.9.3",
     .fingerprint = 0x60f164f8d47ab2f,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

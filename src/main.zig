@@ -136,6 +136,27 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     signals.install();
 
     const stderr = std.Io.File.stderr();
+
+    // Announce identity FIRST, before the config is even read.
+    //
+    // `zift version` reports the binary on disk, which is not
+    // necessarily the one this process is executing: installing an
+    // upgrade replaces the inode, and a daemon that is already running
+    // keeps serving the old code until it is restarted. This line is
+    // therefore the only durable record of what a given process
+    // actually was, and it timestamps every version transition in the
+    // journal for free.
+    //
+    // Emitted before readFileAlloc/parseWithDiag on purpose: a startup
+    // that dies on a bad config should still say which version died.
+    try stderr.writeStreamingAll(io, "zift: starting zift ");
+    try stderr.writeStreamingAll(io, build_options.version);
+    try stderr.writeStreamingAll(io, " (");
+    try stderr.writeStreamingAll(io, build_options.target);
+    try stderr.writeStreamingAll(io, " ");
+    try stderr.writeStreamingAll(io, build_options.optimize);
+    try stderr.writeStreamingAll(io, ")\n");
+
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 20));
     defer gpa.free(contents);
 
