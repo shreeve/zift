@@ -94,16 +94,19 @@ jobs:
           # succeeds without touching /etc and without colliding with
           # any stale artifact at a predictable /tmp path.
           #
-          # We also rewrite `ExecStart` to `/bin/true` for the verify
-          # copy. The verifier checks that the ExecStart path actually
-          # exists and is executable on the host running verify; on a
-          # CI runner where zift isn't installed the unit-file syntax
-          # is correct but the path check fails. We're verifying the
-          # SHIPPED unit's directive syntax (hardening, capabilities,
-          # etc.), not the deployment-specific binary path.
+          # We also rewrite every Exec* line that invokes the zift
+          # binary (ExecStart, and the validating ExecReload added in
+          # 0.10.1) to `/bin/true` for the verify copy. The verifier
+          # checks that each command path actually exists and is
+          # executable on the host running verify; on a CI runner where
+          # zift isn't installed the unit-file syntax is correct but the
+          # path check fails. We're verifying the SHIPPED unit's
+          # directive syntax (hardening, capabilities, etc.), not the
+          # deployment-specific binary path. The `ExecReload=/bin/kill`
+          # line points at a path that exists, so it is left as-is.
           tmpdir=$(mktemp -d)
           trap 'rm -rf "$tmpdir"' EXIT
-          sed 's|^ExecStart=.*|ExecStart=/bin/true|' packaging/systemd/zift.service > "$tmpdir/zift.service"
+          sed -E 's|^(Exec[A-Za-z]*=)/usr/local/bin/zift.*|\1/bin/true|' packaging/systemd/zift.service > "$tmpdir/zift.service"
 
           set +e
           out=$(systemd-analyze verify "$tmpdir/zift.service" 2>&1)
