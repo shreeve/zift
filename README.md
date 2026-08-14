@@ -132,7 +132,7 @@ user foo
   from 127.0.0.1
   auth a…
   allow / read
-  allow /pending read add remove
+  allow /pending create read update delete
   allow /archive read
   deny **.exe
   deny **/.ssh/**
@@ -154,6 +154,179 @@ sftp -P 2222 foo@127.0.0.1
 For production onboarding (service user, directory modes, reload),
 see [`docs/operate.md`](docs/operate.md). Full grammar is in
 [`docs/configure.md`](docs/configure.md).
+
+## Permissions
+
+Policy is default-deny and path-scoped. A partner with valid credentials
+and no `allow` lines can authenticate and do nothing.
+
+There are exactly two kinds of rule:
+
+- **`allow <pattern> <verbs…>`** grants verbs on matching virtual paths.
+- **`deny <pattern>`** refuses matching virtual paths outright. It takes
+  no verbs, because it removes everything.
+
+**`deny` always wins.** Order does not matter, and neither does
+specificity: the first matching `deny` ends the decision, so a broad
+`deny **.exe` overrides a narrow `allow /incoming create`. Use `allow` to
+describe the shape of the job and `deny` to carve out what must never
+happen regardless.
+
+Four verbs cover almost every policy:
+
+| Verb | Grants |
+| --- | --- |
+| `create` | bring a **new** file or directory into existence |
+| `read` | stat, list, and download |
+| `update` | replace, truncate, or append to an entry that **already exists** |
+| `delete` | remove an entry |
+
+`full` is shorthand for `create read update delete rename`.
+
+Four granular verbs exist for narrower policies. Reach for them only
+when the four above cannot say what you mean:
+
+| Verb | Grants |
+| --- | --- |
+| `list` | stat and listing, without download |
+| `write` | file upload only — no mkdir, no rename |
+| `mkdir` | directory creation only |
+| `rename` | rename only, checked on both source and destination |
+
+`rename` is not one of the everyday verbs because it is not one
+operation: it destroys a name and creates another. Granting it means
+granting both halves, which is why `create` alone never implies it — a
+create-only partner could otherwise hide a file by renaming it.
+
+### `create` is not `update`
+
+`create` brings a **new** name into existence. Replacing something that
+already exists is `update`. That includes overwriting, truncating,
+appending, and renaming over an existing file.
+
+```zift
+allow /pending read create          # upload new files; cannot touch existing ones
+allow /pending read create update   # ...and may replace their own files
+allow /pending full                 # ...and may delete them too
+```
+
+Keeping these separate is what makes the most common B2B feed
+expressible: a partner who re-sends `daily.csv` every morning needs
+`update`, and should almost never need `delete`.
+
+Before v0.9.2 these were one verb (`remove`), so overwriting required
+granting deletion. `add` and `remove` still parse as exact aliases for
+the old behaviour — `add` = `create`, `remove` = `delete update` — so
+existing configs are unchanged. New configs should say what they mean.
+
+### Patterns
+
+Patterns match virtual paths, never host paths.
+
+Literal patterns match whole path components, so `/pending` matches
+`/pending`, `/pending/file.csv`, and `/pending/deep/file.csv` — but not
+`/pendingfoo` or `/pending-archive`.
+
+| Pattern | Meaning |
+| --- | --- |
+| `*` | any sequence except `/` |
+| `?` | one character except `/` |
+| `**` | any sequence including `/` |
+
+`deny` always overrides `allow`, whatever the order or specificity.
+Prefer explicit patterns over clever ones.
+
+### Policies that cover most of the real cases
+
+```zift
+# blind drop: send files, cannot see or retrieve anything
+allow /incoming create
+
+# drop zone: browse, upload new files, never modify or delete
+allow / read
+allow /incoming create
+
+# recurring feed: may replace their own file, may never delete
+allow / read
+allow /feed create update
+
+# drop zone they can fully manage
+allow / read
+allow /incoming create update delete
+
+# pickup: download and clean up after collection
+allow / read
+allow /outgoing read delete
+
+# archive: browse and download, nothing else
+allow / read
+
+# two-way exchange
+allow / read
+allow /incoming create
+allow /outgoing read delete
+
+# mutable workspace
+allow /workspace full
+
+# reconcile a manifest without being able to fetch the contents
+allow / list
+```
+
+Add these to any policy — they cost nothing and close common mistakes:
+
+```zift
+deny **.exe
+deny **/.ssh/**
+deny **/.git/**
+```
+
+### Restrict the network too
+
+Path policy answers *what*. `from` answers *from where*, and it is
+checked before authentication is attempted:
+
+```zift
+user ally
+  from 203.0.113.40
+  from 198.51.100.0/28
+  auth a…
+  allow / read
+  allow /incoming create
+```
+
+Each line is one IPv4/IPv6 address or CIDR. With any `from` present, a
+peer that matches none of them cannot authenticate at all. If your
+partners have stable egress addresses, this is the cheapest hardening
+available: partner identity, partner network, and path policy in one
+reviewable block.
+
+### Two things that will cost you time
+
+**A partner's `root` must already exist.** If it does not, the whole
+config is rejected — not just that user. Zift keeps serving the previous
+config, so the partner you just added simply does not exist, and their
+client reports a generic `Permission denied` that looks exactly like a
+bad password. Create the directory first:
+
+```sh
+sudo install -d -o zift -g zift -m 2770 /home/zift/ally
+```
+
+**Always validate before reloading.** A rejected config is never
+applied, which is the safe behavior, but it is also silent from the
+client's point of view. `validate` tells you the reason immediately:
+
+```sh
+zift validate /home/zift/zift.conf   # ok: ... (1 user, listen 0.0.0.0:2222)
+sudo systemctl reload zift
+journalctl -u zift -f                # what the daemon actually did
+```
+
+Reloads apply to new sessions only, and are triggered by the config file
+mtime moving forward or by `SIGHUP`. Changing anything *around* the
+config — creating a partner root, adding a key file, fixing modes —
+leaves the mtime untouched, so reload by hand after those.
 
 ## Documentation
 

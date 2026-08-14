@@ -11,6 +11,9 @@ pub const Operation = enum {
     remove,
     rmdir,
     rename,
+    // The clobber rule: replacing or truncating an entry that already
+    // exists. Distinct from `remove`, which is deletion proper.
+    update,
 };
 
 pub const Decision = enum {
@@ -79,6 +82,7 @@ pub fn policyDerivedMode(
         const can_mutate = (check(user, .open_write, vpath) == .allow) or
             (check(user, .mkdir, vpath) == .allow) or
             (check(user, .rename, vpath) == .allow) or
+            (check(user, .update, vpath) == .allow) or
             (check(user, .remove, vpath) == .allow);
         if (can_mutate) owner |= 0o2;
         if (check(user, .readdir, vpath) == .allow) owner |= 0o1;
@@ -133,6 +137,7 @@ fn permissionFor(operation: Operation) config.Permission {
         .readdir => .list,
         .mkdir => .mkdir,
         .remove, .rmdir => .remove,
+        .update => .update,
         .rename => .rename,
     };
 }

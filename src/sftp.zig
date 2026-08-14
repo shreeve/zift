@@ -978,8 +978,8 @@ const SftpState = struct {
         // offset), or append to it (APPEND) — three different ways
         // to mutate someone else's existing content. All of them
         // require the partner to have BOTH "add"-style (already
-        // checked above as `.open_write`) AND `.remove` permission
-        // on this path. The `.remove` half is the new check: it
+        // checked above as `.open_write`) AND `.update` permission
+        // on this path. The `.update` half is the clobber check: it
         // generalizes the v0.3.0 rename-overwrite guard to every
         // write-open of an existing entry. Without this, an
         // `add`-only partner could destroy the operator's files via
@@ -991,7 +991,7 @@ const SftpState = struct {
         // so no TOCTOU window between probe and act. The fd we
         // hold IS the existing file we're checking authorization
         // for.
-        if (want_write and policy.check(self.user, .remove, path.value) == .deny) {
+        if (want_write and policy.check(self.user, .update, path.value) == .deny) {
             file.close(self.io);
             defer self.auditDenied(op_label, path.value);
             return replyStatus(
@@ -1238,7 +1238,7 @@ const SftpState = struct {
         };
 
         const may_replace = !handle.staging_excl and
-            policy.check(self.user, .remove, target_vpath) == .allow;
+            policy.check(self.user, .update, target_vpath) == .allow;
 
         if (dest_exists and !may_replace) {
             if (handle.staging_excl) {
@@ -1440,14 +1440,14 @@ const SftpState = struct {
         // device entry at the destination would all be missed by
         // openFile (which only succeeds on regular openable files)
         // but is correctly detected as "exists" by lstat. If the
-        // destination exists in any form, require `.remove`
+        // destination exists in any form, require `.update`
         // permission on the destination path.
         //
-        // Overwrite requires `.remove` on the destination. When the
+        // Overwrite requires `.update` on the destination. When the
         // partner lacks it, use a no-replace rename so a create-
         // between-check-and-rename race cannot clobber. When replace
         // is authorized, POSIX rename replaces atomically.
-        const may_replace = policy.check(self.user, .remove, to.value) == .allow;
+        const may_replace = policy.check(self.user, .update, to.value) == .allow;
         if (may_replace) {
             std.Io.Dir.rename(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch {
                 defer self.auditFailed("rename", from.value, "rename failed");

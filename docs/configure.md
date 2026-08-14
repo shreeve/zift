@@ -397,9 +397,15 @@ Zift has three primary verbs:
 
 | Verb | Grants |
 | --- | --- |
+| `create` | create new files and create directories |
 | `read` | stat, list, and download |
-| `add` | create new files and create directories |
-| `remove` | delete files/directories and modify or replace existing entries |
+| `update` | replace, truncate, or append to an entry that already exists |
+| `delete` | delete files and directories |
+
+Before v0.9.2, `create` was spelled `add`, and `update` and `delete`
+were a single verb `remove`. Both old spellings still parse as exact
+aliases (`add` = `create`, `remove` = `delete update`), so existing
+configs behave identically.
 
 `add` grants only non-destructive creation. It does **not** grant
 `rename`: a rename removes the source name, so bundling it into `add`
@@ -407,7 +413,7 @@ would let an `add`-only partner destroy or hide an existing file. Grant
 renames explicitly with the granular `rename` verb (below) or with
 `full`.
 
-`full` is shorthand for `read add remove rename`.
+`full` is shorthand for `create read update delete rename`.
 
 There are also granular verbs for unusual policies:
 
