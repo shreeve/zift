@@ -204,10 +204,16 @@ already exists is `update`. That includes overwriting, truncating,
 appending, and renaming over an existing file.
 
 ```zift
-allow /pending read write           # upload new files; cannot touch existing ones
-allow /pending read write update    # ...and may replace their own files
-allow /pending full                 # ...and may delete them too
+# upload new files; cannot touch existing ones
+allow /pending read write
+# ...and may replace their own files
+allow /pending read write update
+# ...and may delete them too
+allow /pending full
 ```
+
+(Comments sit on their own line — Zift rejects a `#` placed after a
+directive, so trailing inline comments are a parse error, not a note.)
 
 Keeping these separate is what makes the most common B2B feed
 expressible: a partner who re-sends `daily.csv` every morning needs
@@ -313,15 +319,28 @@ bad password. Create the directory first:
 sudo install -d -o zift -g zift -m 2770 /home/zift/ally
 ```
 
-**Always validate before reloading.** A rejected config is never
-applied, which is the safe behavior, but it is also silent from the
-client's point of view. `validate` tells you the reason immediately:
+**Reload through systemd, and watch the journal.** A rejected config is
+never applied — the daemon keeps serving the last-good config — but as of
+0.10.1 that rejection is *loud* on the operator side, not silent. The
+daemon marks itself **degraded**, logs `config reload rejected — SERVING
+PREVIOUS CONFIG`, and emits a
+`{"operation":"config.reload","result":"failed"}` audit event; it stays
+degraded until a valid config loads, then logs `config reload recovered`
+and emits `config.reload` with `result=ok`. Sessions are never dropped
+(fail-open). It is still silent to the *SFTP client*, which only ever
+sees a generic `Permission denied` — which is why you check the journal:
 
 ```sh
 zift validate /home/zift/zift.conf   # ok: ... (1 user, listen 0.0.0.0:2222)
 sudo systemctl reload zift
 journalctl -u zift -f                # what the daemon actually did
 ```
+
+`systemctl reload zift` runs `zift validate` before it signals, so a bad
+edit makes the reload command itself fail non-zero (shown in `systemctl
+status` and the journal) and the daemon is never sent the reload. Running
+`zift validate` by hand first is now belt-and-suspenders — still handy,
+because it prints the exact line and reason immediately.
 
 Reloads apply to new sessions only, and are triggered by the config file
 mtime moving forward or by `SIGHUP`. Changing anything *around* the
