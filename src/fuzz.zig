@@ -15,6 +15,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const policy = @import("policy.zig");
 const vfs_mod = @import("vfs.zig");
+const wire = @import("wire.zig");
 
 const Smith = std.testing.Smith;
 
@@ -144,4 +145,69 @@ fn fuzzPubkeyLine(_: void, smith: *Smith) !void {
     const pk = config.parsePublicKeyLine(std.testing.allocator, line) catch return;
     std.testing.allocator.free(pk.algorithm);
     std.testing.allocator.free(pk.blob);
+}
+
+// ---------------------------------------------------------------------------
+// SFTP wire codec fuzz — the one parser a remote, authenticated partner
+// drives byte-by-byte. Feeds arbitrary bytes through the length-prefixed
+// string/handle decoders; every path must return an error rather than
+// panic (an integer overflow or OOB slice here is a remote DoS). This is
+// exactly the surface that hid the `4 + len` u32-overflow abort.
+
+test "fuzz sftp wire string parser" {
+    return std.testing.fuzz({}, fuzzWireParser, .{ .corpus = &.{
+        &.{ 0, 0, 0, 3, 'a', 'b', 'c' },
+        &.{ 0xFF, 0xFF, 0xFF, 0xFF, 1, 2, 3, 4 },
+        &.{ 0, 0, 0, 4, 0, 0, 0, 7 },
+        &.{ 0, 0 },
+        &.{},
+    } });
+}
+
+fn fuzzWireParser(_: void, smith: *Smith) !void {
+    var buf: [4096]u8 = undefined;
+    const len = smith.sliceWithHash(&buf, 0x5F7B0FF5);
+    const input = buf[0..len];
+
+    // Must never panic regardless of the declared inner length.
+    if (wire.parseString(input)) |parsed| {
+        // The returned slices must stay within the input buffer.
+        std.debug.assert(parsed.value.len <= input.len);
+        std.debug.assert(parsed.rest.len <= input.len);
+    } else |_| {}
+    _ = wire.parseHandleId(input) catch {};
+}
+
+// ---------------------------------------------------------------------------
+// Allocation-free path normalizer fuzz — the security-critical code that
+// authorization now runs against. Must never panic, and must never
+// return a path that escapes the virtual root (a leading-`/`, no `..`
+// component surviving, no reserved `.zift` component).
+
+test "fuzz normalize into buffer" {
+    return std.testing.fuzz({}, fuzzNormalizeInto, .{ .corpus = &.{
+        "/pending/../secret",
+        "/pending/x.exe/",
+        "//a//b/./c",
+        "/.zift/staging/x",
+        "/.ZIFT/x",
+        "/a/../../b",
+    } });
+}
+
+fn fuzzNormalizeInto(_: void, smith: *Smith) !void {
+    var buf: [4096]u8 = undefined;
+    const len = smith.sliceWithHash(&buf, 0x2A2A2F2F);
+    const input = buf[0..len];
+
+    var out: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+    const normalized = vfs_mod.normalizeVirtualInto(input, &out) catch return;
+    // Invariants the authorization layer depends on:
+    std.debug.assert(normalized.len >= 1 and normalized[0] == '/');
+    var it = std.mem.tokenizeScalar(u8, normalized, '/');
+    while (it.next()) |part| {
+        std.debug.assert(!std.mem.eql(u8, part, "."));
+        std.debug.assert(!std.mem.eql(u8, part, ".."));
+        std.debug.assert(!vfs_mod.isReservedComponent(part));
+    }
 }

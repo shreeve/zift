@@ -154,8 +154,11 @@ Parameters are fixed (not stored in the blob), matching Janus:
 
 Plaintext passwords and legacy `$argon2id$…` PHC strings are rejected.
 
-Unknown-user password attempts run the same passhash argon2id work against a
-dummy credential so timing does not enumerate usernames.
+Every password denial runs the same argon2id work — a real verify for a
+known user with a password, and the same cost against a dummy credential
+for an unknown user, a key-only user, or a user rejected by the `from`
+allowlist — so response timing does not enumerate usernames or reveal
+which auth methods a username has.
 
 ### Public Keys
 
@@ -331,6 +334,11 @@ path-validator changes.
 Zift emits structured JSON audit lines for auth and privileged or
 denied operations.
 
+Every partner-influenced field (username, path, detail) is JSON-escaped,
+and invalid UTF-8 bytes in a filename are replaced with U+FFFD before
+encoding, so an audit line is always valid JSON — a partner cannot forge
+a log line or emit bytes that make `jq` or a log shipper drop the line.
+
 Audit is designed for operational visibility, not as a fail-closed
 security control.
 
@@ -427,7 +435,17 @@ These are accepted limitations or follow-up hardening items, not hidden
 promises:
 
 - Glob matching supports `**`, which is useful but recursive. Patterns
-  are operator-controlled, not remote-client-controlled.
+  are operator-controlled, not remote-client-controlled. Matching is
+  bounded by a per-evaluation step budget: a pathological pattern
+  against a long client path fails closed (the operation is denied)
+  rather than consuming unbounded CPU.
+- Glob matching is byte-exact and case-sensitive. On a case-insensitive
+  filesystem (macOS APFS/HFS+), `deny **.exe` matches `tool.exe` but not
+  `TOOL.EXE` even though they are the same file. Prefer case-sensitive
+  local filesystems for partner roots, or write deny patterns that do
+  not depend on case. The reserved `.zift` namespace is folded to be
+  case-insensitive regardless, so partners cannot reach it via a case
+  variant.
 - Audit is not fail-closed.
 - Quotas and disk-full behavior are delegated to the OS.
 

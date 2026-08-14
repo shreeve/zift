@@ -1,7 +1,7 @@
 [Unit]
 Description=Zift SFTP Server
 Documentation=https://github.com/shreeve/zift
-After=network.target
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -10,9 +10,23 @@ User=zift
 Group=zift
 
 ExecStart=/usr/local/bin/zift serve /home/zift/zift.conf
+# Zift reloads its config on SIGHUP, so `systemctl reload zift` should
+# deliver one. Without ExecReload the verb fails outright and operators
+# fall back to `systemctl kill -s HUP`.
+ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=on-failure
 RestartSec=5
+
+# Bound the drain: keep systemd's stop timeout above the daemon's own
+# `shutdown-grace` (default 30s) so graceful drain + force-close can run
+# to completion before systemd SIGKILLs. Raise this if you raise
+# shutdown-grace.
+TimeoutStopSec=60
+
+# Thread-per-connection: cap total tasks so a connection storm can't
+# spawn unbounded threads. Keep comfortably above max-connections.
+TasksMax=512
 
 # Hardening: restrict the process to the minimum it needs. The set
 # below is the union of well-tested directives that work for a long-
@@ -91,6 +105,11 @@ KeyringMode=private
 # and the audit log. ProtectSystem=strict makes the rest of the
 # filesystem read-only.
 ReadWritePaths=/home/zift
+# Partners upload arbitrary bytes into /home/zift. MemoryDenyWriteExecute
+# blocks W^X inside this process, but does not stop something else on the
+# host from execve()ing an uploaded file. Mark the whole writable tree
+# non-executable so an uploaded payload cannot be run from here.
+NoExecPaths=/home/zift
 
 # Resource limits: bound Argon2id memory pressure from auth storms.
 # passhash credentials use fixed argon2id params (64 MiB per verification).

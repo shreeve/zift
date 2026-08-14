@@ -141,10 +141,13 @@ test build.
 They cover:
 
 - config parser
-- virtual path normalization
+- virtual path normalization (both the allocating and the
+  allocation-free `normalizeVirtualInto` used on the hot request path)
 - policy glob matching
 - passhash credential validation via parser paths
 - public-key line validation
+- the SFTP wire codec (`parseString` / `parseHandleId`) — the one
+  parser a remote authenticated partner drives byte-by-byte
 
 The harnesses compile and run once during ordinary `zig build test`.
 

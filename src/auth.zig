@@ -18,8 +18,28 @@ pub fn verifyPassword(
     user: *const config.UserConfig,
     password: []const u8,
 ) bool {
-    const hash = user.password_hash orelse return false;
+    const hash = user.password_hash orelse {
+        // Known user, but key-only (no password credential). Returning
+        // `false` immediately here would take ~0 ms while a real verify
+        // or the unknown-user dummy takes a full argon2id (~58 ms),
+        // handing an attacker a timing oracle that distinguishes
+        // "exists, key-only" from "exists, has password" / "unknown".
+        // Run the same dummy work so all password-denial paths cost the
+        // same. (See also the `from`-denied path in ssh.zig.)
+        runDummyVerify(io, allocator, password);
+        return false;
+    };
     return passhash.verify(io, allocator, password, hash);
+}
+
+/// Run one argon2id verification against the cached dummy credential
+/// and discard the result. Used to keep every password-denial path
+/// (unknown user, key-only user, source-not-allowed) at the same cost
+/// as a real verify so timing cannot enumerate usernames or auth
+/// shapes. PLAN §8.4.
+pub fn runDummyVerify(io: std.Io, allocator: std.mem.Allocator, password: []const u8) void {
+    ensureDummy(io, allocator);
+    _ = passhash.verify(io, allocator, password, dummy_blob[0..passhash.blob_len]);
 }
 
 pub fn verifyLogin(
@@ -36,8 +56,7 @@ pub fn verifyLogin(
     // Unknown user: same argon2id work as a real verify (identical
     // params), against a lazily minted dummy credential — timing does
     // not enumerate the user list.
-    ensureDummy(io, allocator);
-    _ = passhash.verify(io, allocator, password, dummy_blob[0..passhash.blob_len]);
+    runDummyVerify(io, allocator, password);
     return false;
 }
 

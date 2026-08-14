@@ -55,7 +55,15 @@ pub fn writeVersion(channel: c.ssh_channel) !void {
 }
 
 pub fn replyName(channel: c.ssh_channel, request_id: u32, name: []const u8) !void {
-    var buf: [512]u8 = undefined;
+    // The name is a normalized virtual path, up to
+    // `vfs.max_virtual_path_bytes` (4096). The SFTP_NAME frame carries
+    // it TWICE (filename + longname) plus a small fixed envelope, so
+    // the worst case is 33 + 2*4096 ≈ 8225 bytes. A 512-byte buffer
+    // here silently turned any REALPATH of a 240+ byte path into a
+    // session-dropping error — and REALPATH is the first thing most
+    // clients send. Size for the real maximum (on the 8 MiB worker
+    // stack this is cheap).
+    var buf: [9 * 1024]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_NAME));
     try w.putU32(request_id);
@@ -285,11 +293,16 @@ pub const ParsedString = struct {
 
 pub fn parseString(payload: []const u8) !ParsedString {
     if (payload.len < 4) return error.LibsshFailure;
-    const len = readU32(payload[0..4]);
-    if (payload.len < 4 + len) return error.LibsshFailure;
+    // `len` is a client-controlled u32 up to 0xFFFF_FFFF. Widen to
+    // usize and compare against the remaining bytes; computing
+    // `4 + len` in u32 would overflow (panic in safe builds, wrap in
+    // ReleaseFast) BEFORE the bounds check for len >= 0xFFFF_FFFC.
+    const len: usize = readU32(payload[0..4]);
+    const end = 4 + len;
+    if (payload.len < end) return error.LibsshFailure;
     return .{
-        .value = payload[4 .. 4 + len],
-        .rest = payload[4 + len ..],
+        .value = payload[4..end],
+        .rest = payload[end..],
     };
 }
 
@@ -304,4 +317,50 @@ pub fn writeU32(out: []u8, value: u32) void {
     out[1] = @intCast((value >> 16) & 0xff);
     out[2] = @intCast((value >> 8) & 0xff);
     out[3] = @intCast(value & 0xff);
+}
+
+const testing = std.testing;
+
+test "parseString: well-formed" {
+    const payload = [_]u8{ 0, 0, 0, 3, 'a', 'b', 'c', 'x', 'y' };
+    const parsed = try parseString(&payload);
+    try testing.expectEqualStrings("abc", parsed.value);
+    try testing.expectEqualStrings("xy", parsed.rest);
+}
+
+test "parseString: truncated length prefix" {
+    const payload = [_]u8{ 0, 0, 1 };
+    try testing.expectError(error.LibsshFailure, parseString(&payload));
+}
+
+test "parseString: declared length exceeds buffer" {
+    const payload = [_]u8{ 0, 0, 0, 9, 'a', 'b' };
+    try testing.expectError(error.LibsshFailure, parseString(&payload));
+}
+
+test "parseString: max-u32 length does not overflow (regression)" {
+    // Before the fix, `4 + len` was computed in u32 and overflowed for
+    // len >= 0xFFFF_FFFC, panicking in safe builds (a remote whole-
+    // daemon abort). It must now return an error instead.
+    inline for ([_]u32{ 0xFFFF_FFFF, 0xFFFF_FFFE, 0xFFFF_FFFD, 0xFFFF_FFFC, 0x8000_0000 }) |big| {
+        var payload: [8]u8 = undefined;
+        writeU32(payload[0..4], big);
+        payload[4] = 1;
+        payload[5] = 2;
+        payload[6] = 3;
+        payload[7] = 4;
+        try testing.expectError(error.LibsshFailure, parseString(&payload));
+    }
+}
+
+test "parseHandleId: requires exactly 4 payload bytes" {
+    const ok = [_]u8{ 0, 0, 0, 4, 0, 0, 0, 7 };
+    try testing.expectEqual(@as(u32, 7), try parseHandleId(&ok));
+
+    const wrong_len = [_]u8{ 0, 0, 0, 3, 1, 2, 3 };
+    try testing.expectError(error.LibsshFailure, parseHandleId(&wrong_len));
+
+    var overflow: [8]u8 = undefined;
+    writeU32(overflow[0..4], 0xFFFF_FFFF);
+    try testing.expectError(error.LibsshFailure, parseHandleId(&overflow));
 }

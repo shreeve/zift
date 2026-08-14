@@ -84,6 +84,28 @@ pub fn run(
     };
     defer active.releaseActive();
 
+    // Snapshot the restart-only settings that are bound exactly once,
+    // below, so `applyReload` can tell the operator when a reload tries
+    // to change one and is silently ineffective.
+    active.bound_listen = try allocator.dupe(u8, active.current.config.server.listen);
+    active.bound_host_key = try allocator.dupe(u8, active.current.config.server.host_key);
+    active.bound_log = try allocator.dupe(u8, logTargetLabel(active.current.config.server.log));
+    defer {
+        allocator.free(active.bound_listen);
+        allocator.free(active.bound_host_key);
+        allocator.free(active.bound_log);
+    }
+
+    // Size the process file-descriptor limit against the worst case:
+    // every session holding its socket plus the per-session handle cap.
+    // Without this, `max-connections × max_handles_per_session` (128 ×
+    // 256 by default) dwarfs a typical soft `RLIMIT_NOFILE` (1024 on
+    // Linux, 256 on macOS), so a few busy partners exhaust the fd table
+    // and every other session's OPEN/OPENDIR fails. Best-effort: raise
+    // the soft limit toward the hard limit; warn (don't fail) if the
+    // ceiling is still short.
+    ensureFdBudget(io, active.current.config.server.max_connections);
+
     const bind = c.ssh_bind_new() orelse return error.LibsshFailure;
     defer c.ssh_bind_free(bind);
 
@@ -286,7 +308,57 @@ pub fn run(
         }
     }
 
-    signals.deinitSessionRegistry(io, allocator);
+    // Only free the session-fd registry when every worker has actually
+    // exited. A straggler on its way out still calls
+    // `unregisterSessionFd`, which iterates the registry — freeing it
+    // here (as the old code did unconditionally, including down the
+    // "still alive after force-close" branch) is a use-after-free. If
+    // stragglers remain, leak the registry: the process is exiting and
+    // the OS reclaims it in microseconds.
+    if (active_sessions.load(.acquire) == 0) {
+        signals.deinitSessionRegistry(io, allocator);
+    }
+}
+
+/// Human-comparable label for a `LogTarget` ("stderr" or the file
+/// path), so the restart-only reload check can diff the audit
+/// destination as a plain string.
+fn logTargetLabel(target: config.LogTarget) []const u8 {
+    return switch (target) {
+        .stderr => "stderr",
+        .file => |path| path,
+    };
+}
+
+/// Best-effort raise of `RLIMIT_NOFILE` to cover the worst-case fd
+/// demand, warning if the ceiling is still short. See the call site in
+/// `run` for the rationale.
+fn ensureFdBudget(io: std.Io, max_connections: u32) void {
+    // Per session: one socket, a couple of libssh internal fds, plus the
+    // per-session handle cap. Round up with slack.
+    const per_session: u64 = sftp.max_handles_per_session + 8;
+    const needed: u64 = @as(u64, max_connections) * per_session + 64;
+
+    const lim = std.posix.getrlimit(.NOFILE) catch return;
+    if (@as(u64, lim.cur) >= needed) return;
+
+    const target: u64 = @min(@as(u64, lim.max), needed);
+    var raised = lim;
+    raised.cur = @intCast(target);
+    std.posix.setrlimit(.NOFILE, raised) catch {};
+
+    const after = std.posix.getrlimit(.NOFILE) catch return;
+    if (@as(u64, after.cur) >= needed) return;
+
+    const stderr = std.Io.File.stderr();
+    var buf: [320]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        "zift: warning: file-descriptor soft limit {d} is below the worst case {d} " ++
+            "(max-connections {d} × {d} handles/session); lower max-connections or raise LimitNOFILE\n",
+        .{ after.cur, needed, max_connections, sftp.max_handles_per_session },
+    ) catch return;
+    stderr.writeStreamingAll(io, line) catch {};
 }
 
 const ConfigRef = struct {
@@ -321,6 +393,15 @@ const ActiveConfig = struct {
     /// config file. Set on first failure (warning emitted), cleared
     /// when the file becomes readable again. PLAN §7.3.
     stat_warned: bool = false,
+    /// The `listen`, `host-key`, and `log` values actually in force —
+    /// bound once at startup and never re-applied on reload. Owned
+    /// copies (the startup config's arena may be freed once its last
+    /// session drops it). Used to warn the operator when a reload
+    /// changes one of these restart-only settings, instead of silently
+    /// printing "config reloaded" while the change has no effect.
+    bound_listen: []const u8 = "",
+    bound_host_key: []const u8 = "",
+    bound_log: []const u8 = "",
 
     fn acquire(self: *ActiveConfig) *ConfigRef {
         self.mutex.lockUncancelable(self.io);
@@ -386,6 +467,13 @@ const ActiveConfig = struct {
         known_mtime: *std.Io.Timestamp,
     ) !void {
         const stderr = std.Io.File.stderr();
+        // Advance `known_mtime` to the file's current mtime up front, so
+        // a config that keeps failing to parse (a saved typo) is not
+        // re-read, re-parsed, and re-logged every `reload-interval`
+        // forever. The next genuine edit moves mtime forward again and
+        // triggers a fresh attempt. SIGHUP always retries regardless.
+        known_mtime.* = mtime;
+
         const contents = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1 << 20)) catch |err| {
             try stderr.writeStreamingAll(self.io, "zift: config reload read failed: ");
             try stderr.writeStreamingAll(self.io, @errorName(err));
@@ -416,16 +504,41 @@ const ActiveConfig = struct {
             return;
         };
 
+        // Warn about restart-only settings that changed. `listen`,
+        // `host-key`, and `log` are bound exactly once at startup and
+        // are NOT re-applied here, so silently reporting "config
+        // reloaded" would mislead an operator who just repointed the
+        // audit log or the listen address. The reload still applies to
+        // users/rules/timeouts; these three keep their startup values
+        // until a full restart.
+        try self.warnRestartOnly(stderr, "listen", self.bound_listen, next_config.server.listen);
+        try self.warnRestartOnly(stderr, "host-key", self.bound_host_key, next_config.server.host_key);
+        try self.warnRestartOnly(stderr, "log", self.bound_log, logTargetLabel(next_config.server.log));
+
         const next_ref = try ConfigRef.create(self.allocator, next_config);
 
         self.mutex.lockUncancelable(self.io);
         const old_ref = self.current;
         self.current = next_ref;
-        known_mtime.* = mtime;
         self.mutex.unlock(self.io);
 
         old_ref.release(self.allocator);
-        try stderr.writeStreamingAll(self.io, "zift: config reloaded\n");
+        try stderr.writeStreamingAll(self.io, "zift: config reloaded (users/rules/timeouts applied to new sessions)\n");
+    }
+
+    fn warnRestartOnly(
+        self: *ActiveConfig,
+        stderr: std.Io.File,
+        name: []const u8,
+        bound: []const u8,
+        proposed: []const u8,
+    ) !void {
+        if (std.mem.eql(u8, bound, proposed)) return;
+        try stderr.writeStreamingAll(self.io, "zift: warning: '");
+        try stderr.writeStreamingAll(self.io, name);
+        try stderr.writeStreamingAll(self.io, "' changed in config but is applied only at startup; still using '");
+        try stderr.writeStreamingAll(self.io, bound);
+        try stderr.writeStreamingAll(self.io, "' — restart zift to apply\n");
     }
 };
 

@@ -330,25 +330,94 @@ fn formatLineImpl(
     try w.writeAll("\",\"event\":\"zift.audit\"");
     if (user) |value| {
         try w.writeAll(",\"user\":");
-        try std.json.Stringify.encodeJsonString(value, .{}, w);
+        try writeJsonStringLossy(w, value);
     }
     try w.writeAll(",\"operation\":");
-    try std.json.Stringify.encodeJsonString(operation, .{}, w);
+    try writeJsonStringLossy(w, operation);
     try w.writeAll(",\"result\":\"");
     try w.writeAll(@tagName(result));
     try w.writeAll("\"");
     if (path) |value| {
         try w.writeAll(",\"path\":");
-        try std.json.Stringify.encodeJsonString(value, .{}, w);
+        try writeJsonStringLossy(w, value);
     }
     if (detail.len != 0) {
         try w.writeAll(",\"detail\":");
-        try std.json.Stringify.encodeJsonString(detail, .{}, w);
+        try writeJsonStringLossy(w, detail);
     }
     try w.writeAll(",\"ip\":");
-    try std.json.Stringify.encodeJsonString(ip, .{}, w);
+    try writeJsonStringLossy(w, ip);
     if (truncated) try w.writeAll(",\"truncated\":true");
     try w.writeAll("}\n");
+}
+
+/// Emit `s` as a JSON string, escaping control/quote/backslash bytes
+/// exactly like a conformant encoder AND replacing any invalid UTF-8
+/// sequence with U+FFFD.
+///
+/// SFTP paths and usernames are byte strings; nothing upstream forces
+/// them to be valid UTF-8. `std.json.Stringify.encodeJsonString` with
+/// default options passes high bytes through verbatim, so an invalid
+/// byte (e.g. a lone 0xFF in a filename) produced an audit LINE that is
+/// not valid JSON — which `jq` and strict log shippers drop, letting a
+/// partner make their own operations invisible to the operator's
+/// tooling. Turning on `escape_unicode` is NOT the fix: that path
+/// `@panic`s on invalid UTF-8. So we sanitize as we encode.
+fn writeJsonStringLossy(w: *std.Io.Writer, s: []const u8) !void {
+    const replacement = "\u{FFFD}"; // 3 bytes: EF BF BD
+    try w.writeByte('"');
+    var i: usize = 0;
+    while (i < s.len) {
+        const b = s[i];
+        if (b < 0x80) {
+            switch (b) {
+                '"' => try w.writeAll("\\\""),
+                '\\' => try w.writeAll("\\\\"),
+                0x08 => try w.writeAll("\\b"),
+                0x0C => try w.writeAll("\\f"),
+                '\n' => try w.writeAll("\\n"),
+                '\r' => try w.writeAll("\\r"),
+                '\t' => try w.writeAll("\\t"),
+                else => {
+                    if (b < 0x20) {
+                        try w.print("\\u{x:0>4}", .{b});
+                    } else {
+                        try w.writeByte(b);
+                    }
+                },
+            }
+            i += 1;
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch {
+            try w.writeAll(replacement);
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > s.len or !std.unicode.utf8ValidateSlice(s[i..][0..seq_len])) {
+            try w.writeAll(replacement);
+            i += 1;
+            continue;
+        }
+        try w.writeAll(s[i..][0..seq_len]);
+        i += seq_len;
+    }
+    try w.writeByte('"');
+}
+
+test "audit line stays valid JSON for invalid-UTF-8 path" {
+    var buf: [max_line_bytes]u8 = undefined;
+    // A filename with a lone 0xFF byte (invalid UTF-8) plus an embedded
+    // quote and newline to exercise escaping.
+    const nasty = "/pending/\xff\x22\x0aevil";
+    const line = formatLine(&buf, "foo", "open_write", nasty, .denied, "", "127.0.0.1");
+    // No raw control bytes or lone high bytes leaked; must be parseable.
+    for (line[0 .. line.len - 1]) |ch| {
+        try std.testing.expect(ch != '\n' or false);
+    }
+    try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+    try std.testing.expect(std.mem.indexOf(u8, line, "\u{FFFD}") != null);
 }
 
 /// Length of an RFC 3339 UTC timestamp with millisecond precision:

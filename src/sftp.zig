@@ -34,7 +34,7 @@ const parseString = wire.parseString;
 const parseHandleId = wire.parseHandleId;
 
 /// Maximum simultaneously-open file/dir handles per SFTP session.
-const max_handles_per_session: usize = 256;
+pub const max_handles_per_session: usize = 256;
 
 fn nowUnixSecs() i64 {
     var ts: std.c.timespec = undefined;
@@ -363,12 +363,28 @@ const SftpState = struct {
     /// Returning a bool (rather than an error) keeps the malformed-path
     /// case out of `runSftp`'s session-fatal error path — only THIS
     /// request fails; the session continues per PLAN §7.6.
-    fn ensureValidPath(self: *SftpState, request_id: u32, value: []const u8) !bool {
-        vfs_mod.Vfs.validateVirtualPath(value) catch {
+    /// Validate and NORMALIZE a client-supplied path before it is used
+    /// for either authorization or filesystem resolution. Returns the
+    /// normalized slice (living in `out`), or null after replying an
+    /// error status to the client.
+    ///
+    /// This is the fix for the normalize-after-authorize bypass: every
+    /// path handler now runs `policy.check` against the SAME normalized
+    /// string the VFS layer will resolve, so `/pending/../secret` and
+    /// `/pending/x.exe/` can no longer smuggle past a `deny`/scope rule.
+    ///
+    /// Status mapping preserves prior behavior: malformed bytes /
+    /// invalid UTF-8 / over-length → BAD_MESSAGE; traversal above root
+    /// and the reserved `.zift` namespace → PERMISSION_DENIED.
+    fn normalizedPath(self: *SftpState, request_id: u32, raw: []const u8, out: []u8) !?[]const u8 {
+        vfs_mod.Vfs.validateVirtualPath(raw) catch {
             try replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
-            return false;
+            return null;
         };
-        return true;
+        return vfs_mod.normalizeVirtualInto(raw, out) catch {
+            try replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return null;
+        };
     }
 
     /// Translate a real `EntryInfo` (from fstatat/fstat) into what the
@@ -448,14 +464,22 @@ const SftpState = struct {
     fn handleFstat(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const id = parseHandleId(payload) catch
             return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
+        // FSTAT works on either a file OR a directory handle — OpenSSH's
+        // sftp-server permits FSTAT on an open dir handle, and some
+        // clients rely on it. Look up either kind.
         const handle = self.findHandle(id, .file) orelse
+            self.findHandle(id, .dir) orelse
             return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
 
         // `listing.statFd` returns the same shape we use for READDIR
         // (real mode, uid, gid, size, mtime), so STAT/FSTAT/READDIR
         // are now consistent — partner gets the same fields whether
         // they ask via "ls -la" or "stat <file>".
-        const info = listing.statFd(handle.file.?.handle) catch
+        const fd = switch (handle.kind) {
+            .file => handle.file.?.handle,
+            .dir => handle.dir.?.handle,
+        };
+        const info = listing.statFd(fd) catch
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "fstat failed");
 
         // For virtual mode, FSTAT can't ask the policy what the
@@ -469,18 +493,35 @@ const SftpState = struct {
         // handle was created.
         var display = self.applyListingMode(info, null);
         if (self.listing_mode == .virtual) {
-            const file_type = info.mode & 0o170000;
-            var owner: u32 = 0;
-            if (handle.can_read) owner |= 0o4;
-            if (handle.can_write) owner |= 0o2;
-            display.mode = file_type | (owner << 6) | (owner << 3);
+            switch (handle.kind) {
+                .file => {
+                    // No vpath for a file handle; derive the mode from
+                    // the per-handle access bits recorded at OPEN time —
+                    // those are the truth about what's permitted here.
+                    const file_type = info.mode & 0o170000;
+                    var owner: u32 = 0;
+                    if (handle.can_read) owner |= 0o4;
+                    if (handle.can_write) owner |= 0o2;
+                    display.mode = file_type | (owner << 6) | (owner << 3);
+                },
+                .dir => {
+                    // A dir handle DOES carry its vpath, so we can render
+                    // the same policy-derived mode READDIR would show.
+                    if (handle.dir_vpath) |vpath| {
+                        display.mode = policy.policyDerivedMode(self.user, vpath, info.mode);
+                    }
+                    display.uid = 0;
+                    display.gid = 0;
+                },
+            }
         }
         try replyFullAttrs(self.channel, request_id, display);
     }
 
     fn handleStat(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
-        if (!try self.ensureValidPath(request_id, path.value)) return;
+        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+        path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .stat, path.value) == .deny) {
             // PLAN §8.5: emit audit AFTER replying. `defer` guarantees
             // the audit fires once the reply syscall returns, so a slow
@@ -493,7 +534,7 @@ const SftpState = struct {
         // Special-case the root: openVerifiedParent rejects "/" because
         // it has no parent inside the jail. STAT of root means stat the
         // jail directory itself.
-        if (std.mem.eql(u8, path.value, "/") or std.mem.eql(u8, path.value, "")) {
+        if (std.mem.eql(u8, path.value, "/")) {
             // STAT of "/" means stat the jail root itself. Open the
             // root dir to get a stable fd, fstat it, then close.
             // Going through an fd (rather than a path-string stat)
@@ -536,8 +577,9 @@ const SftpState = struct {
     }
 
     fn handleOpendir(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
-        if (!try self.ensureValidPath(request_id, path.value)) return;
+        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+        path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .readdir, path.value) == .deny) {
             defer self.auditDenied("opendir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
@@ -632,8 +674,7 @@ const SftpState = struct {
             // behind by an unswept v0.5.x–v0.7.x install. The validator
             // already rejects it as a path component; this just keeps
             // it out of READDIR results during the transition.
-            if (std.mem.eql(u8, entry.name, vfs_mod.namespace_dir_name)) continue;
-            if (std.mem.eql(u8, entry.name, vfs_mod.legacy_staging_dir_name)) continue;
+            if (vfs_mod.isReservedComponent(entry.name)) continue;
 
             // `fstatat(dir_fd, name, AT_SYMLINK_NOFOLLOW)`. Stays inside
             // the path-jail because `dir_fd` was opened through the
@@ -739,9 +780,10 @@ const SftpState = struct {
 
     fn handleOpen(self: *SftpState, request_id: u32, payload: []const u8) !void {
         var cursor = payload;
-        const path = parseString(cursor) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
-        if (!try self.ensureValidPath(request_id, path.value)) return;
+        var path = parseString(cursor) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         cursor = path.rest;
+        var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+        path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (cursor.len < 4) return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad flags");
         const flags = readU32(cursor[0..4]);
 
@@ -984,6 +1026,13 @@ const SftpState = struct {
         const len = @min(readU32(cursor[8..12]), 32 * 1024);
         const handle = self.findHandle(id, .file) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
 
+        // A 64-bit offset above i64::MAX cannot be a real file position;
+        // the kernel would reject it (or, in a Debug build, the std
+        // pread path bit-casts it negative and panics). Reject cleanly.
+        if (offset > std.math.maxInt(i64)) {
+            return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad offset");
+        }
+
         // Per PLAN §6.3, `read` permission gates SSH_FXP_READ. Enforcing
         // this only at OPEN time would let a write-only-permitted client
         // exfiltrate via the same handle they wrote to.
@@ -991,6 +1040,11 @@ const SftpState = struct {
             defer self.auditDenied("read", null);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
+
+        // A legitimate 0-byte read gets a 0-byte DATA reply, not EOF —
+        // EOF here would be a spurious end-of-file for a client that
+        // deliberately asked for nothing.
+        if (len == 0) return replyData(self.channel, request_id, "");
 
         var buf = try self.allocator.alloc(u8, len);
         defer self.allocator.free(buf);
@@ -1009,6 +1063,12 @@ const SftpState = struct {
         const client_offset = readU64(cursor[0..8]);
         const data = parseString(cursor[8..]) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad data");
         const handle = self.findHandle(id, .file) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+
+        // Reject an out-of-range write offset up front (same reasoning
+        // as READ). Append mode ignores the client offset entirely.
+        if (client_offset > std.math.maxInt(i64)) {
+            return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad offset");
+        }
 
         // Per PLAN §6.3, `write` permission gates SSH_FXP_WRITE.
         if (!handle.can_write) {
@@ -1068,7 +1128,7 @@ const SftpState = struct {
                     // a path-validator regression that let a longer
                     // path through can't make two attacker-
                     // controlled prefixes collide in the audit log.
-                    var audit_target_buf: [4096]u8 = undefined;
+                    var audit_target_buf: [vfs_mod.max_virtual_path_bytes]u8 = undefined;
                     const audit_target = blk: {
                         const tv = handle.staging_target_vpath.?;
                         std.debug.assert(tv.len <= audit_target_buf.len);
@@ -1225,8 +1285,9 @@ const SftpState = struct {
     }
 
     fn handleMkdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
-        if (!try self.ensureValidPath(request_id, path.value)) return;
+        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+        path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .mkdir, path.value) == .deny) {
             defer self.auditDenied("mkdir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
@@ -1280,8 +1341,9 @@ const SftpState = struct {
     }
 
     fn handleRemove(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
-        if (!try self.ensureValidPath(request_id, path.value)) return;
+        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+        path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .remove, path.value) == .deny) {
             defer self.auditDenied("remove", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
@@ -1305,8 +1367,9 @@ const SftpState = struct {
     }
 
     fn handleRmdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
-        if (!try self.ensureValidPath(request_id, path.value)) return;
+        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+        path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .rmdir, path.value) == .deny) {
             defer self.auditDenied("rmdir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
@@ -1330,10 +1393,12 @@ const SftpState = struct {
     }
 
     fn handleRename(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const from = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad source");
-        const to = parseString(from.rest) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad destination");
-        if (!try self.ensureValidPath(request_id, from.value)) return;
-        if (!try self.ensureValidPath(request_id, to.value)) return;
+        var from = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad source");
+        var to = parseString(from.rest) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad destination");
+        var from_buf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+        var to_buf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+        from.value = (try self.normalizedPath(request_id, from.value, &from_buf)) orelse return;
+        to.value = (try self.normalizedPath(request_id, to.value, &to_buf)) orelse return;
         if (policy.checkRename(self.user, from.value, to.value) == .deny) {
             defer self.auditDenied("rename", from.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
@@ -1413,7 +1478,7 @@ const SftpState = struct {
         var dir_local = dir;
         errdefer dir_local.close(self.io);
 
-        const id = self.nextHandleId();
+        const id = try self.nextHandleId();
         // dup the vpath so it survives the caller's `path` going out of
         // scope (the parser hands us a slice into the SFTP packet
         // buffer that gets reused on the next request).
@@ -1443,7 +1508,7 @@ const SftpState = struct {
         var file_local = file;
         errdefer file_local.close(self.io);
 
-        const id = self.nextHandleId();
+        const id = try self.nextHandleId();
         try self.handles.append(self.allocator, .{
             .id = id,
             .kind = .file,
@@ -1479,7 +1544,7 @@ const SftpState = struct {
         const staging_owned = try self.allocator.dupe(u8, staging_basename);
         errdefer self.allocator.free(staging_owned);
 
-        const id = self.nextHandleId();
+        const id = try self.nextHandleId();
         try self.handles.append(self.allocator, .{
             .id = id,
             .kind = .file,
@@ -1684,7 +1749,15 @@ const SftpState = struct {
         }
     }
 
-    fn nextHandleId(self: *SftpState) u32 {
+    fn nextHandleId(self: *SftpState) !u32 {
+        // Monotonic and never reused, which is what makes use-after-close
+        // structurally impossible. Refuse to wrap: at u32::MAX we return
+        // an error (the caller replies FAILURE) rather than `+= 1`
+        // panicking in a safe build, and rather than wrapping — which
+        // would reintroduce id reuse and the aliasing it prevents. A
+        // session that opens 2^32 handles is pathological churn; it can
+        // reconnect.
+        if (self.next_handle == std.math.maxInt(u32)) return error.HandleSpaceExhausted;
         const id = self.next_handle;
         self.next_handle += 1;
         return id;
@@ -1829,6 +1902,12 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
             }
             continue;
         }
+        // Real bytes arrived: the channel is making progress, so clear
+        // the spurious-EOF counter. Without this reset it accumulates
+        // across the whole session lifetime, so a long-lived healthy
+        // connection that absorbs 1000 spurious EOFs over many hours
+        // would eventually be dropped mid-transfer.
+        state.spurious_eof_count = 0;
         offset += @intCast(n);
     }
 }

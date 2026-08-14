@@ -474,55 +474,83 @@ fn assertOpenedDirMode(
     if ((info.mode & forbidden_mask) != 0) return unsafe;
 }
 
-fn normalizeVirtualPath(allocator: std.mem.Allocator, virtual_path: []const u8) Error![]u8 {
+/// True when `part` names the reserved per-partner namespace dir
+/// (`.zift`) or its legacy alias (`.zift-staging`). Compared
+/// case-insensitively so the reservation also holds on
+/// case-insensitive filesystems (APFS/HFS+), where `/.ZIFT/staging`
+/// resolves to the same inode as `/.zift/staging`. Without the fold,
+/// a partner on macOS could reach in-flight uploads and operator
+/// metadata via a case variant. ASCII fold is sufficient — the names
+/// are ASCII and the concern is the FS's own ASCII case-insensitivity.
+pub fn isReservedComponent(part: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(part, namespace_dir_name) or
+        std.ascii.eqlIgnoreCase(part, legacy_staging_dir_name);
+}
+
+/// Normalize a client-supplied virtual path into `out` (which must be
+/// at least `max_virtual_path_bytes + 1` bytes) and return the
+/// normalized slice within it. Allocation-free so it can run on the
+/// hot per-request path: SFTP handlers normalize ONCE and authorize on
+/// the returned string, closing the class of bug where policy matched
+/// the raw wire path (`/pending/../secret`, `/pending/x.exe/`) while
+/// the filesystem operation ran on the normalized path.
+///
+/// Same rules as the historical normalizer: reject over-length / NUL /
+/// C0-control / DEL / invalid-UTF-8 bytes, collapse `.` and empty
+/// components, resolve `..` (rejecting traversal above the virtual
+/// root), and reject the reserved `.zift` / `.zift-staging` component
+/// anywhere in the path.
+pub fn normalizeVirtualInto(virtual_path: []const u8, out: []u8) Error![]u8 {
+    std.debug.assert(out.len >= max_virtual_path_bytes + 1);
+
     // PLAN §7.6 max length, §8.3 byte-set restrictions.
     if (virtual_path.len > max_virtual_path_bytes) return error.PathTooLong;
     for (virtual_path) |b| {
         // PLAN §8.3 step 2: reject NUL, all C0 control bytes, and DEL.
-        // The space-character (0x20) and printable ASCII are allowed;
-        // everything below 0x20 is forbidden including TAB / CR / LF
-        // since they're never legitimate inside a single SFTP path.
         if (b == 0 or b < 0x20 or b == 0x7F) return error.InvalidPath;
     }
     if (!std.unicode.utf8ValidateSlice(virtual_path)) return error.InvalidPath;
 
-    var parts: std.ArrayList([]const u8) = .empty;
-    defer parts.deinit(allocator);
+    // `starts[d]` is the offset in `out` of the leading '/' of the
+    // component at depth d, so a `..` pop is an O(1) truncate. A path
+    // of length N has at most (N+1)/2 components (each ≥ 1 byte plus a
+    // separator), bounded by max_virtual_path_bytes.
+    var starts: [max_virtual_path_bytes / 2 + 2]usize = undefined;
+    var depth: usize = 0;
+    var len: usize = 0;
 
     var iter = std.mem.tokenizeScalar(u8, virtual_path, '/');
     while (iter.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
         if (std.mem.eql(u8, part, "..")) {
-            if (parts.items.len == 0) return error.PathTraversal;
-            _ = parts.pop();
+            if (depth == 0) return error.PathTraversal;
+            depth -= 1;
+            len = starts[depth];
             continue;
         }
-        // v0.8.0: reserve `.zift` (the namespace) AND the legacy
-        // `.zift-staging` (v0.5.0–v0.7.x) as path component names
-        // ANYWHERE in the virtual path. The namespace dir holds
-        // zift's atomic-upload staging files and any operator-
-        // managed metadata an operator drops alongside; partners
-        // must never reach inside via the SFTP wire surface,
-        // neither to observe in-flight uploads, nor to plant
-        // entries that the rename-from-staging step would later
-        // pick up. Reserving the legacy name keeps an opportunist
-        // partner from `mkdir`'ing it under a freshly-upgraded
-        // root and confusing operators who haven't yet swept the
-        // old path. Rejecting here, before any policy or
-        // filesystem resolution, is the cheapest correct check.
-        if (std.mem.eql(u8, part, namespace_dir_name)) return error.InvalidPath;
-        if (std.mem.eql(u8, part, legacy_staging_dir_name)) return error.InvalidPath;
-        try parts.append(allocator, part);
+        // Reserve `.zift` / `.zift-staging` anywhere in the path,
+        // before any policy or filesystem resolution — the cheapest
+        // correct place to keep partners out of the namespace.
+        if (isReservedComponent(part)) return error.InvalidPath;
+        starts[depth] = len;
+        depth += 1;
+        out[len] = '/';
+        len += 1;
+        @memcpy(out[len..][0..part.len], part);
+        len += part.len;
     }
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.append(allocator, '/');
-    for (parts.items, 0..) |part, i| {
-        if (i != 0) try out.append(allocator, '/');
-        try out.appendSlice(allocator, part);
+    if (len == 0) {
+        out[0] = '/';
+        return out[0..1];
     }
-    return try out.toOwnedSlice(allocator);
+    return out[0..len];
+}
+
+fn normalizeVirtualPath(allocator: std.mem.Allocator, virtual_path: []const u8) Error![]u8 {
+    var buf: [max_virtual_path_bytes + 2]u8 = undefined;
+    const normalized = try normalizeVirtualInto(virtual_path, &buf);
+    return allocator.dupe(u8, normalized);
 }
 
 fn joinRoot(allocator: std.mem.Allocator, root: []const u8, normalized_virtual: []const u8) Error![]u8 {
@@ -611,6 +639,39 @@ test "normalize rejects /.zift namespace anywhere in path (v0.8.0)" {
     const ok = try Vfs.normalizeVirtual(std.testing.allocator, "/pending/.cache/foo");
     defer std.testing.allocator.free(ok);
     try std.testing.expectEqualStrings("/pending/.cache/foo", ok);
+}
+
+test "reserved .zift component is case-insensitive (v0.9.0)" {
+    // On case-insensitive filesystems (APFS/HFS+) /.ZIFT resolves to the
+    // same inode as /.zift, so the reservation must fold case or a macOS
+    // partner could reach in-flight uploads via a case variant.
+    for ([_][]const u8{ "/.ZIFT/staging/x", "/.Zift/notes", "/pending/.ZIFT-STAGING/x" }) |p| {
+        try std.testing.expectError(error.InvalidPath, Vfs.normalizeVirtual(std.testing.allocator, p));
+    }
+    try std.testing.expect(isReservedComponent(".ZIFT"));
+    try std.testing.expect(isReservedComponent(".Zift"));
+    try std.testing.expect(!isReservedComponent(".ziftfoo"));
+}
+
+test "normalizeVirtualInto resolves .. before authorization (F1 regression)" {
+    // The buffer normalizer must collapse `..`, `//`, `.` and a trailing
+    // slash so the string the policy layer sees is the SAME one the
+    // filesystem op resolves — the fix for the normalize-after-authorize
+    // bypass.
+    var out: [max_virtual_path_bytes + 2]u8 = undefined;
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "/pending/../secret", .want = "/secret" },
+        .{ .in = "/pending/x.exe/", .want = "/pending/x.exe" },
+        .{ .in = "//a//b/./c", .want = "/a/b/c" },
+        .{ .in = "/", .want = "/" },
+        .{ .in = "/./", .want = "/" },
+        .{ .in = "/a/b/..", .want = "/a" },
+    };
+    for (cases) |case| {
+        const got = try normalizeVirtualInto(case.in, &out);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+    try std.testing.expectError(error.PathTraversal, normalizeVirtualInto("/a/../../b", &out));
 }
 
 test "resolve blocks symlink escape" {

@@ -50,9 +50,11 @@ pub fn mint(io: std.Io, allocator: std.mem.Allocator, password: []const u8, out:
     io.randomSecure(&salt) catch return error.KdfFailed;
 
     var digest: [key_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &digest);
     kdf(io, allocator, password, &salt, &digest) catch return error.KdfFailed;
 
     var raw: [raw_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &raw);
     @memcpy(raw[0..salt_len], &salt);
     @memcpy(raw[salt_len..], &digest);
 
@@ -63,10 +65,13 @@ pub fn mint(io: std.Io, allocator: std.mem.Allocator, password: []const u8, out:
 
 /// Constant-time verify of `password` against a validated blob.
 pub fn verify(io: std.Io, allocator: std.mem.Allocator, password: []const u8, blob: []const u8) bool {
-    const raw = decode(blob) catch return false;
+    var raw = decode(blob) catch return false;
+    defer std.crypto.secureZero(u8, &raw);
     var digest: [key_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &digest);
     kdf(io, allocator, password, raw[0..salt_len], &digest) catch return false;
     var expected: [key_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &expected);
     @memcpy(&expected, raw[salt_len..][0..key_len]);
     return std.crypto.timing_safe.eql([key_len]u8, digest, expected);
 }

@@ -13,13 +13,29 @@ pub fn authenticate(
     session: c.ssh_session,
     peer_ip: ?[]const u8,
 ) !*const config.UserConfig {
-    // PLAN §8.4 implies a finite ceiling on auth attempts per session.
-    // 6 matches OpenSSH's `MaxAuthTries` default. Successes return
-    // early; pubkey "offered" (probing) does not count because libssh
-    // gives us a `pk_ok` follow-up where the real signature verify
-    // happens. Only a `denied` outcome consumes an attempt.
-    const max_auth_attempts: u32 = 6;
-    var failed_attempts: u32 = 0;
+    // Two independent ceilings (PLAN §8.4):
+    //
+    //   HARD failures — a real credential rejection (wrong password,
+    //   unknown-user password spray, a matched key whose signature is
+    //   invalid, or a known user hitting the `from` allowlist). These
+    //   feed the cross-session abuse suppressor and the escalating
+    //   backoff, and 6 of them (OpenSSH's MaxAuthTries default) ends the
+    //   session.
+    //
+    //   SOFT operations — method `none` and public-key *probes* (the
+    //   `SSH_PUBLICKEY_STATE_NONE` "would this key work?" offers, and
+    //   offers of keys that aren't configured). A stock client sends
+    //   `none` plus one probe per agent key BEFORE it ever tries a
+    //   password, so counting these as hard failures made a normal
+    //   5-key agent trip the 6-attempt ceiling and the legitimate
+    //   partner's own IP suppression. Soft ops get no backoff and never
+    //   touch the abuse table; they only have a generous ceiling so a
+    //   client cannot pin a session forever by looping probes (the
+    //   `.offered` path resets libssh's idle timer each round).
+    const max_hard_failures: u32 = 6;
+    const max_soft_ops: u32 = 64;
+    var hard_failures: u32 = 0;
+    var soft_ops: u32 = 0;
     const ip_str = peer_ip orelse "";
 
     while (true) {
@@ -58,14 +74,28 @@ pub fn authenticate(
         else
             null;
 
+        // `is_hard` classifies this message's failure for the ceilings
+        // above. Default `false` (soft): method `none` and any
+        // unrecognized auth method fall through as soft.
+        var is_hard = false;
+
         if (subtype == c.SSH_AUTH_METHOD_PASSWORD) {
             const password_ptr = c.ssh_message_auth_password(msg);
             if (username_ptr != null and password_ptr != null) {
                 const username = std.mem.span(username_ptr);
                 const password = std.mem.span(password_ptr);
+                // Any actual password attempt is a hard failure if it
+                // doesn't succeed — that's exactly the password-spray
+                // pressure the abuse layer exists to throttle.
                 if (cfg.findUser(username)) |user| {
                     if (!netmatch.allowed(user.from, ip_str)) {
+                        // Run the same argon2id dummy work a real verify
+                        // would, so a source outside the `from` allowlist
+                        // cannot enumerate valid usernames by timing the
+                        // ~0 ms early reject against the ~58 ms KDF path.
+                        auth.runDummyVerify(io, allocator, password);
                         audit.log(io, username, "auth.password", null, .denied, "source not allowed", ip_str);
+                        is_hard = true;
                     } else if (auth.verifyPassword(io, allocator, user, password)) {
                         _ = c.ssh_message_auth_reply_success(msg, 0);
                         audit.log(io, username, "auth.password", null, .ok, "", ip_str);
@@ -73,10 +103,12 @@ pub fn authenticate(
                         return user;
                     } else {
                         audit.log(io, username, "auth.password", null, .denied, "bad password", ip_str);
+                        is_hard = true;
                     }
                 } else {
                     _ = auth.verifyLogin(io, allocator, cfg, username, password);
                     audit.log(io, username, "auth.password", null, .denied, "unknown user", ip_str);
+                    is_hard = true;
                 }
             }
         } else if (subtype == c.SSH_AUTH_METHOD_PUBLICKEY) {
@@ -86,22 +118,45 @@ pub fn authenticate(
                     abuse.recordSuccess(io, ip_str);
                     return user;
                 },
-                .offered => continue,
-                .denied => {},
+                .offered => {
+                    // A probe ("would this key work?"). `pk_ok` was
+                    // already sent; wait for the signed follow-up. Bound
+                    // the number of probes so a client cannot pin the
+                    // session by looping offers forever.
+                    soft_ops += 1;
+                    if (soft_ops >= max_soft_ops) {
+                        audit.log(io, null, "auth.too_many_attempts", null, .denied, "pubkey probes", ip_str);
+                        return error.LibsshFailure;
+                    }
+                    continue;
+                },
+                // A matched key with an invalid signature (or a `from`
+                // rejection) is a real failure; an unknown user / no
+                // keys / unconfigured-key offer is a soft probe.
+                .hard_denied => is_hard = true,
+                .soft_denied => {},
             }
         }
 
-        // Reaching here means this attempt failed (or the message
-        // wasn't a recognized auth method). Count it; disconnect when
-        // the ceiling is hit. Auth backoff slows password spraying
-        // without an external ban daemon.
-        failed_attempts += 1;
-        abuse.recordFailure(io, ip_str, audit.nowMonotonicMs());
-        const delay_ms = @min(failed_attempts * 250, 2000);
-        std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
-        if (failed_attempts >= max_auth_attempts) {
-            audit.log(io, null, "auth.too_many_attempts", null, .denied, "", ip_str);
-            return error.LibsshFailure;
+        if (is_hard) {
+            // Real credential rejection: feed the abuse suppressor,
+            // apply escalating backoff, disconnect at the ceiling.
+            hard_failures += 1;
+            abuse.recordFailure(io, ip_str, audit.nowMonotonicMs());
+            const delay_ms = @min(hard_failures * 250, 2000);
+            std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
+            if (hard_failures >= max_hard_failures) {
+                audit.log(io, null, "auth.too_many_attempts", null, .denied, "", ip_str);
+                return error.LibsshFailure;
+            }
+        } else {
+            // Soft op (`none`, unrecognized method, soft pubkey probe):
+            // no backoff, no abuse credit, just a loop bound.
+            soft_ops += 1;
+            if (soft_ops >= max_soft_ops) {
+                audit.log(io, null, "auth.too_many_attempts", null, .denied, "probes", ip_str);
+                return error.LibsshFailure;
+            }
         }
 
         _ = c.ssh_message_auth_set_methods(msg, methodsForUser(cfg, username_for_methods));
@@ -157,9 +212,16 @@ const PublicKeyDecision = union(enum) {
     /// already sent; caller should continue the loop and wait for the
     /// follow-up signed message.
     offered,
-    /// Anything else: unknown user, unmatched key, malformed offer, signature
-    /// failure. Caller should run the default-deny path.
-    denied,
+    /// A real credential rejection: a key that matched a configured key
+    /// but whose signature failed to verify, or a known user rejected
+    /// by the `from` allowlist. Counts as a hard failure (abuse +
+    /// backoff).
+    hard_denied,
+    /// A probe that reveals nothing usable: unknown user, no keys
+    /// configured, an offer of a key that isn't configured, or a
+    /// malformed offer. Does NOT count against the abuse suppressor —
+    /// stock clients enumerate agent keys this way on every login.
+    soft_denied,
 };
 
 fn handlePublicKeyMessage(
@@ -170,7 +232,7 @@ fn handlePublicKeyMessage(
     peer_ip: ?[]const u8,
 ) PublicKeyDecision {
     const username_ptr = c.ssh_message_auth_user(msg);
-    if (username_ptr == null) return .denied;
+    if (username_ptr == null) return .soft_denied;
     const username = std.mem.span(username_ptr);
 
     const ip_str = peer_ip orelse "";
@@ -178,7 +240,7 @@ fn handlePublicKeyMessage(
     const presented = c.ssh_message_auth_pubkey(msg);
     if (presented == null) {
         audit.log(io, username, "auth.publickey", null, .denied, "no key in message", ip_str);
-        return .denied;
+        return .soft_denied;
     }
 
     const user = cfg.findUser(username) orelse {
@@ -189,13 +251,13 @@ fn handlePublicKeyMessage(
         // authentication does not reveal whether the username exists.
         _ = matchAgainstDummyKey(allocator, presented);
         audit.log(io, username, "auth.publickey", null, .denied, "unknown user", ip_str);
-        return .denied;
+        return .soft_denied;
     };
 
     if (!netmatch.allowed(user.from, ip_str)) {
         _ = matchAgainstDummyKey(allocator, presented);
         audit.log(io, username, "auth.publickey", null, .denied, "source not allowed", ip_str);
-        return .denied;
+        return .hard_denied;
     }
 
     if (user.keys.len == 0) {
@@ -203,12 +265,12 @@ fn handlePublicKeyMessage(
         // discriminator (does this user accept keys?) is also masked.
         _ = matchAgainstDummyKey(allocator, presented);
         audit.log(io, username, "auth.publickey", null, .denied, "no keys configured", ip_str);
-        return .denied;
+        return .soft_denied;
     }
 
     const matched_idx = matchesAnyConfiguredKey(allocator, user, presented) orelse {
         audit.log(io, username, "auth.publickey", null, .denied, "key not configured", ip_str);
-        return .denied;
+        return .soft_denied;
     };
 
     const state = c.ssh_message_auth_publickey_state(msg);
@@ -219,7 +281,7 @@ fn handlePublicKeyMessage(
             // SSH_PUBLICKEY_STATE_VALID after libssh verifies the signature.
             if (c.ssh_message_auth_reply_pk_ok_simple(msg) != c.SSH_OK) {
                 audit.log(io, username, "auth.publickey", null, .failed, "pk_ok reply failed", ip_str);
-                return .denied;
+                return .soft_denied;
             }
             return .offered;
         },
@@ -234,7 +296,7 @@ fn handlePublicKeyMessage(
         else => {
             // SSH_PUBLICKEY_STATE_WRONG, SSH_PUBLICKEY_STATE_ERROR, anything else.
             audit.log(io, username, "auth.publickey", null, .denied, "signature invalid", ip_str);
-            return .denied;
+            return .hard_denied;
         },
     }
 }
