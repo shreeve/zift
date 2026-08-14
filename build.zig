@@ -55,6 +55,12 @@ fn buildLinkage(
         .threading = true,
     });
     const mbedtls_lib = mbedtls_dep.artifact("mbedtls");
+    // Compile the vendored C position-independent so the final
+    // executable can be linked PIE (ASLR on the main image). A
+    // static-musl PIE still has zero DT_NEEDED entries; without PIC on
+    // these archives the PIE link fails with R_X86_64_64 relocation
+    // errors against their local symbols.
+    mbedtls_lib.root_module.pic = true;
 
     // zlib provides on-the-wire compression for SSH channels. Optional
     // per the SSH spec but real value for SFTP partner workflows that
@@ -66,8 +72,10 @@ fn buildLinkage(
         .optimize = optimize,
     });
     const zlib_lib = zlib_dep.artifact("z");
+    zlib_lib.root_module.pic = true;
 
     const libssh_lib = buildLibssh(b, target, optimize, mbedtls_lib, zlib_lib);
+    libssh_lib.root_module.pic = true;
 
     // The C-to-Zig translator needs the libssh public headers at
     // generate time. The libssh artifact installs them via
@@ -148,7 +156,16 @@ fn buildLibssh(
         "-ffile-prefix-map={s}=/libssh-{d}.{d}.{d}/",
         .{ libssh_src_abs, libssh_major, libssh_minor, libssh_patch },
     );
-    const libssh_cflags: []const []const u8 = &.{libssh_remap};
+    // Hardening flags for the vendored C (libssh/mbedTLS/zlib) — the
+    // largest attack surface in the binary. `-fstack-protector-strong`
+    // is broadly supported by the clang Zig ships across every release
+    // target. `_FORTIFY_SOURCE` is intentionally NOT set here: it needs
+    // an optimized build to do anything and warns otherwise, and musl's
+    // support for it is partial.
+    const libssh_cflags: []const []const u8 = &.{
+        libssh_remap,
+        "-fstack-protector-strong",
+    };
 
     const is_unix = target.result.os.tag == .linux or target.result.os.tag == .macos;
     const is_linux = target.result.os.tag == .linux;
@@ -293,7 +310,10 @@ fn buildLibssh(
         .WITH_BLOWFISH_CIPHER = false,
         .DEBUG_CRYPTO = false,
         .DEBUG_PACKET = false,
-        .WITH_PCAP = true,
+        // Zift never calls `ssh_pki_set_pcap_file`, so PCAP is dead
+        // packet-capture parsing code compiled into a network daemon —
+        // disable it along with every other unused libssh feature.
+        .WITH_PCAP = false,
         .DEBUG_CALLTRACE = false,
         .WITH_NACL = false,
         .WITH_PKCS11_URI = false,
@@ -572,6 +592,11 @@ pub fn build(b: *std.Build) void {
         .root_module = release_mod,
     });
     release_exe.root_module.linkLibrary(release.libssh_lib);
+    // Position-independent executable so the main image is subject to
+    // ASLR. On static-musl this produces a static-PIE binary (still zero
+    // DT_NEEDED). Without this the Linux release could load at a fixed
+    // address with no ASLR on the main image.
+    release_exe.pie = true;
 
     const artifact_name = b.fmt("zift-{s}-{s}", .{ zift_version, target_triple });
     // `dest_dir = "../release"` resolves through the install prefix

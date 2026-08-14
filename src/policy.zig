@@ -100,7 +100,14 @@ pub fn check(user: *const config.UserConfig, operation: Operation, virtual_path:
     var allowed = false;
 
     for (user.rules) |rule| {
-        if (!globMatch(rule.pattern, virtual_path)) continue;
+        // Fail-closed on an indeterminate match: if pattern evaluation
+        // exhausts its step budget (a pathological glob against a long
+        // client-supplied path), we cannot prove the rule does NOT
+        // match, so we deny the whole operation. Denying is always the
+        // safe direction — a partner cannot turn a runaway pattern into
+        // an *allow*.
+        const matched = globMatchChecked(rule.pattern, virtual_path) orelse return .deny;
+        if (!matched) continue;
 
         switch (rule.effect) {
             .deny => return .deny,
@@ -147,11 +154,34 @@ fn permissionFor(operation: Operation) config.Permission {
 ///             and `dir/sub/foo.exe` alike. `/inbox/**` matches all
 ///             contents of `/inbox` at any depth, but NOT `/inbox`
 ///             itself (matching gitignore convention).
+/// Step budget for a single glob evaluation. `**` backtracking is
+/// worst-case superlinear in the (client-controlled) subject length, so
+/// an unbounded matcher lets a partner burn CPU with a crafted path
+/// against a multi-`**` operator pattern — amplified ~80× per READDIR
+/// packet. Legitimate patterns finish in well under a thousand steps;
+/// this ceiling is ~3 orders of magnitude above that, so it only ever
+/// trips on genuinely pathological input, where we fail closed (deny).
+const glob_budget: usize = 1_000_000;
+
+const MatchCtx = struct {
+    budget: usize,
+    exhausted: bool = false,
+};
+
 pub fn globMatch(pattern: []const u8, value: []const u8) bool {
+    return globMatchChecked(pattern, value) orelse false;
+}
+
+/// Like `globMatch`, but returns null when the step budget is exhausted
+/// (indeterminate) so callers can fail closed.
+pub fn globMatchChecked(pattern: []const u8, value: []const u8) ?bool {
     if (std.mem.indexOfAny(u8, pattern, "*?") == null) {
         return literalPrefixMatch(pattern, value);
     }
-    return globMatchInner(pattern, value);
+    var ctx = MatchCtx{ .budget = glob_budget };
+    const result = globMatchInner(&ctx, pattern, value);
+    if (ctx.exhausted) return null;
+    return result;
 }
 
 fn literalPrefixMatch(pattern: []const u8, value: []const u8) bool {
@@ -164,7 +194,16 @@ fn literalPrefixMatch(pattern: []const u8, value: []const u8) bool {
     return value[pattern.len] == '/';
 }
 
-fn globMatchInner(pattern: []const u8, value: []const u8) bool {
+fn globMatchInner(ctx: *MatchCtx, pattern: []const u8, value: []const u8) bool {
+    // Charge one unit per call. On exhaustion, unwind reporting "no
+    // match" and set the flag so the top-level caller can distinguish
+    // this from a genuine non-match and fail closed.
+    if (ctx.budget == 0) {
+        ctx.exhausted = true;
+        return false;
+    }
+    ctx.budget -= 1;
+
     if (pattern.len == 0) return value.len == 0;
 
     // `**/` — gitignore-style "zero or more path segments". Allows
@@ -186,10 +225,10 @@ fn globMatchInner(pattern: []const u8, value: []const u8) bool {
         while (star_end < pattern.len and pattern[star_end] == '*') star_end += 1;
         if (star_end < pattern.len and pattern[star_end] == '/') {
             const rest = pattern[star_end + 1 ..];
-            if (globMatchInner(rest, value)) return true; // (a)
+            if (globMatchInner(ctx, rest, value)) return true; // (a)
             var i: usize = 0;
             while (i < value.len) : (i += 1) {
-                if (value[i] == '/' and globMatchInner(rest, value[i + 1 ..])) return true; // (b)
+                if (value[i] == '/' and globMatchInner(ctx, rest, value[i + 1 ..])) return true; // (b)
             }
             return false;
         }
@@ -208,7 +247,7 @@ fn globMatchInner(pattern: []const u8, value: []const u8) bool {
 
         var i: usize = 0;
         while (i <= value.len) : (i += 1) {
-            if (globMatchInner(rest, value[i..])) return true;
+            if (globMatchInner(ctx, rest, value[i..])) return true;
         }
         return false;
     }
@@ -217,7 +256,7 @@ fn globMatchInner(pattern: []const u8, value: []const u8) bool {
         // `*` does not cross path boundaries (PLAN §6.3).
         var i: usize = 0;
         while (i <= value.len) : (i += 1) {
-            if (globMatchInner(pattern[1..], value[i..])) return true;
+            if (globMatchInner(ctx, pattern[1..], value[i..])) return true;
             if (i < value.len and value[i] == '/') return false;
         }
         return false;
@@ -228,11 +267,11 @@ fn globMatchInner(pattern: []const u8, value: []const u8) bool {
     if (pattern[0] == '?') {
         // `?` does not cross path boundaries (PLAN §6.3).
         if (value[0] == '/') return false;
-        return globMatchInner(pattern[1..], value[1..]);
+        return globMatchInner(ctx, pattern[1..], value[1..]);
     }
 
     if (pattern[0] == value[0]) {
-        return globMatchInner(pattern[1..], value[1..]);
+        return globMatchInner(ctx, pattern[1..], value[1..]);
     }
 
     return false;
@@ -291,6 +330,50 @@ test "deny overrides allow" {
 
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/tool.exe"));
     try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/tool.txt"));
+}
+
+test "glob budget: pathological pattern fails closed (indeterminate = deny)" {
+    // A pattern crafted to blow up `**` backtracking. `check` must not
+    // hang and must resolve to deny when the budget is exhausted, for
+    // BOTH an allow rule (can't prove match → not allowed) and a deny
+    // rule (can't prove non-match → deny).
+    const evil_pattern = "**a**a**a**a**a**a**a**b";
+    const evil_value = "a" ** 200; // no 'b', so a naive matcher explores exponentially
+
+    {
+        var rules = [_]config.Rule{.{
+            .effect = .allow,
+            .pattern = evil_pattern,
+            .permissions = config.PermissionSet.initFull(),
+        }};
+        const user: config.UserConfig = .{
+            .name = "ally",
+            .password_hash = "hash",
+            .keys = &.{},
+            .key_files = &.{},
+            .from = &.{},
+            .root = "/tmp",
+            .rules = &rules,
+        };
+        try std.testing.expectEqual(Decision.deny, check(&user, .open_read, evil_value));
+    }
+    {
+        var rules = [_]config.Rule{
+            .{ .effect = .allow, .pattern = "/", .permissions = config.PermissionSet.initFull() },
+            .{ .effect = .deny, .pattern = evil_pattern, .permissions = config.PermissionSet.initFull() },
+        };
+        const user: config.UserConfig = .{
+            .name = "ally",
+            .password_hash = "hash",
+            .keys = &.{},
+            .key_files = &.{},
+            .from = &.{},
+            .root = "/tmp",
+            .rules = &rules,
+        };
+        // The deny pattern is indeterminate → whole op denied.
+        try std.testing.expectEqual(Decision.deny, check(&user, .open_read, evil_value));
+    }
 }
 
 test "rename checks source and destination" {

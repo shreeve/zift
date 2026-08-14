@@ -18,8 +18,10 @@ pub const failure_threshold: u32 = 10;
 pub const window_ms: i64 = 10 * 60 * 1000;
 /// How long a source stays rejected after tripping the threshold.
 pub const suppress_ms: i64 = 15 * 60 * 1000;
-/// Cap concurrent tracked sources. Oldest free / expired slots are reused.
-const max_entries: usize = 256;
+/// Cap concurrent tracked sources. Sized generously (each Entry is
+/// ~88 bytes, so 4096 entries ≈ 360 KiB static) to raise the bar for
+/// the table-exhaustion attack described below.
+const max_entries: usize = 4096;
 const max_ip_len: usize = 64;
 
 const Entry = struct {
@@ -28,6 +30,11 @@ const Entry = struct {
     failures: u32 = 0,
     window_start_ms: i64 = 0,
     suppressed_until_ms: i64 = 0,
+    /// Last time this slot was touched (insert or failure). Drives the
+    /// eviction victim choice so we evict the genuinely
+    /// least-recently-active source, not the one closest to tripping
+    /// the threshold.
+    last_seen_ms: i64 = 0,
 
     fn ipSlice(self: *const Entry) []const u8 {
         return self.ip[0..self.ip_len];
@@ -61,6 +68,7 @@ pub fn recordFailure(io: std.Io, ip: []const u8, now_ms: i64) void {
 
     if (entry.suppressed_until_ms > now_ms) return;
 
+    entry.last_seen_ms = now_ms;
     if (entry.window_start_ms == 0 or now_ms - entry.window_start_ms > window_ms) {
         entry.window_start_ms = now_ms;
         entry.failures = 0;
@@ -96,28 +104,45 @@ fn findOrInsert(ip: []const u8, now_ms: i64) ?*Entry {
 
     for (&entries) |*entry| {
         if (entry.ip_len == 0) {
+            entry.* = .{};
             entry.setIp(ip);
+            entry.last_seen_ms = now_ms;
             return entry;
         }
     }
 
-    // Table full: reuse an expired or least-recently-active slot.
-    var best: ?*Entry = null;
-    var best_score: i64 = std.math.maxInt(i64);
+    // Table full. Prefer to evict a NOT-currently-suppressed slot,
+    // picking the least-recently-active one (true LRU on `last_seen_ms`
+    // — the old code scored on `window_start_ms`, which is set at the
+    // START of a failure window, so it preferentially evicted the
+    // sources CLOSEST to tripping the threshold).
+    var lru_unsuppressed: ?*Entry = null;
+    var lru_seen: i64 = std.math.maxInt(i64);
+    // Fallback if EVERY slot is suppressed: evict the one whose
+    // suppression expires soonest. This is graceful degradation —
+    // previously the whole table filling with suppressed sources meant
+    // `recordFailure` silently dropped every new source, permanently
+    // disabling suppression process-wide until entries aged out. Losing
+    // the soonest-to-expire suppression is a far smaller harm than
+    // going blind.
+    var soonest_expiry: ?*Entry = null;
+    var soonest_until: i64 = std.math.maxInt(i64);
     for (&entries) |*entry| {
-        if (entry.suppressed_until_ms > now_ms) continue;
-        const score = @max(entry.window_start_ms, entry.suppressed_until_ms);
-        if (score < best_score) {
-            best_score = score;
-            best = entry;
+        if (entry.suppressed_until_ms > now_ms) {
+            if (entry.suppressed_until_ms < soonest_until) {
+                soonest_until = entry.suppressed_until_ms;
+                soonest_expiry = entry;
+            }
+        } else if (entry.last_seen_ms < lru_seen) {
+            lru_seen = entry.last_seen_ms;
+            lru_unsuppressed = entry;
         }
     }
-    if (best) |entry| {
-        entry.* = .{};
-        entry.setIp(ip);
-        return entry;
-    }
-    return null;
+    const victim = lru_unsuppressed orelse soonest_expiry orelse return null;
+    victim.* = .{};
+    victim.setIp(ip);
+    victim.last_seen_ms = now_ms;
+    return victim;
 }
 
 test "suppress after threshold failures" {

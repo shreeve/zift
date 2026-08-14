@@ -7,5 +7,6 @@ comptime {
     _ = @import("netmatch.zig");
     _ = @import("policy.zig");
     _ = @import("vfs.zig");
+    _ = @import("wire.zig");
     _ = @import("fuzz.zig");
 }

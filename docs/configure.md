@@ -398,10 +398,16 @@ Zift has three primary verbs:
 | Verb | Grants |
 | --- | --- |
 | `read` | stat, list, and download |
-| `add` | create new files, create directories, and rename to fresh paths |
+| `add` | create new files and create directories |
 | `remove` | delete files/directories and modify or replace existing entries |
 
-`full` is shorthand for `read add remove`.
+`add` grants only non-destructive creation. It does **not** grant
+`rename`: a rename removes the source name, so bundling it into `add`
+would let an `add`-only partner destroy or hide an existing file. Grant
+renames explicitly with the granular `rename` verb (below) or with
+`full`.
+
+`full` is shorthand for `read add remove rename`.
 
 There are also granular verbs for unusual policies:
 
@@ -556,7 +562,13 @@ features rather than transfer failures.
 Zift reloads for new sessions when the config mtime moves forward, or
 immediately on `SIGHUP`. Existing sessions keep the snapshot they
 authenticated with. Invalid reloads are rejected; the previous config
-keeps serving. Changing `host-key` still requires a restart.
+keeps serving.
+
+`listen`, `host-key`, and `log` are bound once at startup and are
+**not** re-applied by a reload. If a reload changes one of them, Zift
+logs a warning naming the setting and keeps the value it started with —
+apply the change with a full restart. Everything else (users, rules,
+timeouts, connection caps, modes) applies to new sessions.
 
 Operator runbook (validate-then-HUP, mtime caveats, partner add/remove):
 [`operate.md`](operate.md).

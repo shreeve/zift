@@ -1078,16 +1078,20 @@ fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []con
             permissions.insert(.read);
             permissions.insert(.list);
         } else if (std.mem.eql(u8, token, "add")) {
-            // `add` is a compound verb that grants every "create-or-modify-
-            // by-name" operation: file upload, directory creation, and rename
-            // of either kind. Symmetric with `remove` (which already covers
-            // both file unlink AND rmdir via policy.permissionFor). The
-            // granular verbs (`write`, `mkdir`, `rename`) remain valid for
-            // operators who genuinely need that distinction (e.g. an
-            // immutable-receive workflow that allows uploads but no renames).
+            // `add` grants the non-destructive create operations: file
+            // upload and directory creation. It intentionally does NOT
+            // grant `rename`.
+            //
+            // A rename removes the source name — so if `add` implied
+            // `rename`, an `add`-only partner could destroy or hide an
+            // operator's existing file by renaming it (the clobber rule
+            // only protects the DESTINATION, never the source). That
+            // directly contradicts the documented guarantee that
+            // `read add` "cannot delete anything." Operators who want
+            // rename grant it explicitly via the granular `rename`
+            // verb or via `full`.
             permissions.insert(.write);
             permissions.insert(.mkdir);
-            permissions.insert(.rename);
         } else if (std.mem.eql(u8, token, "full")) {
             // `full` = read + add + remove. The everyday three-verb
             // pattern (`read | add | remove`) collapses to a single
@@ -1151,21 +1155,43 @@ fn parseDurationMs(value: []const u8) Error!u64 {
     // expect seconds; the implementation used to treat it as
     // milliseconds) so we reject it rather than guess.
     if (std.mem.endsWith(u8, value, "ms")) {
-        return std.fmt.parseUnsigned(u64, value[0 .. value.len - 2], 10) catch error.InvalidDuration;
+        const ms = std.fmt.parseUnsigned(u64, value[0 .. value.len - 2], 10) catch return error.InvalidDuration;
+        return capDurationMs(ms);
     }
     if (std.mem.endsWith(u8, value, "s")) {
         const seconds = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
-        return seconds * 1000;
+        return scaleDurationMs(seconds, 1000);
     }
     if (std.mem.endsWith(u8, value, "m")) {
         const minutes = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
-        return minutes * 60 * 1000;
+        return scaleDurationMs(minutes, 60 * 1000);
     }
     if (std.mem.endsWith(u8, value, "h")) {
         const hours = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
-        return hours * 60 * 60 * 1000;
+        return scaleDurationMs(hours, 60 * 60 * 1000);
     }
     return error.InvalidDuration;
+}
+
+/// Largest accepted duration in milliseconds. Every duration is stored
+/// as `u64` in the config but converted to `i64` at runtime (idle,
+/// reload, drain timers), so the ceiling is `maxInt(i64)` — this keeps
+/// both the parse-time multiply and the runtime `@intCast` from ever
+/// overflowing. Without this bound, `idle-timeout 99999999999999h`
+/// panicked `zift validate`, and `reload-interval <huge>ms` passed
+/// validation and then crash-looped the daemon right after it bound the
+/// listener. ~292 million years is not a limit any real deployment
+/// meets.
+pub const max_duration_ms: u64 = std.math.maxInt(i64);
+
+fn capDurationMs(ms: u64) Error!u64 {
+    if (ms > max_duration_ms) return error.InvalidDuration;
+    return ms;
+}
+
+fn scaleDurationMs(count: u64, factor: u64) Error!u64 {
+    const product = std.math.mul(u64, count, factor) catch return error.InvalidDuration;
+    return capDurationMs(product);
 }
 
 fn dupNonEmpty(allocator: std.mem.Allocator, value: []const u8) Error![]const u8 {
@@ -1250,7 +1276,7 @@ test "parse valid config" {
     try std.testing.expect(ally.rules[0].permissions.contains(.write));
 }
 
-test "parse: 'add' verb expands to write+mkdir+rename" {
+test "parse: 'add' verb expands to write+mkdir (NOT rename)" {
     const text =
         \\server
         \\  listen 127.0.0.1:2222
@@ -1270,16 +1296,18 @@ test "parse: 'add' verb expands to write+mkdir+rename" {
     try std.testing.expectEqual(@as(usize, 1), alice.rules.len);
     const rule = alice.rules[0];
     try std.testing.expectEqualStrings("/pending", rule.pattern);
-    // `add` should have unfolded into the granular trio. `read | list |
-    // add | remove` ⇒ {read, list, write, mkdir, rename, remove}. If
-    // someone "simplifies" the parser to alias add↔write only, this
-    // test catches it (mkdir + rename would go missing).
+    // `add` unfolds to {write, mkdir} only. It intentionally does NOT
+    // grant `rename`: a rename removes the source name, so bundling it
+    // into `add` would let an `add`-only partner destroy an existing
+    // file, contradicting the "read add cannot delete anything"
+    // guarantee. `rename` is only reachable via the granular `rename`
+    // verb or via `full`.
     try std.testing.expect(rule.permissions.contains(.read));
     try std.testing.expect(rule.permissions.contains(.list));
     try std.testing.expect(rule.permissions.contains(.write));
     try std.testing.expect(rule.permissions.contains(.mkdir));
-    try std.testing.expect(rule.permissions.contains(.rename));
     try std.testing.expect(rule.permissions.contains(.remove));
+    try std.testing.expect(!rule.permissions.contains(.rename));
 }
 
 test "parse: 'read' is now a superset of 'list' (v0.4.0)" {
