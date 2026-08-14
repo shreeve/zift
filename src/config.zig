@@ -566,6 +566,7 @@ pub const Error = error{
     InvalidDuration,
     InvalidIndent,
     InvalidKeyLine,
+    InvalidListen,
     InvalidPermission,
     InvalidUserName,
     KeyDirectiveRemoved,
@@ -845,6 +846,7 @@ fn parseServerProperty(
     value: []const u8,
 ) Error!void {
     if (std.mem.eql(u8, key, "listen")) {
+        try validateListen(value);
         server.listen = try dupNonEmpty(allocator, value);
     } else if (std.mem.eql(u8, key, "host-key")) {
         server.host_key = try dupNonEmpty(allocator, value);
@@ -1165,6 +1167,29 @@ fn parsePermission(token: []const u8) ?Permission {
     return null;
 }
 
+/// Reject a `listen` value that cannot possibly bind, at PARSE time.
+///
+/// This check previously existed only in server.zig's parseListen(),
+/// which runs at bind time. `zift validate` therefore reported `ok:`
+/// for a config that killed the daemon on the next start -- exactly the
+/// failure the validate-then-reload workflow exists to prevent. It is
+/// worse than it sounds: `listen` is startup-only and is ignored by a
+/// reload, so the breakage surfaces on a restart or a reboot, which is
+/// when nobody is watching.
+///
+/// The HOST half is deliberately left to libssh. Hostnames and
+/// bracketed IPv6 forms are both legitimate here, and re-implementing
+/// that resolution would risk rejecting valid configs -- a worse
+/// failure than the one being fixed. The port is unambiguous, and a
+/// value with no colon at all cannot bind under any reading.
+fn validateListen(value: []const u8) Error!void {
+    const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidListen;
+    const port = value[colon + 1 ..];
+    if (port.len == 0) return error.InvalidListen;
+    const parsed = std.fmt.parseUnsigned(u16, port, 10) catch return error.InvalidListen;
+    if (parsed == 0) return error.InvalidListen;
+}
+
 fn parseDurationMs(value: []const u8) Error!u64 {
     if (value.len == 0) return error.InvalidDuration;
 
@@ -1331,6 +1356,54 @@ test "parse: 'add' verb expands to write+mkdir (NOT rename)" {
     try std.testing.expect(rule.permissions.contains(.mkdir));
     try std.testing.expect(rule.permissions.contains(.remove));
     try std.testing.expect(!rule.permissions.contains(.rename));
+}
+
+test "parse: listen is validated at parse time (v0.9.4)" {
+    // Regression: `zift validate` used to report `ok:` for these and the
+    // daemon then died at bind with InvalidListenAddress. `listen` is
+    // startup-only, so that lands on a restart or a reboot.
+    const bad = [_][]const u8{
+        "NOT-AN-ADDRESS", // no colon at all
+        "127.0.0.1:", // empty port
+        "127.0.0.1:http", // non-numeric port
+        "127.0.0.1:99999", // out of u16 range
+        "127.0.0.1:0", // port 0 never binds usefully
+    };
+    for (bad) |listen| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf,
+            \\server
+            \\  listen {s}
+            \\  host-key /tmp/zift_host_ed25519
+            \\  log stderr
+            \\
+        , .{listen});
+        try std.testing.expectError(error.InvalidListen, parse(std.testing.allocator, text));
+    }
+}
+
+test "parse: legitimate listen forms still accepted (v0.9.4)" {
+    const good = [_][]const u8{
+        "0.0.0.0:2222",
+        "127.0.0.1:2222",
+        ":2222", // host omitted -> 0.0.0.0
+        "[::]:2222", // bracketed IPv6
+        "localhost:2222", // hostname: resolution is libssh's job
+        "0.0.0.0:65535",
+    };
+    for (good) |listen| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf,
+            \\server
+            \\  listen {s}
+            \\  host-key /tmp/zift_host_ed25519
+            \\  log stderr
+            \\
+        , .{listen});
+        var cfg = try parse(std.testing.allocator, text);
+        defer cfg.deinit();
+        try std.testing.expectEqualStrings(listen, cfg.server.listen);
+    }
 }
 
 test "parse: 'update' grants clobber without granting deletion (v0.9.2)" {
