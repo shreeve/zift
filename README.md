@@ -44,7 +44,28 @@ Start with [`docs/evaluate.md`](docs/evaluate.md).
 
 ## Quick Install
 
-Pick the binary for your host from a GitHub release.
+```sh
+curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
+```
+
+Installs the binary for this platform, verified against the release's
+signed `SHA256SUMS`. As root it lands in `/usr/local/bin`, where the
+systemd unit expects it; as a user it lands in `~/.local/bin`, which is
+enough for `zift hash-password` and `zift validate` on a laptop.
+Override either with `BIN=`. Pin a version by passing a tag, and remove
+the binary with `--uninstall`:
+
+```sh
+curl -fsSL .../install.sh | bash -s v0.10.2
+curl -fsSL .../install.sh | bash -s -- --uninstall
+```
+
+This installs the **binary only**. Standing up the daemon — service
+user, host key, config, jail tree, systemd unit — is
+[`docs/operate.md`](docs/operate.md); an uninstall never touches any of
+them.
+
+To place the binary by hand instead:
 
 ```sh
 # Linux x86_64

@@ -27,7 +27,50 @@ paths in its config.
 
 ## Install The Binary
 
-Download the binary for your host:
+```sh
+curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | sudo bash
+```
+
+Resolves the latest release, downloads the binary for this platform,
+verifies it against the release's `SHA256SUMS`, and — because it runs as
+root — installs to `/usr/local/bin/zift`, the path the systemd unit
+below invokes. When `cosign` is on the host the installer also verifies
+the manifest's signature; when it is not, it says so and the checksum
+check still applies. Pass a tag to pin a version.
+
+The installer stops at the binary. Everything from here down — service
+user, host key, config, jail tree, unit — is deliberately yours to run,
+because those steps must never clobber a config that carries partner
+credentials.
+
+### Upgrading A Running Daemon
+
+You do not need to stop the daemon to replace its binary — but you do
+need the right tool. Use `install`, never `cp`:
+
+```sh
+sudo install -m 0755 zift-0.10.2-x86_64-linux /usr/local/bin/zift   # works
+sudo cp        zift-0.10.2-x86_64-linux /usr/local/bin/zift         # Text file busy
+```
+
+`cp` opens the existing file for writing, and the kernel refuses that
+for a file being executed (`ETXTBSY`). `install` unlinks the
+destination and creates a new inode, which is always permitted.
+
+The new inode is also why the upgrade is not live: the running process
+keeps executing the old, now-unlinked inode. It reads as deleted:
+
+```sh
+pid=$(systemctl show zift -p MainPID --value)
+readlink /proc/$pid/exe        # /usr/local/bin/zift (deleted)
+sudo systemctl restart zift    # cuts over; drops live SFTP sessions
+```
+
+`reload` is not a substitute here — it re-reads the config and keeps
+sessions, but the process image is unchanged. The installer detects
+this case and prints the same guidance.
+
+To place the binary by hand instead:
 
 ```sh
 ZIFT_VERSION=0.10.2
