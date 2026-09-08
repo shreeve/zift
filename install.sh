@@ -157,6 +157,26 @@ main() {
   [ -d "$BIN" ] || fail "cannot create $(tildify "$BIN") — set BIN= to a writable directory"
   [ -w "$BIN" ] || fail "$(tildify "$BIN") is not writable — re-run under sudo, or set BIN="
 
+  # A user install on a host that runs zift as a service is almost always a
+  # missing `sudo`: the binary lands somewhere the unit never looks, the
+  # daemon keeps running whatever it already had, and the install appears
+  # to have done nothing. Legitimate on a server for `hash-password` and
+  # `validate`, so this warns rather than refuses — but it warns loudly,
+  # because the quiet version of this message is easy to scroll past.
+  if [ "$(id -u)" != 0 ] && command -v systemctl >/dev/null \
+     && systemctl list-unit-files "$NAME.service" >/dev/null 2>&1; then
+    unit_exec=$(systemctl show "$NAME" -p ExecStart --value 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p')
+    printf '\n'
+    warn "This host runs $NAME as a service, but this is a USER install."
+    warn "It is going to $(tildify "$dest")${unit_exec:+, while the service runs $unit_exec}."
+    warn "The daemon will NOT pick this up. To install the one it runs:"
+    warn ""
+    warn "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sudo bash"
+    warn ""
+    warn "Continuing — a user install is still fine for hash-password and validate."
+    printf '\n'
+  fi
+
   # Is a running daemon executing the very file we are about to replace?
   #
   # `install` unlinks the destination and creates a new inode, so this
