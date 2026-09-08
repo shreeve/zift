@@ -9,10 +9,27 @@
 #   curl -fsSL .../install.sh | bash -s v0.10.2
 #
 # Downloads the release binary for this platform, verifies it against the
-# release's signed SHA256SUMS, and installs it. As root it lands in
-# /usr/local/bin, so the systemd unit's ExecStart path keeps working; as a
-# user it lands in ~/.local/bin, which is enough for `zift hash-password`
-# and `zift validate` on a laptop. Override either with BIN=...
+# release's signed SHA256SUMS, and installs it.
+#
+# Where it lands answers "which binary matters here":
+#
+#   host runs zift as a service  ->  /usr/local/bin, the path the unit's
+#                                    ExecStart names. When you are not
+#                                    root, the script elevates for THAT
+#                                    ONE WRITE via sudo, announcing it
+#                                    first. Nothing else runs as root —
+#                                    not the download, not the signature
+#                                    check. That is strictly narrower
+#                                    than `| sudo bash`, which runs the
+#                                    whole script with privileges.
+#   anywhere else                ->  ~/.local/bin, enough for
+#                                    `zift hash-password` and
+#                                    `zift validate` on a laptop.
+#
+# BIN=/some/path overrides both and is taken literally: an explicit
+# destination is a statement of intent, so the script never elevates
+# behind it. `sudo bash` still works and is the answer when sudo needs a
+# password the pipe cannot carry.
 #
 # This installs the BINARY ONLY. Standing up the daemon — service user,
 # host key, config, jail tree, hardened systemd unit — is deliberately out
@@ -43,12 +60,46 @@ warn() { printf "${Dim}%s${Color_Off}\n" "$*" >&2; }
 fail() { printf "${Red}error${Color_Off}: %s\n" "$*" >&2; exit 1; }
 tildify() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
 
-# The destination: system-wide for root, user-owned for everyone else.
-# A systemd unit invokes zift by absolute path, so a root install has to
-# land where that path points.
-destdir() {
-  if [ "$(id -u)" = 0 ]; then printf '%s' "${BIN:-/usr/local/bin}"
-  else printf '%s' "${BIN:-$HOME/.local/bin}"; fi
+# Does this host run zift as a service? Then the binary that matters is
+# the one the unit invokes, not a copy in somebody's home directory.
+host_runs_service() {
+  command -v systemctl >/dev/null \
+    && systemctl list-unit-files "$NAME.service" >/dev/null 2>&1
+}
+
+# Resolve BIN (where the binary goes) and SUDO (the prefix that supplies
+# privileges for the write, empty when none are needed).
+#
+# Root already has what it needs. An explicit BIN= is a statement of
+# intent — take it literally and never elevate behind the user's back.
+# Otherwise a host running zift as a service wants /usr/local/bin, which
+# is the path the unit's ExecStart names and which only root can write.
+#
+# Elevating this one write is deliberately narrower than piping the whole
+# script to `sudo bash`, which runs the download, the signature check, and
+# every helper as root. Nothing but the write needs privilege.
+#
+# `sudo -n` first, so a passwordless setup is seamless and a password-
+# required one never hangs against a pipe that cannot carry the answer.
+# Only when a real terminal is reachable do we fall back to a `sudo` that
+# may prompt, because it prompts on /dev/tty rather than on stdin — which
+# here is the curl pipe.
+SUDO=""
+resolve_dest() {
+  [ -n "${BIN:-}" ] && return 0
+  if [ "$(id -u)" = 0 ]; then BIN=/usr/local/bin; return 0; fi
+  if host_runs_service; then
+    if sudo -n true 2>/dev/null; then
+      BIN=/usr/local/bin; SUDO="sudo -n"
+    elif command -v sudo >/dev/null && (exec </dev/tty) 2>/dev/null; then
+      BIN=/usr/local/bin; SUDO="sudo"
+    else
+      BIN="$HOME/.local/bin"
+    fi
+  else
+    BIN="$HOME/.local/bin"
+  fi
+  return 0
 }
 
 # Remove only what install put down — the binary. The config, host key,
@@ -57,9 +108,12 @@ destdir() {
 # a host key would break every partner's known_hosts on the next connect.
 # No network: the filesystem answers what's installed.
 uninstall() {
-  BIN=$(destdir)
-  [ -e "$BIN/$NAME" ] || fail "$NAME is not installed at $(tildify "$BIN/$NAME") (BIN= if it lives elsewhere; sudo for a system install)"
-  rm -f "$BIN/$NAME" || fail "cannot remove $(tildify "$BIN/$NAME") — re-run under sudo if it was installed system-wide"
+  # Same resolution as install, so uninstall always targets what install
+  # put down. An uninstall that could not reach the file install created
+  # would report "not installed" about a binary sitting right there.
+  resolve_dest
+  [ -e "$BIN/$NAME" ] || fail "$NAME is not installed at $(tildify "$BIN/$NAME") (BIN= if it lives elsewhere)"
+  $SUDO rm -f "$BIN/$NAME" || fail "cannot remove $(tildify "$BIN/$NAME") — re-run under sudo if it was installed system-wide"
   printf "${Green}$NAME was removed from ${Bold_Green}%s${Color_Off}\n" "$(tildify "$BIN")"
   info "your config, host key, partner trees, and service unit are untouched"
   info "to retire the service too: systemctl disable --now zift"
@@ -148,28 +202,35 @@ main() {
   [ "$sum" = "$want" ]  || fail "checksum mismatch for $asset"
 
   # --- install -------------------------------------------------------------
-  BIN=$(destdir)
+  resolve_dest
   dest="$BIN/$NAME"
 
-  # Create the destination as ourselves when we can, so a missing ~/.local
-  # is not mistaken for an unwritable one.
-  [ -d "$BIN" ] || install -d -m 0755 "$BIN" 2>/dev/null || true
+  # Say it before doing it. Silently acquiring root is the thing people
+  # rightly distrust about piped installers, so name the privilege, the
+  # destination, and the reason at the moment it is used.
+  [ -n "$SUDO" ] && info "using sudo to install to $dest (this host runs $NAME as a service)"
+
+  # Create the destination when we can, so a missing ~/.local is not
+  # mistaken for an unwritable one.
+  [ -d "$BIN" ] || $SUDO install -d -m 0755 "$BIN" 2>/dev/null || true
   [ -d "$BIN" ] || fail "cannot create $(tildify "$BIN") — set BIN= to a writable directory"
-  [ -w "$BIN" ] || fail "$(tildify "$BIN") is not writable — re-run under sudo, or set BIN="
+  if [ -z "$SUDO" ] && [ ! -w "$BIN" ]; then
+    fail "$(tildify "$BIN") is not writable — re-run under sudo, or set BIN="
+  fi
 
   # A user install on a host that runs zift as a service is almost always a
   # missing `sudo`: the binary lands somewhere the unit never looks, the
   # daemon keeps running whatever it already had, and the install appears
-  # to have done nothing. Legitimate on a server for `hash-password` and
-  # `validate`, so this warns rather than refuses — but it warns loudly,
-  # because the quiet version of this message is easy to scroll past.
-  if [ "$(id -u)" != 0 ] && command -v systemctl >/dev/null \
-     && systemctl list-unit-files "$NAME.service" >/dev/null 2>&1; then
+  # to have done nothing. Reaching here means elevation was unavailable —
+  # no sudo rights and no terminal to ask on — so warn rather than refuse,
+  # since a user install is still useful for hash-password and validate.
+  if [ -z "$SUDO" ] && [ "$(id -u)" != 0 ] && host_runs_service; then
     unit_exec=$(systemctl show "$NAME" -p ExecStart --value 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p')
     printf '\n'
     warn "This host runs $NAME as a service, but this is a USER install."
     warn "It is going to $(tildify "$dest")${unit_exec:+, while the service runs $unit_exec}."
-    warn "The daemon will NOT pick this up. To install the one it runs:"
+    warn "The daemon will NOT pick this up, and sudo was not available here."
+    warn "To install the one it runs:"
     warn ""
     warn "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sudo bash"
     warn ""
@@ -194,13 +255,13 @@ main() {
   if command -v systemctl >/dev/null && systemctl is-active --quiet "$NAME" 2>/dev/null; then
     pid=$(systemctl show "$NAME" -p MainPID --value 2>/dev/null || true)
     if [ -n "${pid:-}" ] && [ "$pid" != 0 ]; then
-      case "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" in
+      case "$($SUDO readlink "/proc/$pid/exe" 2>/dev/null || true)" in
         "$dest"|"$dest "*) replacing_running=true ;;
       esac
     fi
   fi
 
-  install -m 0755 "$tmp/$asset" "$dest" || fail "cannot install to $(tildify "$dest")"
+  $SUDO install -m 0755 "$tmp/$asset" "$dest" || fail "cannot install to $(tildify "$dest")"
   printf "${Green}$NAME was installed to ${Bold_Green}%s${Color_Off}\n" "$(tildify "$dest")"
 
   # PATH hint: an install nobody can invoke is not an install.

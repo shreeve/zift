@@ -49,11 +49,19 @@ curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
 ```
 
 Installs the binary for this platform, verified against the release's
-signed `SHA256SUMS`. As root it lands in `/usr/local/bin`, where the
-systemd unit expects it; as a user it lands in `~/.local/bin`, which is
-enough for `zift hash-password` and `zift validate` on a laptop.
-Override either with `BIN=`. Pin a version by passing a tag, and remove
-the binary with `--uninstall`:
+signed `SHA256SUMS`.
+
+Where it lands answers *which binary matters here*. On a host that runs
+zift as a service it goes to `/usr/local/bin` — the path the unit's
+`ExecStart` names — elevating for that one write via `sudo` if you are
+not root, and saying so before it does. Nothing else runs with
+privileges: not the download, not the signature check. Anywhere else it
+goes to `~/.local/bin`, which is enough for `zift hash-password` and
+`zift validate` on a laptop.
+
+`BIN=/some/path` overrides both and is taken literally, so an explicit
+destination is never elevated behind. Pin a version by passing a tag,
+and remove the binary with `--uninstall`:
 
 ```sh
 curl -fsSL .../install.sh | bash -s v0.10.2

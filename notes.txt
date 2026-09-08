@@ -1,0 +1,12 @@
+
+# systemctl uses
+systemctl status zift          # fine bare
+systemctl is-active zift       # fine bare
+sudo systemctl restart zift    # needs sudo
+sudo systemctl reload zift     # needs sudo
+
+# pin a version
+curl -fsSL .../install.sh | sudo bash -s v0.10.2
+
+# uninstall the system binary
+curl -fsSL .../install.sh | sudo bash -s -- --uninstall

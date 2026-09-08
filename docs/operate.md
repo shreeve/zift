@@ -28,15 +28,23 @@ paths in its config.
 ## Install The Binary
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
 ```
 
 Resolves the latest release, downloads the binary for this platform,
-verifies it against the release's `SHA256SUMS`, and — because it runs as
-root — installs to `/usr/local/bin/zift`, the path the systemd unit
-below invokes. When `cosign` is on the host the installer also verifies
-the manifest's signature; when it is not, it says so and the checksum
-check still applies. Pass a tag to pin a version.
+verifies it against the release's `SHA256SUMS`, and installs it to
+`/usr/local/bin/zift` — the path the systemd unit below invokes.
+
+No `sudo` on that line: because the host runs `zift.service`, the
+installer elevates for the single `install` write and announces it
+first. The download and the signature check stay unprivileged, which is
+narrower than `| sudo bash` (that runs everything as root, and still
+works if you prefer it — or if `sudo` here needs a password, since a
+pipe has no way to carry one).
+
+When `cosign` is on the host the installer also verifies the manifest's
+signature; when it is not, it says so and the checksum check still
+applies. Pass a tag to pin a version.
 
 The installer stops at the binary. Everything from here down — service
 user, host key, config, jail tree, unit — is deliberately yours to run,
