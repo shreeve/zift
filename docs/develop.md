@@ -160,16 +160,16 @@ mismatch; switch back to Debug fuzz when a patched Zig is pinned.
 Build one release artifact:
 
 ```sh
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.10.2-dev
+zig build release -Dtarget=x86_64-linux-musl -Dversion=0.10.3-dev
 ```
 
 Supported release targets:
 
 ```sh
-zig build release -Dtarget=x86_64-linux-musl  -Dversion=0.10.2-dev
-zig build release -Dtarget=aarch64-linux-musl -Dversion=0.10.2-dev
-zig build release -Dtarget=x86_64-macos       -Dversion=0.10.2-dev
-zig build release -Dtarget=aarch64-macos      -Dversion=0.10.2-dev
+zig build release -Dtarget=x86_64-linux-musl  -Dversion=0.10.3-dev
+zig build release -Dtarget=aarch64-linux-musl -Dversion=0.10.3-dev
+zig build release -Dtarget=x86_64-macos       -Dversion=0.10.3-dev
+zig build release -Dtarget=aarch64-macos      -Dversion=0.10.3-dev
 ```
 
 Output lands under `release/`.
@@ -364,7 +364,7 @@ tests/run.sh
 tests/run.sh --list
 
 # local release artifact
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.10.2-dev
+zig build release -Dtarget=x86_64-linux-musl -Dversion=0.10.3-dev
 
 # inspect release output
 ls -la release/

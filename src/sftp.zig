@@ -166,7 +166,28 @@ pub fn runSftp(
                     c.ssh_get_error(@as(?*anyopaque, @ptrCast(session)))
                 else
                     null;
-                if (lib_err != null) lw.writeAll(std.mem.span(lib_err)) catch {};
+                const lib_msg: []const u8 = if (lib_err != null) std.mem.span(lib_err) else "";
+
+                // A client that says goodbye at the TRANSPORT layer is
+                // being polite, not failing. libssh marks every received
+                // SSH_MSG_DISCONNECT as SSH_FATAL — its own callback
+                // carries a "TODO: handle a graceful disconnect" — so
+                // the next channel read returns SSH_ERROR and lands
+                // here. Recording that as a failed session buries real
+                // transport faults in ordinary traffic: GUI clients and
+                // most libraries close exactly this way, while OpenSSH's
+                // sftp half-closes the channel and takes the ChannelEof
+                // path above. Only reason 11 is the deliberate goodbye;
+                // every other code names something worth reporting, so
+                // it keeps libssh's text and stays `failed`.
+                if (disconnectReason(lib_msg)) |code| {
+                    if (code == ssh2_disconnect_by_application) {
+                        state.emitSessionEnded("client disconnected", .ok, ip_str);
+                        return;
+                    }
+                }
+
+                lw.writeAll(lib_msg) catch {};
                 state.emitSessionEnded(lw.buffered(), .failed, ip_str);
                 return;
             },
@@ -1845,6 +1866,30 @@ fn readPacketTimed(state: *SftpState, payload_buf: []u8) ![]u8 {
     return payload;
 }
 
+/// RFC 4254 §11.1 SSH_DISCONNECT_BY_APPLICATION: the peer closed the
+/// connection because its application asked to, which is what every
+/// ordinary client does at the end of a session.
+const ssh2_disconnect_by_application: u32 = 11;
+
+/// Extract the numeric reason from libssh's disconnect error text.
+///
+/// libssh exposes no accessor for the code. `ssh_get_disconnect_message`
+/// returns only the peer's free-text message, and the disconnect callback
+/// formats the number into the session error string and nowhere else, in
+/// a fixed shape:
+///
+///     Received SSH_MSG_DISCONNECT: <code>:<message>
+///
+/// Returns null for any other libssh error, so a message we do not
+/// recognize is never mistaken for a graceful close.
+fn disconnectReason(text: []const u8) ?u32 {
+    const marker = "Received SSH_MSG_DISCONNECT: ";
+    const start = std.mem.indexOf(u8, text, marker) orelse return null;
+    const rest = text[start + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
+}
+
 fn readExactTimed(state: *SftpState, out: []u8) !void {
     // Slice ssh_channel_read into ~1-second polls so we can enforce the
     // per-session idle deadline (PLAN §6.2) without rewriting libssh's
@@ -1929,4 +1974,44 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
         state.spurious_eof_count = 0;
         offset += @intCast(n);
     }
+}
+
+test "disconnectReason: the graceful goodbye is recognized" {
+    // The exact text libssh's disconnect callback produces. Real clients
+    // send an empty message, which is what the trailing colon carries.
+    try std.testing.expectEqual(
+        @as(?u32, 11),
+        disconnectReason("Received SSH_MSG_DISCONNECT: 11:"),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, 11),
+        disconnectReason("Received SSH_MSG_DISCONNECT: 11:disconnected by user"),
+    );
+}
+
+test "disconnectReason: other codes are distinguished, not swallowed" {
+    // These name real problems and must keep their `failed` result.
+    try std.testing.expectEqual(
+        @as(?u32, 2),
+        disconnectReason("Received SSH_MSG_DISCONNECT: 2:protocol error"),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, 10),
+        disconnectReason("Received SSH_MSG_DISCONNECT: 10:connection lost"),
+    );
+    // A prefix of 11 must not be read as 11.
+    try std.testing.expectEqual(
+        @as(?u32, 110),
+        disconnectReason("Received SSH_MSG_DISCONNECT: 110:nonsense"),
+    );
+}
+
+test "disconnectReason: unrelated libssh errors stay unrecognized" {
+    // Anything we cannot parse must return null so it is reported as the
+    // failure it is, rather than being mistaken for a graceful close.
+    try std.testing.expectEqual(@as(?u32, null), disconnectReason(""));
+    try std.testing.expectEqual(@as(?u32, null), disconnectReason("Socket error: disconnected"));
+    try std.testing.expectEqual(@as(?u32, null), disconnectReason("Received SSH_MSG_DISCONNECT: "));
+    try std.testing.expectEqual(@as(?u32, null), disconnectReason("Received SSH_MSG_DISCONNECT: abc:x"));
+    try std.testing.expectEqual(@as(?u32, null), disconnectReason("Received SSH_MSG_DISCONNECT: 11"));
 }

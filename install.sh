@@ -6,7 +6,7 @@
 #
 # Pin a version by passing a tag (with or without the leading v):
 #
-#   curl -fsSL .../install.sh | bash -s v0.10.2
+#   curl -fsSL .../install.sh | bash -s v0.10.3
 #
 # Downloads the release binary for this platform, verifies it against the
 # release's signed SHA256SUMS, and installs it.
@@ -187,9 +187,23 @@ main() {
       || fail "cosign could not verify SHA256SUMS against $REPO — do not install this binary"
     info "signature verified (cosign keyless, $REPO workflow)"
   else
-    warn "cosign not found — SHA256SUMS will not be checked for a valid signature"
-    warn "the binary is still verified against it; for a production install see"
-    warn "the provenance steps in docs/operate.md"
+    # Worth naming precisely, because the two checks prove different
+    # things. The hash below binds the binary to SHA256SUMS — but both
+    # come from the same release, so a tampered release supplies a
+    # matching pair and passes. Only the signature binds SHA256SUMS to
+    # the workflow that built it. Say how to get cosign rather than
+    # pointing at a document; a hint you can paste is one that gets used.
+    case "$os" in
+      Linux)  hint="sudo apt install cosign   # or: dnf install cosign" ;;
+      Darwin) hint="brew install cosign" ;;
+      *)      hint="see https://docs.sigstore.dev/cosign/installation/" ;;
+    esac
+    warn "cosign not found — the binary is verified against SHA256SUMS, but"
+    warn "SHA256SUMS itself is NOT verified as signed by the $REPO workflow."
+    warn "For a production host, install cosign and re-run:"
+    warn ""
+    warn "  $hint"
+    warn ""
   fi
 
   if command -v sha256sum >/dev/null; then

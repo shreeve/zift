@@ -57,8 +57,8 @@ You do not need to stop the daemon to replace its binary — but you do
 need the right tool. Use `install`, never `cp`:
 
 ```sh
-sudo install -m 0755 zift-0.10.2-x86_64-linux /usr/local/bin/zift   # works
-sudo cp        zift-0.10.2-x86_64-linux /usr/local/bin/zift         # Text file busy
+sudo install -m 0755 zift-0.10.3-x86_64-linux /usr/local/bin/zift   # works
+sudo cp        zift-0.10.3-x86_64-linux /usr/local/bin/zift         # Text file busy
 ```
 
 `cp` opens the existing file for writing, and the kernel refuses that
@@ -81,7 +81,7 @@ this case and prints the same guidance.
 To place the binary by hand instead:
 
 ```sh
-ZIFT_VERSION=0.10.2
+ZIFT_VERSION=0.10.3
 ARCH=$(uname -m)
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-${ARCH}-linux"
@@ -105,7 +105,7 @@ Production installs should verify both the signed checksum manifest and
 the binary hash.
 
 ```sh
-ZIFT_VERSION=0.10.2
+ZIFT_VERSION=0.10.3
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS"
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS.bundle"

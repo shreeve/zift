@@ -64,7 +64,7 @@ destination is never elevated behind. Pin a version by passing a tag,
 and remove the binary with `--uninstall`:
 
 ```sh
-curl -fsSL .../install.sh | bash -s v0.10.2
+curl -fsSL .../install.sh | bash -s v0.10.3
 curl -fsSL .../install.sh | bash -s -- --uninstall
 ```
 
@@ -77,7 +77,7 @@ To place the binary by hand instead:
 
 ```sh
 # Linux x86_64
-ZIFT_VERSION=0.10.2
+ZIFT_VERSION=0.10.3
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-x86_64-linux"
 chmod +x "zift-${ZIFT_VERSION}-x86_64-linux"
 sudo install -m 0755 "zift-${ZIFT_VERSION}-x86_64-linux" /usr/local/bin/zift
