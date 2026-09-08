@@ -34,7 +34,9 @@ pub const Decision = enum {
 ///   setuid/setgid/sticky  : ALWAYS off — operational, not partner-facing
 ///
 ///   For a FILE:
-///     r  = `read`   permission grants `SSH_FXP_OPEN(read)` / STAT
+///     r  = `read`   permission grants `SSH_FXP_OPEN(read)` — the
+///          bytes themselves. `list` alone does NOT set it: the name
+///          is visible in the listing, the content is not.
 ///     w  = `write`  permission grants `SSH_FXP_OPEN(write)` —
 ///          ability to overwrite the byte content. Note: removal is
 ///          NOT counted toward the file's `w` bit; deletion is a
@@ -44,7 +46,9 @@ pub const Decision = enum {
 ///          useful meaning to a partner.
 ///
 ///   For a DIRECTORY:
-///     r  = `read`   permission grants STAT/LSTAT
+///     r  = `read` OR `list` — either grants STAT/LSTAT, so a
+///          browsable directory renders `r-x`, the Unix spelling of
+///          "you can ls this".
 ///     w  = ANY mutation perm (`write` OR `mkdir` OR `rename` OR
 ///          `remove`) — this directory's *contents* can change. A
 ///          partner with rename-only or mkdir-only sees `w` even
@@ -68,12 +72,18 @@ pub fn policyDerivedMode(
     const file_type = kind_bits & 0o170000;
     const is_dir = file_type == 0o040000;
 
-    const can_read = check(user, .open_read, vpath) == .allow;
-
     var owner: u32 = 0;
-    if (can_read) owner |= 0o4;
 
     if (is_dir) {
+        // Dir `r` = "may learn this directory's metadata" = STAT,
+        // which either `read` or `list` satisfies. Deriving it from
+        // `read` alone would render `d--x` for a directory the partner
+        // can both stat and browse — a listing that contradicts what
+        // the very next request is allowed to do. It also lands on the
+        // Unix reading of the pair: `r-x` on a directory is exactly
+        // "you can ls this".
+        if (check(user, .stat, vpath) == .allow) owner |= 0o4;
+
         // Dir: any of the four mutation ops contributes to `w`. Each
         // op corresponds to a DIFFERENT verb in the config DSL
         // (`write`, `mkdir`, `rename`, `remove`), so we must check
@@ -87,6 +97,12 @@ pub fn policyDerivedMode(
         if (can_mutate) owner |= 0o2;
         if (check(user, .readdir, vpath) == .allow) owner |= 0o1;
     } else {
+        // File `r` strictly means "can download the bytes" — `read`,
+        // and not `list`. A file a partner may see in a listing but
+        // may not fetch renders with no `r`, which is the honest
+        // answer: the name is visible, the content is not.
+        if (check(user, .open_read, vpath) == .allow) owner |= 0o4;
+
         // File: `w` strictly means "can rewrite byte content"
         // (= `write` permission, which gates `SSH_FXP_OPEN(write)`).
         // Removal of the file is a property of the parent dir's
@@ -100,7 +116,7 @@ pub fn policyDerivedMode(
 }
 
 pub fn check(user: *const config.UserConfig, operation: Operation, virtual_path: []const u8) Decision {
-    const needed = permissionFor(operation);
+    const sufficient = permissionsFor(operation);
     var allowed = false;
 
     for (user.rules) |rule| {
@@ -116,7 +132,7 @@ pub fn check(user: *const config.UserConfig, operation: Operation, virtual_path:
         switch (rule.effect) {
             .deny => return .deny,
             .allow => {
-                if (rule.permissions.contains(needed)) allowed = true;
+                if (rule.permissions.intersectWith(sufficient).count() > 0) allowed = true;
             },
         }
     }
@@ -130,16 +146,35 @@ pub fn checkRename(user: *const config.UserConfig, from_path: []const u8, to_pat
     return .allow;
 }
 
-fn permissionFor(operation: Operation) config.Permission {
-    return switch (operation) {
-        .open_read, .stat, .lstat => .read,
-        .open_write => .write,
-        .readdir => .list,
-        .mkdir => .mkdir,
-        .remove, .rmdir => .delete,
-        .update => .update,
-        .rename => .rename,
-    };
+/// The permissions that satisfy `operation`. Holding ANY one of them is
+/// enough; the set is a disjunction, not a requirement list.
+///
+/// Every operation but STAT/LSTAT names exactly one capability. Metadata
+/// is the exception because it is the *listing's own content*: READDIR
+/// hands a partner every name, size, mode, and timestamp in a directory,
+/// so refusing the STAT of a path they may already list withholds
+/// nothing.
+///
+/// It is also what makes `list` usable. Mainstream clients (FileZilla,
+/// WinSCP) stat a remote directory before opening it, so a `list` that
+/// did not satisfy STAT could never render a listing — "browse without
+/// download" has to cover both requests or it covers neither.
+fn permissionsFor(operation: Operation) config.PermissionSet {
+    var set = config.PermissionSet.initEmpty();
+    switch (operation) {
+        .stat, .lstat => {
+            set.insert(.read);
+            set.insert(.list);
+        },
+        .open_read => set.insert(.read),
+        .open_write => set.insert(.write),
+        .readdir => set.insert(.list),
+        .mkdir => set.insert(.mkdir),
+        .remove, .rmdir => set.insert(.delete),
+        .update => set.insert(.update),
+        .rename => set.insert(.rename),
+    }
+    return set;
 }
 
 /// Match a virtual path against a config pattern per PLAN.md §6.3.
@@ -499,4 +534,139 @@ test "deny **.exe denies recursively" {
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/a/b/c/tool.exe"));
     try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/tool.txt"));
     try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/sub/dir/tool.txt"));
+}
+
+test "list satisfies STAT but never download" {
+    // The exact shape of a partner root: browsable everywhere, with
+    // download granted only per-subtree.
+    var rules = [_]config.Rule{
+        .{
+            .effect = .allow,
+            .pattern = "/",
+            .permissions = blk: {
+                var set = config.PermissionSet.initEmpty();
+                set.insert(.list);
+                break :blk set;
+            },
+        },
+        .{
+            .effect = .allow,
+            .pattern = "/results",
+            .permissions = blk: {
+                var set = config.PermissionSet.initEmpty();
+                set.insert(.read);
+                set.insert(.list);
+                break :blk set;
+            },
+        },
+    };
+    const user: config.UserConfig = .{
+        .name = "ola",
+        .password_hash = "hash",
+        .keys = &.{},
+        .key_files = &.{},
+        .from = &.{},
+        .root = "/tmp",
+        .rules = &rules,
+    };
+
+    // A client that stats the remote directory before opening it must
+    // get through on `list` alone, or it can never render a listing.
+    try std.testing.expectEqual(Decision.allow, check(&user, .stat, "/"));
+    try std.testing.expectEqual(Decision.allow, check(&user, .lstat, "/"));
+    try std.testing.expectEqual(Decision.allow, check(&user, .readdir, "/"));
+
+    // `list` stops exactly at the bytes. This is the whole point of
+    // the verb: names are visible, content is not.
+    try std.testing.expectEqual(Decision.deny, check(&user, .open_read, "/"));
+    try std.testing.expectEqual(Decision.deny, check(&user, .open_read, "/secret.pdf"));
+
+    // ...and it grants nothing else, either.
+    try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/"));
+    try std.testing.expectEqual(Decision.deny, check(&user, .mkdir, "/"));
+    try std.testing.expectEqual(Decision.deny, check(&user, .remove, "/"));
+    try std.testing.expectEqual(Decision.deny, check(&user, .rename, "/"));
+    try std.testing.expectEqual(Decision.deny, check(&user, .update, "/"));
+
+    // The subtree that does carry `read` downloads normally.
+    try std.testing.expectEqual(Decision.allow, check(&user, .open_read, "/results/a.pdf"));
+}
+
+test "deny still overrides list-granted stat" {
+    var rules = [_]config.Rule{
+        .{ .effect = .allow, .pattern = "/", .permissions = config.PermissionSet.initFull() },
+        .{ .effect = .deny, .pattern = "**/.ssh/**", .permissions = config.PermissionSet.initFull() },
+    };
+    const user: config.UserConfig = .{
+        .name = "ola",
+        .password_hash = "hash",
+        .keys = &.{},
+        .key_files = &.{},
+        .from = &.{},
+        .root = "/tmp",
+        .rules = &rules,
+    };
+
+    try std.testing.expectEqual(Decision.deny, check(&user, .stat, "/home/.ssh/id_ed25519"));
+    try std.testing.expectEqual(Decision.allow, check(&user, .stat, "/home/notes.txt"));
+}
+
+test "policy-derived mode: browsable dir renders r-x, its files render ---" {
+    var rules = [_]config.Rule{
+        .{
+            .effect = .allow,
+            .pattern = "/",
+            .permissions = blk: {
+                var set = config.PermissionSet.initEmpty();
+                set.insert(.list);
+                break :blk set;
+            },
+        },
+    };
+    const user: config.UserConfig = .{
+        .name = "ola",
+        .password_hash = "hash",
+        .keys = &.{},
+        .key_files = &.{},
+        .from = &.{},
+        .root = "/tmp",
+        .rules = &rules,
+    };
+
+    // Directory: stat + readdir allowed, no mutation → `r-x`, mirrored
+    // into group, world always empty.
+    const dir_mode = policyDerivedMode(&user, "/", 0o040755);
+    try std.testing.expectEqual(@as(u32, 0o040550), dir_mode);
+
+    // File under a list-only rule: visible in the listing, no download
+    // → every permission bit off, file type preserved.
+    const file_mode = policyDerivedMode(&user, "/a.pdf", 0o100644);
+    try std.testing.expectEqual(@as(u32, 0o100000), file_mode);
+}
+
+test "policy-derived mode: read grants r on both dirs and files" {
+    var rules = [_]config.Rule{
+        .{
+            .effect = .allow,
+            .pattern = "/",
+            .permissions = blk: {
+                var set = config.PermissionSet.initEmpty();
+                set.insert(.read);
+                set.insert(.list);
+                break :blk set;
+            },
+        },
+    };
+    const user: config.UserConfig = .{
+        .name = "ola",
+        .password_hash = "hash",
+        .keys = &.{},
+        .key_files = &.{},
+        .from = &.{},
+        .root = "/tmp",
+        .rules = &rules,
+    };
+
+    try std.testing.expectEqual(@as(u32, 0o040550), policyDerivedMode(&user, "/", 0o040755));
+    try std.testing.expectEqual(@as(u32, 0o100440), policyDerivedMode(&user, "/a.pdf", 0o100644));
 }

@@ -412,7 +412,7 @@ Three granular verbs exist for unusual policies:
 
 | Verb | Grants |
 | --- | --- |
-| `list` | directory listing without download (the rare inverse of `read`) |
+| `list` | stat and directory listing, without download (the rare inverse of `read`) |
 | `mkdir` | directory creation only |
 | `rename` | rename only, checked on both source and destination |
 
@@ -420,6 +420,24 @@ There are no aliases and no legacy spellings — every verb names exactly
 one capability, or (for `read` and `full`) one obvious bundle. In
 particular, `write` never silently grants directory creation: say
 `mkdir` or `full` when you want that.
+
+`list` earns its place at the root of a partner tree. Bare patterns
+match by path-component prefix, so `allow / read` grants download over
+the *entire* jail. When you want a navigable root but intend to hand out
+download per subtree, name the root with `list` and let the subtrees
+carry `read`:
+
+```zift
+allow /                list
+allow /orders          read
+allow /results         read
+allow /orders/pending  write update delete rename
+allow /results/pending write update delete rename
+```
+
+The partner can browse `/` and see that `orders` and `results` exist,
+but a directory that appears there later grants them nothing until you
+say so.
 
 ### The Clobber Rule
 

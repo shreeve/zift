@@ -148,10 +148,24 @@ pub fn runSftp(
                 // wire dropped — "Socket error: disconnected", "Read
                 // (socket)…", or "spurious-eof cap reached" when
                 // libssh wedged itself reporting EOF forever.
+                //
+                // `ssh_get_error` takes the SESSION, not the channel:
+                // it reinterprets its argument as `struct error_struct`
+                // and returns the `error_buffer` field. A session
+                // begins with `struct ssh_common_struct`, whose first
+                // member is that error struct, so the cast is sound
+                // there and only there. Handing it a channel — whose
+                // first member is the session pointer — reads pointer
+                // bytes and window counters as text and scans them for
+                // a NUL.
                 var lib_buf: [128]u8 = undefined;
                 var lw = std.Io.Writer.fixed(&lib_buf);
                 lw.writeAll("LibsshFailure: ") catch {};
-                const lib_err = c.ssh_get_error(@as(?*anyopaque, @ptrCast(state.channel)));
+                const session = c.ssh_channel_get_session(state.channel);
+                const lib_err = if (session != null)
+                    c.ssh_get_error(@as(?*anyopaque, @ptrCast(session)))
+                else
+                    null;
                 if (lib_err != null) lw.writeAll(std.mem.span(lib_err)) catch {};
                 state.emitSessionEnded(lw.buffered(), .failed, ip_str);
                 return;
