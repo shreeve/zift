@@ -6,7 +6,7 @@
 #
 # Pin a version by passing a tag (with or without the leading v):
 #
-#   curl -fsSL .../install.sh | bash -s v0.10.3
+#   curl -fsSL .../install.sh | bash -s v0.11.0
 #
 # Downloads the release binary for this platform, verifies it against the
 # release's signed SHA256SUMS, and installs it.
@@ -169,42 +169,30 @@ main() {
     || fail "download failed: $base/$asset"
 
   # --- verify against the release's signed checksum manifest ---------------
-  # Two independent bindings: cosign ties SHA256SUMS to the workflow that
-  # built it, and the hash ties these bytes to that manifest. The hash
-  # check is mandatory. The signature check needs cosign, which is not on
-  # a stock host, so it runs when available and says so when it does not.
-  curl -fsSL --retry 3 --retry-delay 1 -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" \
-    || fail "download failed: SHA256SUMS"
-
-  if command -v cosign >/dev/null; then
-    curl -fsSL --retry 3 --retry-delay 1 -o "$tmp/SHA256SUMS.bundle" "$base/SHA256SUMS.bundle" \
-      || fail "download failed: SHA256SUMS.bundle"
-    cosign verify-blob \
-      --bundle "$tmp/SHA256SUMS.bundle" \
-      --certificate-identity-regexp "https://github.com/$REPO/.+" \
-      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-      "$tmp/SHA256SUMS" >/dev/null 2>&1 \
-      || fail "cosign could not verify SHA256SUMS against $REPO — do not install this binary"
-    info "signature verified (cosign keyless, $REPO workflow)"
-  else
-    # Worth naming precisely, because the two checks prove different
-    # things. The hash below binds the binary to SHA256SUMS — but both
-    # come from the same release, so a tampered release supplies a
-    # matching pair and passes. Only the signature binds SHA256SUMS to
-    # the workflow that built it. Say how to get cosign rather than
-    # pointing at a document; a hint you can paste is one that gets used.
+  # Two independent bindings: cosign ties SHA256SUMS to the exact release
+  # workflow and tag, and the hash ties these bytes to that manifest. Both
+  # checks are mandatory; a checksum downloaded beside a compromised
+  # binary provides no independent authenticity.
+  if ! command -v cosign >/dev/null; then
     case "$os" in
       Linux)  hint="sudo apt install cosign   # or: dnf install cosign" ;;
       Darwin) hint="brew install cosign" ;;
       *)      hint="see https://docs.sigstore.dev/cosign/installation/" ;;
     esac
-    warn "cosign not found — the binary is verified against SHA256SUMS, but"
-    warn "SHA256SUMS itself is NOT verified as signed by the $REPO workflow."
-    warn "For a production host, install cosign and re-run:"
-    warn ""
-    warn "  $hint"
-    warn ""
+    fail "cosign is required to verify this release. Install it first: $hint"
   fi
+
+  curl -fsSL --retry 3 --retry-delay 1 -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" \
+    || fail "download failed: SHA256SUMS"
+  curl -fsSL --retry 3 --retry-delay 1 -o "$tmp/SHA256SUMS.bundle" "$base/SHA256SUMS.bundle" \
+    || fail "download failed: SHA256SUMS.bundle"
+  cosign verify-blob \
+    --bundle "$tmp/SHA256SUMS.bundle" \
+    --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$tag" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "$tmp/SHA256SUMS" >/dev/null 2>&1 \
+    || fail "cosign could not verify SHA256SUMS for the exact $REPO $tag release workflow"
+  info "signature verified (cosign keyless, $REPO $tag release workflow)"
 
   if command -v sha256sum >/dev/null; then
     sum=$(sha256sum "$tmp/$asset" | cut -d' ' -f1)
@@ -246,7 +234,7 @@ main() {
     warn "The daemon will NOT pick this up, and sudo was not available here."
     warn "To install the one it runs:"
     warn ""
-    warn "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sudo bash"
+    warn "  sudo BIN=/usr/local/bin bash install.sh $tag"
     warn ""
     warn "Continuing — a user install is still fine for hash-password and validate."
     printf '\n'

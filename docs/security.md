@@ -107,16 +107,16 @@ host filesystem path.
 
 ## Jail Enforcement
 
-Zift does not rely on string-prefix checks alone.
-
-For filesystem operations, paths are resolved under the user's root and
-the opened file or directory descriptor is verified against the
-canonical path reported by the kernel.
+Zift does not rely on string-prefix checks alone. It walks from the
+partner root one directory component at a time with descriptor-relative
+`NOFOLLOW` opens. Directory symlinks are visible as entries but cannot
+be traversed, so an allowed symlink spelling cannot alias a denied path
+or the reserved `.zift` namespace.
 
 Mutation operations use parent-directory file descriptors where
 possible:
 
-- open the parent directory
+- open each parent component without following symlinks
 - verify the parent fd is inside the user's root
 - perform the operation relative to that fd
 
@@ -468,4 +468,3 @@ Before exposing a deployment:
   no external ban daemon required).
 - Audit logs go to stderr (preferred) or a monitored file.
 - Rollback binary and config backup are available.
-

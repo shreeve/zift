@@ -27,6 +27,9 @@ paths in its config.
 
 ## Install The Binary
 
+Install `cosign` first (`apt install cosign` or `dnf install cosign`).
+The installer fails closed when signature verification is unavailable.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
 ```
@@ -42,9 +45,8 @@ narrower than `| sudo bash` (that runs everything as root, and still
 works if you prefer it — or if `sudo` here needs a password, since a
 pipe has no way to carry one).
 
-When `cosign` is on the host the installer also verifies the manifest's
-signature; when it is not, it says so and the checksum check still
-applies. Pass a tag to pin a version.
+The installer verifies the manifest signature against the exact Zift
+release workflow identity and requested tag. Pass a tag to pin a version.
 
 The installer stops at the binary. Everything from here down — service
 user, host key, config, jail tree, unit — is deliberately yours to run,
@@ -57,8 +59,8 @@ You do not need to stop the daemon to replace its binary — but you do
 need the right tool. Use `install`, never `cp`:
 
 ```sh
-sudo install -m 0755 zift-0.10.3-x86_64-linux /usr/local/bin/zift   # works
-sudo cp        zift-0.10.3-x86_64-linux /usr/local/bin/zift         # Text file busy
+sudo install -m 0755 zift-0.11.0-x86_64-linux /usr/local/bin/zift   # works
+sudo cp        zift-0.11.0-x86_64-linux /usr/local/bin/zift         # Text file busy
 ```
 
 `cp` opens the existing file for writing, and the kernel refuses that
@@ -81,7 +83,7 @@ this case and prints the same guidance.
 To place the binary by hand instead:
 
 ```sh
-ZIFT_VERSION=0.10.3
+ZIFT_VERSION=0.11.0
 ARCH=$(uname -m)
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-${ARCH}-linux"
@@ -105,14 +107,14 @@ Production installs should verify both the signed checksum manifest and
 the binary hash.
 
 ```sh
-ZIFT_VERSION=0.10.3
+ZIFT_VERSION=0.11.0
 
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS"
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS.bundle"
 
 cosign verify-blob \
   --bundle SHA256SUMS.bundle \
-  --certificate-identity-regexp 'https://github.com/shreeve/zift/.+' \
+  --certificate-identity "https://github.com/shreeve/zift/.github/workflows/release.yml@refs/tags/v${ZIFT_VERSION}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 
@@ -629,4 +631,3 @@ Adjust:
 
 The single-tree `/home/zift` layout is recommended because it is easy
 to reason about and easy to bind into a hardened systemd namespace.
-

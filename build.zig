@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 /// this via `-Dversion=...` extracted from the pushed git tag, so the
 /// shipped artifact name matches the tag exactly. Local `zig build release`
 /// invocations without `-Dversion=...` use this value as a stable fallback.
-const default_version = "0.10.3";
+const default_version = "0.11.0";
 
 /// libssh version we vendor. Must match the tag in `build.zig.zon`'s
 /// `libssh_source` URL. Tracked here in source rather than parsed at
@@ -13,7 +13,7 @@ const default_version = "0.10.3";
 /// fields are populated from it.
 const libssh_major: u32 = 0;
 const libssh_minor: u32 = 11;
-const libssh_patch: u32 = 3;
+const libssh_patch: u32 = 5;
 
 /// Per-target shape we want to produce: a libssh static archive (built
 /// from the vendored upstream source via our own build steps), the
@@ -49,12 +49,7 @@ fn buildLinkage(
     // returns SSH_ERROR from `ssh_threads_init` because the only
     // accepted thread-callback type when mbedTLS isn't threaded
     // is "threads_noop".
-    const mbedtls_dep = b.dependency("mbedtls", .{
-        .target = target,
-        .optimize = optimize,
-        .threading = true,
-    });
-    const mbedtls_lib = mbedtls_dep.artifact("mbedtls");
+    const mbedtls_lib = buildMbedTls(b, target, optimize);
     // Compile the vendored C position-independent so the final
     // executable can be linked PIE (ASLR on the main image). A
     // static-musl PIE still has zero DT_NEEDED entries; without PIC on
@@ -102,6 +97,71 @@ fn buildLinkage(
     };
 }
 
+/// Compile the pinned upstream Mbed TLS source as a static library.
+/// Keeping this small build adapter here lets Zift pin the security
+/// release directly instead of waiting for a packaging wrapper to
+/// update its transitive source revision.
+fn buildMbedTls(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const src = b.dependency("mbedtls_source", .{});
+    const lib = b.addLibrary(.{
+        .name = "mbedtls",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    lib.root_module.addIncludePath(src.path("include"));
+    lib.root_module.addCMacro("MBEDTLS_THREADING_C", "");
+    lib.root_module.addCMacro("MBEDTLS_THREADING_PTHREAD", "");
+    lib.root_module.addCSourceFiles(.{
+        .root = src.path("library"),
+        .files = mbedtls_sources,
+        .flags = &.{"-fstack-protector-strong"},
+    });
+    lib.installHeadersDirectory(src.path("include/mbedtls"), "mbedtls", .{});
+    lib.installHeadersDirectory(src.path("include/psa"), "psa", .{});
+    if (target.result.os.tag == .windows) {
+        lib.root_module.linkSystemLibrary("bcrypt", .{});
+    }
+    return lib;
+}
+
+const mbedtls_sources: []const []const u8 = &.{
+    "x509_create.c",                 "x509_crt.c",          "psa_crypto_client.c",                    "aes.c",
+    "psa_crypto_slot_management.c",  "bignum_mod_raw.c",    "psa_crypto_driver_wrappers_no_static.c", "camellia.c",
+    "constant_time.c",               "pk_wrap.c",           "pk.c",                                   "pkcs7.c",
+    "aesce.c",                       "ssl_tls13_client.c",  "ssl_tls12_client.c",                     "psa_util.c",
+    "ecdh.c",                        "ssl_tls.c",           "x509_crl.c",                             "cipher_wrap.c",
+    "chacha20.c",                    "psa_crypto_rsa.c",    "des.c",                                  "ssl_cookie.c",
+    "ctr_drbg.c",                    "psa_crypto_mac.c",    "aesni.c",                                "dhm.c",
+    "ssl_cache.c",                   "ssl_ciphersuites.c",  "ecp_curves_new.c",                       "hmac_drbg.c",
+    "rsa.c",                         "ssl_ticket.c",        "asn1parse.c",                            "mps_trace.c",
+    "pkwrite.c",                     "gcm.c",               "sha1.c",                                 "ssl_client.c",
+    "asn1write.c",                   "ccm.c",               "version_features.c",                     "aria.c",
+    "lms.c",                         "psa_crypto_cipher.c", "entropy_poll.c",                         "x509write_csr.c",
+    "platform.c",                    "cmac.c",              "bignum.c",                               "pkparse.c",
+    "psa_crypto_ffdh.c",             "ssl_msg.c",           "debug.c",                                "ripemd160.c",
+    "pkcs5.c",                       "ssl_tls13_generic.c", "x509write.c",                            "bignum_mod.c",
+    "pem.c",                         "oid.c",               "error.c",                                "psa_crypto_pake.c",
+    "x509_csr.c",                    "psa_its_file.c",      "psa_crypto.c",                           "rsa_alt_helpers.c",
+    "ssl_debug_helpers_generated.c", "platform_util.c",     "psa_crypto_se.c",                        "base64.c",
+    "memory_buffer_alloc.c",         "mps_reader.c",        "psa_crypto_aead.c",                      "ecp.c",
+    "lmots.c",                       "version.c",           "x509.c",                                 "bignum_core.c",
+    "chachapoly.c",                  "ssl_tls13_keys.c",    "sha256.c",                               "ecp_curves.c",
+    "md5.c",                         "timing.c",            "psa_crypto_ecp.c",                       "psa_crypto_storage.c",
+    "poly1305.c",                    "x509write_crt.c",     "hkdf.c",                                 "sha3.c",
+    "threading.c",                   "padlock.c",           "psa_crypto_hash.c",                      "pkcs12.c",
+    "entropy.c",                     "ssl_tls13_server.c",  "ssl_tls12_server.c",                     "net_sockets.c",
+    "sha512.c",                      "md.c",                "ecjpake.c",                              "cipher.c",
+    "ecdsa.c",                       "nist_kw.c",           "pk_ecc.c",                               "psa_crypto_random.c",
+};
+
 /// Compile libssh from vendored source as a static library. Mirrors
 /// what `thomashn/libssh`'s build.zig does, ported to Zig 0.16 API
 /// (`Compile.foo` -> `Compile.root_module.foo` everywhere) and
@@ -136,7 +196,7 @@ fn buildLibssh(
     //
     // We point the remap at our own pinned libssh version string so
     // the rewritten `__FILE__` is still informative if it shows up
-    // in a real error message: `/libssh-0.11.3/src/packet_crypt.c`
+    // in a real error message: `/libssh-0.11.5/src/packet_crypt.c`
     // tells an operator both the library and the file. Just stripping
     // the path prefix entirely would lose that context.
     const libssh_src_path = src.path("").getPath3(b, null);
@@ -151,7 +211,7 @@ fn buildLibssh(
     // append one to OLD (doing so produced `<hash>//` which never
     // matched the single-slash `<hash>/src/file.c` in `__FILE__`).
     // We DO add `/` to NEW so the rewritten path reads cleanly:
-    // `/libssh-0.11.3/src/packet_crypt.c` (vs `/libssh-0.11.3src/...`).
+    // `/libssh-0.11.5/src/packet_crypt.c` (vs `/libssh-0.11.5src/...`).
     const libssh_remap = b.fmt(
         "-ffile-prefix-map={s}=/libssh-{d}.{d}.{d}/",
         .{ libssh_src_abs, libssh_major, libssh_minor, libssh_patch },
@@ -196,6 +256,8 @@ fn buildLibssh(
         .SYSCONFDIR = "/etc",
         .BINARYDIR = "/usr/local/bin",
         .SOURCEDIR = "/src/libssh",
+        .USR_GLOBAL_CONF_DIR = "/etc/ssh",
+        .GLOBAL_CONF_DIR = "/etc/ssh",
         .USR_GLOBAL_BIND_CONFIG = "/etc/ssh/libssh_server_config",
         .GLOBAL_BIND_CONFIG = "/etc/ssh/libssh_server_config",
         .USR_GLOBAL_CLIENT_CONFIG = "/etc/ssh/ssh_config",

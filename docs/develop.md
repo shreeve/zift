@@ -160,16 +160,16 @@ mismatch; switch back to Debug fuzz when a patched Zig is pinned.
 Build one release artifact:
 
 ```sh
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.10.3-dev
+zig build release -Dtarget=x86_64-linux-musl -Dversion=0.11.0-dev
 ```
 
 Supported release targets:
 
 ```sh
-zig build release -Dtarget=x86_64-linux-musl  -Dversion=0.10.3-dev
-zig build release -Dtarget=aarch64-linux-musl -Dversion=0.10.3-dev
-zig build release -Dtarget=x86_64-macos       -Dversion=0.10.3-dev
-zig build release -Dtarget=aarch64-macos      -Dversion=0.10.3-dev
+zig build release -Dtarget=x86_64-linux-musl  -Dversion=0.11.0-dev
+zig build release -Dtarget=aarch64-linux-musl -Dversion=0.11.0-dev
+zig build release -Dtarget=x86_64-macos       -Dversion=0.11.0-dev
+zig build release -Dtarget=aarch64-macos      -Dversion=0.11.0-dev
 ```
 
 Output lands under `release/`.
@@ -182,8 +182,8 @@ glibc.
 
 `build.zig.zon` pins:
 
-- libssh `0.11.3`
-- mbedTLS `3.6.4`
+- libssh `0.11.5`
+- mbedTLS `3.6.7`
 - zlib `1.3.2`
 
 `build.zig` compiles libssh as a static library configured for the
@@ -269,8 +269,8 @@ Before tagging a release:
 Example:
 
 ```sh
-git tag -a v0.10.1 -m "Zift 0.10.1"
-git push origin v0.10.1
+git tag -a v0.11.0 -m "Zift 0.11.0"
+git push origin v0.11.0
 ```
 
 ## Coding Principles
@@ -364,9 +364,8 @@ tests/run.sh
 tests/run.sh --list
 
 # local release artifact
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.10.3-dev
+zig build release -Dtarget=x86_64-linux-musl -Dversion=0.11.0-dev
 
 # inspect release output
 ls -la release/
 ```
-

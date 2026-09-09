@@ -241,10 +241,12 @@ pub fn run(
         const thread = std.Thread.spawn(.{}, sessionThread, .{args}) catch |err| {
             _ = active_sessions.fetchSub(1, .acq_rel);
             _ = unauth_sessions.fetchSub(1, .acq_rel);
+            // Capture libssh's session error while the session is
+            // still alive. ssh_get_error dereferences this pointer.
+            try logLibsshError(io, @errorName(err), session, .note);
             ref.release(allocator);
             c.ssh_free(session);
             allocator.destroy(args);
-            try logLibsshError(io, @errorName(err), session, .note);
             continue :accept_loop;
         };
         thread.detach();
@@ -770,7 +772,6 @@ fn configureSocket(fd: c_int) void {
         _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT, @ptrCast(&probe_count), @sizeOf(c_int));
     }
 }
-
 
 const Listen = struct {
     host: [:0]u8,

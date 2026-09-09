@@ -44,12 +44,16 @@ Start with [`docs/evaluate.md`](docs/evaluate.md).
 
 ## Quick Install
 
+Install `cosign` first (`brew install cosign`, `apt install cosign`, or
+`dnf install cosign`). Zift's installer requires it so the downloaded
+checksum manifest is authenticated before any binary is installed.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
 ```
 
 Installs the binary for this platform, verified against the release's
-signed `SHA256SUMS`.
+signed `SHA256SUMS` and the exact release workflow identity and tag.
 
 Where it lands answers *which binary matters here*. On a host that runs
 zift as a service it goes to `/usr/local/bin` — the path the unit's
@@ -64,7 +68,7 @@ destination is never elevated behind. Pin a version by passing a tag,
 and remove the binary with `--uninstall`:
 
 ```sh
-curl -fsSL .../install.sh | bash -s v0.10.3
+curl -fsSL .../install.sh | bash -s v0.11.0
 curl -fsSL .../install.sh | bash -s -- --uninstall
 ```
 
@@ -77,7 +81,7 @@ To place the binary by hand instead:
 
 ```sh
 # Linux x86_64
-ZIFT_VERSION=0.10.3
+ZIFT_VERSION=0.11.0
 curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-x86_64-linux"
 chmod +x "zift-${ZIFT_VERSION}-x86_64-linux"
 sudo install -m 0755 "zift-${ZIFT_VERSION}-x86_64-linux" /usr/local/bin/zift
@@ -94,7 +98,7 @@ curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/
 
 cosign verify-blob \
   --bundle SHA256SUMS.bundle \
-  --certificate-identity-regexp 'https://github.com/shreeve/zift/.+' \
+  --certificate-identity "https://github.com/shreeve/zift/.github/workflows/release.yml@refs/tags/v${ZIFT_VERSION}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 
@@ -219,12 +223,18 @@ when the four above cannot say what you mean:
 | --- | --- |
 | `list` | stat and listing, without download |
 | `mkdir` | directory creation only |
-| `rename` | rename only, checked on both source and destination |
+| `rename` | rename, checked on both source and destination |
 
 `rename` is not one of the everyday verbs because it is not one
 operation: it destroys a name and creates another. Granting it means
 granting both halves, which is why `write` alone never implies it — a
 write-only partner could otherwise hide a file by renaming it.
+
+A rename cannot increase access to an existing entry. For a directory,
+Zift checks the complete existing subtree at both its old and proposed
+paths and honors every descendant deny. Safe directory renames remain
+available; a rename that would expose or manipulate a protected child is
+denied.
 
 ### `write` is not `update`
 

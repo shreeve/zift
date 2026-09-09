@@ -9,7 +9,7 @@ that produced the shipped binary.
 ## libssh
 
 - Project: <https://www.libssh.org/>
-- Version: 0.11.3
+- Version: 0.11.5
 - Source: <https://gitlab.com/libssh/libssh-mirror>
 - License: LGPL-2.1-or-later
 
@@ -23,7 +23,7 @@ License text: <https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt>
 ## mbedTLS
 
 - Project: <https://www.trustedfirmware.org/projects/mbed-tls/>
-- Version: 3.6.4
+- Version: 3.6.7
 - Source: <https://github.com/Mbed-TLS/mbedtls>
 - License: Apache-2.0
 

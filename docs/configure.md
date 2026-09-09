@@ -414,12 +414,22 @@ Three granular verbs exist for unusual policies:
 | --- | --- |
 | `list` | stat and directory listing, without download (the rare inverse of `read`) |
 | `mkdir` | directory creation only |
-| `rename` | rename only, checked on both source and destination |
+| `rename` | rename, checked on both source and destination |
 
 There are no aliases and no legacy spellings — every verb names exactly
 one capability, or (for `read` and `full`) one obvious bundle. In
 particular, `write` never silently grants directory creation: say
 `mkdir` or `full` when you want that.
+
+Rename authorization also follows the object. Zift rejects a file
+rename that would grant access the source path did not have. For a
+directory, it checks every existing descendant at the old and new paths,
+so a permitted parent rename cannot carry a denied child into an allowed
+subtree. The scan is bounded at 100,000 entries and 256 levels; larger
+trees fail closed.
+Namespace-changing SFTP operations are serialized with that scan so a
+second session cannot swap descendants between authorization and the
+rename syscall.
 
 `list` earns its place at the root of a partner tree. Bare patterns
 match by path-component prefix, so `allow / read` grants download over
@@ -607,4 +617,3 @@ timeouts, connection caps, modes) applies to new sessions.
 
 Operator runbook (validate-then-HUP, mtime caveats, partner add/remove):
 [`operate.md`](operate.md).
-

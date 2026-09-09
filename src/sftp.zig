@@ -13,6 +13,19 @@ const wire = @import("wire.zig");
 /// than this even when idle-timeout is short or disabled.
 const staging_orphan_min_age_ms: i64 = 15 * 60 * 1000;
 
+/// Namespace changes are serialized across sessions. Directory-rename
+/// authorization walks the complete source tree and must observe the
+/// same namespace that the following rename syscall changes. The other
+/// mutating handlers take this lock so a second SFTP session cannot
+/// add, remove, or move an entry between that check and the rename.
+/// Operator-side filesystem changes remain outside Zift's threat model.
+var namespace_mutation_mutex: std.Io.Mutex = .init;
+
+/// Bound the work a single directory rename can force. A larger tree
+/// fails closed instead of monopolizing a session thread indefinitely.
+const max_rename_scan_entries: usize = 100_000;
+const max_rename_scan_depth: usize = 256;
+
 /// macOS exclusive rename (same role as Linux renameat2 NOREPLACE).
 const RENAME_EXCL: c_uint = 0x00000004;
 extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c_int;
@@ -40,6 +53,22 @@ fn nowUnixSecs() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
     return @as(i64, ts.sec);
+}
+
+fn appendVirtualChild(
+    allocator: std.mem.Allocator,
+    parent: []const u8,
+    name: []const u8,
+) ![]u8 {
+    const path = if (std.mem.eql(u8, parent, "/"))
+        try std.fmt.allocPrint(allocator, "/{s}", .{name})
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent, name });
+    if (path.len > vfs_mod.max_virtual_path_bytes) {
+        allocator.free(path);
+        return error.RenameDenied;
+    }
+    return path;
 }
 
 pub fn acceptSftpSubsystem(session: c.ssh_session) !c.ssh_channel {
@@ -586,8 +615,8 @@ const SftpState = struct {
 
         // FD-based stat (PLAN §8.3 — no string-layer authorization
         // artifacts). Resolve the parent through `openVerifiedParent`,
-        // which canonicalizes through any symlinks in the parent path
-        // and verifies the result is inside the jail. Then `statFile`
+        // which walks from the root FD and rejects every parent
+        // symlink. Then `statFile`
         // against the parent FD with `follow_symlinks = false` so a
         // symlink at the final component returns its own metadata
         // (PLAN §7.6: "STAT and LSTAT behave identically. Zift does
@@ -629,19 +658,10 @@ const SftpState = struct {
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "too many open handles");
         }
 
-        const real = self.vfs.resolveExisting(self.io, self.allocator, path.value) catch {
-            return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
-        };
-        defer self.allocator.free(real);
-
-        const dir = std.Io.Dir.openDirAbsolute(self.io, real, .{ .iterate = true }) catch {
+        const dir = self.vfs.openVirtualDir(self.io, self.allocator, path.value, true) catch |err| {
+            const status = parentErrorStatus(err);
             defer self.auditFailed("opendir", path.value, "open dir failed");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open dir failed");
-        };
-        self.vfs.verifyDir(self.io, dir) catch {
-            dir.close(self.io);
-            defer self.auditDenied("opendir", path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return replyStatus(self.channel, request_id, status, "open dir failed");
         };
         const id = try self.addDirHandle(dir, path.value);
         defer self.auditOk("opendir", path.value, "");
@@ -860,16 +880,15 @@ const SftpState = struct {
         const want_append = (flags & @as(u32, @intCast(c.SSH_FXF_APPEND))) != 0;
 
         // Resolve the parent directory through `openVerifiedParent`,
-        // which canonicalizes through any symlinks in the parent path
-        // and verifies the result is inside the user's jail. From here
+        // which walks from the root FD and rejects every symlink in the
+        // parent path. From here
         // on we operate exclusively on `parent.parent` (an FD) plus
         // the basename string — never on a real-path string that the
         // OS could follow back outside the jail. PLAN §8.3.
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
             const status = parentErrorStatus(err);
             defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied(op_label, path.value)
-                else self.auditFailed(op_label, path.value, @errorName(err));
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied(op_label, path.value) else self.auditFailed(op_label, path.value, @errorName(err));
             }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
@@ -1247,11 +1266,13 @@ const SftpState = struct {
             handle.file = null;
         }
 
-        // Re-resolve the target's parent (the destination dir may
-        // have been removed/created by another session during the
-        // upload). openVerifiedParent re-runs the path-jail dance,
-        // so even if the operator restructured the partner root
-        // mid-upload, the rename target is still inside the jail.
+        namespace_mutation_mutex.lockUncancelable(self.io);
+        defer namespace_mutation_mutex.unlock(self.io);
+
+        // Re-open the target's parent (the destination dir may have
+        // been removed/created by another session during the upload).
+        // The descriptor-relative NOFOLLOW walk keeps the target in
+        // the jail and prevents policy aliases.
         var to_parent = self.vfs.openVerifiedParent(self.io, self.allocator, target_vpath) catch |err| {
             return err;
         };
@@ -1332,11 +1353,12 @@ const SftpState = struct {
             defer self.auditDenied("mkdir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
+        namespace_mutation_mutex.lockUncancelable(self.io);
+        defer namespace_mutation_mutex.unlock(self.io);
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
             const status = parentErrorStatus(err);
             defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("mkdir", path.value)
-                else self.auditFailed("mkdir", path.value, @errorName(err));
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("mkdir", path.value) else self.auditFailed("mkdir", path.value, @errorName(err));
             }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
@@ -1388,11 +1410,12 @@ const SftpState = struct {
             defer self.auditDenied("remove", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
+        namespace_mutation_mutex.lockUncancelable(self.io);
+        defer namespace_mutation_mutex.unlock(self.io);
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
             const status = parentErrorStatus(err);
             defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("remove", path.value)
-                else self.auditFailed("remove", path.value, @errorName(err));
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("remove", path.value) else self.auditFailed("remove", path.value, @errorName(err));
             }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
@@ -1414,11 +1437,12 @@ const SftpState = struct {
             defer self.auditDenied("rmdir", path.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
+        namespace_mutation_mutex.lockUncancelable(self.io);
+        defer namespace_mutation_mutex.unlock(self.io);
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
             const status = parentErrorStatus(err);
             defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rmdir", path.value)
-                else self.auditFailed("rmdir", path.value, @errorName(err));
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rmdir", path.value) else self.auditFailed("rmdir", path.value, @errorName(err));
             }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
@@ -1443,11 +1467,12 @@ const SftpState = struct {
             defer self.auditDenied("rename", from.value);
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
+        namespace_mutation_mutex.lockUncancelable(self.io);
+        defer namespace_mutation_mutex.unlock(self.io);
         var from_parent = self.vfs.openVerifiedParent(self.io, self.allocator, from.value) catch |err| {
             const status = parentErrorStatus(err);
             defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", from.value)
-                else self.auditFailed("rename", from.value, @errorName(err));
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", from.value) else self.auditFailed("rename", from.value, @errorName(err));
             }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
@@ -1455,12 +1480,51 @@ const SftpState = struct {
         var to_parent = self.vfs.openVerifiedParent(self.io, self.allocator, to.value) catch |err| {
             const status = parentErrorStatus(err);
             defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", to.value)
-                else self.auditFailed("rename", to.value, @errorName(err));
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", to.value) else self.auditFailed("rename", to.value, @errorName(err));
             }
             return replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer to_parent.deinit(self.io, self.allocator);
+
+        const source_info = listing.statAt(from_parent.parent.handle, from_parent.base) catch |err| {
+            defer self.auditFailed("rename", from.value, @errorName(err));
+            return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+        };
+
+        self.verifyRenameNode(source_info.mode, from.value, to.value) catch {
+            defer self.auditDenied("rename", from.value);
+            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+        };
+
+        // Renaming a directory changes the policy spelling of every
+        // descendant. Validate each existing entry at both spellings
+        // before the atomic rename. This keeps useful directory rename
+        // support while preventing a permitted parent rename from
+        // carrying denied children into an allowed subtree.
+        if ((source_info.mode & listing.S_IFMT) == listing.S_IFDIR) {
+            var source_dir = from_parent.parent.openDir(self.io, from_parent.base, .{
+                .iterate = true,
+                .follow_symlinks = false,
+            }) catch |err| {
+                defer self.auditFailed("rename", from.value, @errorName(err));
+                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename preflight failed");
+            };
+            defer source_dir.close(self.io);
+
+            var scanned: usize = 0;
+            self.verifyRenameSubtree(source_dir, from.value, to.value, &scanned, 0) catch |err| {
+                switch (err) {
+                    error.RenameDenied, error.RenameScanLimit => {
+                        defer self.auditDenied("rename", from.value);
+                        return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+                    },
+                    else => {
+                        defer self.auditFailed("rename", from.value, @errorName(err));
+                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename preflight failed");
+                    },
+                }
+            };
+        }
 
         // POSIX `rename(2)` ATOMICALLY OVERWRITES the destination if
         // it exists — meaning a partner with `rename` permission can
@@ -1507,6 +1571,94 @@ const SftpState = struct {
         }
         defer self.auditOk("rename", from.value, to.value);
         try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
+    }
+
+    /// Require rename permission at both old and new spellings, then
+    /// reject any new capability over an existing object. Requiring
+    /// descendant rename permission also enforces explicit deny rules:
+    /// moving a denied object is itself manipulation of that object,
+    /// even when the destination would remain denied.
+    fn verifyRenameNode(self: *SftpState, mode: u32, old_path: []const u8, new_path: []const u8) !void {
+        if (policy.checkRename(self.user, old_path, new_path) == .deny) return error.RenameDenied;
+
+        const common_ops = [_]policy.Operation{ .stat, .update };
+        for (common_ops) |op| {
+            if (policy.check(self.user, op, new_path) == .allow and
+                policy.check(self.user, op, old_path) == .deny)
+            {
+                return error.RenameDenied;
+            }
+        }
+
+        switch (mode & listing.S_IFMT) {
+            listing.S_IFDIR => {
+                const dir_ops = [_]policy.Operation{ .readdir, .rmdir };
+                for (dir_ops) |op| {
+                    if (policy.check(self.user, op, new_path) == .allow and
+                        policy.check(self.user, op, old_path) == .deny)
+                    {
+                        return error.RenameDenied;
+                    }
+                }
+            },
+            listing.S_IFREG => {
+                const file_ops = [_]policy.Operation{ .open_read, .open_write, .remove };
+                for (file_ops) |op| {
+                    if (policy.check(self.user, op, new_path) == .allow and
+                        policy.check(self.user, op, old_path) == .deny)
+                    {
+                        return error.RenameDenied;
+                    }
+                }
+            },
+            else => {
+                if (policy.check(self.user, .remove, new_path) == .allow and
+                    policy.check(self.user, .remove, old_path) == .deny)
+                {
+                    return error.RenameDenied;
+                }
+            },
+        }
+    }
+
+    fn verifyRenameSubtree(
+        self: *SftpState,
+        dir: std.Io.Dir,
+        old_parent: []const u8,
+        new_parent: []const u8,
+        scanned: *usize,
+        depth: usize,
+    ) !void {
+        if (depth >= max_rename_scan_depth) return error.RenameScanLimit;
+
+        var it = dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            scanned.* += 1;
+            if (scanned.* > max_rename_scan_entries) return error.RenameScanLimit;
+
+            // A local operator can create names that the SFTP protocol
+            // intentionally cannot represent. Moving those entries
+            // cannot be authorized accurately, so fail closed.
+            vfs_mod.Vfs.validateVirtualPath(entry.name) catch return error.RenameDenied;
+            if (vfs_mod.isReservedComponent(entry.name)) return error.RenameDenied;
+
+            const old_path = try appendVirtualChild(self.allocator, old_parent, entry.name);
+            defer self.allocator.free(old_path);
+            const new_path = try appendVirtualChild(self.allocator, new_parent, entry.name);
+            defer self.allocator.free(new_path);
+
+            const info = try listing.statAt(dir.handle, entry.name);
+            try self.verifyRenameNode(info.mode, old_path, new_path);
+
+            if ((info.mode & listing.S_IFMT) == listing.S_IFDIR) {
+                var child = try dir.openDir(self.io, entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                });
+                defer child.close(self.io);
+                try self.verifyRenameSubtree(child, old_path, new_path, scanned, depth + 1);
+            }
+        }
     }
 
     fn addDirHandle(self: *SftpState, dir: std.Io.Dir, vpath: []const u8) !u32 {
