@@ -17,7 +17,6 @@ pub const SemanticError = error{
     UserRootMissing,
     UserRootNotDirectory,
     OverlappingRoots,
-    UnauthCapExceedsTotal,
     AuthKeyFileUnreadable,
     AuthKeyFileTooLarge,
     AuthKeyFileMalformed,
@@ -66,6 +65,7 @@ pub const ServerConfig = struct {
     max_connections: u32,
     /// Separate cap on pre-auth sessions so a handshake storm cannot
     /// fill `max_connections`. 0 = no separate cap; else ≤ max_connections.
+    /// Unset, it is max(1, max_connections / 4).
     max_unauth_connections: u32,
     /// How long SIGTERM waits for sessions before force-closing them.
     shutdown_grace_ms: u64,
@@ -129,16 +129,6 @@ pub const Config = struct {
     }
 };
 
-/// The checks of `validateSemantic` that need no filesystem.
-fn validatePureNumeric(cfg: *const Config) error{UnauthCapExceedsTotal}!void {
-    // A pre-auth cap above the total cap can never fire; it is a typo.
-    if (cfg.server.max_unauth_connections != 0 and
-        cfg.server.max_unauth_connections > cfg.server.max_connections)
-    {
-        return error.UnauthCapExceedsTotal;
-    }
-}
-
 /// Check a parsed config against the live filesystem: host key, user
 /// roots (exist, are directories, do not overlap), and key files.
 /// Used by `zift validate`, `zift serve`, and reload, so each rejection
@@ -148,15 +138,7 @@ pub fn validateSemantic(
     allocator: std.mem.Allocator,
     cfg: *Config,
 ) SemanticError!void {
-    // 1. Numeric checks, before touching the filesystem.
-    validatePureNumeric(cfg) catch |err| {
-        sys.note(io, "zift: max-unauth-connections ({d}) exceeds max-connections ({d})\n", .{
-            cfg.server.max_unauth_connections, cfg.server.max_connections,
-        }) catch {};
-        return err;
-    };
-
-    // 2. Host key: a regular file (not a symlink) with no group-write,
+    // 1. Host key: a regular file (not a symlink) with no group-write,
     // group-exec, or other bits, so 0600, 0400, and 0640 root:zift pass.
     // Key bytes never reach the diagnostic.
     const host_key = cfg.server.host_key;
@@ -190,7 +172,7 @@ pub fn validateSemantic(
     };
     host_file.close(io);
 
-    // 3. Each root must exist and be a directory. Overlap is checked on
+    // 2. Each root must exist and be a directory. Overlap is checked on
     // the canonical (symlink-resolved) paths. Keep the `[:0]` type: freeing
     // without the sentinel is an invalid free.
     var canonical_roots = try allocator.alloc([:0]const u8, cfg.users.len);
@@ -216,7 +198,7 @@ pub fn validateSemantic(
         canonical_count += 1;
     }
 
-    // 4. No root may equal or contain another.
+    // 3. No root may equal or contain another.
     for (canonical_roots[0..canonical_count], 0..) |a, i| {
         for (canonical_roots[i + 1 .. canonical_count], i + 1..) |b, j| {
             if (vfs.isInsideRoot(a, b) or vfs.isInsideRoot(b, a)) {
@@ -228,7 +210,7 @@ pub fn validateSemantic(
         }
     }
 
-    // 5. Load every `auth /path` key file.
+    // 4. Load every `auth /path` key file.
     try resolveAuthKeyFiles(io, allocator, cfg);
 }
 
@@ -376,7 +358,7 @@ const ServerBuilder = struct {
     reload_interval_ms: u64 = 2000,
     idle_timeout_ms: u64 = 300_000,
     max_connections: u32 = 128,
-    /// 0 = no separate cap, fall back to `max_connections`.
+    /// Used only when set; see `ServerConfig.max_unauth_connections`.
     max_unauth_connections: u32 = 0,
     shutdown_grace_ms: u64 = 30_000,
     log: ?LogTarget = null,
@@ -451,6 +433,7 @@ pub const Error = error{
     MissingRulePermissions,
     MissingServerSection,
     MissingValue,
+    UnauthCapExceedsTotal,
     OutOfMemory,
     PasswordDirectiveRemoved,
     PasswordPhcRemoved,
@@ -685,6 +668,20 @@ pub fn parseWithDiag(
     const listen = server.listen orelse return error.MissingListen;
     const host_key = server.host_key orelse return error.MissingHostKey;
 
+    // Unset, handshakes may hold at most a quarter of the slots, so a
+    // pile of silent pre-auth sockets cannot starve every partner. An
+    // explicit value, 0 (no separate cap) included, is kept as written.
+    const unauth_line = server.lines.get(.@"max-unauth-connections");
+    const max_unauth = if (unauth_line != 0) server.max_unauth_connections else @max(1, server.max_connections / 4);
+    if (max_unauth > server.max_connections) {
+        // Such a cap could never fire, so it is a typo.
+        line_no = unauth_line;
+        key_for_diag = "max-unauth-connections";
+        return d.fail(error.UnauthCapExceedsTotal, "max-unauth-connections ({d}) exceeds max-connections ({d})", .{
+            max_unauth, server.max_connections,
+        });
+    }
+
     section = .user;
     const final_users = try allocator.alloc(UserConfig, users.items.len);
     for (users.items, 0..) |*builder, i| {
@@ -725,7 +722,7 @@ pub fn parseWithDiag(
             .reload_interval_ms = server.reload_interval_ms,
             .idle_timeout_ms = server.idle_timeout_ms,
             .max_connections = server.max_connections,
-            .max_unauth_connections = server.max_unauth_connections,
+            .max_unauth_connections = max_unauth,
             .shutdown_grace_ms = server.shutdown_grace_ms,
             .log = server.log orelse .stderr,
             .listing_mode = server.listing_mode,
@@ -752,14 +749,20 @@ fn parseServerProperty(
             server.listen = try allocator.dupe(u8, value);
         },
         .@"host-key" => server.host_key = try allocator.dupe(u8, value),
-        .@"reload-interval" => server.reload_interval_ms = try parseDurationMs(d, value),
+        // Floors: a shorter poll re-stats every key file on each accept-loop
+        // wake-up, and a shorter idle timeout fails every handshake.
+        .@"reload-interval" => server.reload_interval_ms = try parseDurationAtLeast(d, value, 100, "100ms"),
         .@"idle-timeout" => {
-            const ms = try parseDurationMs(d, value);
+            const ms = try parseDurationAtLeast(d, value, std.time.ms_per_s, "1s");
             // Above libssh's signed 32-bit ms limit it waits forever.
             if (ms > max_libssh_idle_timeout_ms) return d.fail(error.InvalidDuration, "at most 24d (libssh's limit)", .{});
             server.idle_timeout_ms = ms;
         },
-        .@"max-connections" => server.max_connections = try parseCount(d, value),
+        .@"max-connections" => {
+            // 0 would refuse every connection; elsewhere 0 means "off".
+            server.max_connections = try parseCount(d, value);
+            if (server.max_connections == 0) return d.fail(error.InvalidNumber, "must be at least 1", .{});
+        },
         .@"max-unauth-connections" => server.max_unauth_connections = try parseCount(d, value),
         .@"shutdown-grace" => server.shutdown_grace_ms = try parseDurationMs(d, value),
         .log => server.log = if (std.mem.eql(u8, value, "stderr"))
@@ -796,8 +799,18 @@ fn dupeAbsolute(allocator: std.mem.Allocator, d: *ParseDiag, value: []const u8) 
 
 /// A decimal count.
 fn parseCount(d: *ParseDiag, value: []const u8) Error!u32 {
-    return std.fmt.parseUnsigned(u32, value, 10) catch
+    return parseDigits(u32, value, 10) orelse
         d.fail(error.InvalidNumber, "expected a whole number", .{});
+}
+
+/// Plain digits only: std's parser also takes `_` separators, which the
+/// docs never promised and which read like a typo.
+fn parseDigits(comptime T: type, text: []const u8, base: u8) ?T {
+    if (text.len == 0) return null;
+    for (text) |ch| {
+        if (ch < '0' or ch - '0' >= base) return null;
+    }
+    return std.fmt.parseUnsigned(T, text, base) catch null;
 }
 
 /// Only 0o600, 0o640, or 0o660: partner data never gets world bits.
@@ -824,7 +837,7 @@ fn parseOctalMode(value: []const u8) !u32 {
         value[2..]
     else
         value;
-    return std.fmt.parseUnsigned(u32, slice, 8);
+    return parseDigits(u32, slice, 8) orelse error.InvalidMode;
 }
 
 fn parseUserProperty(
@@ -1023,12 +1036,19 @@ fn parseDurationMs(d: *ParseDiag, value: []const u8) Error!u64 {
     for (duration_units) |unit| {
         const suffix, const factor = unit;
         if (!std.mem.endsWith(u8, value, suffix)) continue;
-        const count = std.fmt.parseUnsigned(u64, value[0 .. value.len - suffix.len], 10) catch break;
+        const count = parseDigits(u64, value[0 .. value.len - suffix.len], 10) orelse break;
         const ms = std.math.mul(u64, count, factor) catch max_duration_ms + 1;
         if (ms > max_duration_ms) return d.fail(error.InvalidDuration, "too long", .{});
         return ms;
     }
     return d.fail(error.InvalidDuration, "use a number with a unit (ms, s, m, h, d), or 0", .{});
+}
+
+/// A duration that is 0 (off) or at least `floor_ms`.
+fn parseDurationAtLeast(d: *ParseDiag, value: []const u8, floor_ms: u64, comptime floor_text: []const u8) Error!u64 {
+    const ms = try parseDurationMs(d, value);
+    if (ms != 0 and ms < floor_ms) return d.fail(error.InvalidDuration, "must be 0 (off) or at least " ++ floor_text, .{});
+    return ms;
 }
 
 /// libssh stores the blocking-read timeout as a signed 32-bit
@@ -1737,7 +1757,7 @@ test "server defaults applied when properties omitted" {
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u64, 300_000), cfg.server.idle_timeout_ms);
     try std.testing.expectEqual(@as(u32, 128), cfg.server.max_connections);
-    try std.testing.expectEqual(@as(u32, 0), cfg.server.max_unauth_connections);
+    try std.testing.expectEqual(@as(u32, 32), cfg.server.max_unauth_connections);
 }
 
 test "idle-timeout and max-connections parse" {
@@ -1788,37 +1808,78 @@ test "max-unauth-connections explicit 0 parses (operator-documented opt-out)" {
     try std.testing.expectEqual(@as(u32, 0), cfg.server.max_unauth_connections);
 }
 
-test "validatePureNumeric: zero unauth cap accepted (no separate cap)" {
-    var cfg = makeNumericTestConfig(.{ .max_total = 64, .max_unauth = 0 });
-    defer cfg.deinit();
-    try validatePureNumeric(&cfg);
+test "max-unauth-connections: explicit values kept, default a quarter, never above the total" {
+    // { max-connections line, max-unauth-connections line, want (null = UnauthCapExceedsTotal) }
+    const cases = [_]struct { []const u8, []const u8, ?u32 }{
+        .{ "64", "0", 0 }, // explicit 0: no separate cap
+        .{ "32", "32", 32 },
+        .{ "64", "16", 16 },
+        .{ "8", "16", null },
+        .{ "64", "4294967295", null },
+        .{ "64", "", 16 }, // unset: max-connections / 4
+        .{ "3", "", 1 }, // unset: never below 1
+        .{ "1", "", 1 },
+        .{ "", "", 32 }, // both unset: 128 / 4
+    };
+    for (cases) |case| {
+        const total, const unauth, const want = case;
+        var buf: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try w.writeAll("server\n  listen :2222\n  host-key /k\n");
+        if (total.len != 0) try w.print("  max-connections {s}\n", .{total});
+        if (unauth.len != 0) try w.print("  max-unauth-connections {s}\n", .{unauth});
+        if (want) |n| {
+            var cfg = try parse(std.testing.allocator, w.buffered());
+            defer cfg.deinit();
+            try std.testing.expectEqual(n, cfg.server.max_unauth_connections);
+        } else {
+            try std.testing.expectError(error.UnauthCapExceedsTotal, parse(std.testing.allocator, w.buffered()));
+        }
+    }
+    try expectDiag("server\n  listen :2222\n  max-unauth-connections 16\n  max-connections 8\n  host-key /k\n", "line 3: [server] 'max-unauth-connections': UnauthCapExceedsTotal: max-unauth-connections (16) exceeds max-connections (8)");
 }
 
-test "validatePureNumeric: equal caps accepted" {
-    var cfg = makeNumericTestConfig(.{ .max_total = 32, .max_unauth = 32 });
-    defer cfg.deinit();
-    try validatePureNumeric(&cfg);
+test "numbers: plain digits only, and no zero max-connections" {
+    const bad = [_][]const u8{
+        "max-connections 0",         "max-connections 1_000", "max-connections +5",
+        "max-connections 0x10",      "idle-timeout 1_0s",     "publish-mode 6_60",
+        "max-unauth-connections -1",
+    };
+    for (bad) |line| {
+        var buf: [128]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\n  {s}\n", .{line});
+        if (parse(std.testing.allocator, text)) |cfg| {
+            var c = cfg;
+            c.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+    try expectDiag("server\n  max-connections 0\n", "line 2: [server] 'max-connections': InvalidNumber: must be at least 1");
 }
 
-test "validatePureNumeric: unauth cap below total accepted" {
-    var cfg = makeNumericTestConfig(.{ .max_total = 64, .max_unauth = 16 });
-    defer cfg.deinit();
-    try validatePureNumeric(&cfg);
-}
-
-test "validatePureNumeric: unauth cap exceeding total rejected" {
-    var cfg = makeNumericTestConfig(.{ .max_total = 8, .max_unauth = 16 });
-    defer cfg.deinit();
-    try std.testing.expectError(error.UnauthCapExceedsTotal, validatePureNumeric(&cfg));
-}
-
-test "validatePureNumeric: unauth cap at u32 max boundary rejected" {
-    var cfg = makeNumericTestConfig(.{
-        .max_total = 64,
-        .max_unauth = std.math.maxInt(u32),
-    });
-    defer cfg.deinit();
-    try std.testing.expectError(error.UnauthCapExceedsTotal, validatePureNumeric(&cfg));
+test "idle-timeout and reload-interval: 0 or a sane floor" {
+    const cases = [_]struct { []const u8, bool }{
+        .{ "idle-timeout 0", true },
+        .{ "idle-timeout 1s", true },
+        .{ "idle-timeout 999ms", false },
+        .{ "idle-timeout 1ms", false },
+        .{ "reload-interval 0", true },
+        .{ "reload-interval 100ms", true },
+        .{ "reload-interval 99ms", false },
+        .{ "shutdown-grace 1ms", true }, // no floor: 0 already means "force-close now"
+    };
+    for (cases) |case| {
+        const line, const ok = case;
+        var buf: [128]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\n  {s}\n", .{line});
+        if (ok) {
+            var cfg = try parse(std.testing.allocator, text);
+            cfg.deinit();
+        } else {
+            try std.testing.expectError(error.InvalidDuration, parse(std.testing.allocator, text));
+        }
+    }
+    try expectDiag("server\n  idle-timeout 10ms\n", "line 2: [server] 'idle-timeout': InvalidDuration: must be 0 (off) or at least 1s");
 }
 
 test "validateSemantic: host-key mode, symlink, and non-regular file rejected" {

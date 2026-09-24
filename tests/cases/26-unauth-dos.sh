@@ -17,6 +17,8 @@ server
   host-key $TEST_TMP/host_ed25519
   idle-timeout 3s
   max-connections 2
+  # Off: this case is about max-connections (the default pre-auth cap is 1 here).
+  max-unauth-connections 0
   shutdown-grace 2s
   log stderr
 

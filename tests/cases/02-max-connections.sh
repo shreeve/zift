@@ -13,6 +13,8 @@ server
   listen 127.0.0.1:$TEST_PORT
   host-key $TEST_TMP/host_ed25519
   max-connections 2
+  # Off: this case is about max-connections (the default pre-auth cap is 1 here).
+  max-unauth-connections 0
   log stderr
 
 user runner
