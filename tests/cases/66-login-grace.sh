@@ -23,6 +23,7 @@ fi
 make_host_key
 hash=$(make_password_hash secret)
 
+mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it
 write_config <<EOF
 server
   listen 127.0.0.1:$TEST_PORT
@@ -32,7 +33,7 @@ server
 
 user ally
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
