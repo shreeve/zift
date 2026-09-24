@@ -159,10 +159,16 @@ const mbedtls_sources: []const []const u8 = &.{
 
 /// Compile libssh from vendored source as a static library. Mirrors
 /// what `thomashn/libssh`'s build.zig does, ported to Zig 0.16 API
-/// (`Compile.foo` -> `Compile.root_module.foo` everywhere) and
-/// trimmed to just the features Zift uses: server side, SFTP, mbedTLS
-/// crypto backend, zlib compression, ECC + curve25519, no GSSAPI,
-/// no NaCl, no debug crypto/packet output, no PKCS#11.
+/// (`Compile.foo` -> `Compile.root_module.foo` everywhere). Features:
+/// server side, mbedTLS crypto backend, zlib compression, ECC +
+/// curve25519; no GSSAPI, NaCl, PKCS#11 or debug crypto/packet output.
+///
+/// The source list includes client-side files on purpose: session and
+/// auth code reference client.c, agent.c, knownhosts.c and friends, and
+/// objects nothing references (libssh's own SFTP code among them, since
+/// Zift speaks SFTP itself) never reach the binary. Dropping those few
+/// files was measured to change neither the release binaries' size nor
+/// the build time beyond noise.
 fn buildLibssh(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
