@@ -23,15 +23,56 @@ const wire = @import("wire.zig");
 /// registered to a live handle are kept regardless of age.
 const staging_orphan_min_age_ms: i64 = 15 * 60 * 1000;
 
-/// Serialize namespace changes within a partner root, so a directory
+/// Serializes namespace changes within one partner root, so a directory
 /// rename's subtree authorization sees the same tree the rename then
-/// moves. Roots never overlap, so striping by root keeps that guarantee
-/// without making one partner's slow rename stall everyone else.
-/// Operator-side changes are outside the threat model.
-var namespace_locks: [64]std.Io.Mutex = @splat(.init);
+/// moves. One per canonical root: roots never overlap, and a lock shared
+/// by two roots (as hashed stripes were) would let one partner's slow
+/// rename stall another. Operator-side changes are outside the threat
+/// model.
+const NamespaceLock = struct {
+    mutex: std.Io.Mutex = .init,
+    /// Owned; the canonical root.
+    root: []u8,
+    /// Sessions using this lock. Guarded by `namespace_locks_mutex`.
+    sessions: usize = 0,
+};
 
-fn namespaceLockFor(root: []const u8) *std.Io.Mutex {
-    return &namespace_locks[std.hash.Wyhash.hash(0, root) % namespace_locks.len];
+/// The live namespace locks. Each is freed when its last session ends,
+/// and the list's buffer when the list empties, so nothing outlives the
+/// sessions. `namespace_locks_mutex` is a leaf: nothing else is locked
+/// while it is held.
+var namespace_locks_mutex: std.Io.Mutex = .init;
+var namespace_locks: std.ArrayList(*NamespaceLock) = .empty;
+
+/// The lock for canonical `root`, created on first use. Pair with
+/// `releaseNamespaceLock`.
+fn acquireNamespaceLock(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !*NamespaceLock {
+    namespace_locks_mutex.lockUncancelable(io);
+    defer namespace_locks_mutex.unlock(io);
+    for (namespace_locks.items) |lock| {
+        if (std.mem.eql(u8, lock.root, root)) {
+            lock.sessions += 1;
+            return lock;
+        }
+    }
+    try namespace_locks.ensureUnusedCapacity(allocator, 1);
+    const lock = try allocator.create(NamespaceLock);
+    errdefer allocator.destroy(lock);
+    lock.* = .{ .root = try allocator.dupe(u8, root), .sessions = 1 };
+    namespace_locks.appendAssumeCapacity(lock);
+    return lock;
+}
+
+fn releaseNamespaceLock(io: std.Io, allocator: std.mem.Allocator, lock: *NamespaceLock) void {
+    namespace_locks_mutex.lockUncancelable(io);
+    defer namespace_locks_mutex.unlock(io);
+    lock.sessions -= 1;
+    if (lock.sessions != 0) return;
+    const i = std.mem.indexOfScalar(*NamespaceLock, namespace_locks.items, lock).?;
+    _ = namespace_locks.swapRemove(i);
+    allocator.free(lock.root);
+    allocator.destroy(lock);
+    if (namespace_locks.items.len == 0) namespace_locks.clearAndFree(allocator);
 }
 
 /// Staging names held by open uploads in every session. A name is 128
@@ -137,6 +178,8 @@ pub fn runSftp(
 ) !void {
     var jail = try vfs_mod.Vfs.init(io, allocator, user.root);
     defer jail.deinit(allocator);
+    const namespace_lock = try acquireNamespaceLock(io, allocator, jail.root);
+    defer releaseNamespaceLock(io, allocator, namespace_lock);
 
     const buf = try allocator.alloc(u8, wire.sftp_max_packet_bytes);
     defer allocator.free(buf);
@@ -149,7 +192,7 @@ pub fn runSftp(
         .user = user,
         .peer_ip = peer_ip,
         .vfs = jail,
-        .namespace_lock = namespaceLockFor(jail.root),
+        .namespace_lock = &namespace_lock.mutex,
         .idle_timeout_ms = server_cfg.idle_timeout_ms,
         .listing_mode = server_cfg.listing_mode,
         .publish_mode = server_cfg.publish_mode,
@@ -1529,4 +1572,26 @@ test "child paths join under the root and stop at the virtual path limit" {
     const long = [_]u8{'x'} ** (vfs_mod.max_virtual_path_bytes - 3);
     try std.testing.expectEqual(vfs_mod.max_virtual_path_bytes, childPath(&buf, 2, &long).?.len);
     try std.testing.expectEqual(null, childPath(&buf, 2, long ++ "y"));
+}
+
+test "namespace locks: one per root, shared by its sessions, freed with the last" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const a1 = try acquireNamespaceLock(io, gpa, "/srv/a");
+    const b = try acquireNamespaceLock(io, gpa, "/srv/b");
+    const a2 = try acquireNamespaceLock(io, gpa, "/srv/a");
+    try std.testing.expectEqual(a1, a2);
+    try std.testing.expect(&a1.mutex != &b.mutex);
+
+    // Held for a's slow rename, b's lock is still free.
+    a1.mutex.lockUncancelable(io);
+    try std.testing.expect(b.mutex.tryLock());
+    b.mutex.unlock(io);
+    a1.mutex.unlock(io);
+
+    releaseNamespaceLock(io, gpa, a1);
+    try std.testing.expectEqual(@as(usize, 2), namespace_locks.items.len);
+    releaseNamespaceLock(io, gpa, b);
+    releaseNamespaceLock(io, gpa, a2);
+    try std.testing.expectEqual(@as(usize, 0), namespace_locks.capacity);
 }
