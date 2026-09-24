@@ -206,9 +206,13 @@ file) and the reason.
   `-linux-musl` target to use, and it no longer writes `SHA256SUMS-*`
   (the verify step prints the sha256). The version comes only from
   `build.zig.zon`; `default_version` in `build.zig` is gone.
-- install.sh validates the tag, shows cosign's own error, replaces the
-  binary with an atomic rename, and `--uninstall` also looks in
-  `/usr/local/bin` and `~/.local/bin`.
+- install.sh no longer needs cosign: it checks the binary against
+  `SHA256SUMS`, as Janus's installer does; verifying the signature is
+  the by-hand path in `docs/operate.md`. It also validates the tag,
+  replaces the binary with an atomic rename that a failure or Ctrl-C
+  never leaves half done, prints the exact line to add its directory to
+  `PATH`, and `--uninstall` also looks in `/usr/local/bin` and
+  `~/.local/bin`.
 
 ### Fixed
 

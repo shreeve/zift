@@ -29,16 +29,13 @@ quotas, clustering or self-service users. See
 
 ## Install
 
-Install [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/)
-first; the installer uses it to verify the release. Then:
-
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
 ```
 
-This installs the verified binary only: to `/usr/local/bin` when run as
-root or on a host that runs the `zift` service, otherwise to
-`~/.local/bin` (add it to `PATH` if `zift` is not found). Setting up the
+This checks the binary against the release's `SHA256SUMS` and installs
+it, nothing else: to `/usr/local/bin` when run as root or on a host that
+runs the `zift` service, otherwise to `~/.local/bin`. Setting up the
 service is [`docs/operate.md`](docs/operate.md). To build from source,
 see [`docs/develop.md`](docs/develop.md).
 

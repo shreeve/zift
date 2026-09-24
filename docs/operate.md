@@ -22,14 +22,14 @@ and can write only inside partner roots. For another layout, see
 
 ## Install
 
-Install `cosign` and run the installer as in the
-[README](../README.md#install). It checks the cosign signature on
-`SHA256SUMS` against the exact release workflow and tag, checks the
-binary against `SHA256SUMS`, and installs the binary only.
+Run the installer as in the [README](../README.md#install). It checks
+the binary against the release's `SHA256SUMS` and installs the binary
+only. To also verify the cosign signature on `SHA256SUMS`, install
+[by hand](#by-hand).
 
 - On a host with a `zift.service` unit it installs to `/usr/local/bin`,
   the path the unit runs, and uses `sudo` for that one write, saying so
-  first. The download and checks never run as root. If `sudo` is
+  first. The download and check never run as root. If `sudo` is
   unavailable it installs to `~/.local/bin` and warns that the service
   will not see it.
 - Anywhere else it installs to `~/.local/bin` (as root, to
