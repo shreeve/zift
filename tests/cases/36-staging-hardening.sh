@@ -91,6 +91,11 @@ cases = [
     ("RENAME to /.zift-staging/x", sftp.rename, "/pending/seed.bin", "/.zift-staging/x"),
     ("OPENDIR /pending/../.zift", sftp.listdir, "/pending/../.zift"),
     ("OPENDIR /pending/../.zift-staging", sftp.listdir, "/pending/../.zift-staging"),
+    ("REALPATH /.zift", sftp.normalize, "/.zift"),
+    # Folded on every filesystem, not only case-insensitive ones.
+    ("STAT /.ZIFT", sftp.stat, "/.ZIFT"),
+    ("OPEN-write /.Zift/x", sftp.file, "/.Zift/x", "wb"),
+    ("OPENDIR /pending/.ZiFt", sftp.listdir, "/pending/.ZiFt"),
 ]
 for label, fn, *args in cases:
     expect(label, "denied", fn, *args)

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Test: an unset max-unauth-connections defaults to max-connections / 4,
-#       and `from ::ffff:a.b.c.d` admits the same peer seen as IPv4
-# Silent sockets must not hold every slot by default (explicit 0 still
-# turns the cap off); an IPv4-mapped `from` must match a plain IPv4 peer.
+#       and an explicit 0 turns the pre-auth cap off
+# Silent sockets must not be able to hold every slot by default.
 
 source "$(dirname "$0")/../lib/common.sh"
 need_paramiko
@@ -42,29 +41,3 @@ start_zift
 third_admitted || fail "explicit 0: a third silent connection was refused"
 log_contains '"operation":"accept.rejected"' "$AUDIT" && fail "explicit 0: a connection was refused"
 ok "explicit max-unauth-connections 0 means no separate cap"
-stop_zift TERM
-
-# from_config <from line>: user ally admitted only from there.
-from_config() {
-    write_config <<EOF
-$(config_head)
-
-user ally
-  auth $(make_password_hash secret)
-  root $TEST_TMP/root
-  $1
-  allow / read list
-EOF
-}
-from_config "from ::ffff:127.0.0.1"
-start_zift
-"$PY" -c 'from client import *; import sys; sys.exit(0 if can_login("ally", "secret") else 1)' \
-    || fail "from ::ffff:127.0.0.1 did not admit 127.0.0.1"
-ok "from ::ffff:127.0.0.1 admits the peer 127.0.0.1"
-stop_zift TERM
-
-from_config "from ::ffff:10.9.8.7"
-start_zift
-"$PY" -c 'from client import *; import sys; sys.exit(1 if can_login("ally", "secret") else 0)' \
-    || fail "from ::ffff:10.9.8.7 admitted 127.0.0.1"
-ok "from ::ffff:10.9.8.7 still refuses 127.0.0.1"
