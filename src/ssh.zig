@@ -40,7 +40,6 @@ pub fn authenticate(
     // login grace bounds the time. A public-key `from` miss is soft so
     // that it cannot be told apart from an unknown user.
     const max_hard_failures: u32 = 6;
-    const max_soft_ops: u32 = 64;
     var hard_failures: u32 = 0;
     var soft_ops: u32 = 0;
     while (true) {
@@ -56,11 +55,7 @@ pub fn authenticate(
         defer c.ssh_message_free(msg);
 
         if (c.ssh_message_type(msg) != c.SSH_REQUEST_AUTH) {
-            soft_ops += 1;
-            if (soft_ops >= max_soft_ops) {
-                audit.log(io, null, "auth.too_many_attempts", null, .denied, "probes", ip_str);
-                return error.LibsshFailure;
-            }
+            try countSoft(io, &soft_ops, ip_str);
             _ = c.ssh_message_reply_default(msg);
             continue;
         }
@@ -102,11 +97,7 @@ pub fn authenticate(
                 .accepted => |user| return user,
                 .offered => {
                     // `pk_ok` was sent; wait for the signed follow-up.
-                    soft_ops += 1;
-                    if (soft_ops >= max_soft_ops) {
-                        audit.log(io, null, "auth.too_many_attempts", null, .denied, "pubkey probes", ip_str);
-                        return error.LibsshFailure;
-                    }
+                    try countSoft(io, &soft_ops, ip_str);
                     continue;
                 },
                 .hard_denied => is_hard = true,
@@ -123,23 +114,28 @@ pub fn authenticate(
                 audit.log(io, null, "auth.rejected", null, .denied, "source suppressed", ip_str);
                 return error.LibsshFailure;
             }
-            const delay_ms = @min(hard_failures * 250, 2000);
-            std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
             if (hard_failures >= max_hard_failures) {
                 audit.log(io, null, "auth.too_many_attempts", null, .denied, "", ip_str);
                 return error.LibsshFailure;
             }
+            // Backoff: 250 ms per failure so far, at most 1.25 s.
+            std.Io.sleep(io, .fromMilliseconds(hard_failures * 250), .awake) catch {};
         } else {
-            soft_ops += 1;
-            if (soft_ops >= max_soft_ops) {
-                audit.log(io, null, "auth.too_many_attempts", null, .denied, "probes", ip_str);
-                return error.LibsshFailure;
-            }
+            try countSoft(io, &soft_ops, ip_str);
         }
 
         _ = c.ssh_message_auth_set_methods(msg, methodsForUser(cfg, username_for_methods));
         _ = c.ssh_message_reply_default(msg);
     }
+}
+
+/// Count one soft operation (see `authenticate`); fails at the bound.
+fn countSoft(io: std.Io, soft_ops: *u32, ip_str: []const u8) error{LibsshFailure}!void {
+    const max_soft_ops: u32 = 64;
+    soft_ops.* += 1;
+    if (soft_ops.* < max_soft_ops) return;
+    audit.log(io, null, "auth.too_many_attempts", null, .denied, "probes", ip_str);
+    return error.LibsshFailure;
 }
 
 /// From accept to successful authentication, key exchange included.
@@ -379,6 +375,12 @@ test "verifyPassword accepts only the right password" {
 
 test "verifyPassword returns false when user has no password" {
     try std.testing.expect(!try verifyPassword(std.testing.io, std.testing.allocator, null, "anything", no_deadline));
+}
+
+test "countSoft ends the loop at the 64th soft operation" {
+    var soft_ops: u32 = 0;
+    for (0..63) |_| try countSoft(std.testing.io, &soft_ops, "192.0.2.1");
+    try std.testing.expectError(error.LibsshFailure, countSoft(std.testing.io, &soft_ops, "192.0.2.1"));
 }
 
 test "readTimeoutMs: the login deadline caps the idle timeout" {
