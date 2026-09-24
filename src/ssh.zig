@@ -1,9 +1,11 @@
 //! SSH user authentication: password and public key, with timing
 //! equalization and failure ceilings.
 //!
-//! Every password denial runs one Argon2id and every public-key denial one
-//! key import + compare, so response time does not reveal whether a user
-//! exists or which credentials it has.
+//! Every password denial runs one Argon2id, so response time does not
+//! reveal whether a user exists or which credentials it has. Public-key
+//! denials run a dummy import + compare for unknown users, `from` misses
+//! and key-less users; an unconfigured key costs one import per
+//! configured key of its type, which may be none.
 
 const std = @import("std");
 const c = @import("libssh");
@@ -421,4 +423,10 @@ test "KDF slots bound concurrency, and a wait ends at the deadline" {
     kdf_in_use.store(slots, .release);
     defer kdf_in_use.store(0, .release);
     try std.testing.expectError(error.LoginGraceExpired, acquireKdfSlot(io, sys.monotonicMs() + 30));
+}
+
+test "dummy hash decodes, so a denial without a hash still pays the KDF" {
+    // A mistyped constant would make verify return false before Argon2id,
+    // reopening the timing oracle the dummy exists to close.
+    try passhash.validate(dummy_hash);
 }

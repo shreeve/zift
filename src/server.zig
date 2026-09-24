@@ -204,11 +204,11 @@ pub fn run(
     const process_config = false;
     try setBindOption(bind, c.SSH_BIND_OPTIONS_PROCESS_CONFIG, &process_config);
     // libssh verifies SHA-1 `ssh-rsa` user signatures unless the accepted
-    // list excludes it; RSA is allowed with SHA-2 only, and at 2048 bits.
+    // list excludes it; RSA is allowed with SHA-2 only. Config enforces
+    // the 2048-bit floor for user keys. RSA_MIN_SIZE is left at libssh's
+    // default: it also applies when signing with the host key, so raising
+    // it broke every handshake for a working 1024-bit RSA host key.
     try setBindOption(bind, c.SSH_BIND_OPTIONS_PUBKEY_ACCEPTED_KEY_TYPES, signature_algorithms);
-    try setBindOption(bind, c.SSH_BIND_OPTIONS_HOSTKEY_ALGORITHMS, signature_algorithms);
-    const rsa_min_bits: c_int = 2048;
-    try setBindOption(bind, c.SSH_BIND_OPTIONS_RSA_MIN_SIZE, &rsa_min_bits);
 
     if (c.ssh_bind_listen(bind) != c.SSH_OK) {
         logLibsshError(io, "ssh_bind_listen", bind, .note);
@@ -648,8 +648,9 @@ fn setIntOption(fd: c_int, level: i32, option: u32, value: c_int) void {
     _ = std.c.setsockopt(fd, level, option, @ptrCast(&value), @sizeOf(c_int));
 }
 
-/// User-key and host-key signature algorithms: the key types the config
-/// accepts, with RSA limited to its SHA-2 signatures.
+/// User-key signature algorithms: the key types the config accepts, with
+/// RSA limited to its SHA-2 signatures. (libssh 0.11's host-key defaults
+/// already exclude SHA-1 `ssh-rsa`.)
 const signature_algorithms = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521," ++
     "rsa-sha2-512,rsa-sha2-256";
 
