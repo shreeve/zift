@@ -739,7 +739,8 @@ fn parseServerProperty(
     try firstSetting(d, server.lines.getPtr(which), line);
     switch (which) {
         .listen => {
-            try validateListen(value);
+            _ = parseListen(value) catch
+                return d.fail(error.InvalidListen, "use host:port, :port, or [ipv6]:port with a port from 1 to 65535", .{});
             server.listen = try allocator.dupe(u8, value);
         },
         .@"host-key" => server.host_key = try allocator.dupe(u8, value),
@@ -998,15 +999,32 @@ fn parsePermission(token: []const u8) ?Permission {
     return null;
 }
 
-/// Reject a `listen` that cannot bind, so `zift validate` catches it
-/// instead of the next restart (`listen` is not applied on reload). Only
-/// the port is checked; host resolution is left to libssh.
-fn validateListen(value: []const u8) Error!void {
+pub const ListenAddress = struct {
+    /// Brackets removed from an IPv6 literal; `0.0.0.0` when omitted.
+    host: []const u8,
+    port: u16,
+};
+
+/// Split a `listen` value into what to bind: `host:port`, `:port` (every
+/// IPv4 address), or `[ipv6]:port`. The parser uses it so `zift validate`
+/// rejects what `serve` could not bind (`listen` is not applied on
+/// reload). A hostname is left to libssh to resolve.
+pub fn parseListen(value: []const u8) error{InvalidListen}!ListenAddress {
     const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidListen;
-    const port = value[colon + 1 ..];
-    if (port.len == 0) return error.InvalidListen;
-    const parsed = std.fmt.parseUnsigned(u16, port, 10) catch return error.InvalidListen;
-    if (parsed == 0) return error.InvalidListen;
+    const port = parseDigits(u16, value[colon + 1 ..], 10) orelse return error.InvalidListen;
+    if (port == 0) return error.InvalidListen;
+    var host = value[0..colon];
+    if (std.mem.startsWith(u8, host, "[")) {
+        if (!std.mem.endsWith(u8, host, "]")) return error.InvalidListen;
+        host = host[1 .. host.len - 1];
+        _ = std.Io.net.Ip6Address.parse(host, 0) catch return error.InvalidListen;
+    } else if (std.mem.indexOfScalar(u8, host, ':') != null) {
+        // `::1:2222` is ambiguous; IPv6 hosts must be bracketed.
+        return error.InvalidListen;
+    }
+    // Longer than any DNS name.
+    if (host.len > 255) return error.InvalidListen;
+    return .{ .host = if (host.len == 0) "0.0.0.0" else host, .port = port };
 }
 
 /// Unit suffixes, longest first so `ms` is not read as `s`.
@@ -1150,6 +1168,12 @@ test "parse: listen is validated at parse time" {
         "127.0.0.1:http", // non-numeric port
         "127.0.0.1:99999", // out of u16 range
         "127.0.0.1:0", // port 0 never binds usefully
+        "127.0.0.1:+22", // digits only
+        "::1:2222", // unbracketed IPv6 is ambiguous
+        "[::1:2222", // unclosed bracket
+        "[::1]2222", // no ':' after the bracket
+        "[localhost]:2222", // brackets hold an IPv6 literal
+        "[]:2222",
     };
     for (bad) |listen| {
         var buf: [256]u8 = undefined;
@@ -1186,6 +1210,25 @@ test "parse: legitimate listen forms accepted" {
         defer cfg.deinit();
         try std.testing.expectEqualStrings(listen, cfg.server.listen);
     }
+}
+
+test "parseListen: host and port to bind" {
+    const cases = [_]struct { []const u8, []const u8, u16 }{
+        .{ "127.0.0.1:2222", "127.0.0.1", 2222 },
+        .{ ":22", "0.0.0.0", 22 },
+        .{ "[::1]:2222", "::1", 2222 },
+        .{ "[::]:65535", "::", 65535 },
+        .{ "[2001:db8::7]:2022", "2001:db8::7", 2022 },
+        .{ "sftp.example.com:2222", "sftp.example.com", 2222 },
+    };
+    for (cases) |case| {
+        const value, const host, const port = case;
+        const got = try parseListen(value);
+        try std.testing.expectEqualStrings(host, got.host);
+        try std.testing.expectEqual(port, got.port);
+    }
+    // A host longer than any DNS name (validate used to panic on this).
+    try std.testing.expectError(error.InvalidListen, parseListen("a" ** 256 ++ ":22"));
 }
 
 test "parse: 'update' grants clobber without granting deletion" {
