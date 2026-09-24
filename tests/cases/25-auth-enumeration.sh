@@ -22,10 +22,10 @@ stop_zift TERM
 
 known='"user":"ally","operation":"auth.password","result":"denied"'
 unknown='"user":"nonexistent","operation":"auth.password","result":"denied"'
-(($(count_log "$known" "$AUDIT") >= 1)) || fail "no denied line for the known user"
-ok "known user, bad password: denied line"
-(($(count_log "$unknown" "$AUDIT") >= 1)) || fail "no denied line for the unknown user"
-ok "unknown user: denied line"
+[[ $(count_log "$known" "$AUDIT") == 1 ]] || fail "expected one denied line for the known user"
+ok "known user, bad password: one denied line"
+[[ $(count_log "$unknown" "$AUDIT") == 1 ]] || fail "expected one denied line for the unknown user"
+ok "unknown user: one denied line"
 log_contains "$unknown,\"detail\":\"unknown user\"" "$AUDIT" || fail "unknown-user line lacks the 'unknown user' detail"
 ok "the unknown-user line carries 'unknown user'"
 grep -q '"user":"ally".*"detail":"unknown user"' "$AUDIT" && fail "the known user's line says 'unknown user'"
