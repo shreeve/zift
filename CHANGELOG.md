@@ -206,13 +206,19 @@ file) and the reason.
   `-linux-musl` target to use, and it no longer writes `SHA256SUMS-*`
   (the verify step prints the sha256). The version comes only from
   `build.zig.zon`; `default_version` in `build.zig` is gone.
-- install.sh no longer needs cosign: it checks the binary against
-  `SHA256SUMS`, as Janus's installer does; verifying the signature is
-  the by-hand path in `docs/operate.md`. It also validates the tag,
-  replaces the binary with an atomic rename that a failure or Ctrl-C
-  never leaves half done, prints the exact line to add its directory to
-  `PATH`, and `--uninstall` also looks in `/usr/local/bin` and
-  `~/.local/bin`.
+- Releases are one archive per platform,
+  `zift-vX.Y.Z-{linux-amd64,linux-arm64,osx-arm64,osx-amd64}.tar.gz`,
+  holding the binary, its installer, `zift.service`, the README and the
+  licenses, plus `zift-vX.Y.Z-checksums.txt` and its cosign bundle. This
+  is the layout janus and harbor use. Bare binaries, `SHA256SUMS` and
+  `zift-deploy-X.Y.Z.tar.gz` are gone.
+- `install.sh` is the installer janus and harbor share. It no longer
+  needs cosign: it checks the archive against the checksums file, as
+  theirs do; verifying the signature is the by-hand path in
+  `docs/operate.md`. The archive's own installer replaces the binary
+  with an atomic rename that a failure or Ctrl-C never leaves half done,
+  prints the exact line to add its directory to `PATH`, and
+  `--uninstall` also looks in `/usr/local/bin` and `~/.local/bin`.
 
 ### Fixed
 

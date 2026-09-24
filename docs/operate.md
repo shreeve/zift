@@ -22,10 +22,11 @@ and can write only inside partner roots. For another layout, see
 
 ## Install
 
-Run the installer as in the [README](../README.md#install). It checks
-the binary against the release's `SHA256SUMS` and installs the binary
-only. To also verify the cosign signature on `SHA256SUMS`, install
-[by hand](#by-hand).
+Run the installer as in the [README](../README.md#install). It
+downloads this platform's release archive, checks it against the
+release's checksums file, and runs the installer inside the archive,
+which installs the binary only. To also verify the cosign signature on
+the checksums, install [by hand](#by-hand).
 
 - On a host with a `zift.service` unit it installs to `/usr/local/bin`,
   the path the unit runs, and uses `sudo` for that one write, saying so
@@ -45,28 +46,30 @@ The examples below use `ZIFT_VERSION`; set it to the release you want.
 
 ```sh
 ZIFT_VERSION=0.12.0
-ARCH=$(uname -m)          # x86_64 or aarch64
+PLAT=linux-amd64          # linux-arm64, osx-arm64 or osx-amd64
+NAME=zift-v${ZIFT_VERSION}-${PLAT}
 BASE=https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}
 
-curl -fsSLO "$BASE/zift-${ZIFT_VERSION}-${ARCH}-linux"
-curl -fsSLO "$BASE/SHA256SUMS"
-curl -fsSLO "$BASE/SHA256SUMS.bundle"
+curl -fsSLO "$BASE/$NAME.tar.gz"
+curl -fsSLO "$BASE/zift-v${ZIFT_VERSION}-checksums.txt"
+curl -fsSLO "$BASE/zift-v${ZIFT_VERSION}-checksums.txt.bundle"
 
 cosign verify-blob \
-  --bundle SHA256SUMS.bundle \
+  --bundle "zift-v${ZIFT_VERSION}-checksums.txt.bundle" \
   --certificate-identity "https://github.com/shreeve/zift/.github/workflows/release.yml@refs/tags/v${ZIFT_VERSION}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing    # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+  "zift-v${ZIFT_VERSION}-checksums.txt"
+sha256sum -c "zift-v${ZIFT_VERSION}-checksums.txt" --ignore-missing    # macOS: shasum -a 256 -c …
 
-sudo install -m 0755 "zift-${ZIFT_VERSION}-${ARCH}-linux" /usr/local/bin/zift
+tar -xzf "$NAME.tar.gz"
+sudo install -m 0755 "$NAME/zift" /usr/local/bin/zift
 zift version
 ```
 
-cosign binds `SHA256SUMS` to this repository's release workflow; the
-checksum binds the binary to `SHA256SUMS`. Releases ship
-`x86_64-linux`, `aarch64-linux`, `x86_64-macos` and `aarch64-macos`
-binaries. Linux binaries are static and need no libraries on the host.
+cosign binds the checksums file to this repository's release workflow
+and tag; the checksum binds the archive to it. Each archive holds
+`zift`, its `install.sh`, `zift.service`, the README and the licenses.
+Linux binaries are static and need no libraries on the host.
 
 ### Upgrade and rollback
 
@@ -77,7 +80,7 @@ running file and fails with "Text file busy".
 
 ```sh
 sudo cp /usr/local/bin/zift /usr/local/bin/zift.prev
-sudo install -m 0755 "zift-${ZIFT_VERSION}-${ARCH}-linux" /usr/local/bin/zift
+sudo install -m 0755 "$NAME/zift" /usr/local/bin/zift
 sudo -u zift zift validate /home/zift/zift.conf
 sudo systemctl restart zift
 ```
@@ -169,14 +172,11 @@ first: `sudo install -o zift -g zift -m 0640 /dev/null
 /home/zift/audit.jsonl`.
 
 **6. systemd unit.** The unit, set up for `/home/zift`, is
-`packaging/systemd/zift.service` in the repository and
-`zift-deploy-X.Y.Z/zift.service` in each release's
-`zift-deploy-X.Y.Z.tar.gz`:
+`packaging/systemd/zift.service` in the repository and `zift.service`
+in every release archive ([By hand](#by-hand) unpacks one):
 
 ```sh
-curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-deploy-${ZIFT_VERSION}.tar.gz"
-tar -xzf "zift-deploy-${ZIFT_VERSION}.tar.gz"
-sudo install -m 0644 "zift-deploy-${ZIFT_VERSION}/zift.service" /etc/systemd/system/zift.service
+sudo install -m 0644 "$NAME/zift.service" /etc/systemd/system/zift.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now zift
 systemctl status zift

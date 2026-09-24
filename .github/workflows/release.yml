@@ -1,9 +1,10 @@
 name: Release
 
 # Triggered on a `vX.Y.Z` (or `vX.Y.Z-prerelease`) tag push. Builds
-# release artifacts on every supported host runner, aggregates them
-# into a unified SHA256SUMS, signs with cosign keyless via GitHub
-# OIDC, and publishes a GitHub Release with everything attached.
+# the binaries on every supported host runner, packs one archive per
+# platform (scripts/package-release.sh), writes their checksums, signs
+# those with cosign keyless via GitHub OIDC, and publishes a GitHub
+# Release with everything attached.
 #
 # Why cosign keyless: zero secret management, signature is bound to
 # THIS workflow running in shreeve/zift via the OIDC certificate, and
@@ -29,25 +30,15 @@ name: Release
 # musl libc + static link path, giving us a binary that runs on any
 # Linux 3.x+ kernel regardless of distro.
 #
-# Release artifacts:
-#   zift-X.Y.Z-x86_64-linux       static-musl Linux x86_64 binary
-#   zift-X.Y.Z-aarch64-linux      static-musl Linux aarch64 binary
-#   zift-X.Y.Z-x86_64-macos       libSystem-only macOS x86_64 binary
-#   zift-X.Y.Z-aarch64-macos      libSystem-only macOS aarch64 binary
-#   zift-deploy-X.Y.Z.tar.gz      optional systemd unit bundle:
-#                                   - zift.service
-#                                   - LICENSE, THIRD_PARTY_LICENSES.md
-#   SHA256SUMS                    sha256 of every artifact above
-#   SHA256SUMS.bundle             cosign keyless signature over SHA256SUMS
+# Release artifacts, in the layout install.sh shares with janus and
+# harbor:
+#   zift-vX.Y.Z-{linux-amd64,linux-arm64,osx-arm64,osx-amd64}.tar.gz
+#       zift, install.sh, zift.service, README.md, LICENSE,
+#       THIRD_PARTY_LICENSES.md
+#   zift-vX.Y.Z-checksums.txt          sha256 of each archive
+#   zift-vX.Y.Z-checksums.txt.bundle   cosign keyless signature over it
 #
-# Verification by partners:
-#   gh release download vX.Y.Z --pattern 'zift-*' --pattern 'SHA256SUMS*'
-#   cosign verify-blob \
-#     --bundle SHA256SUMS.bundle \
-#     --certificate-identity 'https://github.com/shreeve/zift/.github/workflows/release.yml@refs/tags/vX.Y.Z' \
-#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-#     SHA256SUMS
-#   shasum -a 256 -c SHA256SUMS --ignore-missing
+# Verification by hand: docs/operate.md, "By hand".
 
 on:
   push:
@@ -153,32 +144,25 @@ jobs:
         with:
           path: dist
 
-      - name: Stage release directory + SHA256SUMS
+      - name: Package archives + checksums
         id: stage
         run: |
-          # Tag was validated `vX.Y.Z[-prerelease]` by the build job;
-          # strip the leading `v` for use in artifact filenames.
-          version="${GITHUB_REF_NAME#v}"
-          echo "version=$version"
-
+          # The build job validated the tag's shape.
+          # package-release.sh reads the binaries from release/ and
+          # writes the archives to OUT.
           mkdir -p release
           cp dist/release-*/zift-* release/
-
-          # The systemd unit and the license notices a binary must ship
-          # with. No fail2ban/CrowdSec/logrotate bundle.
-          mkdir -p "staging/zift-deploy-${version}"
-          cp packaging/systemd/zift.service LICENSE THIRD_PARTY_LICENSES.md \
-             "staging/zift-deploy-${version}/"
-          tar -C staging -czf "release/zift-deploy-${version}.tar.gz" "zift-deploy-${version}"
+          for plat in linux-amd64 linux-arm64 osx-arm64 osx-amd64; do
+            TAG="$GITHUB_REF_NAME" PLAT="$plat" OUT=publish scripts/package-release.sh
+          done
 
           # Hash exactly the bytes this job signs and publishes, rather
           # than trusting per-runner checksum files.
-          ( cd release && sha256sum zift-* > SHA256SUMS )
+          ( cd publish && sha256sum *.tar.gz > "zift-$GITHUB_REF_NAME-checksums.txt" )
 
-          echo "=== release/ contents ==="
-          ls -la release/
-          echo "=== SHA256SUMS ==="
-          cat release/SHA256SUMS
+          echo "=== publish/ contents ==="
+          ls -la publish/
+          cat "publish/zift-$GITHUB_REF_NAME-checksums.txt"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -188,15 +172,14 @@ jobs:
       # Keyless signing uses Sigstore's public-good instance, cosign's
       # default. (COSIGN_EXPERIMENTAL, which this step used to set, is a
       # legacy feature toggle and never selected an instance.)
-      - name: Sign SHA256SUMS (cosign keyless via OIDC)
+      - name: Sign the checksums (cosign keyless via OIDC)
         run: |
-          cd release
+          cd publish
           cosign sign-blob \
             --yes \
-            --bundle SHA256SUMS.bundle \
-            SHA256SUMS
-          echo "=== bundle ==="
-          ls -la SHA256SUMS.bundle
+            --bundle "zift-$GITHUB_REF_NAME-checksums.txt.bundle" \
+            "zift-$GITHUB_REF_NAME-checksums.txt"
+          ls -la "zift-$GITHUB_REF_NAME-checksums.txt.bundle"
 
       - name: Create GitHub Release
         env:
@@ -204,7 +187,7 @@ jobs:
         run: |
           # gh CLI is preinstalled on ubuntu-latest. Prerelease flag
           # auto-set when the tag carries a hyphen (e.g. v0.2.0-rc.1).
-          cd release
+          cd publish
           prerelease_flag=""
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             prerelease_flag="--prerelease"
@@ -213,7 +196,4 @@ jobs:
             --title "Zift $GITHUB_REF_NAME" \
             --generate-notes \
             $prerelease_flag \
-            zift-* SHA256SUMS SHA256SUMS.bundle
-          # `zift-*` glob covers both the per-target binaries
-          # (`zift-X.Y.Z-{x86_64,aarch64}-{linux,macos}`) and the
-          # platform-agnostic deploy bundle (`zift-deploy-X.Y.Z.tar.gz`).
+            zift-*

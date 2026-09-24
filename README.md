@@ -33,8 +33,8 @@ quotas, clustering or self-service users. See
 curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
 ```
 
-This checks the binary against the release's `SHA256SUMS` and installs
-it, nothing else: to `/usr/local/bin` when run as root or on a host that
+This checks the release archive against its published checksums and
+installs the binary, nothing else: to `/usr/local/bin` when run as root or on a host that
 runs the `zift` service, otherwise to `~/.local/bin`. Setting up the
 service is [`docs/operate.md`](docs/operate.md). To build from source,
 see [`docs/develop.md`](docs/develop.md).
