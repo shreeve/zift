@@ -21,41 +21,40 @@ pub const EntryInfo = struct {
     mtime_secs: i64,
 };
 
-pub const StatError = error{ NotFound, AccessDenied, Unexpected };
+pub const StatError = error{ NotFound, AccessDenied, NameTooLong, Unexpected };
+
+/// NAME_MAX on Linux and macOS. APFS can hold longer UTF-8 names; those
+/// are refused rather than cut, since a cut name addresses nothing.
+pub const max_name_bytes = 255;
 
 /// lstat of `name` under `dir_fd`: a symlink reports itself, never its
 /// target. `dir_fd` must already be inside the jail; this does not check.
 pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
-    if (name.len >= 256) return error.Unexpected;
-    var name_buf: [256]u8 = undefined;
-    @memcpy(name_buf[0..name.len], name);
-    name_buf[name.len] = 0;
-    const cname: [*:0]const u8 = @ptrCast(&name_buf);
+    if (name.len > max_name_bytes) return error.NameTooLong;
+    var buf: [max_name_bytes + 1]u8 = undefined;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    return stat(dir_fd, buf[0..name.len :0], std.posix.AT.SYMLINK_NOFOLLOW);
+}
 
-    const at_flags: u32 = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
+/// `statAt` for an open fd.
+pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
+    return stat(fd, "", if (builtin.os.tag == .linux) std.os.linux.AT.EMPTY_PATH else 0);
+}
 
+/// An empty `name` stats `fd` itself.
+fn stat(fd: std.posix.fd_t, name: [*:0]const u8, flags: u32) StatError!EntryInfo {
     if (builtin.os.tag == .linux) {
-        // Raw statx: decode with `std.os.linux.errno`. With libc linked,
-        // `std.posix.errno` expects libc's -1/errno convention and reads
-        // every raw -errno return as SUCCESS.
-        var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
-        const mask: std.os.linux.STATX = .{
-            .TYPE = true,
-            .MODE = true,
-            .NLINK = true,
-            .UID = true,
-            .GID = true,
-            .SIZE = true,
-            .MTIME = true,
-        };
-        const rc = std.os.linux.statx(dir_fd, cname, at_flags, mask, &sx);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied,
-            .NOENT, .NOTDIR => return error.NotFound,
-            else => return error.Unexpected,
-        }
-        return EntryInfo{
+        // Raw statx, decoded with `linux.errno`: with libc linked,
+        // `std.posix.errno` expects -1/errno and reads a raw -errno as
+        // SUCCESS. libc's fstat is not used because std leaves it empty
+        // on Linux.
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .NLINK = true, .UID = true, .GID = true, .SIZE = true, .MTIME = true };
+        const errno = linux.errno(linux.statx(fd, name, flags, mask, &sx));
+        if (errno != .SUCCESS) return statError(errno);
+        return .{
             .mode = sx.mode,
             .nlink = sx.nlink,
             .uid = sx.uid,
@@ -64,18 +63,12 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
             .mtime_secs = sx.mtime.sec,
         };
     } else {
-        var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
-        const rc = std.c.fstatat(dir_fd, cname, &st, at_flags);
-        if (rc != 0) {
-            return switch (std.posix.errno(rc)) {
-                .ACCES, .PERM => error.AccessDenied,
-                .NOENT, .NOTDIR => error.NotFound,
-                else => error.Unexpected,
-            };
-        }
-        return EntryInfo{
-            .mode = @intCast(st.mode),
-            .nlink = @intCast(st.nlink),
+        var st: std.c.Stat = undefined;
+        const rc = if (name[0] == 0) std.c.fstat(fd, &st) else std.c.fstatat(fd, name, &st, flags);
+        if (rc != 0) return statError(std.posix.errno(rc));
+        return .{
+            .mode = st.mode,
+            .nlink = st.nlink,
             .uid = st.uid,
             .gid = st.gid,
             .size = @intCast(st.size),
@@ -84,56 +77,12 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
     }
 }
 
-/// `statAt` for an open fd.
-pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
-    if (builtin.os.tag == .linux) {
-        // Raw statx: `std.os.linux.errno`, as in `statAt`.
-        var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
-        const mask: std.os.linux.STATX = .{
-            .TYPE = true,
-            .MODE = true,
-            .NLINK = true,
-            .UID = true,
-            .GID = true,
-            .SIZE = true,
-            .MTIME = true,
-        };
-        const empty: [*:0]const u8 = "";
-        const at_empty: u32 = @intCast(std.posix.AT.EMPTY_PATH);
-        const rc = std.os.linux.statx(fd, empty, at_empty, mask, &sx);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied,
-            .BADF, .NOENT => return error.NotFound,
-            else => return error.Unexpected,
-        }
-        return EntryInfo{
-            .mode = sx.mode,
-            .nlink = sx.nlink,
-            .uid = sx.uid,
-            .gid = sx.gid,
-            .size = sx.size,
-            .mtime_secs = sx.mtime.sec,
-        };
-    } else {
-        var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
-        const rc = std.c.fstat(fd, &st);
-        if (rc != 0) {
-            return switch (std.posix.errno(rc)) {
-                .ACCES, .PERM => error.AccessDenied,
-                .BADF => error.NotFound,
-                else => error.Unexpected,
-            };
-        }
-        return EntryInfo{
-            .mode = @intCast(st.mode),
-            .nlink = @intCast(st.nlink),
-            .uid = st.uid,
-            .gid = st.gid,
-            .size = @intCast(st.size),
-            .mtime_secs = st.mtime().sec,
-        };
-    }
+fn statError(errno: anytype) StatError {
+    return switch (errno) {
+        .ACCES, .PERM => error.AccessDenied,
+        .NOENT, .NOTDIR, .BADF => error.NotFound,
+        else => error.Unexpected,
+    };
 }
 
 /// Per-session uid/gid name cache, inline and allocation-free. Hosts have
@@ -508,4 +457,26 @@ test "formatLongname: file line shows size" {
     try std.testing.expect(std.mem.indexOf(u8, line, "-rw-r--r--") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "41K") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "hey.txt") != null);
+}
+
+test "statAt and statFd report the same entry, and map errors" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "f", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "hello");
+
+    const by_name = try statAt(tmp.dir.handle, "f");
+    const by_fd = try statFd(file.handle);
+    try std.testing.expectEqual(by_name, by_fd);
+    try std.testing.expectEqual(S_IFREG, by_name.mode & S_IFMT);
+    try std.testing.expectEqual(@as(u64, 5), by_name.size);
+
+    try tmp.dir.symLink(io, "f", "link", .{});
+    try std.testing.expectEqual(S_IFLNK, (try statAt(tmp.dir.handle, "link")).mode & S_IFMT);
+    try std.testing.expectError(error.NotFound, statAt(tmp.dir.handle, "missing"));
+    try std.testing.expectError(error.NotFound, statAt(tmp.dir.handle, "f/under-a-file"));
+    try std.testing.expectError(error.NameTooLong, statAt(tmp.dir.handle, "n" ** (max_name_bytes + 1)));
+    try std.testing.expectError(error.NotFound, statAt(tmp.dir.handle, "n" ** max_name_bytes));
 }
