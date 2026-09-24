@@ -187,9 +187,19 @@ pub fn run(
             continue :accept_loop;
         }
 
+        // Registered here, not in the worker, so a drain that starts
+        // before the worker runs still force-closes it.
+        const session_fd = c.ssh_get_fd(session);
+        signals.registerSessionFd(io, allocator, session_fd) catch |err| {
+            sys.note(io, "zift: cannot track session: {s}\n", .{@errorName(err)}) catch {};
+            c.ssh_free(session);
+            continue :accept_loop;
+        };
+
         const ref = active.acquire();
         const args = allocator.create(SessionArgs) catch |err| {
             ref.release(allocator);
+            signals.unregisterSessionFd(io, session_fd);
             c.ssh_free(session);
             return err;
         };
@@ -198,6 +208,7 @@ pub fn run(
             .allocator = allocator,
             .config_ref = ref,
             .session = session,
+            .session_fd = session_fd,
             .ip_buf = ip_buf,
             .ip_len = @intCast(peer_ip.len),
         };
@@ -214,6 +225,7 @@ pub fn run(
             // Before ssh_free: ssh_get_error reads the session.
             try logLibsshError(io, @errorName(err), session, .note);
             ref.release(allocator);
+            signals.unregisterSessionFd(io, session_fd);
             c.ssh_free(session);
             allocator.destroy(args);
             continue :accept_loop;
@@ -492,6 +504,8 @@ const SessionArgs = struct {
     allocator: std.mem.Allocator,
     config_ref: *ConfigRef,
     session: c.ssh_session,
+    /// Already registered with `signals`.
+    session_fd: c_int,
     /// Peer address captured at accept; "" when unknown.
     ip_buf: [64]u8,
     ip_len: u8,
@@ -501,36 +515,31 @@ fn sessionThread(args: *SessionArgs) void {
     const io = args.io;
     const allocator = args.allocator;
     const ref = args.config_ref;
-    const ssh_session = args.session;
+    const session = args.session;
+    const session_fd = args.session_fd;
     const ip_buf = args.ip_buf;
     const peer_ip = ip_buf[0..args.ip_len];
     allocator.destroy(args);
 
-    // Registered so drain can force-close it; failure is not fatal.
-    const session_fd = c.ssh_get_fd(ssh_session);
-    var registered = false;
-    if (session_fd >= 0) {
-        signals.registerSessionFd(io, allocator, session_fd) catch |err| {
-            logLibsshError(io, @errorName(err), ssh_session, .note) catch {};
-        };
-        registered = true;
+    configureSocket(session_fd);
 
-        configureSocket(session_fd);
-    }
-
-    // Set by `handleSession` when it releases the pre-auth slot at auth;
-    // otherwise the defer below releases it.
+    // Set by `handleSession` when it releases the pre-auth slot at auth.
     var auth_completed = false;
-
-    defer {
-        if (!auth_completed) _ = unauth_sessions.fetchSub(1, .acq_rel);
-        if (registered) signals.unregisterSessionFd(io, session_fd);
-        ref.release(allocator);
-        _ = active_sessions.fetchSub(1, .acq_rel);
-    }
-    handleSession(io, allocator, ref.config, ssh_session, peer_ip, &auth_completed) catch |err| {
-        logLibsshError(io, @errorName(err), ssh_session, .skip) catch {};
+    const ok = if (handleSession(io, allocator, ref.config, session, peer_ip, &auth_completed)) true else |err| blk: {
+        // The error text lives in the session, so read it before ssh_free.
+        logLibsshError(io, @errorName(err), session, .skip) catch {};
+        break :blk false;
     };
+
+    // Unregister while the fd is still open: once libssh closes it, the
+    // number can be reused and a force-close would hit another socket.
+    signals.unregisterSessionFd(io, session_fd);
+    if (ok) c.ssh_disconnect(session);
+    c.ssh_free(session);
+
+    if (!auth_completed) _ = unauth_sessions.fetchSub(1, .acq_rel);
+    ref.release(allocator);
+    _ = active_sessions.fetchSub(1, .acq_rel);
 }
 
 fn currentConfigMtime(io: std.Io, path: []const u8) !std.Io.Timestamp {
@@ -667,8 +676,6 @@ fn handleSession(
     peer_ip: []const u8,
     auth_completed: *bool,
 ) !void {
-    defer c.ssh_free(session);
-
     // Before the handshake, or a silent TCP client pins a worker forever.
     setSessionTimeout(session, cfg.server.idle_timeout_ms);
 
@@ -686,9 +693,8 @@ fn handleSession(
 
     const channel = try sftp.acceptSftpSubsystem(session);
 
-    try sftp.runSftp(io, allocator, channel, user, cfg.server, peer_ip);
     // The session owns the channel; freeing it here would double-free.
-    c.ssh_disconnect(session);
+    try sftp.runSftp(io, allocator, channel, user, cfg.server, peer_ip);
 }
 
 /// Timeout for every blocking libssh read before SFTP starts (the SFTP
