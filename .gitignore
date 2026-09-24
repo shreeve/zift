@@ -1,7 +1,7 @@
 .zig-cache/
 zig-out/
-zig-pkg/
+zig-pkg
 bin/
 release/
-tests/.venv/
+tests/.venv
 tests/tmp/

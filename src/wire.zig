@@ -1,68 +1,34 @@
+//! SFTP v3 wire encoding: reply packets, attribute blocks, and the
+//! length-prefixed string parser (client-controlled, so bounds-checked).
+
 const std = @import("std");
 const c = @import("libssh");
 const listing = @import("listing.zig");
 
-/// PLAN §7.6: maximum SFTP packet size is 256 KiB.
 pub const sftp_max_packet_bytes: usize = 256 * 1024;
 
-pub const DirEntry = struct {
-    name_buf: [256]u8 = undefined,
-    name_len: usize = 0,
-    longname_buf: [320]u8 = undefined,
-    longname_len: usize = 0,
-    info: listing.EntryInfo = .{
-        .mode = 0,
-        .nlink = 0,
-        .uid = 0,
-        .gid = 0,
-        .size = 0,
-        .mtime_secs = 0,
-    },
-};
+/// A READDIR entry: name, longname, and a full attribute block, each
+/// length-prefixed.
+const max_name_entry_bytes: usize = 4 + listing.max_name_bytes + 4 + listing.max_longname_bytes + 32;
 
-pub fn parentErrorStatus(err: anyerror) c_int {
-    return switch (err) {
-        error.PathTraversal, error.InvalidPath => c.SSH_FX_PERMISSION_DENIED,
-        error.OutOfMemory => c.SSH_FX_FAILURE,
-        else => c.SSH_FX_NO_SUCH_FILE,
-    };
-}
+/// Where a DATA reply's payload starts in its frame (length, type,
+/// request id, data length).
+pub const data_offset: usize = 13;
 
-pub fn readPacket(channel: c.ssh_channel, payload_buf: []u8) ![]u8 {
-    var len_buf: [4]u8 = undefined;
-    try readExact(channel, &len_buf);
-    const len = readU32(&len_buf);
-    if (len > payload_buf.len) return error.LibsshFailure;
-    const payload = payload_buf[0..len];
-    try readExact(channel, payload);
-    return payload;
-}
+/// The most one READ returns: a DATA reply that fits the packet limit
+/// clients enforce.
+pub const max_read_bytes: usize = sftp_max_packet_bytes - data_offset;
 
-pub fn readExact(channel: c.ssh_channel, out: []u8) !void {
-    var offset: usize = 0;
-    while (offset < out.len) {
-        const n = c.ssh_channel_read(channel, out[offset..].ptr, @intCast(out.len - offset), 0);
-        if (n <= 0) return error.LibsshFailure;
-        offset += @intCast(n);
-    }
-}
 pub fn writeVersion(channel: c.ssh_channel) !void {
     var buf: [9]u8 = undefined;
-    writeU32(buf[0..4], 5);
-    buf[4] = @intCast(c.SSH_FXP_VERSION);
-    writeU32(buf[5..9], 3);
-    try writeAll(channel, &buf);
+    var w: PacketWriter = .{ .buf = &buf };
+    try w.putU8(@intCast(c.SSH_FXP_VERSION));
+    try w.putU32(3);
+    try w.send(channel);
 }
 
 pub fn replyName(channel: c.ssh_channel, request_id: u32, name: []const u8) !void {
-    // The name is a normalized virtual path, up to
-    // `vfs.max_virtual_path_bytes` (4096). The SFTP_NAME frame carries
-    // it TWICE (filename + longname) plus a small fixed envelope, so
-    // the worst case is 33 + 2*4096 ≈ 8225 bytes. A 512-byte buffer
-    // here silently turned any REALPATH of a 240+ byte path into a
-    // session-dropping error — and REALPATH is the first thing most
-    // clients send. Size for the real maximum (on the 8 MiB worker
-    // stack this is cheap).
+    // Carries a path of up to 4097 bytes twice (name and longname).
     var buf: [9 * 1024]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_NAME));
@@ -71,121 +37,109 @@ pub fn replyName(channel: c.ssh_channel, request_id: u32, name: []const u8) !voi
     try w.string(name);
     try w.string(name);
     try writeDirAttrs(&w);
-    try writePayload(channel, w.written());
+    try w.send(channel);
 }
 
-pub fn replyNames(channel: c.ssh_channel, request_id: u32, entries: []const DirEntry) !void {
-    // 32 KiB per packet: 16 entries × ~(255 name + 320 longname + 28
-    // attrs + 12 length-prefix overhead) ≈ 9.8 KiB worst case, with
-    // room to spare for any future attr additions. Stack-allocated;
-    // the worker thread's stack is 8 MiB.
-    var buf: [32 * 1024]u8 = undefined;
-    var w: PacketWriter = .{ .buf = &buf };
-    try w.putU8(@intCast(c.SSH_FXP_NAME));
-    try w.putU32(request_id);
-    try w.putU32(@intCast(entries.len));
-    for (entries) |entry| {
-        try w.string(entry.name_buf[0..@min(entry.name_len, entry.name_buf.len)]);
-        try w.string(entry.longname_buf[0..@min(entry.longname_len, entry.longname_buf.len)]);
-        try writeFullAttrs(&w, entry.info);
+/// A READDIR reply built in place: `begin`, `add` entries while
+/// `hasRoom`, then `send`.
+pub const NameBatch = struct {
+    w: PacketWriter,
+    count: u32 = 0,
+
+    pub fn begin(buf: []u8, request_id: u32) !NameBatch {
+        var w: PacketWriter = .{ .buf = buf };
+        try w.putU8(@intCast(c.SSH_FXP_NAME));
+        try w.putU32(request_id);
+        try w.putU32(0);
+        return .{ .w = w };
     }
-    try writePayload(channel, w.written());
-}
+
+    /// Room for one more entry of the largest possible size.
+    pub fn hasRoom(self: *const NameBatch) bool {
+        return self.w.buf.len - self.w.index >= max_name_entry_bytes;
+    }
+
+    pub fn add(self: *NameBatch, name: []const u8, longname: []const u8, info: listing.EntryInfo) !void {
+        try self.w.string(name);
+        try self.w.string(longname);
+        try writeFullAttrs(&self.w, info);
+        self.count += 1;
+    }
+
+    pub fn send(self: *NameBatch, channel: c.ssh_channel) !void {
+        std.mem.writeInt(u32, self.w.buf[9..13], self.count, .big);
+        try self.w.send(channel);
+    }
+};
 
 pub fn replyHandle(channel: c.ssh_channel, request_id: u32, id: u32) !void {
     var handle_bytes: [4]u8 = undefined;
-    writeU32(&handle_bytes, id);
+    std.mem.writeInt(u32, &handle_bytes, id, .big);
 
-    var buf: [64]u8 = undefined;
+    var buf: [32]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_HANDLE));
     try w.putU32(request_id);
     try w.string(&handle_bytes);
-    try writePayload(channel, w.written());
-}
-
-pub fn replyDirAttrs(channel: c.ssh_channel, request_id: u32) !void {
-    var buf: [128]u8 = undefined;
-    var w: PacketWriter = .{ .buf = &buf };
-    try w.putU8(@intCast(c.SSH_FXP_ATTRS));
-    try w.putU32(request_id);
-    try writeDirAttrs(&w);
-    try writePayload(channel, w.written());
+    try w.send(channel);
 }
 
 pub fn replyFullAttrs(channel: c.ssh_channel, request_id: u32, info: listing.EntryInfo) !void {
-    // SFTP_FXP_ATTRS reply with the full attribute set (mode + uid +
-    // gid + size + atime/mtime). Used by STAT, LSTAT, and FSTAT — so
-    // a partner running `sftp> stat foo` and `sftp> ls -la` see the
-    // same fields, populated from the same `listing.statAt`-derived
-    // EntryInfo.
     var buf: [128]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_ATTRS));
     try w.putU32(request_id);
     try writeFullAttrs(&w, info);
-    try writePayload(channel, w.written());
+    try w.send(channel);
 }
 
-pub fn replyData(channel: c.ssh_channel, request_id: u32, data: []const u8) !void {
-    var header_payload: [9]u8 = undefined;
-    header_payload[0] = @intCast(c.SSH_FXP_DATA);
-    writeU32(header_payload[1..5], request_id);
-    writeU32(header_payload[5..9], @intCast(data.len));
-
-    var header: [4]u8 = undefined;
-    writeU32(&header, @intCast(header_payload.len + data.len));
-    try writeAll(channel, &header);
-    try writeAll(channel, &header_payload);
-    try writeAll(channel, data);
+/// Send the `len` bytes the caller read into `frame[data_offset..]` as
+/// one DATA reply, without copying them. Unlike every other reply, it
+/// takes two channel writes, header then data: a 32 KiB read plus its
+/// 13-byte header would overflow OpenSSH's 32 KiB channel packet and
+/// trail a tiny one, which cost 8% on downloads.
+pub fn replyData(channel: c.ssh_channel, frame: []u8, request_id: u32, len: usize) !void {
+    var w: PacketWriter = .{ .buf = frame };
+    try w.putU8(@intCast(c.SSH_FXP_DATA));
+    try w.putU32(request_id);
+    try w.putU32(@intCast(len));
+    std.mem.writeInt(u32, frame[0..4], @intCast(w.index - 4 + len), .big);
+    try writeAll(channel, frame[0..w.index]);
+    try writeAll(channel, frame[w.index..][0..len]);
 }
 
-pub fn replyStatus(channel: c.ssh_channel, request_id: u32, status: c_int, message: []const u8) !void {
-    var buf: [512]u8 = undefined;
+/// The message is the standard phrase for `status`; detail belongs in
+/// the audit log, never on the wire.
+pub fn replyStatus(channel: c.ssh_channel, request_id: u32, status: c_int) !void {
+    const message: []const u8 = switch (status) {
+        c.SSH_FX_OK => "ok",
+        c.SSH_FX_EOF => "end of file",
+        c.SSH_FX_NO_SUCH_FILE => "no such file",
+        c.SSH_FX_PERMISSION_DENIED => "permission denied",
+        c.SSH_FX_BAD_MESSAGE => "bad message",
+        c.SSH_FX_OP_UNSUPPORTED => "operation unsupported",
+        c.SSH_FX_INVALID_HANDLE => "invalid handle",
+        else => "failure",
+    };
+    var buf: [64]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_STATUS));
     try w.putU32(request_id);
     try w.putU32(@intCast(status));
     try w.string(message);
     try w.string("");
-    try writePayload(channel, w.written());
+    try w.send(channel);
 }
 
-pub fn writeDirAttrs(w: *PacketWriter) !void {
-    // Synthetic attrs for SFTP_NAME replies that only carry a path
-    // without an underlying inode (REALPATH against a virtual root).
-    // We claim "directory, mode 0755, size 0" — minimal but well-
-    // formed; the next STAT/READDIR fetches the real shape.
-    try writeBasicAttrs(w, .directory, 0);
-}
-
-/// Synthetic attrs for callers who don't have an actual stat result —
-/// REALPATH replies and similar virtual paths. Only fills SIZE +
-/// PERMISSIONS with a plausible default. NEW code paths should prefer
-/// `writeFullAttrs` with a real `EntryInfo`.
-pub fn writeBasicAttrs(w: *PacketWriter, kind: std.Io.File.Kind, size: u64) !void {
-    const mode: u32 = switch (kind) {
-        .directory => @intCast(c.SSH_S_IFDIR | 0o755),
-        else => @intCast(c.SSH_S_IFREG | 0o644),
-    };
+/// REALPATH has no inode at hand: claim a 0755 directory of size 0.
+fn writeDirAttrs(w: *PacketWriter) !void {
     try w.putU32(@intCast(c.SSH_FILEXFER_ATTR_SIZE | c.SSH_FILEXFER_ATTR_PERMISSIONS));
-    try w.putU64(size);
-    try w.putU32(mode);
+    try w.putU64(0);
+    try w.putU32(listing.S_IFDIR | 0o755);
 }
 
-/// Emit an SFTP v3 file-attributes block populated from a real
-/// `listing.EntryInfo`. Includes:
-///
-///   - SIZE         : real byte size (0 for directories/specials)
-///   - UIDGID       : real uid + gid for `ls -l` rendering
-///   - PERMISSIONS  : real `st_mode` (file-type bits + permission
-///                    bits), so the client can render `drwxr-xr-x`
-///                    correctly for directories, symlinks, etc.
-///   - ACMODTIME    : atime + mtime as seconds since epoch
-///
-/// The flag word is the OR of the four `SSH_FILEXFER_ATTR_*` bits;
-/// each populated field follows in the spec-defined order.
-pub fn writeFullAttrs(w: *PacketWriter, info: listing.EntryInfo) !void {
+/// SIZE, UIDGID, PERMISSIONS (with file-type bits), and ACMODTIME.
+fn writeFullAttrs(w: *PacketWriter, info: listing.EntryInfo) !void {
     const flags: u32 = @intCast(
         c.SSH_FILEXFER_ATTR_SIZE |
             c.SSH_FILEXFER_ATTR_UIDGID |
@@ -197,28 +151,14 @@ pub fn writeFullAttrs(w: *PacketWriter, info: listing.EntryInfo) !void {
     try w.putU32(info.uid);
     try w.putU32(info.gid);
     try w.putU32(info.mode);
-    // SFTP v3 stores acmodtime as 32-bit seconds. mtime_secs comes
-    // from statx/fstat as i64 to handle pre-1970 files correctly,
-    // but SFTP can only carry u32; clamp to the representable range
-    // (1970..2106) rather than truncate silently. Same for atime,
-    // which we don't track separately — we report mtime for both
-    // since SFTP clients use atime only as a fallback for dirs that
-    // don't track it.
-    const t32: u32 = if (info.mtime_secs < 0) 0
-        else if (info.mtime_secs > std.math.maxInt(u32)) std.math.maxInt(u32)
-        else @intCast(info.mtime_secs);
+    // v3 times are u32 seconds: clamp rather than wrap. mtime stands in
+    // for atime too.
+    const t32: u32 = if (info.mtime_secs < 0) 0 else if (info.mtime_secs > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(info.mtime_secs);
     try w.putU32(t32);
     try w.putU32(t32);
 }
 
-pub fn writePayload(channel: c.ssh_channel, payload: []const u8) !void {
-    var header: [4]u8 = undefined;
-    writeU32(&header, @intCast(payload.len));
-    try writeAll(channel, &header);
-    try writeAll(channel, payload);
-}
-
-pub fn writeAll(channel: c.ssh_channel, bytes: []const u8) !void {
+fn writeAll(channel: c.ssh_channel, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const n = c.ssh_channel_write(channel, bytes[offset..].ptr, @intCast(bytes.len - offset));
@@ -227,64 +167,46 @@ pub fn writeAll(channel: c.ssh_channel, bytes: []const u8) !void {
     }
 }
 
+/// Builds one packet, length prefix included, so a reply is a single
+/// channel write: libssh sends every write as its own SSH packet and
+/// flushes it. `replyData` alone splits header from data, on purpose.
 pub const PacketWriter = struct {
     buf: []u8,
-    index: usize = 0,
+    /// Past the length prefix, which `send` fills in.
+    index: usize = 4,
 
-    fn written(self: PacketWriter) []const u8 {
-        return self.buf[0..self.index];
+    fn send(self: *PacketWriter, channel: c.ssh_channel) !void {
+        std.mem.writeInt(u32, self.buf[0..4], @intCast(self.index - 4), .big);
+        try writeAll(channel, self.buf[0..self.index]);
+    }
+
+    fn put(self: *PacketWriter, bytes: []const u8) !void {
+        if (bytes.len > self.buf.len - self.index) return error.PacketOverflow;
+        @memcpy(self.buf[self.index..][0..bytes.len], bytes);
+        self.index += bytes.len;
     }
 
     fn putU8(self: *PacketWriter, value: u8) !void {
-        if (self.index + 1 > self.buf.len) return error.LibsshFailure;
-        self.buf[self.index] = value;
-        self.index += 1;
+        try self.put(&.{value});
     }
 
     fn putU32(self: *PacketWriter, value: u32) !void {
-        if (self.index + 4 > self.buf.len) return error.LibsshFailure;
-        writeU32(self.buf[self.index .. self.index + 4], value);
-        self.index += 4;
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, value, .big);
+        try self.put(&bytes);
     }
 
     fn putU64(self: *PacketWriter, value: u64) !void {
-        if (self.index + 8 > self.buf.len) return error.LibsshFailure;
-        self.buf[self.index] = @intCast((value >> 56) & 0xff);
-        self.buf[self.index + 1] = @intCast((value >> 48) & 0xff);
-        self.buf[self.index + 2] = @intCast((value >> 40) & 0xff);
-        self.buf[self.index + 3] = @intCast((value >> 32) & 0xff);
-        self.buf[self.index + 4] = @intCast((value >> 24) & 0xff);
-        self.buf[self.index + 5] = @intCast((value >> 16) & 0xff);
-        self.buf[self.index + 6] = @intCast((value >> 8) & 0xff);
-        self.buf[self.index + 7] = @intCast(value & 0xff);
-        self.index += 8;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, value, .big);
+        try self.put(&bytes);
     }
 
     fn string(self: *PacketWriter, value: []const u8) !void {
         try self.putU32(@intCast(value.len));
-        if (self.index + value.len > self.buf.len) return error.LibsshFailure;
-        @memcpy(self.buf[self.index .. self.index + value.len], value);
-        self.index += value.len;
+        try self.put(value);
     }
 };
-
-pub fn readU32(bytes: []const u8) u32 {
-    return (@as(u32, bytes[0]) << 24) |
-        (@as(u32, bytes[1]) << 16) |
-        (@as(u32, bytes[2]) << 8) |
-        @as(u32, bytes[3]);
-}
-
-pub fn readU64(bytes: []const u8) u64 {
-    return (@as(u64, bytes[0]) << 56) |
-        (@as(u64, bytes[1]) << 48) |
-        (@as(u64, bytes[2]) << 40) |
-        (@as(u64, bytes[3]) << 32) |
-        (@as(u64, bytes[4]) << 24) |
-        (@as(u64, bytes[5]) << 16) |
-        (@as(u64, bytes[6]) << 8) |
-        @as(u64, bytes[7]);
-}
 
 pub const ParsedString = struct {
     value: []const u8,
@@ -293,11 +215,8 @@ pub const ParsedString = struct {
 
 pub fn parseString(payload: []const u8) !ParsedString {
     if (payload.len < 4) return error.LibsshFailure;
-    // `len` is a client-controlled u32 up to 0xFFFF_FFFF. Widen to
-    // usize and compare against the remaining bytes; computing
-    // `4 + len` in u32 would overflow (panic in safe builds, wrap in
-    // ReleaseFast) BEFORE the bounds check for len >= 0xFFFF_FFFC.
-    const len: usize = readU32(payload[0..4]);
+    // Widen before adding: `4 + len` in u32 overflows for a hostile len.
+    const len: usize = std.mem.readInt(u32, payload[0..4], .big);
     const end = 4 + len;
     if (payload.len < end) return error.LibsshFailure;
     return .{
@@ -306,17 +225,49 @@ pub fn parseString(payload: []const u8) !ParsedString {
     };
 }
 
+/// What SETSTAT and FSETSTAT act on in a v3 ATTRS block. Fields after
+/// the times, the extensions, are not needed.
+pub const SetAttrs = struct {
+    size: bool,
+    /// Permissions or owners, which are ignored but worth an audit note.
+    mode_or_owner: bool,
+    /// atime, mtime.
+    times: ?[2]u32,
+};
+
+pub fn parseSetAttrs(payload: []const u8) !SetAttrs {
+    if (payload.len < 4) return error.LibsshFailure;
+    const flags = std.mem.readInt(u32, payload[0..4], .big);
+    const has = struct {
+        fn bit(f: u32, b: c_int) bool {
+            return f & @as(u32, @intCast(b)) != 0;
+        }
+    }.bit;
+    var offset: usize = 4;
+    if (has(flags, c.SSH_FILEXFER_ATTR_SIZE)) offset += 8;
+    if (has(flags, c.SSH_FILEXFER_ATTR_UIDGID)) offset += 8;
+    if (has(flags, c.SSH_FILEXFER_ATTR_PERMISSIONS)) offset += 4;
+    var result: SetAttrs = .{
+        .size = has(flags, c.SSH_FILEXFER_ATTR_SIZE),
+        .mode_or_owner = has(flags, c.SSH_FILEXFER_ATTR_UIDGID) or has(flags, c.SSH_FILEXFER_ATTR_PERMISSIONS),
+        .times = null,
+    };
+    if (has(flags, c.SSH_FILEXFER_ATTR_ACMODTIME)) {
+        if (payload.len < offset + 8) return error.LibsshFailure;
+        result.times = .{
+            std.mem.readInt(u32, payload[offset..][0..4], .big),
+            std.mem.readInt(u32, payload[offset + 4 ..][0..4], .big),
+        };
+        offset += 8;
+    }
+    if (payload.len < offset) return error.LibsshFailure;
+    return result;
+}
+
 pub fn parseHandleId(payload: []const u8) !u32 {
     const parsed = try parseString(payload);
     if (parsed.value.len != 4) return error.LibsshFailure;
-    return readU32(parsed.value);
-}
-
-pub fn writeU32(out: []u8, value: u32) void {
-    out[0] = @intCast((value >> 24) & 0xff);
-    out[1] = @intCast((value >> 16) & 0xff);
-    out[2] = @intCast((value >> 8) & 0xff);
-    out[3] = @intCast(value & 0xff);
+    return std.mem.readInt(u32, parsed.value[0..4], .big);
 }
 
 const testing = std.testing;
@@ -339,12 +290,10 @@ test "parseString: declared length exceeds buffer" {
 }
 
 test "parseString: max-u32 length does not overflow (regression)" {
-    // Before the fix, `4 + len` was computed in u32 and overflowed for
-    // len >= 0xFFFF_FFFC, panicking in safe builds (a remote whole-
-    // daemon abort). It must now return an error instead.
+    // In u32, `4 + len` overflows here and a safe build panics.
     inline for ([_]u32{ 0xFFFF_FFFF, 0xFFFF_FFFE, 0xFFFF_FFFD, 0xFFFF_FFFC, 0x8000_0000 }) |big| {
         var payload: [8]u8 = undefined;
-        writeU32(payload[0..4], big);
+        std.mem.writeInt(u32, payload[0..4], big, .big);
         payload[4] = 1;
         payload[5] = 2;
         payload[6] = 3;
@@ -361,6 +310,27 @@ test "parseHandleId: requires exactly 4 payload bytes" {
     try testing.expectError(error.LibsshFailure, parseHandleId(&wrong_len));
 
     var overflow: [8]u8 = undefined;
-    writeU32(overflow[0..4], 0xFFFF_FFFF);
+    std.mem.writeInt(u32, overflow[0..4], 0xFFFF_FFFF, .big);
     try testing.expectError(error.LibsshFailure, parseHandleId(&overflow));
+}
+
+test "parseSetAttrs: skips size, owner and mode to reach the times" {
+    var buf: [36]u8 = undefined;
+    const flags: u32 = @intCast(c.SSH_FILEXFER_ATTR_UIDGID | c.SSH_FILEXFER_ATTR_PERMISSIONS | c.SSH_FILEXFER_ATTR_ACMODTIME);
+    std.mem.writeInt(u32, buf[0..4], flags, .big);
+    @memset(buf[4..16], 0xAA);
+    std.mem.writeInt(u32, buf[16..20], 1000, .big);
+    std.mem.writeInt(u32, buf[20..24], 2000, .big);
+    const got = try parseSetAttrs(buf[0..24]);
+    try testing.expect(!got.size);
+    try testing.expect(got.mode_or_owner);
+    try testing.expectEqual([2]u32{ 1000, 2000 }, got.times.?);
+    try testing.expectError(error.LibsshFailure, parseSetAttrs(buf[0..23]));
+
+    std.mem.writeInt(u32, buf[0..4], @intCast(c.SSH_FILEXFER_ATTR_SIZE), .big);
+    try testing.expectError(error.LibsshFailure, parseSetAttrs(buf[0..11]));
+    const size_only = try parseSetAttrs(buf[0..12]);
+    try testing.expect(size_only.size);
+    try testing.expect(!size_only.mode_or_owner);
+    try testing.expectEqual(null, size_only.times);
 }

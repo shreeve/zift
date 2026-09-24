@@ -36,6 +36,7 @@ name: Release
 #   zift-X.Y.Z-aarch64-macos      libSystem-only macOS aarch64 binary
 #   zift-deploy-X.Y.Z.tar.gz      optional systemd unit bundle:
 #                                   - zift.service
+#                                   - LICENSE, THIRD_PARTY_LICENSES.md
 #   SHA256SUMS                    sha256 of every artifact above
 #   SHA256SUMS.bundle             cosign keyless signature over SHA256SUMS
 #
@@ -46,7 +47,7 @@ name: Release
 #     --certificate-identity 'https://github.com/shreeve/zift/.github/workflows/release.yml@refs/tags/vX.Y.Z' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
 #     SHA256SUMS
-#   shasum -a 256 -c SHA256SUMS
+#   shasum -a 256 -c SHA256SUMS --ignore-missing
 
 on:
   push:
@@ -101,19 +102,21 @@ jobs:
 
       # No libssh / mbedTLS / zlib install step needed since v0.2.0 —
       # `zig build release` compiles all three from vendored source via
-      # build.zig.zon. Hermetic build, reproducible from a clean
-      # checkout on any host with Zig 0.16.0 installed.
+      # build.zig.zon.
+
+      # A tag can be pushed on a commit CI never saw, so at least the unit
+      # tests run here. The integration suite runs only in CI: tag a
+      # commit whose CI run on main is green.
+      - name: Unit tests
+        run: zig build test
 
       - name: Build release artifacts
         env:
           TARGETS: ${{ matrix.targets }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # One `zig build release` per target. build.zig writes
-          # `release/zift-{version}-{target}` and
-          # `SHA256SUMS-{target}` so successive cross-compiles in the
-          # same workspace don't clobber each other. The publish job
-          # aggregates all SHA256SUMS-* into one canonical manifest.
+          # One `zig build release` per target, each writing
+          # `release/zift-{version}-{target}` and verifying it.
           set -euo pipefail
           for tgt in $TARGETS; do
             echo "::group::Building zift-${VERSION}-${tgt}"
@@ -121,16 +124,14 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Show artifacts + checksums
-        run: |
-          ls -la release/
-          cat release/SHA256SUMS-*
+      - name: Show artifacts
+        run: ls -la release/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          # Per-runner artifact name. The publish job picks both up
-          # via `dist/release-*` glob to build the unified manifest.
+          # Per-runner artifact name; the publish job collects both
+          # via the `dist/release-*` glob.
           name: release-${{ matrix.os }}
           path: release/
           if-no-files-found: error
@@ -152,7 +153,7 @@ jobs:
         with:
           path: dist
 
-      - name: Stage release directory + unified SHA256SUMS
+      - name: Stage release directory + SHA256SUMS
         id: stage
         run: |
           # Tag was validated `vX.Y.Z[-prerelease]` by the build job;
@@ -161,27 +162,18 @@ jobs:
           echo "version=$version"
 
           mkdir -p release
-          # Pull every binary into one directory; concatenate the
-          # per-target SHA256SUMS-{target} files into one canonical
-          # manifest. `sort -u` produces a stable ordering across
-          # reruns and de-dupes if the same artifact is uploaded twice.
-          # Glob matches both v0.1.x's `SHA256SUMS` and v0.2.0+'s
-          # `SHA256SUMS-{target}` per-target files.
           cp dist/release-*/zift-* release/
 
-          # Optional systemd unit only. Security and config live in the
-          # binary + docs — no fail2ban/CrowdSec/logrotate bundle.
+          # The systemd unit and the license notices a binary must ship
+          # with. No fail2ban/CrowdSec/logrotate bundle.
           mkdir -p "staging/zift-deploy-${version}"
-          cp packaging/systemd/zift.service \
+          cp packaging/systemd/zift.service LICENSE THIRD_PARTY_LICENSES.md \
              "staging/zift-deploy-${version}/"
           tar -C staging -czf "release/zift-deploy-${version}.tar.gz" "zift-deploy-${version}"
 
-          # Build the unified SHA256SUMS. Per-target binary checksums
-          # come from the build matrix; the deploy tarball is computed
-          # here in the publish job since it's platform-agnostic.
-          cat dist/release-*/SHA256SUMS* | sort -u > release/SHA256SUMS
-          ( cd release && shasum -a 256 "zift-deploy-${version}.tar.gz" ) \
-              >> release/SHA256SUMS
+          # Hash exactly the bytes this job signs and publishes, rather
+          # than trusting per-runner checksum files.
+          ( cd release && sha256sum zift-* > SHA256SUMS )
 
           echo "=== release/ contents ==="
           ls -la release/
@@ -193,12 +185,10 @@ jobs:
         with:
           cosign-release: 'v3.1.2'
 
+      # Keyless signing uses Sigstore's public-good instance, cosign's
+      # default. (COSIGN_EXPERIMENTAL, which this step used to set, is a
+      # legacy feature toggle and never selected an instance.)
       - name: Sign SHA256SUMS (cosign keyless via OIDC)
-        env:
-          # Tell cosign to use Sigstore's public good instance. This
-          # is the default; we set it explicitly so a future Sigstore
-          # config change doesn't silently switch trust roots.
-          COSIGN_EXPERIMENTAL: "0"
         run: |
           cd release
           cosign sign-blob \

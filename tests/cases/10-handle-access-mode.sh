@@ -1,66 +1,39 @@
 #!/usr/bin/env bash
 # Test: per-handle access mode is enforced (write-only handle cannot READ)
-# Covers: PLAN §6.3 ("read controls SSH_FXP_READ, write controls SSH_FXP_WRITE")
-# TODOS: P0 per-handle access mode
+# `read` controls READ and `write` controls WRITE, per handle: a drop-box
+# partner must not read back a file through a handle opened for writing.
 
 source "$(dirname "$0")/../lib/common.sh"
-
-PROBE="$(dirname "$0")/../lib/probe_handle_access.py"
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV (run 'python3 -m venv tests/.venv && tests/.venv/bin/pip install paramiko')"
-    exit 0
-fi
+need_paramiko
 
 make_host_key
-hash=$(make_password_hash secret)
-
 mkdir -p "$TEST_TMP/jail/inbox"
-# Pre-place a "secret" file the drop-box user must NOT be able to read.
-# Their config grants `write list` on /inbox, but NOT `read`.
 echo "TOP-SECRET" > "$TEST_TMP/jail/inbox/secret.txt"
 
+# `update` satisfies the clobber rule for OPEN(write) of an existing
+# file, so the only thing refusing the READ is the handle's mode.
 write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  log stderr
+$(config_head)
 
 user drop
-  auth $hash
+  auth $(user_key)
   root $TEST_TMP/jail
-  # write+update: write enables OPEN(write); update satisfies the
-  # clobber rule (any OPEN(write) on an existing file requires
-  # `update` permission). The test's purpose is to verify
-  # handle-mode authorization, not the clobber rule — so we grant
-  # both verbs explicitly to isolate what we're testing.
   allow /inbox write list update
 EOF
-
 start_zift
 
-# The probe opens /inbox/secret.txt with WRITE flag (no TRUNC), then issues
-# a raw SSH_FXP_READ against the handle. PLAN §6.3 says READ must be denied
-# because the user has no `read` permission on /inbox. The probe exits:
-#     0  denial as expected (fix in place)
-#     2  bypass (bug present)
-#     3  test environment failure
-set +e
-"$PY" "$PROBE" \
-    --host 127.0.0.1 --port "$TEST_PORT" \
-    --user drop --pass secret \
-    --path /inbox/secret.txt \
-    > "$TEST_TMP/probe.out" 2>&1
-rc=$?
-set -e
-
-echo "  probe: $(cat "$TEST_TMP/probe.out")"
-case "$rc" in
-    0) ok "READ on a WRITE-only handle was denied" ;;
-    2) fail "bypass: server returned file content via a WRITE-only handle" ;;
-    *) fail "probe environment error (rc=$rc); see $TEST_TMP/probe.out" ;;
-esac
-
-stop_zift TERM
+"$PY" - <<'EOF'
+from client import *
+sftp = connect("drop")
+kind, reply = raw(sftp, CMD_OPEN, "/inbox/secret.txt", FXF_WRITE, SFTPAttributes())
+if kind != CMD_HANDLE:
+    fail(f"OPEN for write was refused (reply {kind})")
+handle = reply.get_binary()
+kind, reply = raw(sftp, CMD_READ, handle, int64(0), 4096)
+if kind == CMD_DATA:
+    fail(f"bypass: READ on a write-only handle returned {reply.get_binary()!r}")
+code = reply.get_int() if kind == CMD_STATUS else kind
+if code != FX_PERMISSION_DENIED:
+    fail(f"READ on a write-only handle got {code}, want PERMISSION_DENIED")
+ok("READ on a WRITE-only handle was denied")
+EOF

@@ -4,418 +4,116 @@
 
 # Zift
 
-> Zift is a small SFTP server for partner file transfer.
+> Zift is a small SFTP server for partner file exchange.
 
-It is built for the common B2B case where OpenSSH `internal-sftp` plus
-OS users has become awkward, but a managed file transfer platform is too
-large, too stateful, or too expensive to trust for a narrow job.
+It is for teams that run file drops and pickups for external partners
+and have outgrown OpenSSH `internal-sftp` with an OS account per
+partner, but do not want a managed file transfer platform with a
+database, a web UI and a much larger attack surface.
 
-Zift has:
+- Virtual users, their credentials and their path rules live in one
+  config file that reloads without a restart.
+- Policy is default-deny and path-scoped. `write` creates new files;
+  replacing one needs `update`.
+- Each partner is jailed to their root, which symlinks cannot escape,
+  and uploads appear atomically.
+- Per-user source addresses, auth backoff, source suppression and
+  connection caps are built in. No fail2ban needed.
+- Every login and change is a JSON audit line.
+- No shell, web UI, database, plugins, telemetry or OS account per
+  partner. Static Linux release binaries.
 
-- no web UI
-- no database
-- no OS users per partner
-- no chroot setup
-- no plugin system
-- no telemetry
-- no CrowdSec / fail2ban requirement
-- one reloadable config file
-- one SFTP listener
-- virtual users with path-scoped policy
-- optional per-user source IP (`from`) policy
-- built-in auth backoff and temporary source suppression
-- structured JSON audit logs
-- static Linux release binaries
+Not a fit if you need a browser UI, SSO or LDAP, FTP or AS2, workflows,
+quotas, clustering or self-service users. See
+[`docs/evaluate.md`](docs/evaluate.md).
 
-The goal is boring software: install it, configure partner roots and
-credentials, then let ordinary SFTP clients move files.
+## Install
 
-## Should I Use It?
-
-Use Zift if you operate file exchange for a modest number of external
-partners, want onboarding to be a text-file edit, and prefer a small
-runtime surface over a feature platform.
-
-Do not use Zift if you need a browser UI, SSO, LDAP/AD/PAM, FTP/FTPS,
-AS2, scheduling, EDI parsing, clustering, self-service users, quotas,
-or a database-backed management plane.
-
-Start with [`docs/evaluate.md`](docs/evaluate.md).
-
-## Quick Install
-
-Install `cosign` first (`brew install cosign`, `apt install cosign`, or
-`dnf install cosign`). Zift's installer requires it so the downloaded
-checksum manifest is authenticated before any binary is installed.
+Install [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/)
+first; the installer uses it to verify the release. Then:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
 ```
 
-Installs the binary for this platform, verified against the release's
-signed `SHA256SUMS` and the exact release workflow identity and tag.
+This installs the verified binary only: to `/usr/local/bin` when run as
+root or on a host that runs the `zift` service, otherwise to
+`~/.local/bin` (add it to `PATH` if `zift` is not found). Setting up the
+service is [`docs/operate.md`](docs/operate.md). To build from source,
+see [`docs/develop.md`](docs/develop.md).
 
-Where it lands answers *which binary matters here*. On a host that runs
-zift as a service it goes to `/usr/local/bin` — the path the unit's
-`ExecStart` names — elevating for that one write via `sudo` if you are
-not root, and saying so before it does. Nothing else runs with
-privileges: not the download, not the signature check. Anywhere else it
-goes to `~/.local/bin`, which is enough for `zift hash-password` and
-`zift validate` on a laptop.
+## Quickstart
 
-`BIN=/some/path` overrides both and is taken literally, so an explicit
-destination is never elevated behind. Pin a version by passing a tag,
-and remove the binary with `--uninstall`:
+Serve a partner `foo` with password `bar`, who may browse, upload new
+files and replace them under `/pending`, and download from `/archive`:
 
 ```sh
-curl -fsSL .../install.sh | bash -s v0.11.0
-curl -fsSL .../install.sh | bash -s -- --uninstall
-```
+mkdir -p /tmp/zift/foo/pending /tmp/zift/foo/archive
+ssh-keygen -q -t ed25519 -f /tmp/zift/host_ed25519 -N ""
+HASH=$(printf '%s\n' 'bar' | zift hash-password)
 
-This installs the **binary only**. Standing up the daemon — service
-user, host key, config, jail tree, systemd unit — is
-[`docs/operate.md`](docs/operate.md); an uninstall never touches any of
-them.
-
-To place the binary by hand instead:
-
-```sh
-# Linux x86_64
-ZIFT_VERSION=0.11.0
-curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-x86_64-linux"
-chmod +x "zift-${ZIFT_VERSION}-x86_64-linux"
-sudo install -m 0755 "zift-${ZIFT_VERSION}-x86_64-linux" /usr/local/bin/zift
-
-zift version
-```
-
-Release artifacts also include a `SHA256SUMS` manifest and
-`SHA256SUMS.bundle` signature. Production installs should verify both:
-
-```sh
-curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS"
-curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS.bundle"
-
-cosign verify-blob \
-  --bundle SHA256SUMS.bundle \
-  --certificate-identity "https://github.com/shreeve/zift/.github/workflows/release.yml@refs/tags/v${ZIFT_VERSION}" \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  SHA256SUMS
-
-sha256sum -c SHA256SUMS --ignore-missing
-```
-
-On macOS, use `shasum -a 256 -c SHA256SUMS --ignore-missing` if
-`sha256sum` is not installed.
-
-For a production runbook, read [`docs/operate.md`](docs/operate.md).
-
-## Build From Source
-
-Zift requires Zig `0.16.0`.
-
-`libssh`, `mbedTLS`, and `zlib` are pinned in `build.zig.zon` and built
-from source by the Zig build. No system package is required for release
-builds.
-
-```sh
-zig build
-bin/zift version
-zig build test
-```
-
-Integration tests require Python 3, Paramiko, OpenSSH client tools,
-`expect`, and `lsof`:
-
-```sh
-tests/run.sh
-```
-
-Contributor details are in [`docs/develop.md`](docs/develop.md).
-
-## Minimal Example
-
-Add a partner `foo` with password `bar` and the usual B2B path
-policy: browse `/`, upload under `/pending`, read `/archive`.
-
-```sh
-# host key + partner directories (partner-root /tmp/zift => root /tmp/zift/foo)
-ssh-keygen -t ed25519 -f /tmp/zift_host_ed25519 -N ""
-mkdir -p /tmp/zift/foo/{pending,archive}
-
-# password hash — paste the full a… line into the config below
-printf '%s\n' 'bar' | bin/zift hash-password
-```
-
-Write `/tmp/zift/example.zift` (replace `a…` with the hash you just
-printed):
-
-```zift
+cat > /tmp/zift/zift.conf <<EOF
 server
   listen 127.0.0.1:2222
-  host-key /tmp/zift_host_ed25519
+  host-key /tmp/zift/host_ed25519
   partner-root /tmp/zift
-  reload-interval 2s
-  idle-timeout 5m
-  max-connections 14
-  max-unauth-connections 4
   log stderr
 
 user foo
-  from 127.0.0.1
-  auth a…
+  auth $HASH
   allow / read
-  allow /pending write read update delete
-  allow /archive read
+  allow /pending write update
   deny **.exe
-  # **/.ssh/** does not match the .ssh directory itself, so READDIR can list names while OPEN of the key file stays denied.
-  deny **/.ssh
-  deny **/.ssh/**
+EOF
+
+zift validate /tmp/zift/zift.conf
+zift serve /tmp/zift/zift.conf
 ```
 
-Validate and serve:
-
-```sh
-bin/zift validate /tmp/zift/example.zift
-bin/zift serve /tmp/zift/example.zift
-```
-
-Connect with any normal SFTP client (password `bar`):
+In another terminal, log in with password `bar`:
 
 ```sh
 sftp -P 2222 foo@127.0.0.1
 ```
 
-For production onboarding (service user, directory modes, reload),
-see [`docs/operate.md`](docs/operate.md). Full grammar is in
-[`docs/configure.md`](docs/configure.md).
+Stop the server with Ctrl-C. `partner-root /tmp/zift` makes
+`/tmp/zift/foo` the root for user `foo`.
 
-## Permissions
+## Permissions In Brief
 
-Policy is default-deny and path-scoped. A partner with valid credentials
-and no `allow` lines can authenticate and do nothing.
-
-There are exactly two kinds of rule:
-
-- **`allow <pattern> <verbs…>`** grants verbs on matching virtual paths.
-- **`deny <pattern>`** refuses matching virtual paths outright. It takes
-  no verbs, because it removes everything.
-
-**`deny` always wins.** Order does not matter, and neither does
-specificity: the first matching `deny` ends the decision, so a broad
-`deny **.exe` overrides a narrow `allow /incoming write`. Use `allow` to
-describe the shape of the job and `deny` to carve out what must never
-happen regardless.
-
-Four verbs cover almost every policy:
+A user can do nothing until an `allow` line grants it. `allow <pattern>
+<verbs>` grants verbs on matching paths; `deny <pattern>` refuses them
+outright and always wins.
 
 | Verb | Grants |
 | --- | --- |
-| `read` | stat, list, and download |
-| `write` | bring a **new** file into existence |
-| `update` | replace, truncate, or append to an entry that **already exists** |
+| `read` | download, stat and list |
+| `write` | create a new file |
+| `update` | replace, truncate or append to an existing file |
 | `delete` | remove an entry |
+| `full` | all of these, plus `mkdir` and `rename` |
 
-`full` is shorthand for `read list write update delete mkdir rename`.
-
-Three granular verbs exist for narrower policies. Reach for them only
-when the four above cannot say what you mean:
-
-| Verb | Grants |
-| --- | --- |
-| `list` | stat and listing, without download |
-| `mkdir` | directory creation only |
-| `rename` | rename, checked on both source and destination |
-
-`rename` is not one of the everyday verbs because it is not one
-operation: it destroys a name and creates another. Granting it means
-granting both halves, which is why `write` alone never implies it — a
-write-only partner could otherwise hide a file by renaming it.
-
-A rename cannot increase access to an existing entry. For a directory,
-Zift checks the complete existing subtree at both its old and proposed
-paths and honors every descendant deny. Safe directory renames remain
-available; a rename that would expose or manipulate a protected child is
-denied.
-
-### `write` is not `update`
-
-`write` brings a **new** name into existence. Replacing something that
-already exists is `update`. That includes overwriting, truncating,
-appending, and renaming over an existing file.
-
-```zift
-# upload new files; cannot touch existing ones
-allow /pending read write
-# ...and may replace their own files
-allow /pending read write update
-# ...and may delete them too
-allow /pending full
-```
-
-(Comments sit on their own line — Zift rejects a `#` placed after a
-directive, so trailing inline comments are a parse error, not a note.)
-
-Keeping these separate is what makes the most common B2B feed
-expressible: a partner who re-sends `daily.csv` every morning needs
-`update`, and should almost never need `delete`.
-
-Before v0.9.2 these were one verb (`remove`), so overwriting required
-granting deletion. The `add`, `create`, and `remove` verbs were retired
-in 0.10.0 and are now rejected outright — configs that used them must
-migrate to the CRUD verbs (`add` and `create` become `write`; `remove`
-becomes `delete`). New configs should say what they mean.
-
-### Patterns
-
-Patterns match virtual paths, never host paths.
-
-Literal patterns match whole path components, so `/pending` matches
-`/pending`, `/pending/file.csv`, and `/pending/deep/file.csv` — but not
-`/pendingfoo` or `/pending-archive`.
-
-| Pattern | Meaning |
-| --- | --- |
-| `*` | any sequence except `/` |
-| `?` | one character except `/` |
-| `**` | any sequence including `/` |
-
-`deny` always overrides `allow`, whatever the order or specificity.
-Prefer explicit patterns over clever ones.
-
-### Policies that cover most of the real cases
-
-```zift
-# blind drop: send files, cannot see or retrieve anything
-allow /incoming write
-
-# drop zone: browse, upload new files, never modify or delete
-allow / read
-allow /incoming write
-
-# recurring feed: may replace their own file, may never delete
-allow / read
-allow /feed write update
-
-# drop zone they can fully manage
-allow / read
-allow /incoming write update delete
-
-# pickup: download and clean up after collection
-allow / read
-allow /outgoing read delete
-
-# archive: browse and download, nothing else
-allow / read
-
-# two-way exchange
-allow / read
-allow /incoming write
-allow /outgoing read delete
-
-# mutable workspace
-allow /workspace full
-
-# reconcile a manifest without being able to fetch the contents
-allow / list
-```
-
-Add these to any policy — they cost nothing and close common mistakes.
-`**/.ssh/**` does not match the directory `.ssh` itself, so READDIR of
-that directory can list names while OPEN of the key file stays denied:
-
-```zift
-deny **.exe
-deny **/.ssh
-deny **/.ssh/**
-deny **/.git/**
-```
-
-### Restrict the network too
-
-Path policy answers *what*. `from` answers *from where*, and it is
-checked before authentication is attempted:
-
-```zift
-user ally
-  from 203.0.113.40
-  from 198.51.100.0/28
-  auth a…
-  allow / read
-  allow /incoming write
-```
-
-Each line is one IPv4/IPv6 address or CIDR. With any `from` present, a
-peer that matches none of them cannot authenticate at all. If your
-partners have stable egress addresses, this is the cheapest hardening
-available: partner identity, partner network, and path policy in one
-reviewable block.
-
-### Two things that will cost you time
-
-**A partner's `root` must already exist.** If it does not, the whole
-config is rejected — not just that user. Zift keeps serving the previous
-config, so the partner you just added simply does not exist, and their
-client reports a generic `Permission denied` that looks exactly like a
-bad password. Create the directory first:
-
-```sh
-sudo install -d -o zift -g zift -m 2770 /home/zift/ally
-```
-
-**Reload through systemd, and watch the journal.** A rejected config is
-never applied — the daemon keeps serving the last-good config — but as of
-0.10.1 that rejection is *loud* on the operator side, not silent. The
-daemon marks itself **degraded**, logs `config reload rejected — SERVING
-PREVIOUS CONFIG`, and emits a
-`{"operation":"config.reload","result":"failed"}` audit event; it stays
-degraded until a valid config loads, then logs `config reload recovered`
-and emits `config.reload` with `result=ok`. Sessions are never dropped
-(fail-open). It is still silent to the *SFTP client*, which only ever
-sees a generic `Permission denied` — which is why you check the journal:
-
-```sh
-zift validate /home/zift/zift.conf   # ok: ... (1 user, listen 0.0.0.0:2222)
-sudo systemctl reload zift
-journalctl -u zift -f                # what the daemon actually did
-```
-
-`systemctl reload zift` runs `zift validate` before it signals, so a bad
-edit makes the reload command itself fail non-zero (shown in `systemctl
-status` and the journal) and the daemon is never sent the reload. Running
-`zift validate` by hand first is now belt-and-suspenders — still handy,
-because it prints the exact line and reason immediately.
-
-Reloads apply to new sessions only, and are triggered when the
-`zift.conf` mtime or an authorized-key file's mtime moves forward, or
-by `SIGHUP`. Creating a partner root or fixing directory modes leaves
-those mtimes untouched, so reload by hand after those. Replacing an
-authorized-key file does not need a dummy edit of `zift.conf`.
+`/pending` covers everything below it; `*`, `?` and `**` are globs, and
+every pattern starts with `/` or `**`. The full grammar, the granular
+verbs and common policies are in [`docs/configure.md`](docs/configure.md).
 
 ## Documentation
 
-- [`docs/evaluate.md`](docs/evaluate.md): product rationale, audience,
-  tradeoffs, and comparisons.
-- [`docs/operate.md`](docs/operate.md): installation, deployment,
-  supervision, reloads, logs, backups, and rollback.
-- [`docs/configure.md`](docs/configure.md): config grammar, virtual
-  users, auth, roots, permissions, patterns, and examples.
-- [`docs/security.md`](docs/security.md): threat model, guarantees,
-  caveats, audit posture, and deployment hardening.
-- [`docs/develop.md`](docs/develop.md): source layout, build system,
-  tests, CI, release workflow, and maintenance notes.
+- [`docs/evaluate.md`](docs/evaluate.md): who Zift is for, and the
+  alternatives.
+- [`docs/configure.md`](docs/configure.md): the config file,
+  permissions, patterns, reloads and limits.
+- [`docs/operate.md`](docs/operate.md): install, service setup, reload,
+  signals, logs and runbooks.
+- [`docs/security.md`](docs/security.md): threat model, guarantees and
+  known caveats.
+- [`docs/develop.md`](docs/develop.md): building, testing and releasing.
+- [`CHANGELOG.md`](CHANGELOG.md): what changed, and how to migrate.
 
 ## License
 
-Zift is released under the [MIT License](LICENSE).
+Zift is released under the [MIT License](LICENSE). Release binaries
+statically link libssh (LGPL-2.1), mbedTLS (Apache-2.0) and zlib; see
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
-Release binaries statically link libssh (LGPL-2.1), mbedTLS (Apache-2.0),
-and zlib (zlib license). See
-[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for attribution and
-license texts.
-
-## Security
-
-To report a suspected vulnerability privately, see
-[`SECURITY.md`](SECURITY.md). For deployment hardening and threat model,
-see [`docs/security.md`](docs/security.md).
+To report a vulnerability privately, see [`SECURITY.md`](SECURITY.md).

@@ -112,99 +112,30 @@ failure by refusing to own them:
 The cost is obvious: if you need those features, Zift will not grow them
 for you.
 
-## What Zift Does
+## What Zift Is, And Is Not
 
-Zift provides:
-
-- SFTP version 3 service over SSH.
-- Virtual users defined in a text config file.
-- Password auth using compact versioned passhashes (`a…`, argon2id; shared with Janus).
-- Public-key auth using operator-managed key files.
-- Per-user filesystem roots.
-- Optional `partner-root` shorthand for `/home/zift/<user>` style
-  layouts.
-- Path-scoped allow/deny rules.
-- A small permission vocabulary: `read`, `write`, `update`, `delete`,
-  `full`, plus granular `list`, `mkdir`, and `rename`.
-- Default-deny authorization.
-- Structured JSON audit logs.
-- Hot config reload for new sessions.
-- Graceful shutdown and forced close after a configured grace period.
-- Atomic publish of new uploads through a private staging directory.
-- Virtualized directory listings that show partner-facing permissions
-  rather than host filesystem ownership.
-- Static Linux release binaries and signed release manifests.
-
-## What Zift Refuses To Do
-
-Zift does not contain:
-
-- A database.
-- A web UI.
-- A management API.
-- A plugin system.
-- A scripting runtime.
-- A scheduler.
-- A queue.
-- A transfer processor.
-- A metrics endpoint.
-- External identity integration.
-- Cluster coordination.
-- Automatic updates.
-- Telemetry.
-
-The intended model is self-contained for the normal case: one binary,
-one config, built-in connection caps, auth backoff, temporary source
-suppression, and optional per-user `from` CIDRs. Use a process
-supervisor (systemd) if you want autostart. Pipe JSON audit logs
-wherever you already ship logs. Filesystem snapshots cover backups;
-external watchers handle post-upload processing. Zift does not require
-fail2ban, CrowdSec, or a separate ban daemon.
-
-## Why The Narrowness Is A Feature
-
-SFTP servers sit on a remote trust boundary. Every feature added to the
-daemon becomes something that can fail, be misconfigured, or need
-patching at the worst possible time.
-
-Zift treats operational simplicity as a security property:
-
-- One binary is easier to inspect and roll back.
-- One config file is easier to review.
-- No database means no schema, migrations, connection pools, or DB
-  corruption mode.
-- No web UI means no browser attack surface.
-- No external auth means no availability dependency on directory or
-  identity systems.
-- No plugin system means no third-party code execution inside the
-  daemon.
-
-This does not make Zift universally safer than larger systems. It makes
-its failure modes smaller and easier to reason about for the job it
-chooses to do.
+Zift serves SFTP version 3 to virtual users from one config file, with
+default-deny path rules, jailed roots, per-user source addresses,
+built-in abuse controls, JSON audit lines, hot reload and atomic
+uploads (see the [README](../README.md)). It has no database, web UI,
+management API, plugins, scheduler, metrics endpoint, external
+identity, clustering, automatic updates or telemetry: each would be one
+more thing on a trust boundary to fail, misconfigure or patch. A
+supervisor starts it, a log shipper takes the audit lines, snapshots
+cover backups, and external watchers handle post-upload processing.
 
 ## Current Maturity
 
-The implementation is a compact Zig codebase using libssh for the SSH
-transport. Release builds vendor libssh, mbedTLS, and zlib through the
-Zig package graph.
+Zift is a compact Zig codebase on libssh, with unit tests, fuzzing, and
+an integration suite that drives real OpenSSH and Paramiko clients
+against a release build made exactly as releases are (ReleaseSafe,
+stripped, static on Linux). Releases are signed
+with cosign.
 
-The repository includes:
-
-- unit tests via `zig build test`
-- integration tests using OpenSSH clients, shell scripts, Expect, and
-  Paramiko probes
-- CI that builds a static Linux release-style binary and runs the
-  integration suite against it
-- a release workflow that builds Linux and macOS artifacts, emits
-  `SHA256SUMS`, signs the manifest with cosign keyless, and publishes a
-  deploy bundle
-- a security guide that covers the threat model, invariants, deployment
-  hardening, and known caveats
-
-Remaining known caveats are documented in [`security.md`](security.md).
-The most important are filesystem edge cases around no-replace rename
-semantics and cross-filesystem atomic uploads.
+Read the [known caveats](security.md#known-caveats) before deciding. The
+ones most likely to matter: partner roots need a filesystem with
+no-replace rename (not NFS or SMB), a reload does not cut off a partner
+who is already connected, and overwrites are not atomic.
 
 ## The Evaluation Test
 

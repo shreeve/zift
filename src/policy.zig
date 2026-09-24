@@ -1,18 +1,26 @@
+//! Path policy: default deny, any matching `deny` wins, and an `allow`
+//! must grant a permission that satisfies the operation.
+//!
+//! Callers pass the normalized virtual path. Pattern syntax is described
+//! at `globMatch` and in docs/configure.md.
+
 const std = @import("std");
 const config = @import("config.zig");
+const listing = @import("listing.zig");
+const vfs = @import("vfs.zig");
+const sys = @import("sys.zig");
 
 pub const Operation = enum {
     open_read,
     open_write,
+    /// STAT and LSTAT alike.
     stat,
-    lstat,
     readdir,
     mkdir,
     remove,
     rmdir,
     rename,
-    // The clobber rule: replacing or truncating an entry that already
-    // exists. Distinct from `remove`, which is deletion proper.
+    // The clobber rule: replacing or truncating an existing entry.
     update,
 };
 
@@ -21,123 +29,30 @@ pub const Decision = enum {
     deny,
 };
 
-/// Compose a fictional `mode_t`-shaped value for `vpath` from this
-/// user's policy and the entry's real file kind. Used by the virtual
-/// listing renderer (`listing-mode virtual`, default in v0.3.0+) so
-/// `sftp> ls -la` shows a partner what they can actually DO with each
-/// entry rather than what's on disk.
-///
-/// The mapping has DIFFERENT semantics for files vs directories,
-/// because `w` means different things in those two worlds:
-///
-///   File-type bits        : preserved from the inode (`d` / `-` / `l` / ...)
-///   setuid/setgid/sticky  : ALWAYS off — operational, not partner-facing
-///
-///   For a FILE:
-///     r  = `read`   permission grants `SSH_FXP_OPEN(read)` — the
-///          bytes themselves. `list` alone does NOT set it: the name
-///          is visible in the listing, the content is not.
-///     w  = `write`  permission grants `SSH_FXP_OPEN(write)` —
-///          ability to overwrite the byte content. Note: removal is
-///          NOT counted toward the file's `w` bit; deletion is a
-///          property of the parent directory (you `unlink`-from-the-
-///          dir, not `unlink`-the-file).
-///     x  = always 0. SFTP doesn't execute files; the bit has no
-///          useful meaning to a partner.
-///
-///   For a DIRECTORY:
-///     r  = `read` OR `list` — either grants STAT/LSTAT, so a
-///          browsable directory renders `r-x`, the Unix spelling of
-///          "you can ls this".
-///     w  = ANY mutation perm (`write` OR `mkdir` OR `rename` OR
-///          `remove`) — this directory's *contents* can change. A
-///          partner with rename-only or mkdir-only sees `w` even
-///          though they can't open files for write at this path.
-///     x  = `list`   permission grants `OPENDIR`/`READDIR` and
-///          traversal. (Following Unix convention: a dir with
-///          traverse-but-not-list is an obscurity, not a security
-///          property; we just couple them.)
-///
-///   Group triplet  : MIRRORS owner — the partner is the only
-///                    inhabitant of their jail, "group" doesn't model
-///                    anyone else.
-///   Other triplet  : ALWAYS `---` — there is no third class of
-///                    viewer in the jail, so showing world bits would
-///                    imply a reader who doesn't exist.
-pub fn policyDerivedMode(
-    user: *const config.UserConfig,
-    vpath: []const u8,
-    kind_bits: u32,
-) u32 {
-    const file_type = kind_bits & 0o170000;
-    const is_dir = file_type == 0o040000;
-
-    var owner: u32 = 0;
-
-    if (is_dir) {
-        // Dir `r` = "may learn this directory's metadata" = STAT,
-        // which either `read` or `list` satisfies. Deriving it from
-        // `read` alone would render `d--x` for a directory the partner
-        // can both stat and browse — a listing that contradicts what
-        // the very next request is allowed to do. It also lands on the
-        // Unix reading of the pair: `r-x` on a directory is exactly
-        // "you can ls this".
-        if (check(user, .stat, vpath) == .allow) owner |= 0o4;
-
-        // Dir: any of the four mutation ops contributes to `w`. Each
-        // op corresponds to a DIFFERENT verb in the config DSL
-        // (`write`, `mkdir`, `rename`, `remove`), so we must check
-        // them all — a partner with `mkdir` but not `write` still
-        // gets `w` because they CAN mutate this directory's contents.
-        const can_mutate = (check(user, .open_write, vpath) == .allow) or
-            (check(user, .mkdir, vpath) == .allow) or
-            (check(user, .rename, vpath) == .allow) or
-            (check(user, .update, vpath) == .allow) or
-            (check(user, .remove, vpath) == .allow);
-        if (can_mutate) owner |= 0o2;
-        if (check(user, .readdir, vpath) == .allow) owner |= 0o1;
-    } else {
-        // File `r` strictly means "can download the bytes" — `read`,
-        // and not `list`. A file a partner may see in a listing but
-        // may not fetch renders with no `r`, which is the honest
-        // answer: the name is visible, the content is not.
-        if (check(user, .open_read, vpath) == .allow) owner |= 0o4;
-
-        // File: `w` strictly means "can rewrite byte content"
-        // (= `write` permission, which gates `SSH_FXP_OPEN(write)`).
-        // Removal of the file is a property of the parent dir's
-        // policy, not this file's mode bits — exactly like Unix,
-        // where `rm somefile` consults the dir's `w` bit, not the
-        // file's.
-        if (check(user, .open_write, vpath) == .allow) owner |= 0o2;
+/// Everything the partner may do at `path`, in one pass over the rules:
+/// empty if any `deny` matches, else the union of the matching `allow`s.
+/// A path longer than `vfs.max_virtual_path_bytes` gets nothing: no
+/// client can name one, and `globMatch` is sized for that bound.
+pub fn effective(user: *const config.UserConfig, path: []const u8) config.PermissionSet {
+    var granted = config.PermissionSet.initEmpty();
+    if (path.len > vfs.max_virtual_path_bytes) return granted;
+    for (user.rules) |rule| {
+        if (!globMatch(rule.pattern, path)) continue;
+        switch (rule.effect) {
+            .deny => return config.PermissionSet.initEmpty(),
+            .allow => granted.setUnion(rule.permissions),
+        }
     }
+    return granted;
+}
 
-    return file_type | (owner << 6) | (owner << 3) | 0;
+/// Whether `granted` (from `effective`) allows `operation`.
+pub fn permits(granted: config.PermissionSet, operation: Operation) bool {
+    return granted.intersectWith(permissionsFor(operation)).count() > 0;
 }
 
 pub fn check(user: *const config.UserConfig, operation: Operation, virtual_path: []const u8) Decision {
-    const sufficient = permissionsFor(operation);
-    var allowed = false;
-
-    for (user.rules) |rule| {
-        // Fail-closed on an indeterminate match: if pattern evaluation
-        // exhausts its step budget (a pathological glob against a long
-        // client-supplied path), we cannot prove the rule does NOT
-        // match, so we deny the whole operation. Denying is always the
-        // safe direction — a partner cannot turn a runaway pattern into
-        // an *allow*.
-        const matched = globMatchChecked(rule.pattern, virtual_path) orelse return .deny;
-        if (!matched) continue;
-
-        switch (rule.effect) {
-            .deny => return .deny,
-            .allow => {
-                if (rule.permissions.intersectWith(sufficient).count() > 0) allowed = true;
-            },
-        }
-    }
-
-    return if (allowed) .allow else .deny;
+    return if (permits(effective(user, virtual_path), operation)) .allow else .deny;
 }
 
 pub fn checkRename(user: *const config.UserConfig, from_path: []const u8, to_path: []const u8) Decision {
@@ -146,82 +61,168 @@ pub fn checkRename(user: *const config.UserConfig, from_path: []const u8, to_pat
     return .allow;
 }
 
-/// The permissions that satisfy `operation`. Holding ANY one of them is
-/// enough; the set is a disjunction, not a requirement list.
-///
-/// Every operation but STAT/LSTAT names exactly one capability. Metadata
-/// is the exception because it is the *listing's own content*: READDIR
-/// hands a partner every name, size, mode, and timestamp in a directory,
-/// so refusing the STAT of a path they may already list withholds
-/// nothing.
-///
-/// It is also what makes `list` usable. Mainstream clients (FileZilla,
-/// WinSCP) stat a remote directory before opening it, so a `list` that
-/// did not satisfy STAT could never render a listing — "browse without
-/// download" has to cover both requests or it covers neither.
+/// Permissions any one of which allows `operation`. Only STAT takes two:
+/// `list` already reveals everything STAT returns, and clients such as
+/// FileZilla and WinSCP stat a directory before listing it.
 fn permissionsFor(operation: Operation) config.PermissionSet {
-    var set = config.PermissionSet.initEmpty();
-    switch (operation) {
-        .stat, .lstat => {
-            set.insert(.read);
-            set.insert(.list);
-        },
-        .open_read => set.insert(.read),
-        .open_write => set.insert(.write),
-        .readdir => set.insert(.list),
-        .mkdir => set.insert(.mkdir),
-        .remove, .rmdir => set.insert(.delete),
-        .update => set.insert(.update),
-        .rename => set.insert(.rename),
-    }
-    return set;
+    return switch (operation) {
+        .stat => .initMany(&.{ .read, .list }),
+        .open_read => .initOne(.read),
+        .open_write => .initOne(.write),
+        .readdir => .initOne(.list),
+        .mkdir => .initOne(.mkdir),
+        .remove, .rmdir => .initOne(.delete),
+        .update => .initOne(.update),
+        .rename => .initOne(.rename),
+    };
 }
 
-/// Match a virtual path against a config pattern per PLAN.md §6.3.
+/// `derivedMode` of the permissions at `vpath`.
+pub fn policyDerivedMode(
+    user: *const config.UserConfig,
+    vpath: []const u8,
+    kind_bits: u32,
+) u32 {
+    return derivedMode(effective(user, vpath), kind_bits);
+}
+
+/// A mode for `listing-mode virtual` showing what the partner may do,
+/// not what is on disk. The file type is kept; setuid, setgid, sticky,
+/// and other bits are always off; group mirrors owner.
 ///
-/// - Patterns with no `*` or `?` are **literal path-component prefix**
-///   matches: pattern matches path P iff P equals the pattern, or P
-///   starts with the pattern followed by `/`. So `/pending` matches
-///   `/pending`, `/pending/inbox`, `/pending/inbox/file.csv`, but
-///   never `/pendingfoo`. The root pattern `/` matches every path
-///   that begins with `/`.
-/// - Patterns containing `*` or `?` are globs. Three wildcards:
-///     `*`   — any sequence not including `/` (single component).
-///     `?`   — exactly one character that is not `/`.
-///     `**`  — any sequence INCLUDING `/` (cross-component). Runs of
-///             three or more `*` collapse to one `**`. So
-///             `deny **.exe` correctly denies `foo.exe`, `dir/foo.exe`,
-///             and `dir/sub/foo.exe` alike. `/inbox/**` matches all
-///             contents of `/inbox` at any depth, but NOT `/inbox`
-///             itself (matching gitignore convention).
-/// Step budget for a single glob evaluation. `**` backtracking is
-/// worst-case superlinear in the (client-controlled) subject length, so
-/// an unbounded matcher lets a partner burn CPU with a crafted path
-/// against a multi-`**` operator pattern — amplified ~80× per READDIR
-/// packet. Legitimate patterns finish in well under a thousand steps;
-/// this ceiling is ~3 orders of magnitude above that, so it only ever
-/// trips on genuinely pathological input, where we fail closed (deny).
-const glob_budget: usize = 1_000_000;
-
-const MatchCtx = struct {
-    budget: usize,
-    exhausted: bool = false,
-};
-
-pub fn globMatch(pattern: []const u8, value: []const u8) bool {
-    return globMatchChecked(pattern, value) orelse false;
+///   dir:  r = stat, w = any change inside, x = list
+///   file: r = download, w = overwrite (`write` and `update`, since the
+///         file exists); never x. Removal is the parent's `w`, as on Unix.
+///   anything else (symlink, FIFO, ...): no bits, since OPEN refuses it.
+pub fn derivedMode(granted: config.PermissionSet, kind_bits: u32) u32 {
+    const file_type = kind_bits & listing.S_IFMT;
+    var owner: u32 = 0;
+    switch (file_type) {
+        listing.S_IFDIR => {
+            // Browsable renders `r-x`, as on Unix.
+            if (permits(granted, .stat)) owner |= 0o4;
+            const changes: config.PermissionSet = .initMany(&.{ .write, .mkdir, .rename, .update, .delete });
+            if (granted.intersectWith(changes).count() > 0) owner |= 0o2;
+            if (granted.contains(.list)) owner |= 0o1;
+        },
+        listing.S_IFREG => {
+            // `list` shows the name, not the bytes, so it gives no `r`.
+            if (granted.contains(.read)) owner |= 0o4;
+            if (granted.contains(.write) and granted.contains(.update)) owner |= 0o2;
+        },
+        else => {},
+    }
+    return file_type | (owner << 6) | (owner << 3);
 }
 
-/// Like `globMatch`, but returns null when the step budget is exhausted
-/// (indeterminate) so callers can fail closed.
-pub fn globMatchChecked(pattern: []const u8, value: []const u8) ?bool {
-    if (std.mem.indexOfAny(u8, pattern, "*?") == null) {
+/// Match a normalized virtual path against a rule pattern.
+///
+/// A pattern without `*` or `?` is a literal component prefix: `/pending`
+/// matches `/pending` and everything below it, never `/pendingfoo`; `/`
+/// matches every path that starts with `/`. Any other pattern must match
+/// the whole value, where
+///
+/// - `?` matches one UTF-8 character other than `/` (an invalid byte
+///   counts as one character);
+/// - `*` matches any run, possibly empty, that contains no `/`;
+/// - `**` (two or more stars) matches any run, `/` included;
+/// - `**/` also matches nothing at all, so `/a/**/b` matches `/a/b`;
+/// - every other byte matches itself, case-sensitively.
+///
+/// So `/inbox/**` does not match `/inbox`, and since a normalized path
+/// starts with `/`, only a pattern starting with `/`, `**`, or `*/` can
+/// match one (`*.exe` never does); config accepts only `/` and `**`. A value longer than
+/// `vfs.max_virtual_path_bytes` matches no wildcard pattern.
+///
+/// Time is O(len(pattern) * len(value)); space is one fixed buffer.
+pub fn globMatch(pattern: []const u8, value: []const u8) bool {
+    const head = std.mem.indexOfAny(u8, pattern, "*?") orelse
         return literalPrefixMatch(pattern, value);
+    if (value.len > vfs.max_virtual_path_bytes) return false;
+    // Cheap rejects: the literal text before the first wildcard and after
+    // the last one (and its `/`, which `**/` may skip) must frame the value.
+    var tail = std.mem.lastIndexOfAny(u8, pattern, "*?").? + 1;
+    if (std.mem.endsWith(u8, pattern[0..tail], "**") and std.mem.startsWith(u8, pattern[tail..], "/")) tail += 1;
+    if (!std.mem.startsWith(u8, value, pattern[0..head])) return false;
+    if (!std.mem.endsWith(u8, value, pattern[tail..])) return false;
+
+    // reach[i]: the pattern read so far can match exactly value[0..i].
+    // Tokens only move offsets forward, so one array updated in place
+    // suffices. Every live offset lies in [lo, hi].
+    var buf: [vfs.max_virtual_path_bytes + 1]bool = undefined;
+    const reach = buf[0 .. value.len + 1];
+    @memset(reach, false);
+    reach[head] = true;
+    var lo = head;
+    var hi = head;
+
+    var p = head;
+    while (p < pattern.len) {
+        const token = pattern[p];
+        p += 1;
+        if (token != '*') {
+            // One character. Descending, so each offset is read before
+            // anything lands on it.
+            var next_lo: usize = reach.len;
+            var next_hi: usize = 0;
+            var i = hi + 1;
+            while (i > lo) {
+                i -= 1;
+                if (!reach[i]) continue;
+                reach[i] = false;
+                if (i == value.len) continue;
+                const n: usize = if (token != '?')
+                    @intFromBool(value[i] == token)
+                else if (value[i] != '/')
+                    charLen(value[i..])
+                else
+                    0;
+                if (n == 0) continue;
+                reach[i + n] = true;
+                next_lo = @min(next_lo, i + n);
+                next_hi = @max(next_hi, i + n);
+            }
+            if (next_lo == reach.len) return false;
+            lo = next_lo;
+            hi = next_hi;
+            continue;
+        }
+        var stars: usize = 1;
+        while (p < pattern.len and pattern[p] == '*') : (p += 1) stars += 1;
+        if (stars == 1) {
+            // `*`: extend each live offset up to the next `/`.
+            var i = lo;
+            while (i <= hi and i < value.len) : (i += 1) {
+                if (reach[i] and value[i] != '/') {
+                    reach[i + 1] = true;
+                    hi = @max(hi, i + 1);
+                }
+            }
+        } else if (p < pattern.len and pattern[p] == '/') {
+            // `**/`: zero segments (offsets stay live), or resume just
+            // past any later `/`.
+            p += 1;
+            for (value[lo..], lo..) |b, i| {
+                if (b == '/') {
+                    reach[i + 1] = true;
+                    hi = @max(hi, i + 1);
+                }
+            }
+        } else {
+            // `**`: anything from the lowest live offset on.
+            @memset(reach[lo..], true);
+            hi = value.len;
+        }
     }
-    var ctx = MatchCtx{ .budget = glob_budget };
-    const result = globMatchInner(&ctx, pattern, value);
-    if (ctx.exhausted) return null;
-    return result;
+    return reach[value.len];
+}
+
+/// Bytes in the character at the start of `s`: a whole valid UTF-8
+/// sequence, else one byte. Never covers a `/` after the first byte.
+fn charLen(s: []const u8) usize {
+    const n = std.unicode.utf8ByteSequenceLength(s[0]) catch return 1;
+    if (n > s.len or !std.unicode.utf8ValidateSlice(s[0..n])) return 1;
+    return n;
 }
 
 fn literalPrefixMatch(pattern: []const u8, value: []const u8) bool {
@@ -234,210 +235,87 @@ fn literalPrefixMatch(pattern: []const u8, value: []const u8) bool {
     return value[pattern.len] == '/';
 }
 
-fn globMatchInner(ctx: *MatchCtx, pattern: []const u8, value: []const u8) bool {
-    // Charge one unit per call. On exhaustion, unwind reporting "no
-    // match" and set the flag so the top-level caller can distinguish
-    // this from a genuine non-match and fail closed.
-    if (ctx.budget == 0) {
-        ctx.exhausted = true;
-        return false;
-    }
-    ctx.budget -= 1;
-
-    if (pattern.len == 0) return value.len == 0;
-
-    // `**/` — gitignore-style "zero or more path segments". Allows
-    // `/foo/**/bar` to match `/foo/bar` (zero intermediates),
-    // `/foo/x/bar` (one), `/foo/x/y/bar` (two), etc. Without this
-    // special case the literal `/` in the pattern after `**` would
-    // require at least one segment between the two slashes — the
-    // surprise behavior the live demo surfaced.
-    //
-    // Detection: pattern starts with two or more `*` followed by `/`.
-    // We collapse the run of `*` and then split on the trailing slash.
-    // The wildcard then matches either:
-    //   (a) zero segments — `pattern[after_slash..]` runs against `value`
-    //       directly, as if `**/` weren't there.
-    //   (b) one or more segments — try every `/` position in `value`
-    //       as the boundary.
-    if (pattern.len >= 3 and pattern[0] == '*' and pattern[1] == '*') {
-        var star_end: usize = 2;
-        while (star_end < pattern.len and pattern[star_end] == '*') star_end += 1;
-        if (star_end < pattern.len and pattern[star_end] == '/') {
-            const rest = pattern[star_end + 1 ..];
-            if (globMatchInner(ctx, rest, value)) return true; // (a)
-            var i: usize = 0;
-            while (i < value.len) : (i += 1) {
-                if (value[i] == '/' and globMatchInner(ctx, rest, value[i + 1 ..])) return true; // (b)
-            }
-            return false;
-        }
-        // Fall through to the general `**` case (e.g. `**.exe`).
-    }
-
-    // General `**` — two or more consecutive `*` not followed by `/`.
-    // Matches any sequence of characters INCLUDING `/`. We collapse
-    // runs of three or more `*` to a single cross-slash wildcard so
-    // `***...*` doesn't blow up the recursion in the pathological
-    // pattern case.
-    if (pattern.len >= 2 and pattern[0] == '*' and pattern[1] == '*') {
-        var rest_idx: usize = 2;
-        while (rest_idx < pattern.len and pattern[rest_idx] == '*') rest_idx += 1;
-        const rest = pattern[rest_idx..];
-
-        var i: usize = 0;
-        while (i <= value.len) : (i += 1) {
-            if (globMatchInner(ctx, rest, value[i..])) return true;
-        }
-        return false;
-    }
-
-    if (pattern[0] == '*') {
-        // `*` does not cross path boundaries (PLAN §6.3).
-        var i: usize = 0;
-        while (i <= value.len) : (i += 1) {
-            if (globMatchInner(ctx, pattern[1..], value[i..])) return true;
-            if (i < value.len and value[i] == '/') return false;
-        }
-        return false;
-    }
-
-    if (value.len == 0) return false;
-
-    if (pattern[0] == '?') {
-        // `?` does not cross path boundaries (PLAN §6.3).
-        if (value[0] == '/') return false;
-        return globMatchInner(ctx, pattern[1..], value[1..]);
-    }
-
-    if (pattern[0] == value[0]) {
-        return globMatchInner(ctx, pattern[1..], value[1..]);
-    }
-
-    return false;
-}
-
-test "default deny and explicit allow" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/pending",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.read);
-                set.insert(.write);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
+fn testUser(rules: []const config.Rule) config.UserConfig {
+    return .{
         .name = "ally",
         .password_hash = "hash",
         .keys = &.{},
         .key_files = &.{},
         .from = &.{},
         .root = "/tmp",
-        .rules = &rules,
+        .rules = rules,
     };
+}
 
+fn allow(pattern: []const u8, permissions: []const config.Permission) config.Rule {
+    return .{ .effect = .allow, .pattern = pattern, .permissions = .initMany(permissions) };
+}
+
+fn deny(pattern: []const u8) config.Rule {
+    return .{ .effect = .deny, .pattern = pattern, .permissions = .initFull() };
+}
+
+const full = std.enums.values(config.Permission);
+
+test "default deny and explicit allow" {
+    const user = testUser(&.{allow("/pending", &.{ .read, .write })});
     try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/pending/file.txt"));
     try std.testing.expectEqual(Decision.deny, check(&user, .readdir, "/pending"));
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/archive/file.txt"));
 }
 
 test "deny overrides allow" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = config.PermissionSet.initFull(),
-        },
-        .{
-            .effect = .deny,
-            .pattern = "/*.exe",
-            .permissions = config.PermissionSet.initFull(),
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ally",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{ allow("/", full), deny("/*.exe") });
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/tool.exe"));
     try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/tool.txt"));
 }
 
-test "glob budget: pathological pattern fails closed (indeterminate = deny)" {
-    // A pattern crafted to blow up `**` backtracking. `check` must not
-    // hang and must resolve to deny when the budget is exhausted, for
-    // BOTH an allow rule (can't prove match → not allowed) and a deny
-    // rule (can't prove non-match → deny).
-    const evil_pattern = "**a**a**a**a**a**a**a**b";
-    const evil_value = "a" ** 200; // no 'b', so a naive matcher explores exponentially
+test "effective: deny empties the set in any rule order, allows unite" {
+    const user = testUser(&.{
+        allow("/in", &.{.list}),
+        deny("/in/*.exe"),
+        allow("/in/**", &.{ .read, .write }),
+    });
+    try std.testing.expect(effective(&user, "/in/a.exe").eql(.initEmpty()));
+    try std.testing.expect(effective(&user, "/in/a.csv").eql(.initMany(&.{ .list, .read, .write })));
+    try std.testing.expect(effective(&user, "/in").eql(.initOne(.list)));
+    try std.testing.expect(permits(effective(&user, "/in"), .stat));
+    try std.testing.expect(!permits(effective(&user, "/in"), .open_read));
+}
 
-    {
-        var rules = [_]config.Rule{.{
-            .effect = .allow,
-            .pattern = evil_pattern,
-            .permissions = config.PermissionSet.initFull(),
-        }};
-        const user: config.UserConfig = .{
-            .name = "ally",
-            .password_hash = "hash",
-            .keys = &.{},
-            .key_files = &.{},
-            .from = &.{},
-            .root = "/tmp",
-            .rules = &rules,
-        };
-        try std.testing.expectEqual(Decision.deny, check(&user, .open_read, evil_value));
-    }
-    {
-        var rules = [_]config.Rule{
-            .{ .effect = .allow, .pattern = "/", .permissions = config.PermissionSet.initFull() },
-            .{ .effect = .deny, .pattern = evil_pattern, .permissions = config.PermissionSet.initFull() },
-        };
-        const user: config.UserConfig = .{
-            .name = "ally",
-            .password_hash = "hash",
-            .keys = &.{},
-            .key_files = &.{},
-            .from = &.{},
-            .root = "/tmp",
-            .rules = &rules,
-        };
-        // The deny pattern is indeterminate → whole op denied.
-        try std.testing.expectEqual(Decision.deny, check(&user, .open_read, evil_value));
-    }
+test "effective: a path longer than any client can name gets nothing" {
+    const user = testUser(&.{allow("/", full)});
+    const long = "/" ++ "a" ** vfs.max_virtual_path_bytes;
+    try std.testing.expect(effective(&user, long).eql(.initEmpty()));
+    try std.testing.expect(effective(&user, long[0..vfs.max_virtual_path_bytes]).eql(.initFull()));
+}
+
+test "pathological patterns match correctly and in linear time" {
+    // Each once exhausted the old backtracking matcher's step budget or
+    // took tens of milliseconds, and so was denied whatever the rules.
+    var path_buf: [vfs.max_virtual_path_bytes]u8 = undefined;
+    for (&path_buf, 0..) |*b, i| b.* = if (i % 64 == 0) '/' else 'a';
+    const path: []const u8 = &path_buf;
+    const user = testUser(&.{
+        allow("/", full),
+        deny("**/**/**/**/**/b"),
+        deny("**a**a**a**a**a**a**a**b"),
+        deny("/inbox/**/archive/**/*.csv"),
+    });
+
+    const start = sys.monotonicMs();
+    try std.testing.expectEqual(Decision.allow, check(&user, .open_read, path));
+    path_buf[path_buf.len - 1] = 'b';
+    try std.testing.expectEqual(Decision.deny, check(&user, .open_read, path));
+    try std.testing.expect(sys.monotonicMs() - start < 250);
+
+    const archive = "/inbox" ++ "/archive" ** 510;
+    try std.testing.expect(!globMatch("/inbox/**/archive/**/*.csv", archive));
+    try std.testing.expect(globMatch("/inbox/**/archive/**/*.csv", archive ++ "/x.csv"));
 }
 
 test "rename checks source and destination" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/pending",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.rename);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ally",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{allow("/pending", &.{.rename})});
     try std.testing.expectEqual(Decision.allow, checkRename(&user, "/pending/a", "/pending/b"));
     try std.testing.expectEqual(Decision.deny, checkRename(&user, "/pending/a", "/archive/b"));
 }
@@ -463,6 +341,21 @@ test "star does not cross path boundary" {
     try std.testing.expect(!globMatch("*.exe", "/tool.exe"));
     try std.testing.expect(globMatch("/pending/*.tmp", "/pending/foo.tmp"));
     try std.testing.expect(!globMatch("/pending/*.tmp", "/pending/sub/foo.tmp"));
+    try std.testing.expect(globMatch("/pending/*", "/pending/"));
+    try std.testing.expect(!globMatch("/pending/*", "/pending/a/"));
+}
+
+test "question mark matches one character, not one byte, never `/`" {
+    try std.testing.expect(globMatch("/?.txt", "/a.txt"));
+    try std.testing.expect(globMatch("/?.txt", "/é.txt"));
+    try std.testing.expect(globMatch("/?.txt", "/€.txt"));
+    try std.testing.expect(globMatch("/?.txt", "/😀.txt"));
+    try std.testing.expect(!globMatch("/??.txt", "/é.txt"));
+    try std.testing.expect(!globMatch("/a?b", "/a/b"));
+    try std.testing.expect(!globMatch("/?", "/"));
+    // A byte that starts no valid character is one character.
+    try std.testing.expect(globMatch("/?x", "/\xc3x"));
+    try std.testing.expect(globMatch("/??", "/\xa9\xa9"));
 }
 
 test "double-star crosses path boundary" {
@@ -479,10 +372,7 @@ test "double-star crosses path boundary" {
     try std.testing.expect(globMatch("/inbox/**", "/inbox/sub/file.csv"));
     try std.testing.expect(globMatch("/inbox/**", "/inbox/a/b/c/file.csv"));
 
-    // gitignore convention: `/inbox/**` does NOT match `/inbox` itself
-    // (no character available for `**` to consume after the trailing
-    // `/`). Operators that want to deny the dir too write
-    // `deny /inbox` separately.
+    // Not `/inbox` itself; deny that separately.
     try std.testing.expect(!globMatch("/inbox/**", "/inbox"));
     try std.testing.expect(!globMatch("/inbox/**", "/outbox/file.csv"));
 
@@ -491,11 +381,12 @@ test "double-star crosses path boundary" {
     try std.testing.expect(globMatch("/foo/**/bar", "/foo/x/bar"));
     try std.testing.expect(globMatch("/foo/**/bar", "/foo/x/y/z/bar"));
     try std.testing.expect(!globMatch("/foo/**/bar", "/foo/baz"));
+    try std.testing.expect(!globMatch("/foo/**/bar", "/foo/xbar"));
 
-    // Three or more `*` collapse to `**` (no recursive blowup, no
-    // semantic surprise).
+    // Three or more `*` act as `**`.
     try std.testing.expect(globMatch("***.exe", "/dir/tool.exe"));
     try std.testing.expect(globMatch("****", "/anything/at/all"));
+    try std.testing.expect(globMatch("/a/***/b", "/a/b"));
 
     // `**` alone matches anything (including the empty string).
     try std.testing.expect(globMatch("**", ""));
@@ -504,31 +395,8 @@ test "double-star crosses path boundary" {
 }
 
 test "deny **.exe denies recursively" {
-    // The `*.exe` footgun the live demo surfaced: with single-star
-    // semantics, `deny *.exe` only matches `.exe` files in the
-    // current directory level. `deny **.exe` does the right thing.
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = config.PermissionSet.initFull(),
-        },
-        .{
-            .effect = .deny,
-            .pattern = "**.exe",
-            .permissions = config.PermissionSet.initFull(),
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ally",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    // `*.exe` would match only one level; `**.exe` matches every depth.
+    const user = testUser(&.{ allow("/", full), deny("**.exe") });
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/tool.exe"));
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/sub/tool.exe"));
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/a/b/c/tool.exe"));
@@ -537,47 +405,13 @@ test "deny **.exe denies recursively" {
 }
 
 test "list satisfies STAT but never download" {
-    // The exact shape of a partner root: browsable everywhere, with
-    // download granted only per-subtree.
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.list);
-                break :blk set;
-            },
-        },
-        .{
-            .effect = .allow,
-            .pattern = "/results",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.read);
-                set.insert(.list);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ola",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
+    // Browsable everywhere, downloadable in one subtree.
+    const user = testUser(&.{ allow("/", &.{.list}), allow("/results", &.{ .read, .list }) });
 
-    // A client that stats the remote directory before opening it must
-    // get through on `list` alone, or it can never render a listing.
     try std.testing.expectEqual(Decision.allow, check(&user, .stat, "/"));
-    try std.testing.expectEqual(Decision.allow, check(&user, .lstat, "/"));
     try std.testing.expectEqual(Decision.allow, check(&user, .readdir, "/"));
 
-    // `list` stops exactly at the bytes. This is the whole point of
-    // the verb: names are visible, content is not.
+    // Names are visible, content is not.
     try std.testing.expectEqual(Decision.deny, check(&user, .open_read, "/"));
     try std.testing.expectEqual(Decision.deny, check(&user, .open_read, "/secret.pdf"));
 
@@ -593,80 +427,41 @@ test "list satisfies STAT but never download" {
 }
 
 test "deny still overrides list-granted stat" {
-    var rules = [_]config.Rule{
-        .{ .effect = .allow, .pattern = "/", .permissions = config.PermissionSet.initFull() },
-        .{ .effect = .deny, .pattern = "**/.ssh/**", .permissions = config.PermissionSet.initFull() },
-    };
-    const user: config.UserConfig = .{
-        .name = "ola",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{ allow("/", full), deny("**/.ssh/**") });
     try std.testing.expectEqual(Decision.deny, check(&user, .stat, "/home/.ssh/id_ed25519"));
     try std.testing.expectEqual(Decision.allow, check(&user, .stat, "/home/notes.txt"));
 }
 
 test "policy-derived mode: browsable dir renders r-x, its files render ---" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.list);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ola",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{allow("/", &.{.list})});
     // Directory: stat + readdir allowed, no mutation → `r-x`, mirrored
     // into group, world always empty.
-    const dir_mode = policyDerivedMode(&user, "/", 0o040755);
-    try std.testing.expectEqual(@as(u32, 0o040550), dir_mode);
-
+    try std.testing.expectEqual(@as(u32, 0o040550), policyDerivedMode(&user, "/", 0o040755));
     // File under a list-only rule: visible in the listing, no download
     // → every permission bit off, file type preserved.
-    const file_mode = policyDerivedMode(&user, "/a.pdf", 0o100644);
-    try std.testing.expectEqual(@as(u32, 0o100000), file_mode);
+    try std.testing.expectEqual(@as(u32, 0o100000), policyDerivedMode(&user, "/a.pdf", 0o100644));
 }
 
 test "policy-derived mode: read grants r on both dirs and files" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.read);
-                set.insert(.list);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ola",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{allow("/", &.{ .read, .list })});
     try std.testing.expectEqual(@as(u32, 0o040550), policyDerivedMode(&user, "/", 0o040755));
     try std.testing.expectEqual(@as(u32, 0o100440), policyDerivedMode(&user, "/a.pdf", 0o100644));
+}
+
+test "policy-derived mode: a file's w needs update, since it already exists" {
+    const file = listing.S_IFREG | 0o644;
+    // A drop box can create files but not overwrite them.
+    try std.testing.expectEqual(@as(u32, 0o100000), derivedMode(.initOne(.write), file));
+    try std.testing.expectEqual(@as(u32, 0o100000), derivedMode(.initOne(.update), file));
+    try std.testing.expectEqual(@as(u32, 0o100660), derivedMode(.initMany(&.{ .read, .write, .update }), file));
+    // The directory still shows `w`: creating inside it is allowed.
+    for ([_]config.Permission{ .write, .mkdir, .rename, .update, .delete }) |perm| {
+        try std.testing.expectEqual(@as(u32, 0o040220), derivedMode(.initOne(perm), listing.S_IFDIR | 0o755));
+    }
+}
+
+test "policy-derived mode: symlinks and special files get no bits" {
+    for ([_]u32{ listing.S_IFLNK, listing.S_IFIFO, listing.S_IFSOCK, listing.S_IFCHR }) |kind| {
+        try std.testing.expectEqual(kind, derivedMode(.initFull(), kind | 0o777));
+    }
 }

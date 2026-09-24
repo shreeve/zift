@@ -1,646 +1,435 @@
 # Operate Zift
 
-This guide describes a production-style Linux deployment.
-
-The recommended layout keeps all Zift runtime state under one tree:
+This guide sets up and runs Zift as a Linux service. It keeps every
+piece of Zift state under one tree:
 
 ```text
-/home/zift/
-├── zift.conf
-├── host_ed25519
-├── host_ed25519.pub
-├── audit.jsonl
-├── keys/
-│   └── ally.pub
-├── ally/
+/home/zift/                     0750 root:zift
+├── zift.conf                   0640 root:zift
+├── host_ed25519                0640 root:zift
+├── keys/                       0750 root:zift
+│   └── ally.pub                0640 root:zift
+├── ally/                       2770 zift:zift   partner root
 │   ├── pending/
-│   ├── archive/
-│   └── .zift/
-│       ├── staging/                (daemon-owned upload staging)
-│       └── notes.md                (optional operator-managed; partner-invisible)
+│   └── .zift/                  reserved; see security.md
 └── other-partner/
-    └── ...
 ```
 
-This is a convention, not a hardcoded path. Zift only cares about the
-paths in its config.
+The layout is a convention; Zift only uses the paths in its config.
+The daemon can read the config, host key and keys but not change them,
+and can write only inside partner roots. For another layout, see
+[Alternative Layouts](#alternative-layouts).
 
-## Install The Binary
+## Install
 
-Install `cosign` first (`apt install cosign` or `dnf install cosign`).
-The installer fails closed when signature verification is unavailable.
+Install `cosign` and run the installer as in the
+[README](../README.md#install). It checks the cosign signature on
+`SHA256SUMS` against the exact release workflow and tag, checks the
+binary against `SHA256SUMS`, and installs the binary only.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
-```
+- On a host with a `zift.service` unit it installs to `/usr/local/bin`,
+  the path the unit runs, and uses `sudo` for that one write, saying so
+  first. The download and checks never run as root. If `sudo` is
+  unavailable it installs to `~/.local/bin` and warns that the service
+  will not see it.
+- Anywhere else it installs to `~/.local/bin` (as root, to
+  `/usr/local/bin`), which is enough for
+  `zift hash-password` and `zift validate`.
+- `BIN=/some/dir` overrides both and is never elevated.
+- `bash -s vX.Y.Z` pins a release; `bash -s -- --uninstall` removes the
+  binary and nothing else.
 
-Resolves the latest release, downloads the binary for this platform,
-verifies it against the release's `SHA256SUMS`, and installs it to
-`/usr/local/bin/zift` — the path the systemd unit below invokes.
+### By hand
 
-No `sudo` on that line: because the host runs `zift.service`, the
-installer elevates for the single `install` write and announces it
-first. The download and the signature check stay unprivileged, which is
-narrower than `| sudo bash` (that runs everything as root, and still
-works if you prefer it — or if `sudo` here needs a password, since a
-pipe has no way to carry one).
-
-The installer verifies the manifest signature against the exact Zift
-release workflow identity and requested tag. Pass a tag to pin a version.
-
-The installer stops at the binary. Everything from here down — service
-user, host key, config, jail tree, unit — is deliberately yours to run,
-because those steps must never clobber a config that carries partner
-credentials.
-
-### Upgrading A Running Daemon
-
-You do not need to stop the daemon to replace its binary — but you do
-need the right tool. Use `install`, never `cp`:
+The examples below use `ZIFT_VERSION`; set it to the release you want.
 
 ```sh
-sudo install -m 0755 zift-0.11.0-x86_64-linux /usr/local/bin/zift   # works
-sudo cp        zift-0.11.0-x86_64-linux /usr/local/bin/zift         # Text file busy
-```
+ZIFT_VERSION=0.12.0
+ARCH=$(uname -m)          # x86_64 or aarch64
+BASE=https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}
 
-`cp` opens the existing file for writing, and the kernel refuses that
-for a file being executed (`ETXTBSY`). `install` unlinks the
-destination and creates a new inode, which is always permitted.
-
-The new inode is also why the upgrade is not live: the running process
-keeps executing the old, now-unlinked inode. It reads as deleted:
-
-```sh
-pid=$(systemctl show zift -p MainPID --value)
-readlink /proc/$pid/exe        # /usr/local/bin/zift (deleted)
-sudo systemctl restart zift    # cuts over; drops live SFTP sessions
-```
-
-`reload` is not a substitute here — it re-reads the config and keeps
-sessions, but the process image is unchanged. The installer detects
-this case and prints the same guidance.
-
-To place the binary by hand instead:
-
-```sh
-ZIFT_VERSION=0.11.0
-ARCH=$(uname -m)
-
-curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-${ZIFT_VERSION}-${ARCH}-linux"
-sudo install -m 0755 "zift-${ZIFT_VERSION}-${ARCH}-linux" /usr/local/bin/zift
-zift version
-```
-
-Supported release targets:
-
-- `x86_64-linux`
-- `aarch64-linux`
-- `x86_64-macos`
-- `aarch64-macos`
-
-Linux release binaries are static musl binaries. They do not require
-`libssh`, `mbedTLS`, `zlib`, or libc packages on the target host.
-
-## Verify Release Provenance
-
-Production installs should verify both the signed checksum manifest and
-the binary hash.
-
-```sh
-ZIFT_VERSION=0.11.0
-
-curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS"
-curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/SHA256SUMS.bundle"
+curl -fsSLO "$BASE/zift-${ZIFT_VERSION}-${ARCH}-linux"
+curl -fsSLO "$BASE/SHA256SUMS"
+curl -fsSLO "$BASE/SHA256SUMS.bundle"
 
 cosign verify-blob \
   --bundle SHA256SUMS.bundle \
   --certificate-identity "https://github.com/shreeve/zift/.github/workflows/release.yml@refs/tags/v${ZIFT_VERSION}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing    # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
 
-sha256sum -c SHA256SUMS --ignore-missing
+sudo install -m 0755 "zift-${ZIFT_VERSION}-${ARCH}-linux" /usr/local/bin/zift
+zift version
 ```
 
-The cosign certificate binds the signature to the GitHub Actions
-workflow for this repository. The checksum check binds the downloaded
-binary bytes to the signed manifest.
+cosign binds `SHA256SUMS` to this repository's release workflow; the
+checksum binds the binary to `SHA256SUMS`. Releases ship
+`x86_64-linux`, `aarch64-linux`, `x86_64-macos` and `aarch64-macos`
+binaries. Linux binaries are static and need no libraries on the host.
 
-## Create The Service User
+### Upgrade and rollback
 
-Create a dedicated unprivileged user:
+Read the [changelog](../CHANGELOG.md) first, and run `zift validate` on
+your config with the new binary before restarting. Replace the binary
+with `install` (or the installer), never `cp`: `cp` writes into the
+running file and fails with "Text file busy".
 
 ```sh
-sudo useradd --system --create-home --home-dir /home/zift \
-  --shell /usr/sbin/nologin zift
+sudo cp /usr/local/bin/zift /usr/local/bin/zift.prev
+sudo install -m 0755 "zift-${ZIFT_VERSION}-${ARCH}-linux" /usr/local/bin/zift
+sudo -u zift zift validate /home/zift/zift.conf
+sudo systemctl restart zift
 ```
 
-Harden the top-level directory so the daemon can traverse it but cannot
-rewrite the config or host key when those files are owned by `root:zift`:
+The running daemon keeps executing the old binary until it restarts
+(`readlink /proc/<pid>/exe` shows `(deleted)`), and a restart drops live
+sessions. `systemctl reload` does not load a new binary. The journal's
+`zift: starting zift X.Y.Z` line records what each start ran. To roll
+back, install `zift.prev` the same way and restart.
+
+## Set Up The Host
+
+Run these in order.
+
+**1. Service user.** The daemon runs as `zift`, which may read but not
+change the top of its tree:
 
 ```sh
+sudo useradd --system --create-home --home-dir /home/zift --shell /usr/sbin/nologin zift
 sudo chown root:zift /home/zift
 sudo chmod 0750 /home/zift
 ```
 
-Create the audit file before starting the daemon:
-
-```sh
-sudo touch /home/zift/audit.jsonl
-sudo chown zift:zift /home/zift/audit.jsonl
-sudo chmod 0640 /home/zift/audit.jsonl
-```
-
-## Generate The Host Key
+**2. Host key.**
 
 ```sh
 sudo ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N ""
 sudo chown root:zift /home/zift/host_ed25519 /home/zift/host_ed25519.pub
 sudo chmod 0640 /home/zift/host_ed25519
-sudo chmod 0644 /home/zift/host_ed25519.pub
 ```
 
-The daemon needs read access to the private key. It does not need write
-access.
+To rotate it later, replace the file, restart Zift, and tell partners
+the fingerprint changed; a reload does not change the running host key.
 
-## Create Partner Credentials
-
-Password credential:
+**3. Credentials.** A password becomes a passhash for the config:
 
 ```sh
 printf '%s\n' 'ally-secret' | zift hash-password
 ```
 
-Public-key credential:
+A partner's public key, received out of band, goes in a key file that
+only root can change:
 
 ```sh
 sudo install -d -o root -g zift -m 0750 /home/zift/keys
 sudo install -o root -g zift -m 0640 ally.pub /home/zift/keys/ally.pub
 ```
 
-Here `ally.pub` is the partner's OpenSSH public key, supplied out of
-band. Public-key files must not be group-writable or world-writable. A
-writable key file is equivalent to a writable credential.
-
-## Create Partner Roots
+**4. Partner root.** Create the root first, then its subdirectories:
 
 ```sh
 sudo install -d -o zift -g zift -m 2770 /home/zift/ally
-sudo install -d -o zift -g zift -m 2770 /home/zift/ally/pending
-sudo install -d -o zift -g zift -m 2770 /home/zift/ally/archive
+sudo install -d -o zift -g zift -m 2770 /home/zift/ally/pending /home/zift/ally/archive
 ```
 
-The setgid bit keeps new directories in group `zift`, which makes
-operator access predictable.
+`install -d` gives missing parents root ownership and mode 0755, so
+creating `ally/pending` alone would leave `ally` unwritable by the
+daemon and every upload would fail. The setgid bit keeps new
+directories in group `zift`.
 
-## Operator Access
-
-Operators who need host-side access can join group `zift`:
-
-```sh
-sudo usermod -aG zift "$USER"
-```
-
-Log out and back in before relying on the new group membership. When
-dropping files into partner directories from the host side, use
-`install -m 0660 -g zift ...` or set `umask 007` first. The setgid bit
-keeps the group as `zift`, but an ordinary shell umask still controls
-the file mode.
-
-Config and host key stay `root:zift` and not group-writable so a daemon
-compromise cannot edit its own config or server identity. The audit log
-is readable by group `zift`, but only the daemon should write it.
-
-## Write The Config
-
-Create `/home/zift/zift.conf` (see [`configure.md`](configure.md) for
-the full grammar):
-
-```sh
-sudo -e /home/zift/zift.conf
-sudo chown root:zift /home/zift/zift.conf
-sudo chmod 0640 /home/zift/zift.conf
-```
-
-Minimal production shape:
+**5. Config.** Write `/home/zift/zift.conf` (grammar in
+[`configure.md`](configure.md)), make it `root:zift 0640`, and validate
+it as the service user:
 
 ```zift
 server
   listen 0.0.0.0:2222
   host-key /home/zift/host_ed25519
   partner-root /home/zift
-  reload-interval 2s
-  idle-timeout 5m
-  max-connections 14
-  max-unauth-connections 4
   log stderr
-  listing-mode virtual
-  publish-mode 0o660
-  mkdir-mode 0o2770
 
 user ally
   from 203.0.113.40
   auth /home/zift/keys/ally.pub
   allow / read
-  allow /pending full
-  allow /archive read
+  allow /pending write update
   deny **.exe
-  # **/.ssh/** does not match the .ssh directory itself, so READDIR can list names while OPEN of the key file stays denied.
-  deny **/.ssh
-  deny **/.ssh/**
 ```
 
-Prefer `log stderr` so journald (or Docker/Kubernetes) owns retention.
-Use a file path only when you already have a log-shipping preference.
-
-Validate:
-
 ```sh
+sudo chown root:zift /home/zift/zift.conf
+sudo chmod 0640 /home/zift/zift.conf
 sudo -u zift zift validate /home/zift/zift.conf
 ```
 
-Validation checks syntax plus live filesystem invariants:
+Keep `log stderr` so journald owns retention. If you log to a file
+instead, the daemon cannot create files in `/home/zift`, so create it
+first: `sudo install -o zift -g zift -m 0640 /dev/null
+/home/zift/audit.jsonl`.
 
-- host key is a readable regular file, not a symlink, with no
-  other-permission bits and no group-write or group-exec (`0640` and
-  `0600` pass; `0644` and `0660` fail)
-- partner roots exist
-- partner roots are directories
-- partner roots do not overlap after symlink resolution
-- public-key files are readable, non-symlink regular files, not
-  group-writable or world-writable, non-empty, and parse as supported
-  OpenSSH public keys
-- pre-auth cap does not exceed total connection cap
-
-## Install systemd Unit
-
-The repository ships `packaging/systemd/zift.service`, configured for
-`/home/zift`.
+**6. systemd unit.** The unit, set up for `/home/zift`, is
+`packaging/systemd/zift.service` in the repository and
+`zift-deploy-X.Y.Z/zift.service` in each release's
+`zift-deploy-X.Y.Z.tar.gz`:
 
 ```sh
-sudo install -m 0644 packaging/systemd/zift.service /etc/systemd/system/zift.service
-sudo systemd-analyze verify /etc/systemd/system/zift.service
+curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-deploy-${ZIFT_VERSION}.tar.gz"
+tar -xzf "zift-deploy-${ZIFT_VERSION}.tar.gz"
+sudo install -m 0644 "zift-deploy-${ZIFT_VERSION}/zift.service" /etc/systemd/system/zift.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now zift
-sudo systemctl status zift
+systemctl status zift
 ```
 
-The unit runs as `zift:zift`, confines filesystem access to
-`/home/zift`, restricts address families to IPv4/IPv6, removes
-capabilities, applies syscall filters, and sets `MemoryMax=4G`.
+The unit runs as `zift:zift` with no capabilities, makes everything but
+`/home/zift` read-only, hides the rest of `/home`, forbids executing
+anything under `/home/zift`, allows only IPv4 and IPv6 sockets, filters
+system calls, and sets `MemoryMax=4G`, `LimitNOFILE=65536` and
+`TasksMax=512`. `systemctl status` and `is-active` need no `sudo`;
+`start`, `stop`, `restart` and `reload` do.
 
-To rotate the SSH host key, generate the new key, update `host-key` if
-the path changes, restart Zift, and notify partners that the host
-fingerprint changed. `SIGHUP` reloads config for new sessions but does
-not rotate the running host key.
+To serve on a port below 1024, such as 22, grant the one capability
+that needs (`sudo systemctl edit zift`):
 
-Pair `MemoryMax` with config values. Each password verification uses
-fixed passhash argon2id params (64 MiB). Keep concurrent pre-auth work
-bounded with `max-unauth-connections`.
+```ini
+[Service]
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+```
 
-## Source Policy
+### Sizing
 
-Prefer per-user `from` lines in `zift.conf` over a separate firewall
-rule set. That keeps partner network identity next to credentials and
-path policy.
+The defaults fit the shipped unit. If you change them, keep these in
+step:
 
-Zift also applies built-in abuse controls for unrestricted users and
-unknown scanners: per-session auth attempt ceiling, backoff after
-failures, temporary source suppression, and the connection caps above.
-Full numbers and threat-model notes are in [`security.md`](security.md).
+- **Memory.** Each password check uses 64 MiB, and at most
+  clamp(CPU count, 2, 8) run at once, so password checks peak at
+  512 MiB whatever the load. Each SFTP session adds a 256 KiB packet
+  buffer, 32 MiB at `max-connections 128`. `MemoryMax=4G` leaves ample
+  headroom; if it is ever reached, the kernel kills the daemon and every
+  session with it.
+- **File descriptors.** A session can hold 256 handles plus its socket
+  and libssh's own, so the worst case is `max-connections` × 264 + 64:
+  33,856 at 128. Zift raises its soft limit toward that at startup and
+  on reload, and warns when it can't. Raise `LimitNOFILE` with
+  `max-connections`.
+- **Threads.** One per connection. Keep `TasksMax` above
+  `max-connections`.
+- **Pre-auth slots.** Connections that have not logged in are capped at
+  `max-unauth-connections` (32 by default) and 8 per source, and each
+  gets 120 s to log in.
 
-A host or cloud firewall is optional defense-in-depth for hostile
-networks. Keep SSH admin access on a different port from Zift.
+## Operator Access
 
-## Start, Stop, Reload
+Operators who need host-side access join group `zift` (`sudo usermod
+-aG zift "$USER"`, then log in again). When dropping files into a
+partner directory from the host, use `install -m 0660 -g zift …` or
+`umask 007`: setgid keeps the group, but your umask still sets the
+mode. Config and host key stay `root:zift` and not group-writable, so
+neither operators in the group nor a compromised daemon can change
+them.
 
-Start:
+## Reload
 
 ```sh
-sudo systemctl start zift
+sudo systemctl reload zift
 ```
 
-Stop:
+The unit's reload runs `zift validate` on the on-disk config first. If
+that fails, the reload command fails (non-zero, shown in `systemctl
+status` and the journal) and the daemon is never signalled.
+`systemctl kill -s HUP zift` skips that check. Zift also reloads by
+itself when the config or a key file changes (see
+[`configure.md`](configure.md#reloads)).
 
-```sh
-sudo systemctl stop zift
-```
+When the daemon rejects a config it keeps serving the previous one and
+says so loudly:
 
-Restart:
+- stderr: `zift: config reload rejected — SERVING PREVIOUS CONFIG; fix
+  <path> and it will auto-apply: <reason>`;
+- audit: `config.reload` with result `failed` and the reason as detail.
 
-```sh
-sudo systemctl restart zift
-```
-
-Force config reload:
-
-```sh
-sudo systemctl reload zift          # validates first, then SIGHUPs
-# or, low-level:
-sudo systemctl kill -s HUP zift
-```
-
-Prefer `systemctl reload`: the unit runs `zift validate` on the on-disk
-config **before** signalling, so an invalid config makes the reload
-command **fail** (non-zero, shown in `systemctl status` and the journal)
-and the daemon is never HUPed. `systemctl kill -s HUP` skips that guard.
-
-Zift watches the `zift.conf` mtime and each authorized-key file's mtime
-on `reload-interval`, and reloads on `SIGHUP`. Replacing an
-authorized-key file does not need a dummy edit of `zift.conf`. Reloads
-affect new sessions only. Existing sessions keep their current config
-snapshot until disconnect.
-
-Polling notices a watched file only when its timestamp moves forward.
-If your deploy tool preserves or rewinds mtimes, send `SIGHUP` after the
-file is in place.
-
-Write config changes atomically: write a temporary file and rename it
-into place. An in-place rewrite can be observed as a valid prefix.
-
-### A rejected reload is loud (0.10.1)
-
-If the daemon rejects a reloaded config (parse error, or a semantic check
-like an unreadable host-key), it keeps serving the **previous** config —
-but it does not do so silently. It logs `config reload rejected — SERVING
-PREVIOUS CONFIG` and emits a `config.reload` audit event with
-`result:"failed"`; it stays in this degraded (on-disk ≠ in-memory) state
-until a valid config loads, then logs `config reload recovered` and emits
-a `config.reload` `result:"ok"` event. Watch for the failure event:
+It stays in that degraded state until a valid config loads, then logs
+`config reload recovered` and audits `config.reload` `ok`. A partner
+added by the rejected edit just sees "Permission denied", so watch the
+journal:
 
 ```sh
 journalctl -u zift -o cat | grep '"operation":"config.reload"'
 ```
 
-Because the process stays up, `systemctl is-active` still reports
-`active` while degraded. The definitive point-in-time probe is: **service
-active AND `zift validate` of the on-disk config fails ⇒ the daemon is
-serving stale rules a restart would fail to reload.** The host-zift
-runbook's `verify` checks exactly this ("on-disk config in sync with
-running daemon").
+`systemctl is-active` still says `active` while degraded. The reliable
+check is: the service is active **and** `zift validate` of the on-disk
+config fails. Then the daemon is serving rules that a restart would
+refuse to load.
 
-A reload whose status write or allocation fails does not exit the
-process. An invalid config file still keeps the previous config in
-service.
+## Signals
+
+| Signal | Effect |
+| --- | --- |
+| `SIGHUP` | reload the config now, changed or not |
+| `SIGTERM`, `SIGINT` | stop accepting, wait up to `shutdown-grace` for sessions, close the rest, exit |
+| `SIGUSR1` | reopen the audit log file, on the next audit line (no effect with `log stderr`) |
+| `SIGPIPE` | ignored |
+
+The unit's `TimeoutStopSec=60` must stay above `shutdown-grace`.
 
 ## Add A Partner
 
-1. Create the partner data tree.
-2. Create or install credentials.
-3. Edit `zift.conf`.
-4. Validate.
-5. Send `SIGHUP` or wait for `reload-interval`.
-
-Example:
+Edit a copy, validate it, then move it into place, so the running
+daemon never sees a half-written or invalid file:
 
 ```sh
+sudo install -d -o zift -g zift -m 2770 /home/zift/vendor
 sudo install -d -o zift -g zift -m 2770 /home/zift/vendor/incoming
-sudo install -d -o zift -g zift -m 2770 /home/zift/vendor/archive
 printf '%s\n' 'vendor-secret' | zift hash-password
-sudo -e /home/zift/zift.conf
-sudo -u zift zift validate /home/zift/zift.conf
-sudo systemctl kill -s HUP zift
+sudo cp -p /home/zift/zift.conf /home/zift/zift.conf.new
+sudo -e /home/zift/zift.conf.new        # add the user block
+sudo -u zift zift validate /home/zift/zift.conf.new
+sudo mv /home/zift/zift.conf.new /home/zift/zift.conf
+sudo systemctl reload zift
 ```
 
-If the edited config is invalid, the running daemon keeps the previous
-config. Validate anyway so mistakes are caught before operators rely on
-reload behavior.
+A root that does not exist rejects the whole config, not just that
+user, and the partner sees only "Permission denied". That is why the
+root comes first.
 
 ## Remove A Partner
 
-Delete or comment out the `user <name>` block and reload.
-
-Existing sessions authenticated before the reload continue until they
-disconnect. New auth attempts for that user fail.
-
-To immediately cut off active sessions, restart the service after
-removing the user.
+Delete the `user` block the same way and reload. New connections for
+that user fail at once, but connections accepted before the reload
+keep the old config until they end.
+To cut a partner off immediately, restart the service; that drops every
+session.
 
 ## Logs
 
-Zift writes two kinds of output:
+Zift writes human-readable status lines to stderr and one JSON audit
+object per line to `log`. With `log stderr` both reach the journal;
+with a file, only status lines do.
 
-- human-readable operational messages to stderr
-- structured audit JSON lines to `server.log`
+Fields appear in this order: `time` (RFC 3339 UTC, milliseconds),
+`event` (always `zift.audit`), `user`, `operation`, `result` (`ok`,
+`denied` or `failed`), `path`, `detail`, `ip`, and `truncated` when a
+line was clipped at 4096 bytes. `user` and `path` are omitted when they
+do not apply and `detail` when empty; `ip` is always present. A clipped
+line shortens `detail` first, then drops `path`, then `user`.
 
-When `log stderr` is used, both go to the supervisor. When `log` points
-to a file, audit lines go to that file and operational warnings still
-go to stderr.
-
-Audit lines are one JSON object per line. Typical fields include:
-
-- `time`
-- `event`
-- `user`
-- `operation`
-- `result`
-- `path`
-- `detail`
-- `ip`
-- `truncated`
-
-Use line-oriented tools:
+| `operation` | Meaning |
+| --- | --- |
+| `accept.rejected` | connection refused at accept; detail `max-connections reached`, `max-unauth-connections reached`, `source suppressed` or `too many pre-auth connections from source` (at most one line per source per minute) |
+| `handshake.failed` | key exchange failed |
+| `auth.password` | password login; denied detail `unknown user`, `source not allowed` or `bad password` |
+| `auth.publickey` | key login; ok detail is the key algorithm; denied detail `unknown user`, `source not allowed`, `no keys configured`, `key not configured`, `no key in message` or `signature invalid`; failed detail `pk_ok reply failed` |
+| `auth.rejected` | login ended: `source suppressed`, or `login grace expired` after key exchange (during it, the expiry is a `handshake.failed`) |
+| `auth.too_many_attempts` | six hard failures, or detail `probes` after 64 soft operations |
+| `config.reload` | reload rejected (`failed`, reason in detail) or recovered (`ok`) |
+| `idle.timeout` | session closed for idleness before the client sent SFTP INIT; later, `session.ended` with detail `idle timeout` |
+| `session.ended` | session over; detail is the reason and `duration_ms`; `failed` when it ended on an error |
+| `opendir`, `open_read`, `open_write` | directory or file opened; a new upload's `open_write` has detail `staged` |
+| `publish` | upload renamed into place at close |
+| `close` | an upload that could not be published at close: refused (the target appeared, or the clobber rule) or failed |
+| `read`, `write` | refused on a handle opened without that access (once per handle) |
+| `stat` | STAT refused (successes are not logged) |
+| `mkdir`, `remove`, `rmdir`, `rename`, `setstat`, `fsetstat` | as named; `rename`'s detail is the new path |
 
 ```sh
-tail -F /home/zift/audit.jsonl
-jq -c 'select(.result=="denied")' /home/zift/audit.jsonl
+journalctl -u zift -o cat | grep '^{' | jq -c 'select(.result=="denied")'
+tail -F /home/zift/audit.jsonl | jq -c 'select(.operation=="publish")'
 ```
 
-## Log Retention
+## Log Rotation
 
-Default and preferred: `log stderr` and let the supervisor retain
-logs (journald, Docker, Kubernetes).
+With `log stderr`, journald rotates for you. With a file, rotate it
+with logrotate and signal a reopen. Because the daemon cannot create
+files in `/home/zift`, logrotate must create the new file:
 
-If you log to a file, rotate it yourself and send `SIGUSR1` after
-renaming so Zift reopens the path. Zift does not ship a logrotate
-rule or a ban-tool integration — abuse protection is in the binary.
+```text
+/home/zift/audit.jsonl {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 zift zift
+    postrotate
+        systemctl kill -s USR1 zift
+    endscript
+}
+```
+
+The reopen happens on the next audit line, so until then the old file
+still receives writes; `delaycompress` leaves it alone for one cycle. If
+the reopen fails, Zift keeps the old file, warns on stderr, and retries
+every 5 s.
 
 ## Health Checks
 
-Zift intentionally has no HTTP health endpoint.
-
-Basic TCP probe:
+Zift has no HTTP endpoint. For liveness, probe the TCP port:
 
 ```sh
 nc -z -w2 127.0.0.1 2222
 ```
 
-SSH banner/auth-path probe:
-
-```sh
-echo | timeout 5 ssh \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  -p 2222 nobody@127.0.0.1
-```
-
-The SSH probe intentionally reaches the auth path and creates auth
-failure audit entries. Frequent probes from a monitor IP can trip
-built-in source suppression; use the TCP probe for quiet liveness
-checks, or put the monitor IP in a `from` line for a dedicated probe
-user.
-
-Deep SFTP probes require a real configured user. Use them only if the
-monitor can safely store that credential.
+Each probe is a connection: it holds a pre-auth slot for a moment and
+writes a `handshake.failed` audit line and a `zift: LibsshFailure:
+Socket error: …` status line. A probe that goes further, such
+as an `ssh` login attempt, writes more audit lines, and a failed
+password counts toward source suppression. `from` does not exempt a source. A monitor that must log in
+needs a real user with real credentials.
 
 ## Backup
 
-Back up:
-
-- `/usr/local/bin/zift`
-- `/home/zift/zift.conf`
-- `/home/zift/host_ed25519`
-- `/home/zift/keys/`
-- partner root directories
-- audit logs if retention requires it
-
-There is no database to dump.
-
-Example:
-
-```sh
-sudo tar czf zift-backup.tgz /usr/local/bin/zift /home/zift
-```
-
-Filesystem snapshots, `rsync`, `restic`, `borg`, ZFS, btrfs, and LVM
-all work because Zift state is just files.
-
-## Upgrading to v0.8.0
-
-v0.8.0 reshapes the reserved per-partner directory from
-`<root>/.zift-staging/` (a single-purpose staging dir, v0.5.0–v0.7.x)
-into the namespace `<root>/.zift/` with `staging/` as a subdirectory.
-See `docs/security.md` "Per-Partner Namespace" for the full model.
-
-Two consequences for an upgrade in place:
-
-1. The path-validator now reserves `.zift` AND legacy `.zift-staging`
-   as virtual-path components **anywhere** in a partner-visible path,
-   not just at the partner root. After upgrade, any pre-existing
-   partner-visible file or directory crossing one of those names is
-   denied by the SFTP wire surface and hidden from directory
-   listings. Examples that would have worked on v0.7.1 but lose
-   partner access on v0.8.0:
-
-   ```text
-   /archive/vendor/.zift/state.json
-   /pending/.zift-staging/tmp.dat
-   ```
-
-   Before upgrading, scan partner roots for reserved names:
-
-   ```sh
-   sudo find /home/zift -name .zift -o -name .zift-staging
-   ```
-
-   Anything that surfaces and isn't zift's own staging dir is
-   pre-existing partner data that needs renaming before v0.8.0
-   takes effect.
-
-2. The v0.8.0 daemon never reads or writes `<root>/.zift-staging/`.
-   Any orphaned staging files left behind by v0.5.0–v0.7.x crash
-   recovery (or by partners who disconnected mid-upload right
-   before the upgrade) will sit at the old path indefinitely. To
-   help operators notice, v0.8.0 logs a one-line stderr WARN at
-   startup for each partner root that still has a `.zift-staging`
-   entry — any file type (real dir, symlink, regular file) trips
-   it. Look in the journal:
-
-   ```text
-   zift: warning: legacy staging dir at /home/zift/ally/.zift-staging
-     is ignored by v0.8.0+; sweep with `rm -rf` once no in-flight
-     sessions need it
-   ```
-
-   Sweep them manually once you've confirmed no in-flight sessions
-   need them:
-
-   ```sh
-   sudo find /home/zift -mindepth 2 -maxdepth 2 -name .zift-staging
-   sudo rm -rf /home/zift/<partner>/.zift-staging
-   ```
-
-   The validator's continued reservation of the legacy name means
-   partners can't re-create the old path via SFTP, so the
-   operator-side cleanup window is unbounded.
-
-## Rollback
-
-Keep the previous binary:
-
-```sh
-sudo cp /usr/local/bin/zift /usr/local/bin/zift.prev
-sudo install -m 0755 zift-new /usr/local/bin/zift
-sudo systemctl restart zift
-```
-
-Rollback:
-
-```sh
-sudo install -m 0755 /usr/local/bin/zift.prev /usr/local/bin/zift
-sudo systemctl restart zift
-```
-
-Check whether the config grammar changed before rolling across major
-versions. `zift validate` is the first command to run after any binary
-change.
+Back up `/usr/local/bin/zift`, `/home/zift/zift.conf`, the host key,
+`/home/zift/keys/`, the partner roots, and the audit log if you keep
+one. There is no database; `tar`, `rsync`, `restic`, or filesystem
+snapshots all work.
 
 ## Troubleshooting
 
-Validate config:
-
 ```sh
 sudo -u zift zift validate /home/zift/zift.conf
-```
-
-Check service logs:
-
-```sh
 journalctl -u zift -n 100 --no-pager
-```
-
-Check listener:
-
-```sh
 ss -ltnp | grep 2222
 ```
 
-Check recent audit:
-
-```sh
-tail -n 50 /home/zift/audit.jsonl
-```
-
-Common failures:
-
 | Symptom | Likely cause |
 | --- | --- |
-| startup fails | bad config, rejected host key (unreadable, symlink, or mode), missing root, port in use |
-| `config reload rejected` / degraded | edited config is invalid; previous config is still serving. Fix the file (reload auto-recovers) or run `systemctl reload` to see the validation error |
-| auth denied | wrong credential, missing key file, unsupported key type |
-| upload fails at close | target collision, policy denial, cross-filesystem publish |
-| uploads fail after crash | orphaned files under `<root>/.zift/staging/` (or legacy `<root>/.zift-staging/` on pre-v0.8.0 installs); inspect and clear when no sessions are active |
-| no audit file writes | file missing, permissions wrong, filesystem full |
-| partners see unexpected `ls -l` owner/mode | `listing-mode reality` is enabled |
+| startup fails | invalid config, host key rejected, missing root, audit log cannot be opened, port in use |
+| `ssh_bind_listen` fails with permission denied | a port below 1024 without `CAP_NET_BIND_SERVICE`; see the [unit drop-in](#set-up-the-host) |
+| `config reload rejected` | the edited config is invalid and the previous one is serving; fix the file (it applies itself) or run `systemctl reload` to see the error |
+| login denied | wrong credential, `from` mismatch, source suppressed, or the partner's key is not in their key file |
+| every new upload fails with `staging dir unavailable` | the partner root or its `.zift` is not writable or owned as required (see [`security.md`](security.md#uploads-and-the-per-partner-namespace)) |
+| upload fails at close | the target appeared meanwhile, policy denial, or the target is on another filesystem |
+| rename or upload fails on NFS or SMB | the filesystem lacks no-replace rename (see [`security.md`](security.md#known-caveats)) |
+| startup warns about `.zift-staging` | leftover from 0.7.x or earlier; remove it once no session needs it |
+| partners see host owners and modes | `listing-mode reality` |
 
 ## Alternative Layouts
 
-An FHS-style layout works:
+An FHS layout works, for example:
 
 ```text
-/etc/zift/zift.conf
-/etc/zift/host_ed25519
-/srv/sftp/<partner>/
+/etc/zift/zift.conf          0640 root:zift
+/etc/zift/host_ed25519       0640 root:zift
+/srv/sftp/<partner>/         2770 zift:zift
 /var/log/zift/audit.jsonl
 ```
 
-Adjust:
+Set `host-key`, `log`, and `partner-root` (or each `root`) in the
+config, and change these unit lines, or uploads and the audit log fail
+with a read-only filesystem:
 
-- `server.host-key`
-- `server.log`
-- `server.partner-root` or per-user `root`
-- `packaging/systemd/zift.service` `ExecStart`
-- systemd `ReadWritePaths`
-- systemd `ReadOnlyPaths`
+```ini
+ExecStart=/usr/local/bin/zift serve /etc/zift/zift.conf
+ExecReload=/usr/local/bin/zift validate /etc/zift/zift.conf
+ReadWritePaths=/srv/sftp
+NoExecPaths=/srv/sftp
+LogsDirectory=zift
+```
 
-The single-tree `/home/zift` layout is recommended because it is easy
-to reason about and easy to bind into a hardened systemd namespace.
+Remove `BindPaths=/home/zift`, which fails when that directory does not
+exist; `ProtectHome=tmpfs` can stay. `LogsDirectory=zift` creates
+`/var/log/zift`, owned by `zift` and writable by the service.

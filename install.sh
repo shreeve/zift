@@ -6,7 +6,7 @@
 #
 # Pin a version by passing a tag (with or without the leading v):
 #
-#   curl -fsSL .../install.sh | bash -s v0.11.0
+#   curl -fsSL .../install.sh | bash -s v0.12.0
 #
 # Downloads the release binary for this platform, verifies it against the
 # release's signed SHA256SUMS, and installs it.
@@ -34,8 +34,8 @@
 # This installs the BINARY ONLY. Standing up the daemon — service user,
 # host key, config, jail tree, hardened systemd unit — is deliberately out
 # of scope: those steps must be idempotent and must never clobber a config
-# that carries partner credentials, which is a job for the host-zift
-# runbook or docs/operate.md, not for a script piped from the internet.
+# that carries partner credentials, which is a job for docs/operate.md,
+# not for a script piped from the internet.
 #
 # Uninstall the same way — the binary goes; your config, host key, partner
 # trees, and service unit stay:
@@ -85,21 +85,32 @@ host_runs_service() {
 # may prompt, because it prompts on /dev/tty rather than on stdin — which
 # here is the curl pipe.
 SUDO=""
+try_sudo() {
+  if sudo -n true 2>/dev/null; then
+    SUDO="sudo -n"
+  elif command -v sudo >/dev/null && (exec </dev/tty) 2>/dev/null; then
+    SUDO="sudo"
+  else
+    return 1
+  fi
+}
+
 resolve_dest() {
   [ -n "${BIN:-}" ] && return 0
   if [ "$(id -u)" = 0 ]; then BIN=/usr/local/bin; return 0; fi
-  if host_runs_service; then
-    if sudo -n true 2>/dev/null; then
-      BIN=/usr/local/bin; SUDO="sudo -n"
-    elif command -v sudo >/dev/null && (exec </dev/tty) 2>/dev/null; then
-      BIN=/usr/local/bin; SUDO="sudo"
-    else
-      BIN="$HOME/.local/bin"
-    fi
+  if host_runs_service && try_sudo; then
+    BIN=/usr/local/bin
   else
     BIN="$HOME/.local/bin"
   fi
   return 0
+}
+
+# Release tags are v<major>.<minor>.<patch>[-prerelease], the same shape
+# the release workflow accepts. Anything else (a typo, a stray flag) would
+# only turn into a confusing download or signature failure.
+valid_tag() {
+  [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]
 }
 
 # Remove only what install put down — the binary. The config, host key,
@@ -108,11 +119,28 @@ resolve_dest() {
 # a host key would break every partner's known_hosts on the next connect.
 # No network: the filesystem answers what's installed.
 uninstall() {
-  # Same resolution as install, so uninstall always targets what install
-  # put down. An uninstall that could not reach the file install created
-  # would report "not installed" about a binary sitting right there.
+  # Same resolution as install, so uninstall targets what install put
+  # down. Without BIN=, also look in the other place install may have
+  # used: a root install on a host that does not run the service lands in
+  # /usr/local/bin, which a non-root resolution would never check, and a
+  # service host's user install lands in ~/.local/bin.
+  local explicit=${BIN:-}
   resolve_dest
+  if [ ! -e "$BIN/$NAME" ] && [ -z "$explicit" ]; then
+    for dir in /usr/local/bin "$HOME/.local/bin"; do
+      # resolve_dest may have armed sudo for the other directory; a
+      # fallback decides elevation afresh below.
+      if [ -e "$dir/$NAME" ]; then BIN=$dir; SUDO=""; break; fi
+    done
+  fi
   [ -e "$BIN/$NAME" ] || fail "$NAME is not installed at $(tildify "$BIN/$NAME") (BIN= if it lives elsewhere)"
+  # Never delete, least of all with sudo, a file that is not a zift binary.
+  "$BIN/$NAME" version 2>/dev/null | head -1 | grep -q "^$NAME " \
+    || fail "$(tildify "$BIN/$NAME") is not a $NAME binary; not removing it"
+  # An explicit BIN= never elevates, same as install.
+  if [ -z "$SUDO" ] && [ -z "$explicit" ] && [ ! -w "$BIN" ] && try_sudo; then
+    info "using sudo to remove $BIN/$NAME"
+  fi
   $SUDO rm -f "$BIN/$NAME" || fail "cannot remove $(tildify "$BIN/$NAME") — re-run under sudo if it was installed system-wide"
   printf "${Green}$NAME was removed from ${Bold_Green}%s${Color_Off}\n" "$(tildify "$BIN")"
   info "your config, host key, partner trees, and service unit are untouched"
@@ -147,14 +175,15 @@ main() {
   tag=${1:-}
   if [ -n "$tag" ]; then
     case "$tag" in v*) ;; *) tag="v$tag" ;; esac
+    valid_tag "$tag" || fail "not a release tag: ${1} (expected vX.Y.Z or vX.Y.Z-pre, e.g. v0.12.0)"
   else
     tag=$(curl -fsSLI --retry 3 --retry-delay 1 -o /dev/null -w '%{url_effective}' \
       "https://github.com/$REPO/releases/latest") || fail "cannot reach github.com"
     tag=${tag##*/}
+    # With no releases, GitHub redirects .../latest to .../releases — so
+    # the resolved "tag" is only real if it looks like one.
+    valid_tag "$tag" || fail "no releases found for $REPO"
   fi
-  # With no releases, GitHub redirects .../latest to .../releases — so the
-  # resolved "tag" is only real if it looks like one.
-  case "$tag" in v*) ;; *) fail "no releases found for $REPO" ;; esac
 
   # Release assets carry the bare version; the tag carries the leading v.
   version=${tag#v}
@@ -175,9 +204,8 @@ main() {
   # binary provides no independent authenticity.
   if ! command -v cosign >/dev/null; then
     case "$os" in
-      Linux)  hint="sudo apt install cosign   # or: dnf install cosign" ;;
       Darwin) hint="brew install cosign" ;;
-      *)      hint="see https://docs.sigstore.dev/cosign/installation/" ;;
+      *)      hint="see https://docs.sigstore.dev/cosign/system_config/installation/" ;;
     esac
     fail "cosign is required to verify this release. Install it first: $hint"
   fi
@@ -186,12 +214,17 @@ main() {
     || fail "download failed: SHA256SUMS"
   curl -fsSL --retry 3 --retry-delay 1 -o "$tmp/SHA256SUMS.bundle" "$base/SHA256SUMS.bundle" \
     || fail "download failed: SHA256SUMS.bundle"
-  cosign verify-blob \
+  # Keep cosign's own words: "no matching signature" and "cannot parse
+  # this bundle" (a cosign too old for the release's bundle format) call
+  # for very different responses.
+  if ! cosign_out=$(cosign verify-blob \
     --bundle "$tmp/SHA256SUMS.bundle" \
     --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$tag" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    "$tmp/SHA256SUMS" >/dev/null 2>&1 \
-    || fail "cosign could not verify SHA256SUMS for the exact $REPO $tag release workflow"
+    "$tmp/SHA256SUMS" 2>&1); then
+    printf '%s\n' "$cosign_out" | sed 's/^/  cosign: /' >&2
+    fail "cosign could not verify SHA256SUMS for the exact $REPO $tag release workflow (if cosign could not read the bundle, upgrade it: https://docs.sigstore.dev/cosign/system_config/installation/)"
+  fi
   info "signature verified (cosign keyless, $REPO $tag release workflow)"
 
   if command -v sha256sum >/dev/null; then
@@ -234,7 +267,7 @@ main() {
     warn "The daemon will NOT pick this up, and sudo was not available here."
     warn "To install the one it runs:"
     warn ""
-    warn "  sudo BIN=/usr/local/bin bash install.sh $tag"
+    warn "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sudo BIN=/usr/local/bin bash -s $tag"
     warn ""
     warn "Continuing — a user install is still fine for hash-password and validate."
     printf '\n'
@@ -242,11 +275,11 @@ main() {
 
   # Is a running daemon executing the very file we are about to replace?
   #
-  # `install` unlinks the destination and creates a new inode, so this
-  # write succeeds while the daemon runs. `cp` does NOT: it opens the
-  # existing inode for writing, which the kernel refuses for a file being
-  # executed — `cp: cannot create regular file: Text file busy`. That is
-  # the whole reason this uses `install` and why no shutdown is needed.
+  # The new binary is written beside the destination and renamed over it.
+  # The rename is atomic, so a `Restart=on-failure` never finds the path
+  # missing, and it never writes into the running inode, which the kernel
+  # refuses for a file being executed (`cp` fails with "Text file busy").
+  # That is why no shutdown is needed.
   #
   # The cost of the new inode is that the running process keeps executing
   # the old, now-unlinked one (its /proc/<pid>/exe reads "... (deleted)")
@@ -263,7 +296,9 @@ main() {
     fi
   fi
 
-  $SUDO install -m 0755 "$tmp/$asset" "$dest" || fail "cannot install to $(tildify "$dest")"
+  staged="$BIN/.$NAME.new.$$"
+  $SUDO install -m 0755 "$tmp/$asset" "$staged" || fail "cannot write to $(tildify "$BIN")"
+  $SUDO mv -f "$staged" "$dest" || { $SUDO rm -f "$staged"; fail "cannot install to $(tildify "$dest")"; }
   printf "${Green}$NAME was installed to ${Bold_Green}%s${Color_Off}\n" "$(tildify "$dest")"
 
   # PATH hint: an install nobody can invoke is not an install.

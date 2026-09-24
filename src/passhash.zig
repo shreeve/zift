@@ -50,14 +50,18 @@ pub fn mint(io: std.Io, allocator: std.mem.Allocator, password: []const u8, out:
 
     var salt: [salt_len]u8 = undefined;
     io.randomSecure(&salt) catch return error.KdfFailed;
+    return mintWithSalt(io, allocator, password, &salt, out);
+}
 
+/// `mint` with a given salt: deterministic, so tests can pin the format.
+fn mintWithSalt(io: std.Io, allocator: std.mem.Allocator, password: []const u8, salt: *const [salt_len]u8, out: []u8) Error![]const u8 {
     var digest: [key_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &digest);
-    kdf(io, allocator, password, &salt, &digest) catch return error.KdfFailed;
+    kdf(io, allocator, password, salt, &digest) catch return error.KdfFailed;
 
     var raw: [raw_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &raw);
-    @memcpy(raw[0..salt_len], &salt);
+    @memcpy(raw[0..salt_len], salt);
     @memcpy(raw[salt_len..], &digest);
 
     @memcpy(out[0..prefix.len], prefix);
@@ -101,11 +105,7 @@ pub fn decode(blob: []const u8) Error![raw_len]u8 {
     if (!std.mem.startsWith(u8, blob, prefix)) {
         return error.UnknownVersionTag;
     }
-    const rest = blob[prefix.len..][0..enc_len];
-    for (rest) |ch| {
-        if (base62Value(ch) == null) return error.InvalidAlphabet;
-    }
-    return base62Decode(rest) catch return error.InvalidEncoding;
+    return base62Decode(blob[prefix.len..][0..enc_len]);
 }
 
 fn base62Encode(raw: *const [raw_len]u8, out: *[enc_len]u8) void {
@@ -117,10 +117,10 @@ fn base62Encode(raw: *const [raw_len]u8, out: *[enc_len]u8) void {
     }
 }
 
-fn base62Decode(src: *const [enc_len]u8) error{InvalidEncoding}![raw_len]u8 {
+fn base62Decode(src: *const [enc_len]u8) error{ InvalidAlphabet, InvalidEncoding }![raw_len]u8 {
     var buf = [_]u8{0} ** raw_len;
     for (src.*) |ch| {
-        const v = base62Value(ch) orelse return error.InvalidEncoding;
+        const v = base62Value(ch) orelse return error.InvalidAlphabet;
         mulAdd62(&buf, v) catch return error.InvalidEncoding;
     }
     return buf;
@@ -176,6 +176,26 @@ test "mint and verify round-trip" {
     try validate(blob);
     try std.testing.expect(verify(std.testing.io, std.testing.allocator, "correct horse", blob));
     try std.testing.expect(!verify(std.testing.io, std.testing.allocator, "wrong horse", blob));
+}
+
+test "known answers pin the Janus wire format" {
+    // Minted by Janus's own codec: passEncode and the argon2.IDKey call
+    // copied verbatim from janus/auth_config.go and janus/auth.go into a
+    // Go program (golang.org/x/crypto v0.53.0), with these fixed salts in
+    // place of rand.Read. A change to the alphabet, byte order, salt/key
+    // split, or Argon2id parameters breaks this test, not partner logins.
+    const vectors = [_]struct { []const u8, *const [salt_len]u8, []const u8 }{
+        .{ "correct horse battery staple", "zift+jns", "aJpXa3CaYzTaKvqO1kgesTECmlyPTWpr" },
+        .{ "pässwörd ✓", &.{ 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8 }, "afTIsu9NTV6jZacZdTS7HZYu9DNhfNSC" },
+    };
+    for (vectors) |v| {
+        const password, const salt, const want = v;
+        var buf: [blob_len]u8 = undefined;
+        try std.testing.expectEqualStrings(want, try mintWithSalt(std.testing.io, std.testing.allocator, password, salt, &buf));
+        try std.testing.expectEqualSlices(u8, salt, (try decode(want))[0..salt_len]);
+        try std.testing.expect(verify(std.testing.io, std.testing.allocator, password, want));
+    }
+    try std.testing.expect(!verify(std.testing.io, std.testing.allocator, "correct horse battery stapl", vectors[0][2]));
 }
 
 test "validate rejects legacy and bad shapes" {

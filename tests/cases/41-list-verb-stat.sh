@@ -1,116 +1,52 @@
 #!/usr/bin/env bash
 # Test: the `list` verb satisfies STAT/LSTAT, so "browse without
-#       download" is expressible against real SFTP clients.
-# Covers: policy.permissionsFor (STAT/LSTAT accept read OR list),
-#         policy.policyDerivedMode (a browsable dir renders r-x)
-#
-# Mainstream clients stat a remote directory before opening it —
-# FileZilla and WinSCP both do, and OpenSSH's `cd` does the same via
-# do_stat(). A `list` that did not satisfy STAT would refuse that
-# request with SSH_FX_PERMISSION_DENIED, and the client could never
-# render a listing at all, so the verb could not do the one thing it
-# names.
-#
-# The policy below is the browsable-root shape from configure.md: `/`
-# carries `list` only, download is granted per-subtree. The oracle is
-# two-sided, so the browse half and the refuse half are checked in
-# SEPARATE sessions — one log must contain no denial at all, the other
-# must contain exactly one.
+#       download" works with real SFTP clients
+# Clients stat a directory before opening it (OpenSSH `cd`, FileZilla,
+# WinSCP). The browse session must see no denial at all, and the fetch
+# session exactly one: the download under the list-only root.
 
 source "$(dirname "$0")/../lib/common.sh"
 
 make_host_key
-hash=$(make_password_hash secret)
-
 mkdir -p "$TEST_TMP/jail/results"
-# A file at the list-only root: visible by name, never downloadable.
 printf 'root-secret-body' > "$TEST_TMP/jail/root-only.txt"
-# A file in the read subtree: downloadable.
 printf 'fetchable' > "$TEST_TMP/jail/results/report.txt"
-
 write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  log stderr
+$(config_head)
 
 user user1
-  auth $hash
+  auth $(make_password_hash secret)
   root $TEST_TMP/jail
   allow /        list
   allow /results read
 EOF
-
 start_zift
-
 cd "$TEST_TMP"
+denials() { count_log '"result":"denied"'; }
 
-# --- Session 1: browse. Nothing here may be refused. ------------------
-sftp_password user1 secret \
-    "cd /" \
-    "ls -la /" \
-    >"$TEST_TMP/browse.raw" 2>&1 || true
-# expect drives a PTY, so every line arrives CRLF-terminated. Strip the
-# CR once here; otherwise an anchored `...$` match never fires.
-tr -d '\r' < "$TEST_TMP/browse.raw" > "$TEST_TMP/browse.log"
+# expect drives a PTY; strip the CRs so anchored matches work.
+sftp_password user1 secret "cd /" "ls -la /" 2>&1 | tr -d '\r' > browse.log || fail "browse session failed"
+sed 's/^/    /' browse.log
+grep -qi 'permission denied\|couldn.t stat' browse.log && fail "a list-only root refused stat-then-list"
+[[ $(denials) == 0 ]] || fail "the browse session was audited with a denial"
+ok "stat-then-list at a list-only root: no denial on the client or in the audit"
+grep -q 'root-only.txt' browse.log || fail "the listing lacks root-only.txt"
+ok "the listing shows entries at the list-only root"
+grep -qE '^dr-xr-x--- .* results$' browse.log || fail "browsable dir 'results' is not dr-xr-x---"
+ok "a browsable dir renders dr-xr-x---"
+grep -qE '^---------- .* root-only.txt$' browse.log || fail "list-only file 'root-only.txt' is not ----------"
+ok "a list-only file renders ---------- (name visible, content not)"
 
-echo "  --- browse session ---"
-sed 's/^/    /' "$TEST_TMP/browse.log"
-
-# `cd /` issues STAT — the exact request a read-gated STAT refused, and
-# the one that left the partner's client unable to list anything.
-if grep -qi 'permission denied\|couldn.t stat' "$TEST_TMP/browse.log"; then
-    fail "a list-only root refused the stat-then-list path"
-fi
-ok "stat-then-list at a list-only root succeeded"
-
-grep -q 'root-only.txt' "$TEST_TMP/browse.log" \
-    || fail "listing did not include root-only.txt — READDIR produced nothing"
-ok "listing rendered entries at the list-only root"
-
-# A browsable directory must render `r-x`: a dir that serves STAT but
-# shows no `r` contradicts the request it just answered.
-DIR_LINE=$(grep -E '^d[rwx-]{9} .* results$' "$TEST_TMP/browse.log" | head -1 || true)
-[[ -n "$DIR_LINE" ]] || fail "no directory line for 'results' in the listing"
-DIR_MODE=$(echo "$DIR_LINE" | awk '{print $1}')
-[[ "$DIR_MODE" == "dr-xr-x---" ]] \
-    || fail "browsable dir rendered $DIR_MODE, expected dr-xr-x---"
-ok "browsable dir renders $DIR_MODE"
-
-# A file under a list-only rule shows its name and size but no `r`:
-# the listing is honest that the content is out of reach.
-FILE_LINE=$(grep -E '^-[rwx-]{9} .* root-only.txt$' "$TEST_TMP/browse.log" | head -1 || true)
-[[ -n "$FILE_LINE" ]] || fail "no file line for 'root-only.txt' in the listing"
-FILE_MODE=$(echo "$FILE_LINE" | awk '{print $1}')
-[[ "$FILE_MODE" == "----------" ]] \
-    || fail "list-only file rendered $FILE_MODE, expected ----------"
-ok "list-only file renders $FILE_MODE (name visible, content not)"
-
-# --- Session 2: fetch. The bytes at the root must stay refused. -------
-sftp_password user1 secret \
-    "get /root-only.txt" \
-    "get /results/report.txt" \
-    >"$TEST_TMP/fetch.raw" 2>&1 || true
-tr -d '\r' < "$TEST_TMP/fetch.raw" > "$TEST_TMP/fetch.log"
-
-echo "  --- fetch session ---"
-sed 's/^/    /' "$TEST_TMP/fetch.log"
-
-grep -qi 'remote open "/root-only.txt": permission denied' "$TEST_TMP/fetch.log" \
-    || fail "download at the list-only root was not refused"
-[[ -f "$TEST_TMP/root-only.txt" ]] \
-    && fail "downloaded a file under a list-only rule — the verb leaked content"
-ok "download refused at the list-only root"
-
-[[ -f "$TEST_TMP/report.txt" ]] \
-    || fail "read-granted subtree did not download"
-[[ "$(cat "$TEST_TMP/report.txt")" == "fetchable" ]] \
-    || fail "read-granted subtree downloaded the wrong bytes"
-ok "read-granted subtree downloads normally"
-
-stop_zift TERM
-
-# The audit trail must show the same story the client saw.
-log_contains '"operation":"opendir","result":"ok"' \
-    || fail "audit log has no successful opendir at the list-only root"
-ok "audit records the successful browse"
+sftp_password user1 secret "get /root-only.txt" "get /results/report.txt" 2>&1 | tr -d '\r' > fetch.log \
+    || fail "fetch session failed"
+sed 's/^/    /' fetch.log
+[[ $(grep -ci 'permission denied' fetch.log) == 1 ]] || fail "expected exactly one refusal on the client"
+grep -qi 'remote open "/root-only.txt": permission denied' fetch.log || fail "the root download was not the refusal"
+[[ ! -e root-only.txt ]] || fail "downloaded a file under a list-only rule"
+[[ $(denials) == 1 ]] && log_contains '"operation":"open_read","result":"denied","path":"/root-only.txt"' \
+    || fail "expected exactly one denial in the audit, for /root-only.txt"
+ok "download refused at the list-only root, once"
+[[ "$(cat report.txt)" == fetchable ]] || fail "the read-granted subtree did not download correctly"
+ok "the read-granted subtree downloads normally"
+log_contains '"operation":"opendir","result":"ok"' || fail "no successful opendir audited"
+ok "audit records the browse"
