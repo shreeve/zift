@@ -112,72 +112,17 @@ failure by refusing to own them:
 The cost is obvious: if you need those features, Zift will not grow them
 for you.
 
-## What Zift Does
+## What Zift Is, And Is Not
 
-Zift provides:
-
-- SFTP version 3 service over SSH.
-- Virtual users defined in a text config file.
-- Password auth with Argon2id hashes, and public-key auth (Ed25519,
-  ECDSA, RSA) from operator-managed key files.
-- Per-user roots that symlinks cannot escape.
-- Default-deny, path-scoped allow/deny rules with a small vocabulary:
-  `read`, `write`, `update`, `delete`, `full`, plus `list`, `mkdir` and
-  `rename`.
-- Optional per-user source addresses, and built-in auth backoff,
-  source suppression and connection caps.
-- Structured JSON audit logs.
-- Hot config reload for new sessions.
-- Graceful shutdown and forced close after a configured grace period.
-- Atomic publish of new uploads through a private staging directory.
-- Virtualized directory listings that show partner-facing permissions
-  rather than host filesystem ownership.
-- Static Linux release binaries and signed release manifests.
-
-## What Zift Refuses To Do
-
-Zift does not contain:
-
-- A database.
-- A web UI.
-- A management API.
-- A plugin system.
-- A scripting runtime.
-- A scheduler.
-- A queue.
-- A transfer processor.
-- A metrics endpoint.
-- External identity integration.
-- Cluster coordination.
-- Automatic updates.
-- Telemetry.
-
-The normal case is one binary and one config. A supervisor such as
-systemd starts it, your log shipper takes the JSON audit lines,
-filesystem snapshots cover backups, and external watchers handle
-post-upload processing. No fail2ban, CrowdSec or ban daemon is needed.
-
-## Why The Narrowness Is A Feature
-
-SFTP servers sit on a remote trust boundary. Every feature added to the
-daemon becomes something that can fail, be misconfigured, or need
-patching at the worst possible time.
-
-Zift treats operational simplicity as a security property:
-
-- One binary is easier to inspect and roll back.
-- One config file is easier to review.
-- No database means no schema, migrations, connection pools, or DB
-  corruption mode.
-- No web UI means no browser attack surface.
-- No external auth means no availability dependency on directory or
-  identity systems.
-- No plugin system means no third-party code execution inside the
-  daemon.
-
-This does not make Zift universally safer than larger systems. It makes
-its failure modes smaller and easier to reason about for the job it
-chooses to do.
+Zift serves SFTP version 3 to virtual users from one config file, with
+default-deny path rules, jailed roots, per-user source addresses,
+built-in abuse controls, JSON audit lines, hot reload and atomic
+uploads (see the [README](../README.md)). It has no database, web UI,
+management API, plugins, scheduler, metrics endpoint, external
+identity, clustering, automatic updates or telemetry: each would be one
+more thing on a trust boundary to fail, misconfigure or patch. A
+supervisor starts it, a log shipper takes the audit lines, snapshots
+cover backups, and external watchers handle post-upload processing.
 
 ## Current Maturity
 
