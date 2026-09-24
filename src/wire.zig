@@ -108,8 +108,11 @@ pub fn replyData(channel: c.ssh_channel, frame: []u8, request_id: u32, len: usiz
     try w.putU8(@intCast(c.SSH_FXP_DATA));
     try w.putU32(request_id);
     try w.putU32(@intCast(len));
-    w.index += len;
-    try w.send(channel);
+    // Header and data as separate writes: a 32 KiB read plus its 13-byte
+    // header would overflow a 32 KiB channel packet and trail a tiny one.
+    std.mem.writeInt(u32, frame[0..4], @intCast(w.index - 4 + len), .big);
+    try writeAll(channel, frame[0..w.index]);
+    try writeAll(channel, frame[w.index..][0..len]);
 }
 
 /// The message is the standard phrase for `status`; detail belongs in
