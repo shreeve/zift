@@ -5,7 +5,8 @@
 #         gets NO_SUCH_FILE for a missing entry; OPEN of a FIFO fails at
 #         once instead of blocking the session; a handle's refused READs
 #         are audited once; a malformed packet and the rename scan limit
-#         leave audit lines that say so
+#         leave audit lines that say so; one READ returns far more than
+#         32 KiB and one READDIR reply far more than 16 entries
 
 source "$(dirname "$0")/../lib/common.sh"
 
@@ -26,6 +27,9 @@ done
 deep="$TEST_TMP/jail/box/deep"
 for _ in $(seq 257); do deep="$deep/d"; done
 mkdir -p "$deep"
+mkdir -p "$TEST_TMP/jail/box/many"
+for i in $(seq 200); do : > "$TEST_TMP/jail/box/many/entry-$i"; done
+head -c 300000 /dev/zero > "$TEST_TMP/jail/box/big.bin"
 
 write_config <<EOF
 server
@@ -97,6 +101,25 @@ f = sftp.open("/box/file.txt", "a")
 for _ in range(20):
     expect("READ on a write-only handle", "denied", sftp._request, CMD_READ, f.handle, int64(0), 10)
 f.close()
+
+from paramiko.sftp import CMD_OPENDIR, CMD_READDIR, CMD_DATA, CMD_NAME
+with sftp.open("/box/big.bin", "r") as f:
+    kind, msg = sftp._request(CMD_READ, f.handle, int64(0), 1 << 20)
+    got = len(msg.get_binary()) if kind == CMD_DATA else -1
+if got > 200 * 1024:
+    print(f"  ok: one READ returned {got} bytes")
+else:
+    print(f"  fail: one READ returned {got} bytes")
+    failed = True
+kind, msg = sftp._request(CMD_OPENDIR, "/box/many")
+handle = msg.get_binary()
+kind, msg = sftp._request(CMD_READDIR, handle)
+count = msg.get_int() if kind == CMD_NAME else -1
+if count == 200:
+    print(f"  ok: one READDIR reply carried all {count} entries")
+else:
+    print(f"  fail: one READDIR reply carried {count} entries")
+    failed = True
 
 sftp.close()
 t.close()
