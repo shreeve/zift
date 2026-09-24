@@ -1,11 +1,9 @@
 # Configure Zift
 
-Zift is configured by one text file. The file defines one `server`
-block and one `user <name>` block per virtual user.
-
-There is no include system, no variables, no environment interpolation,
-no inheritance, no embedded expressions, and no runtime database. The
-file on disk is the configuration.
+Zift is configured by one text file: one `server` block, then one
+`user <name>` block per partner. There are no includes, variables,
+environment interpolation or runtime database. The file on disk is the
+configuration.
 
 ## Example
 
@@ -14,339 +12,155 @@ server
   listen 0.0.0.0:2222
   host-key /home/zift/host_ed25519
   partner-root /home/zift
-  reload-interval 2s
-  idle-timeout 5m
-  max-connections 14
-  max-unauth-connections 4
-  shutdown-grace 30s
   log stderr
-  listing-mode virtual
-  publish-mode 0o660
-  mkdir-mode 0o2770
 
 user ally
   from 203.0.113.40
   from 198.51.100.0/28
-  auth a…
+  auth a…                        # passhash from `zift hash-password`
   auth /home/zift/keys/ally.pub
   allow / read
   allow /pending full
-  allow /archive read
   deny **.exe
-  # **/.ssh/** does not match the .ssh directory itself, so READDIR can list names while OPEN of the key file stays denied.
-  deny **/.ssh
-  deny **/.ssh/**
 ```
 
-Validate before serving:
+Check it, then serve it:
 
 ```sh
 zift validate /home/zift/zift.conf
-```
-
-Run:
-
-```sh
 zift serve /home/zift/zift.conf
 ```
 
+`validate` runs every check `serve` runs before it listens:
+
+- the file parses (errors name the line, section, directive and reason);
+- the host key loads as an unencrypted private key and passes the file
+  checks under [`host-key`](#host-key);
+- the log's directory exists, and an existing log is a regular file,
+  FIFO or character device, never a symlink;
+- every root exists, is a directory, and overlaps no other root after
+  symlinks are resolved;
+- every key file passes the checks under [`auth`](#auth);
+- the config file, host key, key files and log all lie outside every
+  partner root, through symlinks too.
+
+Run it as the service user (`sudo -u zift zift validate …`): file
+ownership is checked against the user running it.
+
 ## File Shape
 
-The grammar is intentionally small:
-
-- A section header is either `server` or `user <name>`.
-- Properties are indented under a section.
-- Blank lines are ignored.
-- Whole-line comments are ignored when the first non-whitespace
-  character is `#`.
-- Inline comments are not accepted. Put comments on their own lines.
-- User names may contain ASCII letters, digits, `_`, `-`, and `.`.
-- User names may not be empty, may not start with `.`, and may not be
-  `.` or `..`.
-- User names are limited to 64 bytes.
-- Virtual paths are UTF-8 and limited to 4096 bytes.
-
-Durations require a suffix: `ms`, `s`, `m`, `h`, or `d`. Bare `0` is
-allowed for settings where zero disables a behavior.
+- A section header starts in column 0: `server` or `user <name>`.
+- Directives are indented under a section, one per line: `name value`.
+- Blank lines are ignored. `#` starts a comment at the start of a line
+  or after a space or tab; a `#` inside a token is literal.
+- User names use ASCII letters, digits, `_`, `-` and `.`, are at most 64
+  bytes, and may not start with `.`.
+- Durations need a unit: `ms`, `s`, `m`, `h` or `d` (`30s`, `5m`). A bare
+  `0` turns the setting off where that is allowed.
+- Numbers are plain decimal digits. Modes are octal: `0o660`, `0660` and
+  `660` are the same.
+- A directive that takes one value may appear once per section
+  (`DuplicateDirective`).
+- Paths (`host-key`, `partner-root`, `root`, `log`, key files) must be
+  absolute.
 
 ## Server Directives
 
-### `listen`
-
-Required.
-
-TCP listen address:
-
-```zift
-listen 127.0.0.1:2222
-listen 0.0.0.0:2222
-```
-
-Prefer per-user `from` source policy in the user block (see below).
-A host or cloud firewall is optional defense-in-depth, not required.
+| Directive | Default | Meaning |
+| --- | --- | --- |
+| `listen` | required | `host:port`, `:port` (every IPv4 address), or `[ipv6]:port` such as `[::]:2222` |
+| `host-key` | required | SSH host private key |
+| `partner-root` | none | base for users without `root`: user `ally` gets `<partner-root>/ally` |
+| `reload-interval` | `2s` | how often to check the config and key files for changes; `0` or at least `100ms` |
+| `idle-timeout` | `5m` | close a session idle this long; `0` or `1s` to `24d` |
+| `max-connections` | `128` | concurrent sessions, at least 1 |
+| `max-unauth-connections` | a quarter of `max-connections` (at least 1) | concurrent sessions not yet logged in; `0` = no separate cap; at most `max-connections` |
+| `shutdown-grace` | `30s` | how long SIGTERM waits for sessions before closing them |
+| `log` | `stderr` | audit destination: `stderr` or an absolute path |
+| `listing-mode` | `virtual` | `virtual` or `reality` |
+| `publish-mode` | `0o660` | mode of a finished upload |
+| `mkdir-mode` | `0o2770` | mode of a directory made over SFTP |
 
 ### `host-key`
 
-Required.
+Generate one with `ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N
+""`. The file must be a regular file (a symlink is followed and its
+target checked), owned by root or the daemon's user, with no
+group-write, group-exec or other bits: `0600` and `0640` pass, `0644`
+and `0660` do not. `root:zift 0640` lets the daemon read its identity
+but not rewrite it.
 
-Path to an unencrypted SSH host private key:
+### `max-connections` and `max-unauth-connections`
 
-```zift
-host-key /home/zift/host_ed25519
-```
-
-Generate one with:
-
-```sh
-ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N ""
-```
-
-The file must be a regular file, not a symlink, and readable by the
-`zift` process. Its mode must not include any other-permission bit, and
-must not include group-write or group-exec. `0640` and `0600` are
-valid; `0644` and `0660` are rejected by `zift validate` and by
-startup. In hardened deployments, make it `root:zift` and mode `0640`
-so the daemon can read but not rewrite its own server identity.
-
-### `partner-root`
-
-Optional.
-
-Base directory for users that do not declare an explicit `root`.
-
-```zift
-partner-root /home/zift
-```
-
-With this setting:
-
-```zift
-user ally
-  auth a…
-```
-
-defaults to:
-
-```zift
-root /home/zift/ally
-```
-
-Explicit `root` still wins. `partner-root` must be an absolute path.
-Trailing slashes are normalized.
-
-### `reload-interval`
-
-Optional. Default: `2s`.
-
-How often Zift checks the `zift.conf` mtime and each authorized-key
-file's mtime for changes:
-
-```zift
-reload-interval 2s
-```
-
-Set to `0` to disable polling. `SIGHUP` still forces a reload.
-
-Valid reloads apply to new sessions only; see [Reloads](#reloads) below
-and [`operate.md`](operate.md). Changing `host-key` requires a restart.
-
-### `idle-timeout`
-
-Optional. Default: `5m`.
-
-Disconnects idle sessions, including pre-auth sessions:
-
-```zift
-idle-timeout 5m
-```
-
-Set to `0` to disable. Any other value must be at most 2147483647
-milliseconds (about 24.8 days). Larger values are a config error.
-
-### `max-connections`
-
-Optional. Default: `128`.
-
-Maximum total concurrent sessions:
-
-```zift
-max-connections 14
-```
-
-Size this with password-verify memory in mind. Each passhash verification
-uses a fixed 64 MiB argon2id profile. The shipped systemd unit sets
-`MemoryMax=4G`; production configs typically keep
-`max-connections` / `max-unauth-connections` modest so a handshake
-storm cannot pin every worker on KDF work.
-
-### `max-unauth-connections`
-
-Optional. Default: `0`.
-
-Maximum concurrent pre-auth sessions:
-
-```zift
-max-unauth-connections 4
-```
-
-`0` disables the separate cap. When set, it must be less than or equal
-to `max-connections`.
-
-This protects authenticated partner traffic from being crowded out by
-handshake storms or clients that connect and never authenticate.
-
-### `shutdown-grace`
-
-Optional. Default: `30s`.
-
-How long graceful shutdown waits for active sessions before Zift closes
-their sockets:
-
-```zift
-shutdown-grace 30s
-```
-
-This is mostly useful to reduce wait time in tests or tightly managed
-deployments.
+`max-connections` bounds everything; `max-unauth-connections` keeps
+connections that never log in from filling it. Password checks are
+bounded separately (see [Limits](#limits)), so the defaults are safe
+under the shipped unit's `MemoryMax`. The arithmetic is in
+[`operate.md`](operate.md#sizing).
 
 ### `log`
 
-Optional. Default: `stderr`.
-
-Audit destination:
-
-```zift
-log stderr
-log /home/zift/audit.jsonl
-```
-
-Prefer `stderr` in production so the supervisor (journald, Docker,
-Kubernetes) owns retention. Use a file path only when you already have
-a log-shipping preference. File paths must be absolute. The file is
-opened append-only and with `NOFOLLOW`: a symlink at the log path is
-refused. A file the daemon creates is mode `0640`. A pre-existing
-regular file is appended to and is not chmod'd. The path is reopened
-on `SIGUSR1`; a failed reopen is retried. That supports ordinary
-external rotation (send `SIGUSR1` after renaming the file).
+Prefer `stderr`, so the supervisor (journald, Docker, Kubernetes) owns
+retention. A path is opened append-only and never through a symlink. It
+may be a regular file, a FIFO read by a log shipper, or a character
+device such as `/dev/null`; a FIFO's reader must be running before Zift
+starts. A file Zift creates gets mode `0640`; an existing file keeps its
+mode. `SIGUSR1` reopens the path for rotation (see
+[`operate.md`](operate.md#log-rotation)). A log that cannot be opened at
+startup stops `serve`; after that, write failures are reported on
+stderr and serving continues.
 
 ### `listing-mode`
 
-Optional. Default: `virtual`.
-
-Controls long directory listing output:
-
-```zift
-listing-mode virtual
-listing-mode reality
-```
-
-`virtual` shows the partner their virtual user name, a fixed group of
-`sftp`, and policy-derived mode bits. It hides host filesystem owner,
-group, and mode details.
-
-`reality` passes through on-disk owner/group/mode. Use it mainly for
+`virtual` shows the partner their own user name, group `sftp`, and mode
+bits derived from their policy, not the host's owner and mode.
+`reality` passes the on-disk owner, group and mode through; use it for
 debugging.
 
-### `publish-mode`
+### `publish-mode` and `mkdir-mode`
 
-Optional. Default: `0o660`.
-
-Mode applied to files after a successful staged upload publish:
-
-```zift
-publish-mode 0o660
-```
-
-Allowed values:
-
-- `0o600`
-- `0o640`
-- `0o660`
-
-The allowed set prevents accidental world-readable or world-writable
-partner data.
-
-### `mkdir-mode`
-
-Optional. Default: `0o2770`.
-
-Mode applied to directories created through SFTP:
-
-```zift
-mkdir-mode 0o2770
-```
-
-Allowed values:
-
-- `0o2700`
-- `0o2750`
-- `0o2770`
-
-The defaults match the recommended `/home/zift/<partner>` layout where
-setgid directories keep group ownership consistent for operators.
+`publish-mode` needs owner `rw` and may not include other-write or any
+setuid, setgid or sticky bit. `mkdir-mode` needs owner `rwx`, may not
+include other-write, and may include setgid, which keeps new
+directories in the partner tree's group.
 
 ## User Directives
 
 ### `auth`
 
-Required: each user needs at least one credential.
-
-`auth` accepts either a password hash or an absolute path to a public
-key file.
-
-Password (Janus-identical `a…` passhash — argon2id with fixed
-params, `a` + 31 base62 chars — always 32 chars, alphabet `[0-9A-Za-z]`):
+At least one per user. The value is a password hash or an absolute path
+to a public-key file:
 
 ```zift
 auth a…
+auth /home/zift/keys/ally.pub
 ```
 
-Generate it with:
+A user may have one password hash and any number of key files. Mint the
+hash with:
 
 ```sh
 printf '%s\n' 'secret' | zift hash-password
 ```
 
-Legacy `$argon2id$…` PHC strings are rejected; remint with
-`zift hash-password`.
+It reads the first line of stdin, refuses an empty password, and prints
+a 32-character `a…` passhash (format in [`security.md`](security.md#passwords)).
+Plaintext passwords and old `$argon2id$…` strings are rejected.
 
-`zift hash-password` rejects an empty password and writes nothing to
-stdout. An empty password never authenticates, even against a
-previously minted hash of the empty string.
-
-Public-key file:
-
-```zift
-auth /home/zift/keys/ally.pub
-```
-
-A user may have:
-
-- one password hash
-- zero or more public-key files
-- both password and public-key auth
-
-Multiple `auth /path/to/file.pub` lines accumulate. At most one
-password hash is allowed per user.
-
-Public-key files:
-
-- must use absolute paths
-- must be regular files
-- must not be group-writable or world-writable
-- must not be symlinks
-- must contain at least one public-key line
-- may contain multiple OpenSSH-style public-key lines
-- accept `ssh-ed25519`, `ecdsa-sha2-nistp256`,
-  `ecdsa-sha2-nistp384`, and `ecdsa-sha2-nistp521`
-
-RSA and DSA keys are not accepted.
+A key file holds OpenSSH public-key lines (`<algorithm> <base64>
+[comment]`); blank lines and `#` lines are skipped, and option prefixes
+are not allowed. Accepted algorithms: `ssh-ed25519`,
+`ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521`, and
+`ssh-rsa` from 2048 to 8192 bits. RSA keys authenticate only with
+`rsa-sha2-256` or `rsa-sha2-512` signatures, never SHA-1; DSA is
+rejected. The file must be a regular file (a symlink is followed and its
+target checked, so Kubernetes Secrets and systemd credentials work),
+owned by root or the daemon's user, not group- or world-writable, and
+contain at least one key.
 
 ### `from`
 
-Optional. Repeatable.
-
-Restrict which source IPs may authenticate as this user:
+Optional and repeatable: one IPv4 or IPv6 address or CIDR per line.
 
 ```zift
 from 203.0.113.40
@@ -354,299 +168,222 @@ from 198.51.100.0/28
 from 2001:db8::/32
 ```
 
-Each line is a single IPv4/IPv6 address or CIDR. When one or more
-`from` lines are present, the peer must match at least one of them
-before password or public-key auth can succeed. When omitted, any
-source may attempt auth (still subject to credentials and Zift's
-built-in abuse suppression).
-
-This is the preferred B2B hardening: partner identity + partner
-network + path policy in one reviewable file.
+With any `from` line, a peer that matches none of them cannot log in as
+this user. The attempt is still timed and counted like a bad password,
+so it reveals nothing. `::ffff:a.b.c.d` forms match plain IPv4 peers,
+and `::/0` matches every peer. This is the cheapest hardening there is
+when partners have stable egress addresses.
 
 ### `root`
 
-Optional when `server.partner-root` is set. Required otherwise.
+The host directory that is this user's `/`. Required unless
+`partner-root` is set. It must exist and be a directory, and no two
+users' roots may be equal or nested, after symlinks are resolved.
 
-Maps the virtual user's `/` to a real filesystem directory:
-
-```zift
-root /home/zift/ally
-```
-
-Like `partner-root`, `root` must be an absolute path. A relative root
-is a config error at parse time and does not abort the daemon.
-
-The root must exist and be a directory when the config is validated,
-loaded, or reloaded.
-
-Zift rejects configs with overlapping roots. Two virtual users cannot
-share the same root, and one user root cannot be inside another. Roots
-are canonicalized through symlinks before this check, which keeps the
-per-user policy model honest.
-
-### `allow`
-
-Grants permissions on matching virtual paths:
+### `allow` and `deny`
 
 ```zift
-allow / read
-allow /pending full
-allow /archive read
+allow /pending read write
+deny **.exe /archive/private
 ```
 
-Policy is default-deny. A user with credentials and no `allow` rules
-can authenticate but cannot do useful SFTP work.
+`allow <pattern> <verb>...` grants verbs on matching paths. `deny
+<pattern>...` takes one or more patterns and no verbs, because it
+removes everything. See [Permissions](#permissions) and
+[Patterns](#patterns).
 
-### `deny`
+## Permissions
 
-Denies matching virtual paths:
-
-```zift
-deny **.exe
-deny **/.ssh
-deny **/.ssh/**
-```
-
-`**/.ssh/**` does not match the directory `.ssh` itself, so READDIR of
-that directory can list names while OPEN of the key file stays denied.
-
-`deny` overrides `allow`.
-
-## Permission Model
-
-Zift's everyday vocabulary is CRUD plus one bundle:
+Policy is default-deny: a user with credentials and no `allow` lines can
+log in and do nothing. Rules match the normalized virtual path the
+partner sees, never a host path. If any `deny` matches, the path gets
+nothing, whatever the order or specificity of the `allow` lines.
+Otherwise the path gets the union of every matching `allow`.
 
 | Verb | Grants |
 | --- | --- |
-| `read` | download **and** list (stat, directory listing, download) |
-| `write` | create a **new** file (no overwrite, no directory creation) |
-| `update` | overwrite, truncate, or append to a file that **already exists** |
-| `delete` | delete files and directories |
-| `full` | everything: read, write, update, delete, plus `mkdir` and `rename` |
+| `read` | download, stat and list (`read` includes `list`) |
+| `write` | create a **new** file |
+| `update` | overwrite, truncate or append to an **existing** file, rename over one, and set its times |
+| `delete` | remove a file or an empty directory |
+| `full` | all of the above plus `mkdir` and `rename` |
+| `list` | stat and list without download |
+| `mkdir` | create a directory |
+| `rename` | rename, checked at both the old and the new path |
 
-Those five cover almost every real policy. `read` and `full` are the two
-you reach for most; `write` / `update` / `delete` are the individual CRUD
-letters for finer control. `full` is exactly `read write update delete
-mkdir rename`.
+The first five cover almost every policy. `write` never implies
+`mkdir` or `rename`.
 
-Three granular verbs exist for unusual policies:
+**The clobber rule.** `write` creates; `update` replaces. With `allow
+/pending read write`, a partner can drop new files but cannot
+overwrite, truncate, append to or rename over an existing one, so a
+submitted file cannot be quietly retracted. Add `update` for a feed
+that re-sends `daily.csv` every morning, and `delete` only if they
+should clean up.
 
-| Verb | Grants |
-| --- | --- |
-| `list` | stat and directory listing, without download (the rare inverse of `read`) |
-| `mkdir` | directory creation only |
-| `rename` | rename, checked on both source and destination |
+**Renames follow the object.** A rename needs `rename` at both paths,
+plus `update` to replace an existing target, and is denied if it would
+give the entry more access than it had. A directory rename checks every
+existing descendant at both paths, so a permitted parent cannot carry a
+denied child somewhere allowed; trees too large to scan fail closed.
 
-There are no aliases and no legacy spellings — every verb names exactly
-one capability, or (for `read` and `full`) one obvious bundle. In
-particular, `write` never silently grants directory creation: say
-`mkdir` or `full` when you want that.
-
-Rename authorization also follows the object. Zift rejects a file
-rename that would grant access the source path did not have. For a
-directory, it checks every existing descendant at the old and new paths,
-so a permitted parent rename cannot carry a denied child into an allowed
-subtree. The scan is bounded at 100,000 entries and 256 levels; larger
-trees fail closed.
-Namespace-changing SFTP operations are serialized with that scan so a
-second session cannot swap descendants between authorization and the
-rename syscall.
-
-`list` earns its place at the root of a partner tree. Bare patterns
-match by path-component prefix, so `allow / read` grants download over
-the *entire* jail. When you want a navigable root but intend to hand out
-download per subtree, name the root with `list` and let the subtrees
-carry `read`:
+**A browsable root.** A literal pattern covers everything below it, so
+`allow / read` grants download over the whole jail. To let a partner
+browse `/` but download only from named subtrees, give the root `list`:
 
 ```zift
 allow /                list
 allow /orders          read
-allow /results         read
 allow /orders/pending  write update delete rename
-allow /results/pending write update delete rename
 ```
 
-The partner can browse `/` and see that `orders` and `results` exist,
-but a directory that appears there later grants them nothing until you
-say so.
+A directory added under `/` later grants nothing until you say so.
 
-### The Clobber Rule
+## Patterns
 
-`write` creates; `update` modifies. They are deliberately separate.
+A pattern without `*` or `?` is a literal component prefix: `/pending`
+matches `/pending`, `/pending/a.csv` and `/pending/deep/a.csv`, but not
+`/pendingfoo`. `/` matches every path.
 
-Creating a **new** file needs `write`. Overwriting, truncating, or
-appending to a file that **already exists** additionally needs `update`
-— the "clobber" right. Splitting them lets you express two opposite
-intents a single write verb cannot.
+Any other pattern must match the whole path:
 
-With:
-
-```zift
-allow /pending read write
-```
-
-a partner can create new files under `/pending`, but cannot overwrite,
-truncate, append to, rename over, or delete an existing one — an
-append-only submit box (a claim, once dropped, cannot be quietly
-retracted).
-
-With:
-
-```zift
-allow /pending read write update
-```
-
-the partner can also replace their own files (the daily-resend case),
-but still cannot delete. Add `delete` for that, or use `full` for
-complete control of the subtree.
-
-## Pattern Matching
-
-Patterns match virtual paths, not host filesystem paths.
-
-Literal patterns are path-component prefix matches:
-
-```zift
-allow /pending read
-```
-
-matches:
-
-- `/pending`
-- `/pending/file.csv`
-- `/pending/deep/file.csv`
-
-It does not match:
-
-- `/pendingfoo`
-- `/pending-archive`
-
-Glob patterns support:
-
-| Pattern | Meaning |
+| Token | Matches |
 | --- | --- |
-| `*` | any sequence except `/` |
+| `*` | any run of characters except `/`, possibly empty |
 | `?` | one character except `/` |
-| `**` | any sequence including `/` |
+| `**` | any run of characters, `/` included |
+| `**/` | also nothing at all, so `/a/**/b` matches `/a/b` |
 
-Examples:
+Matching is case-sensitive and byte-exact apart from `?`, which takes
+one whole UTF-8 character.
 
-```zift
-deny /*.exe      # .exe files directly under the virtual root
-deny **.exe      # .exe files at any depth
-deny **/.ssh
-deny **/.ssh/**
-```
+Paths are normalized before matching: they start with `/` and have no
+`.`, `..`, empty or trailing components. A pattern that could never
+match such a path is rejected with `InvalidPattern`:
 
-`**/.ssh/**` does not match the directory `.ssh` itself, so READDIR of
-that directory can list names while OPEN of the key file stays denied.
+| Rejected | Write instead |
+| --- | --- |
+| `*.exe`, `secret` | `/*.exe` (top level) or `**.exe`, `**/secret` (any depth) |
+| `/dir/` | `/dir` |
+| `/a//b`, `/a/./b`, `/a/../b` | `/a/b` |
 
-Prefer explicit patterns over clever ones. The config language is meant
-to stay small.
+`/dir/**` matches everything below `/dir` but not `/dir` itself. So
+`deny **/.ssh/**` refuses every file under any `.ssh` directory, and
+because READDIR hides what STAT refuses, listing `.ssh` shows nothing.
+Add `deny **/.ssh` if the directory itself should be invisible too.
 
 ## Common Policies
 
-Drop zone: partner can upload new files but not overwrite or delete.
-
 ```zift
+# blind drop: upload new files, see nothing
+allow /incoming write
+
+# drop zone: browse, upload new files, never change or delete them
 allow / read
 allow /incoming write
-```
 
-Pickup directory: partner can download and delete after pickup, but not
-overwrite in place.
-
-```zift
+# recurring feed: may replace their own file, never delete
 allow / read
-allow /reports read delete
-```
+allow /feed write update
 
-Archive: partner can browse and download only.
-
-```zift
+# pickup: download, and delete after collection
 allow / read
-allow /archive read
-```
+allow /outgoing read delete
 
-Mutable workspace:
+# two-way exchange
+allow / read
+allow /incoming write
+allow /outgoing read delete
 
-```zift
+# workspace they fully manage
 allow /workspace full
+
+# reconcile a manifest without fetching contents
+allow / list
 ```
 
-Block common dangerous names everywhere. `**/.ssh/**` does not match
-the directory `.ssh` itself, so READDIR of that directory can list
-names while OPEN of the key file stays denied:
+Add carve-outs that must hold whatever else is granted:
 
 ```zift
-deny **/.ssh
-deny **/.ssh/**
 deny **.exe
+deny **/.ssh/**
+deny **/.git/**
 ```
-
-## Atomic Uploads
-
-New file uploads are staged under `<root>/.zift/staging/` and published
-with an atomic rename when the client closes the file handle.
-Processors watching a partner-visible directory therefore do not see
-half-uploaded files.
-
-`.zift` (and legacy `.zift-staging`) is reserved: hidden from listings
-and rejected in virtual paths. Use `publish-mode` for the final file
-mode after publish. Partner root and target directory must share one
-filesystem.
-
-Full namespace model, hardening, and caveats:
-[`security.md`](security.md). Upgrade notes for the v0.8.0 path change:
-[`operate.md`](operate.md).
-
-## SFTP Surface
-
-Zift speaks SFTP version 3. A client `INIT` version below 3 drops the
-session. A client version of 3 or higher is answered with version 3.
-It supports the request types needed for ordinary file transfer:
-
-- `REALPATH`
-- `STAT`, `LSTAT`, and `FSTAT`
-- `OPENDIR` and `READDIR`
-- `OPEN`, `READ`, `WRITE`, and `CLOSE`
-- `MKDIR`, `REMOVE`, `RMDIR`, and `RENAME`
-
-Unsupported operations such as `SETSTAT`, `FSETSTAT`, `READLINK`,
-`SYMLINK`, and `EXTENDED` return "operation unsupported" and the
-session continues. Clients that try to set mtime, chmod, chown, create
-symlinks, or use protocol extensions should treat those as unsupported
-features rather than transfer failures.
-
-Append writes are `O_APPEND` `write(2)` calls, not a stat of the size
-followed by `pwrite`.
 
 ## Reloads
 
-Zift reloads for new sessions when the `zift.conf` mtime or an
-authorized-key file's mtime moves forward, or immediately on `SIGHUP`.
-Existing sessions keep the snapshot they authenticated with. Invalid
-reloads are rejected; the previous config keeps serving. A reload
-whose status write or allocation fails does not exit the process.
+Zift checks the config file and every `auth` key file each
+`reload-interval`, and reloads when any of their size, mtime, ctime or
+inode changes. `SIGHUP` reloads at once, changed or not. A valid config
+applies to new sessions; sessions already open keep the config they
+logged in with until they end. An invalid one is rejected and the
+previous config keeps serving (see [`operate.md`](operate.md#reload)).
 
-A rejected reload is **loud**, not silent (0.10.1). The daemon marks
-itself degraded, logs `config reload rejected — SERVING PREVIOUS CONFIG`,
-and emits a structured `config.reload` audit event with `result:"failed"`
-into the audit stream — so a monitor watching the JSON log sees the
-divergence even though the process stays up and `systemctl is-active`
-still reports `active`. It stays degraded (on-disk and in-memory
-diverged) until a valid config loads, at which point it logs
-`config reload recovered` and emits a `config.reload` event with
-`result:"ok"`. The shipped systemd unit reinforces this on the manual
-path: `systemctl reload` runs `zift validate` first and **fails** if the
-on-disk config is invalid, so a bad edit is caught at reload time instead
-of on the next restart.
+Directories are not watched: after creating a partner root or fixing its
+mode, reload by hand. Write config changes atomically (write a
+temporary file and rename it into place), or a poll can read a half
+written file.
 
-`listen`, `host-key`, and `log` are bound once at startup and are
-**not** re-applied by a reload. If a reload changes one of them, Zift
-logs a warning naming the setting and keeps the value it started with —
-apply the change with a full restart. Everything else (users, rules,
-timeouts, connection caps, modes) applies to new sessions.
+`listen`, `host-key` and `log` are bound at startup. A reload that
+changes one logs a warning and keeps the old value; restart to apply
+it. Everything else applies to new sessions.
 
-Operator runbook (validate-then-HUP, mtime caveats, partner add/remove):
-[`operate.md`](operate.md).
+## SFTP Surface
+
+Zift speaks SFTP version 3 and refuses clients that offer less. It
+serves REALPATH, STAT, LSTAT, FSTAT, OPENDIR, READDIR, OPEN, READ,
+WRITE, CLOSE, MKDIR, REMOVE, RMDIR, RENAME, SETSTAT and FSETSTAT.
+READLINK, SYMLINK, hard links and every EXTENDED request return
+OP_UNSUPPORTED, and the session continues.
+
+- **Uploads are atomic.** A new file is written under
+  `<root>/.zift/staging/` and renamed into place when the client closes
+  it, so a processor watching the target directory never sees a partial
+  file. The partner root and the target must be on one filesystem.
+  Overwriting an existing file (with `update`) writes in place.
+- **SETSTAT and FSETSTAT set times only.** SETSTAT needs `update` on the
+  path and never follows a final symlink. FSETSTAT is allowed on the
+  partner's own write handle, so `put -p` works into a write-only drop.
+  Mode and owner changes are accepted and ignored, since host modes
+  belong to the daemon; a size change returns OP_UNSUPPORTED.
+- **Listings hide what the partner cannot stat.** READDIR skips any
+  entry STAT would refuse, `.zift`, and names with control bytes or
+  invalid UTF-8.
+- **Symlinks are not followed.** STAT reports a symlink as a symlink,
+  directory symlinks cannot be traversed, and OPEN of a symlink, FIFO,
+  socket or device is refused.
+- **A write-only partner learns nothing about what exists.** Without
+  `read` or `list`, a missing and an existing path get the same status.
+- Only a missing entry, or a file used as a directory, is NO_SUCH_FILE.
+  A server-side problem (out of descriptors, a host permission error) is
+  FAILURE, with the reason in the audit line.
+
+## Limits
+
+Fixed in the binary; none is configurable.
+
+| Limit | Value |
+| --- | --- |
+| Open handles per session | 256 |
+| SFTP packet | 256 KiB |
+| READ reply | 256 KiB − 13 bytes |
+| READDIR reply | about 64 KiB |
+| Virtual path | 4096 bytes |
+| File name shown in a listing | 255 bytes |
+| Directory rename scan | 100,000 entries, 256 levels |
+| Config file | 1 MiB |
+| Key file | 32 KiB, and 8 KiB per line |
+| Host key file | 64 KiB |
+| User name | 64 bytes |
+| Audit line | 4096 bytes (longer lines are clipped and marked `truncated`) |
+| Login grace, from accept to successful login | 120 s |
+| Hard auth failures per connection (bad password, `from` miss) | 6 |
+| Soft auth operations per connection (key offers, `none`, other messages) | 64 |
+| Backoff after the nth hard failure | 250 ms × n |
+| Source suppression | 10 hard failures within 10 min block the source for 15 min |
+| Pre-auth connections per source | 8 |
+| Concurrent password checks | CPU count, clamped to 2..8; 64 MiB each |
+| Non-auth messages before the SFTP subsystem | 64 |
+
+A source is an IPv4 address or an IPv6 /64. Abuse controls are described
+in [`security.md`](security.md#abuse-controls).
