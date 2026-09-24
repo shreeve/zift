@@ -66,7 +66,8 @@ zig build release -Dtarget=aarch64-macos
 
 Linux targets must be `-linux-musl`; a glibc target fails at once and
 names the musl target to use. The step works from any directory and
-with `--prefix`, and prints the artifact's sha256.
+with `--prefix` (then in `<prefix>/../release/`), and prints the
+artifact's sha256.
 
 ## Versioning
 
@@ -76,7 +77,8 @@ does with the tag minus its leading `v`. To release:
 
 1. Set `.version` in `build.zig.zon`.
 2. Rename `## Unreleased` in `CHANGELOG.md` to `## X.Y.Z — <date>`.
-3. Run the unit and integration tests.
+3. Run the unit and integration tests, and wait for CI on that commit
+   to pass: the release workflow runs unit tests only.
 4. Tag and push: `git tag -a vX.Y.Z -m "Zift X.Y.Z" && git push origin
    vX.Y.Z`.
 

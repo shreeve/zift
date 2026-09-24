@@ -66,12 +66,13 @@ AmbientCapabilities=
 # TCP over IPv4 and IPv6 only.
 RestrictAddressFamilies=AF_INET AF_INET6
 
-# Syscalls. EPERM, not SIGSYS: raising RLIMIT_NOFILE for a large
-# max-connections is blocked, and Zift then warns instead of dying.
+# Syscalls. A filtered call kills the process (SIGSYS), the loud default.
+# The last line re-allows raising the soft fd limit up to LimitNOFILE,
+# which needs no privilege and which ~@resources would otherwise take.
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 SystemCallFilter=~@resources
-SystemCallErrorNumber=EPERM
+SystemCallFilter=setrlimit prlimit64
 SystemCallArchitectures=native
 
 KeyringMode=private

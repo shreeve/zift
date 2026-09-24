@@ -174,10 +174,9 @@ fn writeLine(fd: c_int, line: []const u8) ?std.posix.E {
     return null;
 }
 
-/// Operator diagnostics go to stderr. Under `zig build test` they are
-/// expected, and printing them makes a passing run look failed.
+/// Best effort: a diagnostic that cannot be written is not worth failing
+/// an audit write over. (`sys.note` is silent under `zig build test`.)
 fn note(io: std.Io, comptime fmt: []const u8, args: anytype) void {
-    if (builtin.is_test) return;
     sys.note(io, fmt, args) catch {};
 }
 
