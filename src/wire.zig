@@ -102,14 +102,15 @@ pub fn replyFullAttrs(channel: c.ssh_channel, request_id: u32, info: listing.Ent
 }
 
 /// Send the `len` bytes the caller read into `frame[data_offset..]` as
-/// one DATA reply: one channel write, no copy.
+/// one DATA reply, without copying them. Unlike every other reply, it
+/// takes two channel writes, header then data: a 32 KiB read plus its
+/// 13-byte header would overflow OpenSSH's 32 KiB channel packet and
+/// trail a tiny one, which cost 8% on downloads.
 pub fn replyData(channel: c.ssh_channel, frame: []u8, request_id: u32, len: usize) !void {
     var w: PacketWriter = .{ .buf = frame };
     try w.putU8(@intCast(c.SSH_FXP_DATA));
     try w.putU32(request_id);
     try w.putU32(@intCast(len));
-    // Header and data as separate writes: a 32 KiB read plus its 13-byte
-    // header would overflow a 32 KiB channel packet and trail a tiny one.
     std.mem.writeInt(u32, frame[0..4], @intCast(w.index - 4 + len), .big);
     try writeAll(channel, frame[0..w.index]);
     try writeAll(channel, frame[w.index..][0..len]);
@@ -174,9 +175,9 @@ fn writeAll(channel: c.ssh_channel, bytes: []const u8) !void {
     }
 }
 
-/// Builds one packet, length prefix included, so each reply is a single
+/// Builds one packet, length prefix included, so a reply is a single
 /// channel write: libssh sends every write as its own SSH packet and
-/// flushes it.
+/// flushes it. `replyData` alone splits header from data, on purpose.
 pub const PacketWriter = struct {
     buf: []u8,
     /// Past the length prefix, which `send` fills in.
