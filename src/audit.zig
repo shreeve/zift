@@ -27,9 +27,12 @@
 //! destinations we additionally open with `O_APPEND` so each `write(2)`
 //! is positioned atomically by the kernel; this matters under
 //! logrotate's "rename old, signal, recreate" sequence and under any
-//! other writer touching the same path.
+//! other writer touching the same path. The final component is opened
+//! `O_NOFOLLOW`; a symlink or any non-regular inode is refused. Mode
+//! `0640` is pinned with `fchmod` only when this call created the file.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("config.zig");
 const signals = @import("signals.zig");
 
@@ -60,6 +63,16 @@ pub const Sink = struct {
     /// Stable storage for the file-target path so the Sink owns its
     /// strings — the config snapshot may be torn down underneath us.
     owned_path: ?[]const u8 = null,
+    /// Monotonic ms when a failed reopen may be tried again. 0 means
+    /// no retry is pending. A failed SIGUSR1 must not put
+    /// `log_reopen_requested` back: that retries on every audit line
+    /// and writes a stderr line per event. The deadline is one
+    /// `warn_min_interval_ms` out, and `maybeReopen` honors it even
+    /// when no new signal has arrived.
+    reopen_retry_at_ms: std.atomic.Value(i64) = .init(0),
+    /// Monotonic ms of the last reopen-failure stderr line. Guarded
+    /// by `mutex`. 0 means a failure has not been reported yet.
+    last_reopen_warn_ms: i64 = 0,
 
     pub fn initFromConfig(
         allocator: std.mem.Allocator,
@@ -93,26 +106,60 @@ pub const Sink = struct {
     /// log-rotator thread. Lazy semantics: a low-traffic server with
     /// SIGUSR1 pending holds the old fd open until the next audit
     /// line; logrotate operators should account for that.
+    ///
+    /// On open failure the old fd stays in use (the line is not
+    /// dropped and is not written twice). The retry deadline, not the
+    /// signal flag, schedules the next attempt.
     fn maybeReopen(self: *Sink, io: std.Io) void {
-        if (!signals.log_reopen_requested.swap(false, .acq_rel)) return;
+        const signaled = signals.log_reopen_requested.load(.acquire);
+        const retry_at = self.reopen_retry_at_ms.load(.acquire);
+        if (!signaled) {
+            if (retry_at == 0 or nowMonotonicMs() < retry_at) return;
+        }
 
         // Only file targets have a fd to reopen; stderr is always open.
         const path = switch (self.target) {
-            .stderr => return,
+            .stderr => {
+                _ = signals.log_reopen_requested.swap(false, .acq_rel);
+                self.reopen_retry_at_ms.store(0, .release);
+                return;
+            },
             .file => |p| p,
         };
 
         self.mutex.lockUncancelable(io);
-        const new_fd = openLogFile(path) catch |err| {
+        // Consume the signal inside the mutex so two writers cannot
+        // both open. A signal that arrives during the open stays set
+        // and is honored on the next line.
+        const signaled_now = signals.log_reopen_requested.swap(false, .acq_rel);
+        const now = nowMonotonicMs();
+        const retry_at_now = self.reopen_retry_at_ms.load(.acquire);
+        if (!signaled_now and (retry_at_now == 0 or now < retry_at_now)) {
             self.mutex.unlock(io);
-            writeStderrRaw("zift: audit log reopen failed: ");
-            writeStderrRaw(@errorName(err));
-            writeStderrRaw("\n");
+            return;
+        }
+
+        const new_fd = openLogFile(path) catch |err| {
+            const failed_at = nowMonotonicMs();
+            self.reopen_retry_at_ms.store(failed_at + warn_min_interval_ms, .release);
+            const warn = self.last_reopen_warn_ms == 0 or
+                failed_at - self.last_reopen_warn_ms >= warn_min_interval_ms;
+            if (warn) self.last_reopen_warn_ms = failed_at;
+            self.mutex.unlock(io);
+            if (warn) {
+                writeStderrRaw("zift: audit log reopen failed: ");
+                writeStderrRaw(@errorName(err));
+                writeStderrRaw("\n");
+            }
             return;
         };
+
+        self.reopen_retry_at_ms.store(0, .release);
         const old_fd = self.fd.swap(new_fd, .acq_rel);
         self.mutex.unlock(io);
 
+        // Close only after the swap. `log` writes the audit line after
+        // we return, so the line hits the new fd and not both.
         if (old_fd >= 0) _ = std.c.close(old_fd);
         writeStderrRaw("zift: audit log reopened\n");
     }
@@ -202,17 +249,69 @@ fn openLogFile(path: []const u8) !c_int {
     if (path.len >= path_z.len) return error.PathTooLong;
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
+    const path_c: [*:0]const u8 = @ptrCast(&path_z);
 
-    const flags: std.posix.O = .{
+    const mode: std.posix.mode_t = 0o640;
+    // EXCL distinguishes "this call created the inode" from "it was
+    // already there". O_CREAT|O_EXCL on a final-component symlink
+    // returns EEXIST (Linux) rather than following it, so the NOFOLLOW
+    // open below is what actually rejects the symlink. A pre-existing
+    // regular file is appended to and not fchmod'd.
+    const created = std.c.open(path_c, .{
         .ACCMODE = .WRONLY,
         .APPEND = true,
         .CREAT = true,
+        .EXCL = true,
         .CLOEXEC = true,
-    };
-    const mode: std.posix.mode_t = 0o640;
-    const fd = std.c.open(@ptrCast(&path_z), flags, mode);
-    if (fd < 0) return error.OpenFailed;
+        .NOFOLLOW = true,
+    }, mode);
+    if (created >= 0) {
+        if (!fdIsRegularFile(created) or std.c.fchmod(created, mode) != 0) {
+            _ = std.c.close(created);
+            return error.OpenFailed;
+        }
+        return created;
+    }
+    if (std.posix.errno(created) != .EXIST) return error.OpenFailed;
+
+    const fd = std.c.open(path_c, .{
+        .ACCMODE = .WRONLY,
+        .APPEND = true,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    });
+    if (fd < 0 or !fdIsRegularFile(fd)) {
+        if (fd >= 0) _ = std.c.close(fd);
+        return error.OpenFailed;
+    }
     return fd;
+}
+
+/// Mode bits of an already-open fd, or null when stat fails.
+/// `std.c.fstat` is empty on Linux (no stable libc stat layout); statx
+/// with `AT_EMPTY_PATH` is the fd stat that build already uses elsewhere.
+fn fdFileMode(fd: c_int) ?u32 {
+    if (builtin.os.tag == .linux) {
+        var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
+        const mask: std.os.linux.STATX = .{
+            .TYPE = true,
+            .MODE = true,
+        };
+        const empty: [*:0]const u8 = "";
+        const at_empty: u32 = @intCast(std.posix.AT.EMPTY_PATH);
+        const rc = std.os.linux.statx(fd, empty, at_empty, mask, &sx);
+        if (std.os.linux.errno(rc) != .SUCCESS) return null;
+        return sx.mode;
+    } else {
+        var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
+        if (std.c.fstat(fd, &st) != 0) return null;
+        return st.mode;
+    }
+}
+
+fn fdIsRegularFile(fd: c_int) bool {
+    const mode = fdFileMode(fd) orelse return false;
+    return std.posix.S.ISREG(mode);
 }
 
 // ----- process-wide singleton ----------------------------------------------
@@ -638,4 +737,269 @@ test "audit line truncates detail when over the line cap" {
     try std.testing.expect(std.mem.indexOf(u8, line, "\"truncated\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"ip\":\"10.0.0.1\"") != null);
     try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
+}
+
+test "openLogFile refuses symlinks and non-regular files and pins 0640 only on create" {
+    const io = std.testing.io;
+    const Probe = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.posix.mode_t) c_int;
+
+        fn join(buf: []u8, parent: []const u8, name: []const u8) [:0]u8 {
+            const n = parent.len + 1 + name.len;
+            std.debug.assert(n < buf.len);
+            @memcpy(buf[0..parent.len], parent);
+            buf[parent.len] = '/';
+            @memcpy(buf[parent.len + 1 ..][0..name.len], name);
+            buf[n] = 0;
+            return buf[0..n :0];
+        }
+
+        fn perm(path: [*:0]const u8) !u32 {
+            if (builtin.os.tag == .linux) {
+                var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
+                const mask: std.os.linux.STATX = .{ .TYPE = true, .MODE = true };
+                const flags: u32 = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
+                const rc = std.os.linux.statx(std.posix.AT.FDCWD, path, flags, mask, &sx);
+                if (std.os.linux.errno(rc) != .SUCCESS) return error.TestUnexpectedResult;
+                return @as(u32, sx.mode) & 0o777;
+            } else {
+                var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
+                const flags: u32 = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
+                if (std.c.fstatat(std.posix.AT.FDCWD, path, &st, flags) != 0) return error.TestUnexpectedResult;
+                return @as(u32, st.mode) & 0o777;
+            }
+        }
+
+        fn fdPerm(fd: c_int) !u32 {
+            const mode = fdFileMode(fd) orelse return error.TestUnexpectedResult;
+            return mode & 0o777;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "d", .default_dir);
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPathFile(io, "d", &dir_buf);
+    const dir = dir_buf[0..dir_len];
+
+    {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = Probe.join(&buf, dir, "created.log");
+        // umask 077 would leave the open() mode at 0600. fchmod is what
+        // pins 0640, and only for the inode this call creates.
+        const old_mask = std.c.umask(0o077);
+        defer _ = std.c.umask(old_mask);
+        const fd = try openLogFile(path);
+        defer _ = std.c.close(fd);
+        try std.testing.expectEqual(@as(u32, 0o640), try Probe.fdPerm(fd));
+        try std.testing.expectEqual(@as(isize, 3), std.c.write(fd, "new", 3));
+    }
+    {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = Probe.join(&buf, dir, "created.log");
+        try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(path, 0o604));
+        const fd = try openLogFile(path);
+        defer _ = std.c.close(fd);
+        // Pre-existing regular file: append, do not fchmod back to 0640.
+        try std.testing.expectEqual(@as(u32, 0o604), try Probe.fdPerm(fd));
+        try std.testing.expectEqual(@as(isize, 3), std.c.write(fd, "end", 3));
+    }
+    {
+        var got: [16]u8 = undefined;
+        const body = try tmp.dir.readFile(io, "d/created.log", &got);
+        try std.testing.expectEqualStrings("newend", body);
+    }
+
+    {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = Probe.join(&buf, dir, "existing.log");
+        const raw = std.c.open(path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+            .CLOEXEC = true,
+            .NOFOLLOW = true,
+        }, @as(std.posix.mode_t, 0o600));
+        try std.testing.expect(raw >= 0);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(raw, 0o600));
+        try std.testing.expectEqual(@as(isize, 3), std.c.write(raw, "old", 3));
+        _ = std.c.close(raw);
+        const fd = try openLogFile(path);
+        defer _ = std.c.close(fd);
+        try std.testing.expectEqual(@as(u32, 0o600), try Probe.fdPerm(fd));
+        try std.testing.expectEqual(@as(isize, 3), std.c.write(fd, "NEW", 3));
+    }
+    {
+        var got: [16]u8 = undefined;
+        const body = try tmp.dir.readFile(io, "d/existing.log", &got);
+        try std.testing.expectEqualStrings("oldNEW", body);
+    }
+
+    {
+        var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const target = Probe.join(&target_buf, dir, "target.log");
+        const raw = std.c.open(target, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+            .CLOEXEC = true,
+            .NOFOLLOW = true,
+        }, @as(std.posix.mode_t, 0o600));
+        try std.testing.expect(raw >= 0);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(raw, 0o600));
+        try std.testing.expectEqual(@as(isize, 4), std.c.write(raw, "safe", 4));
+        _ = std.c.close(raw);
+
+        var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const link = Probe.join(&link_buf, dir, "link.log");
+        try tmp.dir.symLink(io, target, "d/link.log", .{});
+        try std.testing.expectError(error.OpenFailed, openLogFile(link));
+        try std.testing.expectEqual(@as(u32, 0o600), try Probe.perm(target));
+        var got: [16]u8 = undefined;
+        const body = try tmp.dir.readFile(io, "d/target.log", &got);
+        try std.testing.expectEqualStrings("safe", body);
+    }
+
+    try tmp.dir.createDir(io, "d/subdir", .default_dir);
+    {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = Probe.join(&buf, dir, "subdir");
+        try std.testing.expectError(error.OpenFailed, openLogFile(path));
+    }
+
+    const devnull_before = try Probe.perm("/dev/null");
+    try std.testing.expectError(error.OpenFailed, openLogFile("/dev/null"));
+    try std.testing.expectEqual(devnull_before, try Probe.perm("/dev/null"));
+
+    {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = Probe.join(&buf, dir, "audit.fifo");
+        try std.testing.expectEqual(@as(c_int, 0), Probe.mkfifo(path, 0o640));
+        try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(path, 0o612));
+        const Reader = struct {
+            fn run(fifo: [*:0]const u8) void {
+                const fd = std.c.open(fifo, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+                if (fd < 0) return;
+                var scratch: [8]u8 = undefined;
+                _ = std.c.read(fd, &scratch, scratch.len);
+                _ = std.c.close(fd);
+            }
+        };
+        const thr = try std.Thread.spawn(.{}, Reader.run, .{path});
+        defer thr.join();
+        // Open succeeds far enough to unblock the reader, then fstat
+        // rejects the fifo. A hang here means the writer never opened.
+        try std.testing.expectError(error.OpenFailed, openLogFile(path));
+        try std.testing.expectEqual(@as(u32, 0o612), try Probe.perm(path));
+    }
+}
+
+test "failed audit reopen retries on a deadline without a stderr storm" {
+    const io = std.testing.io;
+    const saved_flag = signals.log_reopen_requested.load(.acquire);
+    defer signals.log_reopen_requested.store(saved_flag, .release);
+    signals.log_reopen_requested.store(false, .release);
+
+    const Paths = struct {
+        fn join(buf: []u8, parent: []const u8, name: []const u8) [:0]u8 {
+            const n = parent.len + 1 + name.len;
+            std.debug.assert(n < buf.len);
+            @memcpy(buf[0..parent.len], parent);
+            buf[parent.len] = '/';
+            @memcpy(buf[parent.len + 1 ..][0..name.len], name);
+            buf[n] = 0;
+            return buf[0..n :0];
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "d", .default_dir);
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPathFile(io, "d", &dir_buf);
+    const dir = dir_buf[0..dir_len];
+
+    var audit_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const audit_path = Paths.join(&audit_buf, dir, "audit.jsonl");
+    var kept_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const kept_path = Paths.join(&kept_buf, dir, "kept.jsonl");
+    var other_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const other_path = Paths.join(&other_buf, dir, "other.jsonl");
+
+    var sink = try Sink.initFromConfig(std.testing.allocator, .{ .file = audit_path });
+    defer sink.deinit(std.testing.allocator);
+    const original_fd = sink.fd.load(.acquire);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.link(audit_path, kept_path));
+
+    sink.log(io, "u", "before-fail", null, .ok, "", "203.0.113.9");
+    try tmp.dir.deleteFile(io, "d/audit.jsonl");
+    {
+        const other_fd = try openLogFile(other_path);
+        _ = std.c.close(other_fd);
+    }
+    try tmp.dir.symLink(io, other_path, "d/audit.jsonl", .{});
+
+    signals.log_reopen_requested.store(true, .release);
+    sink.log(io, "u", "during-fail", null, .ok, "", "203.0.113.9");
+    try std.testing.expectEqual(original_fd, sink.fd.load(.acquire));
+    try std.testing.expect(sink.last_reopen_warn_ms != 0);
+    const warned_at = sink.last_reopen_warn_ms;
+    const retry_at = sink.reopen_retry_at_ms.load(.acquire);
+    try std.testing.expect(retry_at >= nowMonotonicMs());
+    try std.testing.expect(!signals.log_reopen_requested.load(.acquire));
+
+    // Deadline still ahead and no new signal: leave the fd alone.
+    sink.maybeReopen(io);
+    try std.testing.expectEqual(retry_at, sink.reopen_retry_at_ms.load(.acquire));
+    try std.testing.expectEqual(warned_at, sink.last_reopen_warn_ms);
+    try std.testing.expectEqual(original_fd, sink.fd.load(.acquire));
+
+    // A fresh SIGUSR1 retries immediately but must not warn again.
+    const sentinel = nowMonotonicMs() + 1_000_000;
+    sink.reopen_retry_at_ms.store(sentinel, .release);
+    signals.log_reopen_requested.store(true, .release);
+    sink.maybeReopen(io);
+    try std.testing.expect(!signals.log_reopen_requested.load(.acquire));
+    try std.testing.expect(sink.reopen_retry_at_ms.load(.acquire) < sentinel);
+    try std.testing.expectEqual(warned_at, sink.last_reopen_warn_ms);
+    try std.testing.expectEqual(original_fd, sink.fd.load(.acquire));
+
+    // Deadline alone retries, still inside the warn window.
+    sink.reopen_retry_at_ms.store(nowMonotonicMs() - 1, .release);
+    sink.maybeReopen(io);
+    const after_deadline = sink.reopen_retry_at_ms.load(.acquire);
+    const now = nowMonotonicMs();
+    try std.testing.expect(after_deadline >= now);
+    try std.testing.expect(after_deadline <= now + warn_min_interval_ms);
+    try std.testing.expectEqual(warned_at, sink.last_reopen_warn_ms);
+    try std.testing.expectEqual(original_fd, sink.fd.load(.acquire));
+
+    var kept_read: [2048]u8 = undefined;
+    const kept_body = try tmp.dir.readFile(io, "d/kept.jsonl", &kept_read);
+    try std.testing.expect(std.mem.indexOf(u8, kept_body, "\"operation\":\"before-fail\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept_body, "\"operation\":\"during-fail\"") != null);
+    var other_read: [256]u8 = undefined;
+    const other_body = try tmp.dir.readFile(io, "d/other.jsonl", &other_read);
+    try std.testing.expect(std.mem.indexOf(u8, other_body, "during-fail") == null);
+
+    try tmp.dir.deleteFile(io, "d/audit.jsonl");
+    sink.reopen_retry_at_ms.store(nowMonotonicMs() - 1, .release);
+    signals.log_reopen_requested.store(false, .release);
+    sink.log(io, "u", "after-ok", null, .ok, "", "203.0.113.9");
+
+    const new_fd = sink.fd.load(.acquire);
+    try std.testing.expect(new_fd >= 0 and new_fd != original_fd);
+    try std.testing.expectEqual(@as(i64, 0), sink.reopen_retry_at_ms.load(.acquire));
+    try std.testing.expect(std.c.write(original_fd, "x", 1) < 0);
+
+    var new_read: [2048]u8 = undefined;
+    const new_body = try tmp.dir.readFile(io, "d/audit.jsonl", &new_read);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "\"operation\":\"after-ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "during-fail") == null);
+    try std.testing.expect(std.mem.indexOf(u8, new_body, "before-fail") == null);
+    var kept_again_buf: [2048]u8 = undefined;
+    const kept_again = try tmp.dir.readFile(io, "d/kept.jsonl", &kept_again_buf);
+    try std.testing.expect(std.mem.indexOf(u8, kept_again, "\"operation\":\"after-ok\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kept_again, "\"operation\":\"during-fail\"") != null);
 }
