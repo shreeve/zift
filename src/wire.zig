@@ -236,6 +236,8 @@ pub fn parseString(payload: []const u8) !ParsedString {
 /// the times, the extensions, are not needed.
 pub const SetAttrs = struct {
     size: bool,
+    /// Permissions or owners, which are ignored but worth an audit note.
+    mode_or_owner: bool,
     /// atime, mtime.
     times: ?[2]u32,
 };
@@ -252,7 +254,11 @@ pub fn parseSetAttrs(payload: []const u8) !SetAttrs {
     if (has(flags, c.SSH_FILEXFER_ATTR_SIZE)) offset += 8;
     if (has(flags, c.SSH_FILEXFER_ATTR_UIDGID)) offset += 8;
     if (has(flags, c.SSH_FILEXFER_ATTR_PERMISSIONS)) offset += 4;
-    var result: SetAttrs = .{ .size = has(flags, c.SSH_FILEXFER_ATTR_SIZE), .times = null };
+    var result: SetAttrs = .{
+        .size = has(flags, c.SSH_FILEXFER_ATTR_SIZE),
+        .mode_or_owner = has(flags, c.SSH_FILEXFER_ATTR_UIDGID) or has(flags, c.SSH_FILEXFER_ATTR_PERMISSIONS),
+        .times = null,
+    };
     if (has(flags, c.SSH_FILEXFER_ATTR_ACMODTIME)) {
         if (payload.len < offset + 8) return error.LibsshFailure;
         result.times = .{
@@ -324,6 +330,7 @@ test "parseSetAttrs: skips size, owner and mode to reach the times" {
     std.mem.writeInt(u32, buf[20..24], 2000, .big);
     const got = try parseSetAttrs(buf[0..24]);
     try testing.expect(!got.size);
+    try testing.expect(got.mode_or_owner);
     try testing.expectEqual([2]u32{ 1000, 2000 }, got.times.?);
     try testing.expectError(error.LibsshFailure, parseSetAttrs(buf[0..23]));
 
@@ -331,5 +338,6 @@ test "parseSetAttrs: skips size, owner and mode to reach the times" {
     try testing.expectError(error.LibsshFailure, parseSetAttrs(buf[0..11]));
     const size_only = try parseSetAttrs(buf[0..12]);
     try testing.expect(size_only.size);
+    try testing.expect(!size_only.mode_or_owner);
     try testing.expectEqual(null, size_only.times);
 }

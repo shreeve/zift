@@ -878,30 +878,39 @@ const SftpState = struct {
         return c.SSH_FX_OK;
     }
 
-    /// SETSTAT sets times where the partner holds `update`.
+    /// SETSTAT sets times where the partner holds `update`. A request
+    /// with nothing to set gets the same checks, so its OK never vouches
+    /// for a path the partner may not change or that does not exist.
     fn handleSetstat(self: *SftpState, request_id: u32, payload: []const u8) !void {
         var buf: PathBuf = undefined;
         const arg = (try self.pathArg(request_id, payload, &buf)) orelse return;
         const path = arg.value;
-        const times = (try self.requestedTimes(request_id, arg.rest)) orelse return;
+        const request = (try self.setRequest(request_id, arg.rest)) orelse return;
         if (policy.check(self.user, .update, path) == .deny) return self.deny(request_id, "setstat", path);
         var parent = (try self.parentOrReply(request_id, "setstat", path)) orelse return;
         defer parent.deinit(self.io, self.allocator);
 
-        setTimesAt(parent.parent.handle, parent.base, &times) catch |err| {
-            return self.fsFailure(request_id, "setstat", path, err);
-        };
-        defer self.auditLog("setstat", path, .ok, "");
+        if (request.times) |*times| {
+            setTimesAt(parent.parent.handle, parent.base, times) catch |err| {
+                return self.fsFailure(request_id, "setstat", path, err);
+            };
+        } else {
+            _ = listing.statAt(parent.parent.handle, parent.base) catch |err| {
+                return self.fsFailure(request_id, "setstat", path, err);
+            };
+        }
+        defer self.auditLog("setstat", path, .ok, request.detail());
         try self.status(request_id, c.SSH_FX_OK);
     }
 
     /// FSETSTAT sets times on a write handle, which already holds
     /// `update` or is the partner's own new upload, or on any handle whose
-    /// path the partner holds `update` on.
+    /// path the partner holds `update` on. A request with nothing to set
+    /// passes the same check first.
     fn handleFsetstat(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const id = wire.parseHandleId(payload) catch return self.status(request_id, c.SSH_FX_BAD_MESSAGE);
         const handle = self.findHandle(id) orelse return self.status(request_id, c.SSH_FX_INVALID_HANDLE);
-        const times = (try self.requestedTimes(request_id, payload[8..])) orelse return;
+        const request = (try self.setRequest(request_id, payload[8..])) orelse return;
         const writable = switch (handle.kind) {
             .file => |f| f.can_write,
             .dir => false,
@@ -910,22 +919,35 @@ const SftpState = struct {
             return self.deny(request_id, "fsetstat", handle.vpath);
         }
 
-        const fd = switch (handle.kind) {
-            .file => |f| f.file.handle,
-            .dir => |d| d.dir.handle,
-        };
-        if (std.c.futimens(fd, &times) != 0) {
-            return self.reject(request_id, c.SSH_FX_FAILURE, "fsetstat", handle.vpath, @tagName(std.posix.errno(-1)));
+        if (request.times) |*times| {
+            const fd = switch (handle.kind) {
+                .file => |f| f.file.handle,
+                .dir => |d| d.dir.handle,
+            };
+            if (std.c.futimens(fd, times) != 0) {
+                return self.reject(request_id, c.SSH_FX_FAILURE, "fsetstat", handle.vpath, @tagName(std.posix.errno(-1)));
+            }
         }
-        defer self.auditLog("fsetstat", handle.vpath, .ok, "");
+        defer self.auditLog("fsetstat", handle.vpath, .ok, request.detail());
         try self.status(request_id, c.SSH_FX_OK);
     }
 
-    /// The atime and mtime a SETSTAT or FSETSTAT asks for, or null after
-    /// replying. Permissions and owners are ignored, since host modes
-    /// belong to the daemon, so a request without times is a successful
-    /// no-op. Changing the size is not supported.
-    fn requestedTimes(self: *SftpState, request_id: u32, attrs: []const u8) !?[2]std.c.timespec {
+    /// What a SETSTAT or FSETSTAT will act on.
+    const SetRequest = struct {
+        /// atime, mtime.
+        times: ?[2]std.c.timespec,
+        /// Permissions or owners were asked for. They are ignored, since
+        /// host modes belong to the daemon, and the request still succeeds.
+        mode_or_owner: bool,
+
+        fn detail(request: SetRequest) []const u8 {
+            return if (request.mode_or_owner) "mode/owner ignored" else "";
+        }
+    };
+
+    /// Parse a SETSTAT or FSETSTAT attribute block, or reply and return
+    /// null. Changing the size is not supported.
+    fn setRequest(self: *SftpState, request_id: u32, attrs: []const u8) !?SetRequest {
         const parsed = wire.parseSetAttrs(attrs) catch {
             try self.status(request_id, c.SSH_FX_BAD_MESSAGE);
             return null;
@@ -934,11 +956,11 @@ const SftpState = struct {
             try self.status(request_id, c.SSH_FX_OP_UNSUPPORTED);
             return null;
         }
-        const times = parsed.times orelse {
-            try self.status(request_id, c.SSH_FX_OK);
-            return null;
-        };
-        return .{ .{ .sec = times[0], .nsec = 0 }, .{ .sec = times[1], .nsec = 0 } };
+        const times: ?[2]std.c.timespec = if (parsed.times) |t|
+            .{ .{ .sec = t[0], .nsec = 0 }, .{ .sec = t[1], .nsec = 0 } }
+        else
+            null;
+        return .{ .times = times, .mode_or_owner = parsed.mode_or_owner };
     }
 
     fn handleMkdir(self: *SftpState, request_id: u32, payload: []const u8) !void {

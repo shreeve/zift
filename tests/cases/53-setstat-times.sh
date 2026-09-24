@@ -59,6 +59,12 @@ sftp.chmod("/inbox/p.txt", 0o777)
 if stat.S_IMODE(st("/inbox/p.txt").st_mode) != before:
     fail("chmod changed the host mode")
 ok("SETSTAT of permissions is a no-op that succeeds")
+# Nothing is set, but the answer is still the one times would get.
+expect("SETSTAT of permissions without update", "denied", sftp.chmod, "/ro/file.txt", 0o777)
+expect("SETSTAT of owners without update", "denied", sftp.chown, "/ro/file.txt", 0, 0)
+expect("SETSTAT of permissions on a missing file", "missing", sftp.chmod, "/inbox/missing.txt", 0o777)
+expect("SETSTAT of permissions in a write-only drop", "denied", sftp.chmod, "/drop/p.txt", 0o777)
+expect("SETSTAT of permissions on a missing file in a write-only drop", "denied", sftp.chmod, "/drop/missing.txt", 0o777)
 expect("SETSTAT of size", "failure", sftp.truncate, "/inbox/p.txt", 0)
 if st("/inbox/p.txt").st_size == 0:
     fail("truncate changed the size")
@@ -78,10 +84,17 @@ if int(st("/inbox/p.txt").st_mtime) != 1200000000:
     fail("FSETSTAT on a read handle under update did not set mtime")
 with sftp.open("/ro/file.txt", "r") as f:
     expect("FSETSTAT on a read handle without update", "denied", f.utime, (3, 4))
+    expect("FSETSTAT of permissions on a read handle without update", "denied", f.chmod, 0o777)
     expect("FSETSTAT of size", "failure", f.truncate, 0)
+with sftp.open("/inbox/p.txt", "r") as f:
+    expect("FSETSTAT of permissions on a read handle under update", "ok", f.chmod, 0o777)
 ok("FSETSTAT follows the same rules on read handles")
 EOF
 
 log_contains '"operation":"fsetstat","result":"ok","path":"/drop/p.txt"' || fail "no fsetstat audit line for the drop upload"
 log_contains '"operation":"setstat","result":"denied","path":"/ro/file.txt"' || fail "no denied setstat audit line"
+log_contains '"operation":"setstat","result":"ok","path":"/inbox/p.txt","detail":"mode/owner ignored"' \
+    || fail "no setstat audit line for the ignored chmod"
+log_contains '"operation":"fsetstat","result":"ok","path":"/inbox/p.txt","detail":"mode/owner ignored"' \
+    || fail "no fsetstat audit line for the ignored chmod"
 ok "SETSTAT and FSETSTAT are audited"
