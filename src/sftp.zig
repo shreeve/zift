@@ -42,6 +42,14 @@ fn namespaceLockFor(root: []const u8) *std.Io.Mutex {
 var staging_live_mutex: std.Io.Mutex = .init;
 var staging_live: std.ArrayList([32]u8) = .empty;
 
+/// Caller holds `staging_live_mutex`.
+fn stagingLiveIndex(name: []const u8) ?usize {
+    for (staging_live.items, 0..) |*live, i| {
+        if (std.mem.eql(u8, live, name)) return i;
+    }
+    return null;
+}
+
 /// Ignored SSH messages tolerated before the sftp subsystem is accepted.
 const max_ignored_pre_subsystem: u32 = 64;
 
@@ -78,12 +86,10 @@ pub fn acceptSftpSubsystem(session: c.ssh_session) !c.ssh_channel {
         {
             channel = c.ssh_message_channel_request_open_reply_accept(msg);
             if (channel != null) continue;
-            try noteIgnoredPreSubsystem(&ignored);
-            continue;
+        } else {
+            _ = c.ssh_message_reply_default(msg);
         }
-
         try noteIgnoredPreSubsystem(&ignored);
-        _ = c.ssh_message_reply_default(msg);
     }
 
     while (true) {
@@ -282,11 +288,9 @@ const SftpState = struct {
                     // libssh turns every SSH_MSG_DISCONNECT into SSH_FATAL, so
                     // a client's ordinary goodbye (reason 11, how GUI clients
                     // close) lands here. Only that code counts as a clean end.
-                    if (disconnectReason(lib_msg)) |code| {
-                        if (code == ssh2_disconnect_by_application) {
-                            self.emitSessionEnded("client disconnected", .ok);
-                            return;
-                        }
+                    if (disconnectReason(lib_msg) == ssh2_disconnect_by_application) {
+                        self.emitSessionEnded("client disconnected", .ok);
+                        return;
                     }
 
                     lw.writeAll(lib_msg) catch {};
@@ -349,7 +353,7 @@ const SftpState = struct {
     /// Reply PERMISSION_DENIED, then audit it. Audits follow the reply so
     /// a slow audit destination never delays the client.
     fn deny(self: *SftpState, request_id: u32, op: []const u8, vpath: ?[]const u8) !void {
-        defer self.auditDenied(op, vpath);
+        defer self.auditLog(op, vpath, .denied, "");
         return self.status(request_id, c.SSH_FX_PERMISSION_DENIED);
     }
 
@@ -357,7 +361,7 @@ const SftpState = struct {
     /// failed with `detail`.
     fn reject(self: *SftpState, request_id: u32, code: c_int, op: []const u8, vpath: ?[]const u8, detail: []const u8) !void {
         if (code == c.SSH_FX_PERMISSION_DENIED) return self.deny(request_id, op, vpath);
-        defer self.auditFailed(op, vpath, detail);
+        defer self.auditLog(op, vpath, .failed, detail);
         return self.status(request_id, code);
     }
 
@@ -369,16 +373,8 @@ const SftpState = struct {
         return self.status(request_id, code);
     }
 
-    fn auditOk(self: *SftpState, op: []const u8, vpath: ?[]const u8, detail: []const u8) void {
-        audit.log(self.io, self.user.name, op, vpath, .ok, detail, self.peer_ip);
-    }
-
-    fn auditDenied(self: *SftpState, op: []const u8, vpath: ?[]const u8) void {
-        audit.log(self.io, self.user.name, op, vpath, .denied, "", self.peer_ip);
-    }
-
-    fn auditFailed(self: *SftpState, op: []const u8, vpath: ?[]const u8, detail: []const u8) void {
-        audit.log(self.io, self.user.name, op, vpath, .failed, detail, self.peer_ip);
+    fn auditLog(self: *SftpState, op: []const u8, vpath: ?[]const u8, result: audit.Result, detail: []const u8) void {
+        audit.log(self.io, self.user.name, op, vpath, result, detail, self.peer_ip);
     }
 
     /// Parse and normalize a path argument into `buf`, or reply and return
@@ -519,7 +515,7 @@ const SftpState = struct {
         const id = self.addHandle(path, .{ .dir = .{ .dir = dir, .iter = dir.iterate() } }) catch |err| {
             return self.reject(request_id, c.SSH_FX_FAILURE, "opendir", path, @errorName(err));
         };
-        defer self.auditOk("opendir", path, "");
+        defer self.auditLog("opendir", path, .ok, "");
         try wire.replyHandle(self.channel, request_id, id);
     }
 
@@ -661,7 +657,7 @@ const SftpState = struct {
             .can_write = want_write,
             .is_append = want_append,
         } }) catch |err| return self.reject(request_id, c.SSH_FX_FAILURE, op, path, @errorName(err));
-        defer self.auditOk(op, path, "");
+        defer self.auditLog(op, path, .ok, "");
         try wire.replyHandle(self.channel, request_id, id);
     }
 
@@ -703,18 +699,6 @@ const SftpState = struct {
             self.unregisterStagingName(&name);
             return self.reject(request_id, c.SSH_FX_FAILURE, op, path, "staging create failed");
         };
-        const setup_failure: ?[]const u8 = blk: {
-            file.setPermissions(self.io, permissions) catch break :blk "staging chmod failed";
-            if (want_append) setFdFlags(file.handle, true) catch break :blk "append flag failed";
-            break :blk null;
-        };
-        if (setup_failure) |detail| {
-            file.close(self.io);
-            staging.deleteFile(self.io, &name) catch {};
-            self.unregisterStagingName(&name);
-            return self.reject(request_id, c.SSH_FX_FAILURE, op, path, detail);
-        }
-
         const id = self.addHandle(path, .{ .file = .{
             .file = file,
             .can_read = want_read,
@@ -722,7 +706,17 @@ const SftpState = struct {
             .is_append = want_append,
             .staged = .{ .name = name, .excl = want_excl },
         } }) catch |err| return self.reject(request_id, c.SSH_FX_FAILURE, op, path, @errorName(err));
-        defer self.auditOk(op, path, "staged");
+        // From here, closing the handle also unlinks and unregisters.
+        const setup_failure: ?[]const u8 = blk: {
+            file.setPermissions(self.io, permissions) catch break :blk "staging chmod failed";
+            if (want_append) setFdFlags(file.handle, true) catch break :blk "append flag failed";
+            break :blk null;
+        };
+        if (setup_failure) |detail| {
+            self.closeHandle(self.takeHandle(id).?);
+            return self.reject(request_id, c.SSH_FX_FAILURE, op, path, detail);
+        }
+        defer self.auditLog(op, path, .ok, "staged");
         try wire.replyHandle(self.channel, request_id, id);
     }
 
@@ -794,10 +788,7 @@ const SftpState = struct {
         const code = self.publish(staged, handle.vpath) catch |err| {
             return self.reject(request_id, c.SSH_FX_FAILURE, "close", handle.vpath, @errorName(err));
         };
-        if (code == c.SSH_FX_OK) {
-            defer self.auditOk("publish", handle.vpath, "");
-            return self.status(request_id, code);
-        }
+        defer if (code == c.SSH_FX_OK) self.auditLog("publish", handle.vpath, .ok, "");
         try self.status(request_id, code);
     }
 
@@ -823,7 +814,7 @@ const SftpState = struct {
                 error.PathAlreadyExists => {
                     // EXCL reports FAILURE ("exists"), otherwise it is the
                     // clobber rule.
-                    self.auditDenied("close", target);
+                    self.auditLog("close", target, .denied, "");
                     return if (staged.excl) c.SSH_FX_FAILURE else c.SSH_FX_PERMISSION_DENIED;
                 },
                 else => return err,
@@ -846,7 +837,7 @@ const SftpState = struct {
         setTimesAt(parent.parent.handle, parent.base, &times) catch |err| {
             return self.fsFailure(request_id, "setstat", path, err);
         };
-        defer self.auditOk("setstat", path, "");
+        defer self.auditLog("setstat", path, .ok, "");
         try self.status(request_id, c.SSH_FX_OK);
     }
 
@@ -872,7 +863,7 @@ const SftpState = struct {
         if (std.c.futimens(fd, &times) != 0) {
             return self.reject(request_id, c.SSH_FX_FAILURE, "fsetstat", handle.vpath, @tagName(std.posix.errno(-1)));
         }
-        defer self.auditOk("fsetstat", handle.vpath, "");
+        defer self.auditLog("fsetstat", handle.vpath, .ok, "");
         try self.status(request_id, c.SSH_FX_OK);
     }
 
@@ -924,7 +915,7 @@ const SftpState = struct {
             parent.parent.deleteDir(self.io, parent.base) catch {};
             return self.reject(request_id, c.SSH_FX_FAILURE, "mkdir", path, detail);
         }
-        defer self.auditOk("mkdir", path, "");
+        defer self.auditLog("mkdir", path, .ok, "");
         try self.status(request_id, c.SSH_FX_OK);
     }
 
@@ -946,7 +937,7 @@ const SftpState = struct {
             .dir => parent.parent.deleteDir(self.io, parent.base),
         };
         removed catch |err| return self.fsFailure(request_id, label, path, err);
-        defer self.auditOk(label, path, "");
+        defer self.auditLog(label, path, .ok, "");
         try self.status(request_id, c.SSH_FX_OK);
     }
 
@@ -994,7 +985,7 @@ const SftpState = struct {
                 return self.reject(request_id, c.SSH_FX_FAILURE, "rename", from, "rename failed");
             };
         }
-        defer self.auditOk("rename", from, to);
+        defer self.auditLog("rename", from, .ok, to);
         try self.status(request_id, c.SSH_FX_OK);
     }
 
@@ -1055,21 +1046,13 @@ const SftpState = struct {
     fn unregisterStagingName(self: *SftpState, name: *const [32]u8) void {
         staging_live_mutex.lockUncancelable(self.io);
         defer staging_live_mutex.unlock(self.io);
-        for (staging_live.items, 0..) |*live, i| {
-            if (std.mem.eql(u8, live, name)) {
-                _ = staging_live.swapRemove(i);
-                return;
-            }
-        }
+        if (stagingLiveIndex(name)) |i| _ = staging_live.swapRemove(i);
     }
 
     fn stagingNameIsLive(self: *SftpState, name: []const u8) bool {
         staging_live_mutex.lockUncancelable(self.io);
         defer staging_live_mutex.unlock(self.io);
-        for (staging_live.items) |*live| {
-            if (std.mem.eql(u8, live, name)) return true;
-        }
-        return false;
+        return stagingLiveIndex(name) != null;
     }
 
     fn nextHandleId(self: *SftpState) !u32 {
