@@ -3,7 +3,9 @@
 # Oracle: a partner who may not stat never learns whether a path or its
 #         parent exists from MKDIR/REMOVE/RMDIR/RENAME; one who may stat
 #         gets NO_SUCH_FILE for a missing entry; OPEN of a FIFO fails at
-#         once instead of blocking the session
+#         once instead of blocking the session; a handle's refused READs
+#         are audited once; a malformed packet and the rename scan limit
+#         leave audit lines that say so
 
 source "$(dirname "$0")/../lib/common.sh"
 
@@ -20,6 +22,10 @@ for d in drop box; do
     echo x > "$TEST_TMP/jail/$d/file.txt"
     mkfifo "$TEST_TMP/jail/$d/fifo"
 done
+# One level deeper than the rename scan follows.
+deep="$TEST_TMP/jail/box/deep"
+for _ in $(seq 257); do deep="$deep/d"; done
+mkdir -p "$deep"
 
 write_config <<EOF
 server
@@ -83,10 +89,44 @@ expect("open of a FIFO for writing in /box", "failure", sftp.open, "/box/fifo", 
 expect("open of a FIFO for writing in /drop", "denied", sftp.open, "/drop/fifo", "w")
 expect("session still answers after the FIFO opens", "ok", sftp.listdir, "/box")
 
+expect("rename past the scan depth limit", "failure", sftp.rename, "/box/deep", "/box/deep2")
+
+# A write-only handle refuses every READ; only the first is audited.
+from paramiko.sftp import CMD_READ, int64
+f = sftp.open("/box/file.txt", "a")
+for _ in range(20):
+    expect("READ on a write-only handle", "denied", sftp._request, CMD_READ, f.handle, int64(0), 10)
+f.close()
+
 sftp.close()
+t.close()
+
+# A packet too short to carry a request id ends the session.
+import struct
+sock = socket.create_connection(("127.0.0.1", port), timeout=15)
+t = paramiko.Transport(sock)
+t.connect(username="runner", password="secret")
+chan = t.open_session()
+chan.invoke_subsystem("sftp")
+chan.sendall(struct.pack(">IBI", 5, 1, 3))
+chan.recv(64)
+chan.sendall(struct.pack(">IBH", 3, 5, 0))
+chan.settimeout(10)
+while chan.recv(64):
+    pass
 t.close()
 sys.exit(1 if failed else 0)
 EOF
 
 stop_zift TERM
 wait "$ZIFT_PID" 2>/dev/null || true
+
+reads=$(grep -c '"operation":"read","result":"denied","path":"/box/file.txt"' "$ZIFT_LOG" || true)
+[[ "$reads" == 1 ]] || fail "refused READs audited $reads times, want once"
+ok "refused READs on one handle are audited once, with the path"
+grep -q '"operation":"rename","result":"failed","path":"/box/deep","detail":"rename scan limit"' "$ZIFT_LOG" \
+    || fail "no rename scan limit audit line"
+ok "the rename scan limit is audited as a failure that names it"
+grep -q '"operation":"session.ended","result":"failed","detail":"ShortPacket' "$ZIFT_LOG" \
+    || fail "no session.ended line for a session that ended on an error"
+ok "a session that ends on an error still gets session.ended"

@@ -154,86 +154,11 @@ pub fn runSftp(
     };
     defer state.deinit();
 
-    state.sweepStagingOrphans();
-
-    const first_payload = readPacketTimed(&state) catch |err| switch (err) {
-        error.IdleTimeout => {
-            audit.log(io, user.name, "idle.timeout", null, .ok, "", peer_ip);
-            return;
-        },
-        else => return err,
+    state.serve() catch |err| {
+        // The clean ways out audit their own reason.
+        state.emitSessionEnded(@errorName(err), .failed);
+        return err;
     };
-    try acceptInitPayload(first_payload);
-    try wire.writeVersion(channel);
-    state.last_activity_ms = sys.monotonicMs();
-
-    while (true) {
-        const payload = readPacketTimed(&state) catch |err| switch (err) {
-            error.IdleTimeout => {
-                state.emitSessionEnded("idle timeout", .ok);
-                return;
-            },
-            error.ChannelEof => {
-                state.emitSessionEnded("client closed channel", .ok);
-                return;
-            },
-            error.LibsshFailure => {
-                // Record libssh's reason. `ssh_get_error` must get the
-                // session, not the channel: it casts its argument to the
-                // error struct that only a session begins with.
-                var lib_buf: [128]u8 = undefined;
-                var lw = std.Io.Writer.fixed(&lib_buf);
-                lw.writeAll("LibsshFailure: ") catch {};
-                const session = c.ssh_channel_get_session(state.channel);
-                const lib_err = if (session != null)
-                    c.ssh_get_error(@as(?*anyopaque, @ptrCast(session)))
-                else
-                    null;
-                const lib_msg: []const u8 = if (lib_err != null) std.mem.span(lib_err) else "";
-
-                // libssh turns every SSH_MSG_DISCONNECT into SSH_FATAL, so
-                // a client's ordinary goodbye (reason 11, how GUI clients
-                // close) lands here. Only that code counts as a clean end.
-                if (disconnectReason(lib_msg)) |code| {
-                    if (code == ssh2_disconnect_by_application) {
-                        state.emitSessionEnded("client disconnected", .ok);
-                        return;
-                    }
-                }
-
-                lw.writeAll(lib_msg) catch {};
-                state.emitSessionEnded(lw.buffered(), .failed);
-                return;
-            },
-        };
-        state.last_activity_ms = sys.monotonicMs();
-        if (payload.len < 5) return error.LibsshFailure;
-
-        const id = std.mem.readInt(u32, payload[1..5], .big);
-        const args = payload[5..];
-        switch (payload[0]) {
-            c.SSH_FXP_REALPATH => try state.handleRealpath(id, args),
-            // STAT and LSTAT both lstat, so a symlink is reported, never
-            // followed.
-            c.SSH_FXP_STAT, c.SSH_FXP_LSTAT => try state.handleStat(id, args),
-            c.SSH_FXP_FSTAT => try state.handleFstat(id, args),
-            c.SSH_FXP_OPENDIR => try state.handleOpendir(id, args),
-            c.SSH_FXP_READDIR => try state.handleReaddir(id, args),
-            c.SSH_FXP_OPEN => try state.handleOpen(id, args),
-            c.SSH_FXP_READ => try state.handleRead(id, args),
-            c.SSH_FXP_WRITE => try state.handleWrite(id, args),
-            c.SSH_FXP_CLOSE => try state.handleClose(id, args),
-            c.SSH_FXP_MKDIR => try state.handleMkdir(id, args),
-            c.SSH_FXP_REMOVE => try state.handleUnlink(id, args, .file),
-            c.SSH_FXP_RMDIR => try state.handleUnlink(id, args, .dir),
-            c.SSH_FXP_RENAME => try state.handleRename(id, args),
-            c.SSH_FXP_SETSTAT => try state.handleSetstat(id, args),
-            c.SSH_FXP_FSETSTAT => try state.handleFsetstat(id, args),
-            // OP_UNSUPPORTED (not FAILURE) tells a probing client the
-            // operation does not exist here.
-            else => try state.status(id, c.SSH_FX_OP_UNSUPPORTED),
-        }
-    }
 }
 
 const FileHandle = struct {
@@ -245,6 +170,8 @@ const FileHandle = struct {
     /// SSH_FXF_APPEND: fd has O_APPEND and WRITE ignores the offset.
     is_append: bool,
     staged: ?Staged = null,
+    /// A READ or WRITE the handle's access refused has been audited.
+    denial_audited: bool = false,
 };
 
 /// A new file written as `<root>/.zift/staging/<name>` and renamed to
@@ -310,6 +237,91 @@ const SftpState = struct {
         self.handles.deinit(self.allocator);
         if (self.staging_dir) |*dir| dir.close(self.io);
         self.staging_dir = null;
+    }
+
+    /// The SFTP conversation, from the INIT packet to the end of the
+    /// session.
+    fn serve(self: *SftpState) !void {
+        self.sweepStagingOrphans();
+
+        const first_payload = readPacketTimed(self) catch |err| switch (err) {
+            error.IdleTimeout => {
+                audit.log(self.io, self.user.name, "idle.timeout", null, .ok, "", self.peer_ip);
+                return;
+            },
+            else => return err,
+        };
+        try acceptInitPayload(first_payload);
+        try wire.writeVersion(self.channel);
+        self.last_activity_ms = sys.monotonicMs();
+
+        while (true) {
+            const payload = readPacketTimed(self) catch |err| switch (err) {
+                error.IdleTimeout => {
+                    self.emitSessionEnded("idle timeout", .ok);
+                    return;
+                },
+                error.ChannelEof => {
+                    self.emitSessionEnded("client closed channel", .ok);
+                    return;
+                },
+                error.LibsshFailure => {
+                    // Record libssh's reason. `ssh_get_error` must get the
+                    // session, not the channel: it casts its argument to the
+                    // error struct that only a session begins with.
+                    var lib_buf: [128]u8 = undefined;
+                    var lw = std.Io.Writer.fixed(&lib_buf);
+                    lw.writeAll("LibsshFailure: ") catch {};
+                    const session = c.ssh_channel_get_session(self.channel);
+                    const lib_err = if (session != null)
+                        c.ssh_get_error(@as(?*anyopaque, @ptrCast(session)))
+                    else
+                        null;
+                    const lib_msg: []const u8 = if (lib_err != null) std.mem.span(lib_err) else "";
+
+                    // libssh turns every SSH_MSG_DISCONNECT into SSH_FATAL, so
+                    // a client's ordinary goodbye (reason 11, how GUI clients
+                    // close) lands here. Only that code counts as a clean end.
+                    if (disconnectReason(lib_msg)) |code| {
+                        if (code == ssh2_disconnect_by_application) {
+                            self.emitSessionEnded("client disconnected", .ok);
+                            return;
+                        }
+                    }
+
+                    lw.writeAll(lib_msg) catch {};
+                    self.emitSessionEnded(lw.buffered(), .failed);
+                    return;
+                },
+            };
+            self.last_activity_ms = sys.monotonicMs();
+            if (payload.len < 5) return error.ShortPacket;
+
+            const id = std.mem.readInt(u32, payload[1..5], .big);
+            const args = payload[5..];
+            switch (payload[0]) {
+                c.SSH_FXP_REALPATH => try self.handleRealpath(id, args),
+                // STAT and LSTAT both lstat, so a symlink is reported, never
+                // followed.
+                c.SSH_FXP_STAT, c.SSH_FXP_LSTAT => try self.handleStat(id, args),
+                c.SSH_FXP_FSTAT => try self.handleFstat(id, args),
+                c.SSH_FXP_OPENDIR => try self.handleOpendir(id, args),
+                c.SSH_FXP_READDIR => try self.handleReaddir(id, args),
+                c.SSH_FXP_OPEN => try self.handleOpen(id, args),
+                c.SSH_FXP_READ => try self.handleRead(id, args),
+                c.SSH_FXP_WRITE => try self.handleWrite(id, args),
+                c.SSH_FXP_CLOSE => try self.handleClose(id, args),
+                c.SSH_FXP_MKDIR => try self.handleMkdir(id, args),
+                c.SSH_FXP_REMOVE => try self.handleUnlink(id, args, .file),
+                c.SSH_FXP_RMDIR => try self.handleUnlink(id, args, .dir),
+                c.SSH_FXP_RENAME => try self.handleRename(id, args),
+                c.SSH_FXP_SETSTAT => try self.handleSetstat(id, args),
+                c.SSH_FXP_FSETSTAT => try self.handleFsetstat(id, args),
+                // OP_UNSUPPORTED (not FAILURE) tells a probing client the
+                // operation does not exist here.
+                else => try self.status(id, c.SSH_FX_OP_UNSUPPORTED),
+            }
+        }
     }
 
     /// `session.ended` with `(duration_ms=N[, spurious_eof=N])` appended.
@@ -720,14 +732,15 @@ const SftpState = struct {
         const offset = std.mem.readInt(u64, payload[8..16], .big);
         const len = @min(std.mem.readInt(u32, payload[16..20], .big), wire.max_read_bytes);
         const handle = self.findFile(id) orelse return self.status(request_id, c.SSH_FX_INVALID_HANDLE);
+        const file = &handle.kind.file;
 
         // Above i64 max, std's pread path would panic in a safe build.
         if (offset > std.math.maxInt(i64)) return self.status(request_id, c.SSH_FX_BAD_MESSAGE);
-        if (!handle.can_read) return self.deny(request_id, "read", null);
+        if (!file.can_read) return self.denyAccess(request_id, handle, "read");
 
         // The request is parsed, so its buffer can take the data and the
         // reply around it.
-        const n = handle.file.readPositionalAll(self.io, self.buf[wire.data_offset..][0..len], offset) catch {
+        const n = file.file.readPositionalAll(self.io, self.buf[wire.data_offset..][0..len], offset) catch {
             return self.status(request_id, c.SSH_FX_FAILURE);
         };
         // A 0-byte read gets empty DATA, not EOF.
@@ -741,21 +754,31 @@ const SftpState = struct {
         const offset = std.mem.readInt(u64, payload[8..16], .big);
         const data = wire.parseString(payload[16..]) catch return self.status(request_id, c.SSH_FX_BAD_MESSAGE);
         const handle = self.findFile(id) orelse return self.status(request_id, c.SSH_FX_INVALID_HANDLE);
+        const file = &handle.kind.file;
 
         // Same bound as READ; append ignores the offset.
-        if (!handle.is_append and offset > std.math.maxInt(i64)) {
+        if (!file.is_append and offset > std.math.maxInt(i64)) {
             return self.status(request_id, c.SSH_FX_BAD_MESSAGE);
         }
-        if (!handle.can_write) return self.deny(request_id, "write", null);
+        if (!file.can_write) return self.denyAccess(request_id, handle, "write");
 
         // SSH_FXF_APPEND: write(2) honors the O_APPEND set at OPEN,
         // including writes from other sessions. pwrite does not.
-        const written = if (handle.is_append)
-            handle.file.writeStreamingAll(self.io, data.value)
+        const written = if (file.is_append)
+            file.file.writeStreamingAll(self.io, data.value)
         else
-            handle.file.writePositionalAll(self.io, data.value, offset);
+            file.file.writePositionalAll(self.io, data.value, offset);
         written catch return self.status(request_id, c.SSH_FX_FAILURE);
         try self.status(request_id, c.SSH_FX_OK);
+    }
+
+    /// A handle's access is fixed at OPEN, so only its first refused READ
+    /// or WRITE is audited; the rest would repeat that line at wire speed.
+    fn denyAccess(self: *SftpState, request_id: u32, handle: *Handle, op: []const u8) !void {
+        const file = &handle.kind.file;
+        if (file.denial_audited) return self.status(request_id, c.SSH_FX_PERMISSION_DENIED);
+        file.denial_audited = true;
+        return self.deny(request_id, op, handle.vpath);
     }
 
     fn handleClose(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -952,7 +975,8 @@ const SftpState = struct {
         // an allowed subtree.
         if ((source.mode & listing.S_IFMT) == listing.S_IFDIR) {
             self.verifyRenameTree(from_parent, from, to) catch |err| switch (err) {
-                error.RenameDenied, error.RenameScanLimit => return self.deny(request_id, "rename", from),
+                error.RenameDenied => return self.deny(request_id, "rename", from),
+                error.RenameScanLimit => return self.reject(request_id, c.SSH_FX_FAILURE, "rename", from, "rename scan limit"),
                 else => return self.reject(request_id, c.SSH_FX_FAILURE, "rename", from, @errorName(err)),
             };
         }
@@ -1066,12 +1090,9 @@ const SftpState = struct {
         return null;
     }
 
-    fn findFile(self: *SftpState, id: u32) ?*FileHandle {
+    fn findFile(self: *SftpState, id: u32) ?*Handle {
         const handle = self.findHandle(id) orelse return null;
-        return switch (handle.kind) {
-            .file => |*f| f,
-            .dir => null,
-        };
+        return if (handle.kind == .file) handle else null;
     }
 
     /// Remove the handle from the table; the caller closes it.
@@ -1330,9 +1351,9 @@ fn idleExpired(state: *const SftpState) bool {
     return sys.monotonicMs() - state.last_activity_ms >= @as(i64, @intCast(state.idle_timeout_ms));
 }
 
-fn acceptInitPayload(payload: []const u8) error{LibsshFailure}!void {
-    if (payload.len < 5 or payload[0] != c.SSH_FXP_INIT) return error.LibsshFailure;
-    if (std.mem.readInt(u32, payload[1..5], .big) < 3) return error.LibsshFailure;
+fn acceptInitPayload(payload: []const u8) error{BadInit}!void {
+    if (payload.len < 5 or payload[0] != c.SSH_FXP_INIT) return error.BadInit;
+    if (std.mem.readInt(u32, payload[1..5], .big) < 3) return error.BadInit;
 }
 
 fn handleIdAvailable(next_handle: u32) bool {
@@ -1464,9 +1485,9 @@ test "disconnectReason: unrelated libssh errors stay unrecognized" {
 
 test "init below version 3 drops; version 3 and above are accepted" {
     const init: u8 = @intCast(c.SSH_FXP_INIT);
-    try std.testing.expectError(error.LibsshFailure, acceptInitPayload(&[_]u8{ init, 0, 0, 0 }));
-    try std.testing.expectError(error.LibsshFailure, acceptInitPayload(&[_]u8{ 2, 0, 0, 0, 3 }));
-    try std.testing.expectError(error.LibsshFailure, acceptInitPayload(&[_]u8{ init, 0, 0, 0, 2 }));
+    try std.testing.expectError(error.BadInit, acceptInitPayload(&[_]u8{ init, 0, 0, 0 }));
+    try std.testing.expectError(error.BadInit, acceptInitPayload(&[_]u8{ 2, 0, 0, 0, 3 }));
+    try std.testing.expectError(error.BadInit, acceptInitPayload(&[_]u8{ init, 0, 0, 0, 2 }));
     try acceptInitPayload(&[_]u8{ init, 0, 0, 0, 3 });
     // Trailing extension bytes are ignored.
     try acceptInitPayload(&[_]u8{ init, 0, 0, 0, 6, 0, 1, 2, 3 });
