@@ -25,6 +25,10 @@ for d in range(10):
         open(os.path.join(sub, f"f{f}"), "w").close()
 EOF
 
+# Unrelated rules make every policy check, and so the rename scan, slow
+# enough to observe on any machine.
+padding=$(for i in $(seq 300); do echo "  allow /unrelated-$i/**/*.dat read"; done)
+
 write_config <<EOF
 server
   listen 127.0.0.1:$TEST_PORT
@@ -36,6 +40,7 @@ user alice
   auth $hash
   root $TEST_TMP/alice
   allow / full
+$padding
 
 user bob
   auth $hash
@@ -70,6 +75,7 @@ def rename():
     done.set()
 
 th = threading.Thread(target=rename)
+start = time.monotonic()
 th.start()
 time.sleep(0.2)
 ops = 0
@@ -79,6 +85,7 @@ while not done.is_set():
     if not done.is_set():
         ops += 1
 th.join()
+print(f"  alice's rename took {time.monotonic() - start:.2f}s")
 
 print(f"  bob finished {ops} mkdir+rmdir pairs during alice's rename")
 if ops < 3:

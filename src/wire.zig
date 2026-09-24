@@ -100,8 +100,20 @@ pub fn replyData(channel: c.ssh_channel, request_id: u32, data: []const u8) !voi
     try writeAll(channel, data);
 }
 
-pub fn replyStatus(channel: c.ssh_channel, request_id: u32, status: c_int, message: []const u8) !void {
-    var buf: [512]u8 = undefined;
+/// The message is the standard phrase for `status`; detail belongs in
+/// the audit log, never on the wire.
+pub fn replyStatus(channel: c.ssh_channel, request_id: u32, status: c_int) !void {
+    const message: []const u8 = switch (status) {
+        c.SSH_FX_OK => "ok",
+        c.SSH_FX_EOF => "end of file",
+        c.SSH_FX_NO_SUCH_FILE => "no such file",
+        c.SSH_FX_PERMISSION_DENIED => "permission denied",
+        c.SSH_FX_BAD_MESSAGE => "bad message",
+        c.SSH_FX_OP_UNSUPPORTED => "operation unsupported",
+        c.SSH_FX_INVALID_HANDLE => "invalid handle",
+        else => "failure",
+    };
+    var buf: [64]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_STATUS));
     try w.putU32(request_id);
