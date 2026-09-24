@@ -9,7 +9,7 @@
 #
 # Each case script gets its own:
 #   TEST_TMP    scratch dir (deleted after pass unless --keep)
-#   TEST_PORT   unique TCP port (22200 + index)
+#   TEST_PORT   unique TCP port (ZIFT_TEST_PORT_BASE, default 22200, + index)
 #   TEST_NAME   filename without .sh
 #   ZIFT_BIN    absolute path to the built zift
 #
@@ -93,7 +93,7 @@ for case_path in "${CASES[@]}"; do
     name=$(basename "$case_path" .sh)
     desc=$(awk '/^# Test:/{sub(/^# Test: */,""); print; exit}' "$case_path")
     INDEX=$((INDEX + 1))
-    port=$((22200 + INDEX))
+    port=$((${ZIFT_TEST_PORT_BASE:-22200} + INDEX))
     tmp="$(pwd)/tmp/${name}.XXXXXX"
     tmp=$(mktemp -d "$tmp")
 
