@@ -10,8 +10,8 @@ const config = @import("config.zig");
 pub const Operation = enum {
     open_read,
     open_write,
+    /// STAT and LSTAT alike.
     stat,
-    lstat,
     readdir,
     mkdir,
     remove,
@@ -96,7 +96,7 @@ pub fn checkRename(user: *const config.UserConfig, from_path: []const u8, to_pat
 fn permissionsFor(operation: Operation) config.PermissionSet {
     var set = config.PermissionSet.initEmpty();
     switch (operation) {
-        .stat, .lstat => {
+        .stat => {
             set.insert(.read);
             set.insert(.list);
         },
@@ -458,7 +458,6 @@ test "list satisfies STAT but never download" {
     };
 
     try std.testing.expectEqual(Decision.allow, check(&user, .stat, "/"));
-    try std.testing.expectEqual(Decision.allow, check(&user, .lstat, "/"));
     try std.testing.expectEqual(Decision.allow, check(&user, .readdir, "/"));
 
     // Names are visible, content is not.

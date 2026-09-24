@@ -78,8 +78,6 @@ pub const ServerConfig = struct {
     /// Mode of an SFTP MKDIR (0o2700, 0o2750, or 0o2770). Setgid keeps
     /// the partner tree's group on every new subdirectory.
     mkdir_mode: u32,
-    /// Default root for users without `root`: `<partner-root>/<name>`.
-    partner_root: ?[]const u8,
 };
 
 pub const ListingMode = enum {
@@ -276,7 +274,6 @@ fn resolveAuthKeyFiles(
         if (user.key_files.len == 0) continue;
 
         var combined: std.ArrayList(PublicKey) = .empty;
-        for (user.keys) |existing| try combined.append(arena_alloc, existing);
 
         for (user.key_files) |path| {
             try resolveOneKeyFile(io, gpa, stderr, arena_alloc, &combined, user.name, path);
@@ -426,13 +423,13 @@ const ServerBuilder = struct {
     listing_mode: ListingMode = .virtual,
     publish_mode: u32 = 0o660,
     mkdir_mode: u32 = 0o2770,
+    /// Default root for users without `root`: `<partner-root>/<name>`.
     partner_root: ?[]const u8 = null,
 };
 
 const UserBuilder = struct {
     name: []const u8,
     password_hash: ?[]const u8 = null,
-    keys: std.ArrayList(PublicKey) = .empty,
     key_files: std.ArrayList([]const u8) = .empty,
     from: std.ArrayList(netmatch.Cidr) = .empty,
     root: ?[]const u8 = null,
@@ -454,7 +451,6 @@ pub const Error = error{
     InvalidAuth,
     InvalidConfig,
     InvalidDuration,
-    InvalidIndent,
     InvalidKeyLine,
     InvalidListen,
     InvalidPermission,
@@ -627,8 +623,6 @@ pub fn parseWithDiag(
             return error.UnknownSection;
         }
 
-        if (indent < 1) return error.InvalidIndent;
-
         const key, const value = splitKeyValue(line) orelse return error.InvalidConfig;
         key_for_diag = key;
         switch (section) {
@@ -645,10 +639,7 @@ pub fn parseWithDiag(
 
     const final_users = try allocator.alloc(UserConfig, users.items.len);
     for (users.items, 0..) |*builder, i| {
-        if (builder.password_hash == null and
-            builder.keys.items.len == 0 and
-            builder.key_files.items.len == 0)
-        {
+        if (builder.password_hash == null and builder.key_files.items.len == 0) {
             return error.MissingCredentials;
         }
 
@@ -667,7 +658,7 @@ pub fn parseWithDiag(
         final_users[i] = .{
             .name = builder.name,
             .password_hash = builder.password_hash,
-            .keys = try builder.keys.toOwnedSlice(allocator),
+            .keys = &.{},
             .key_files = try builder.key_files.toOwnedSlice(allocator),
             .from = try builder.from.toOwnedSlice(allocator),
             .root = root_value,
@@ -689,7 +680,6 @@ pub fn parseWithDiag(
             .listing_mode = server.listing_mode,
             .publish_mode = server.publish_mode,
             .mkdir_mode = server.mkdir_mode,
-            .partner_root = server.partner_root,
         },
         .users = final_users,
     };
@@ -703,9 +693,9 @@ fn parseServerProperty(
 ) Error!void {
     if (std.mem.eql(u8, key, "listen")) {
         try validateListen(value);
-        server.listen = try dupNonEmpty(allocator, value);
+        server.listen = try allocator.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "host-key")) {
-        server.host_key = try dupNonEmpty(allocator, value);
+        server.host_key = try allocator.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "reload-interval")) {
         server.reload_interval_ms = try parseDurationMs(value);
     } else if (std.mem.eql(u8, key, "idle-timeout")) {
@@ -725,7 +715,7 @@ fn parseServerProperty(
         } else {
             // Absolute only: a relative path depends on the daemon's cwd.
             if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
-            server.log = .{ .file = try dupNonEmpty(allocator, value) };
+            server.log = .{ .file = try allocator.dupe(u8, value) };
         }
     } else if (std.mem.eql(u8, key, "listing-mode")) {
         if (std.mem.eql(u8, value, "virtual")) {
@@ -744,7 +734,7 @@ fn parseServerProperty(
         if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
         var pr = value;
         while (pr.len > 1 and pr[pr.len - 1] == '/') pr = pr[0 .. pr.len - 1];
-        server.partner_root = try dupNonEmpty(allocator, pr);
+        server.partner_root = try allocator.dupe(u8, pr);
     } else {
         return error.UnknownKey;
     }
@@ -791,7 +781,7 @@ fn parseUserProperty(
         // Absolute only: `realPathFileAbsoluteAlloc` in validateSemantic
         // asserts it, and a bad reload must not reach that assert.
         if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
-        user.root = try dupNonEmpty(allocator, value);
+        user.root = try allocator.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "from")) {
         try parseFrom(allocator, user, value);
     } else if (std.mem.eql(u8, key, "allow")) {
@@ -811,12 +801,11 @@ fn parseUserProperty(
 /// `auth a…` is a passhash (at most one); `auth /…` names a key file
 /// (any number); a legacy `$…` PHC string must be reminted.
 fn parseAuth(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
-    if (value.len == 0) return error.InvalidAuth;
-    // A leading letter is a passhash version tag.
-    if (value.len > 0 and value[0] >= 'a' and value[0] <= 'z') {
+    // A leading letter is a passhash version tag. `value` is never empty.
+    if (value[0] >= 'a' and value[0] <= 'z') {
         if (user.password_hash != null) return error.DuplicatePassword;
         passhash.validate(value) catch return error.InvalidPasshash;
-        user.password_hash = try dupNonEmpty(allocator, value);
+        user.password_hash = try allocator.dupe(u8, value);
         return;
     }
     if (value[0] == '$') {
@@ -863,10 +852,8 @@ fn isValidStandardBase64(data: []const u8) bool {
 
 /// One IP or CIDR per `from` line; lines accumulate.
 fn parseFrom(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
-    const token = std.mem.trim(u8, value, " \t");
-    if (token.len == 0) return error.InvalidFrom;
-    if (std.mem.indexOfAny(u8, token, " \t") != null) return error.InvalidFrom;
-    const cidr = netmatch.parseCidr(token) catch return error.InvalidFrom;
+    if (std.mem.indexOfAny(u8, value, " \t") != null) return error.InvalidFrom;
+    const cidr = netmatch.parseCidr(value) catch return error.InvalidFrom;
     try user.from.append(allocator, cidr);
 }
 
@@ -984,11 +971,6 @@ fn capDurationMs(ms: u64) Error!u64 {
 fn scaleDurationMs(count: u64, factor: u64) Error!u64 {
     const product = std.math.mul(u64, count, factor) catch return error.InvalidDuration;
     return capDurationMs(product);
-}
-
-fn dupNonEmpty(allocator: std.mem.Allocator, value: []const u8) Error![]const u8 {
-    if (value.len == 0) return error.InvalidConfig;
-    return allocator.dupe(u8, value);
 }
 
 fn countIndent(line: []const u8) usize {
@@ -1570,7 +1552,6 @@ test "partner-root '/' derives single-slash user root (POSIX-safe)" {
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqualStrings("/ally", cfg.findUser("ally").?.root);
-    try std.testing.expectEqualStrings("/", cfg.server.partner_root.?);
 }
 
 test "auth value that is neither valid passhash nor /path rejected" {
@@ -1637,7 +1618,6 @@ test "partner-root: trailing slash trimmed before deriving user root" {
     defer cfg.deinit();
     // Trimmed `partner-root` stored as `/home/zift`; user root joined
     // as `/home/zift/ally` — no double-slash.
-    try std.testing.expectEqualStrings("/home/zift", cfg.server.partner_root.?);
     try std.testing.expectEqualStrings("/home/zift/ally", cfg.findUser("ally").?.root);
 }
 
@@ -1672,7 +1652,6 @@ test "partner-root: missing user root defaults to <partner-root>/<user>" {
     var cfg = try parse(std.testing.allocator, text);
     defer cfg.deinit();
     try std.testing.expectEqualStrings("/home/zift/ally", cfg.findUser("ally").?.root);
-    try std.testing.expectEqualStrings("/home/zift", cfg.server.partner_root.?);
 }
 
 test "partner-root: unset, missing user root still rejected" {
@@ -1859,7 +1838,6 @@ fn makeNumericTestConfig(args: NumericTestArgs) Config {
             .listing_mode = .virtual,
             .publish_mode = 0o660,
             .mkdir_mode = 0o2770,
-            .partner_root = null,
         },
         .users = &.{},
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),

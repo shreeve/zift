@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
 
     const elf_magic = [_]u8{ 0x7f, 'E', 'L', 'F' };
     if (std.mem.eql(u8, data[0..4], &elf_magic)) {
-        const code = try verifyElf(io, init.gpa, path, data);
+        const code = try verifyElf(io, path, data);
         std.process.exit(code);
     }
 
@@ -62,8 +62,7 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(2);
 }
 
-fn verifyElf(io: std.Io, gpa: std.mem.Allocator, path: []const u8, data: []const u8) !u8 {
-    _ = gpa;
+fn verifyElf(io: std.Io, path: []const u8, data: []const u8) !u8 {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
 

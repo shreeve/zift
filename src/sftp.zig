@@ -50,22 +50,6 @@ const max_rename_scan_depth: usize = 256;
 const RENAME_EXCL: c_uint = 0x00000004;
 extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c_int;
 
-const sftp_max_packet_bytes = wire.sftp_max_packet_bytes;
-const DirEntry = wire.DirEntry;
-const parentErrorStatus = wire.parentErrorStatus;
-const writeVersion = wire.writeVersion;
-const replyName = wire.replyName;
-const replyNames = wire.replyNames;
-const replyHandle = wire.replyHandle;
-const replyDirAttrs = wire.replyDirAttrs;
-const replyFullAttrs = wire.replyFullAttrs;
-const replyData = wire.replyData;
-const replyStatus = wire.replyStatus;
-const readU32 = wire.readU32;
-const readU64 = wire.readU64;
-const parseString = wire.parseString;
-const parseHandleId = wire.parseHandleId;
-
 /// Maximum simultaneously-open file/dir handles per SFTP session.
 pub const max_handles_per_session: usize = 256;
 
@@ -171,7 +155,7 @@ pub fn runSftp(
     state.sweepStagingOrphans();
 
     // On the heap: 256 KiB is too much for a worker stack.
-    const payload_buf = try allocator.alloc(u8, sftp_max_packet_bytes);
+    const payload_buf = try allocator.alloc(u8, wire.sftp_max_packet_bytes);
     defer allocator.free(payload_buf);
 
     const ip_str = peer_ip orelse "";
@@ -183,7 +167,7 @@ pub fn runSftp(
         else => return err,
     };
     try acceptInitPayload(first_payload);
-    try writeVersion(channel);
+    try wire.writeVersion(channel);
     state.last_activity_ms = audit.nowMonotonicMs();
 
     while (true) {
@@ -229,7 +213,7 @@ pub fn runSftp(
         if (payload.len < 5) return error.LibsshFailure;
 
         const msg_type = payload[0];
-        const request_id = readU32(payload[1..5]);
+        const request_id = wire.readU32(payload[1..5]);
         switch (msg_type) {
             c.SSH_FXP_REALPATH => try state.handleRealpath(request_id, payload[5..]),
             c.SSH_FXP_STAT, c.SSH_FXP_LSTAT => try state.handleStat(request_id, payload[5..]),
@@ -251,8 +235,8 @@ pub fn runSftp(
             c.SSH_FXP_READLINK,
             c.SSH_FXP_SYMLINK,
             c.SSH_FXP_EXTENDED,
-            => try replyStatus(channel, request_id, c.SSH_FX_OP_UNSUPPORTED, "unsupported"),
-            else => try replyStatus(channel, request_id, c.SSH_FX_OP_UNSUPPORTED, "unsupported"),
+            => try wire.replyStatus(channel, request_id, c.SSH_FX_OP_UNSUPPORTED, "unsupported"),
+            else => try wire.replyStatus(channel, request_id, c.SSH_FX_OP_UNSUPPORTED, "unsupported"),
         }
     }
 }
@@ -351,11 +335,11 @@ const SftpState = struct {
     /// Bad bytes or length: BAD_MESSAGE. Traversal or `.zift`: DENIED.
     fn normalizedPath(self: *SftpState, request_id: u32, raw: []const u8, out: []u8) !?[]const u8 {
         vfs_mod.Vfs.validateVirtualPath(raw) catch {
-            try replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+            try wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
             return null;
         };
         return vfs_mod.normalizeVirtualInto(raw, out) catch {
-            try replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            try wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
             return null;
         };
     }
@@ -395,28 +379,28 @@ const SftpState = struct {
     }
 
     fn handleRealpath(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const parsed = parseString(payload) catch
-            return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        const parsed = wire.parseString(payload) catch
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         const normalized = (try self.normalizedPath(request_id, parsed.value, &vbuf)) orelse return;
-        try replyName(self.channel, request_id, normalized);
+        try wire.replyName(self.channel, request_id, normalized);
     }
 
     /// FSTAT inherits the OPEN's authorization; no new policy check.
     fn handleFstat(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const id = parseHandleId(payload) catch
-            return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
+        const id = wire.parseHandleId(payload) catch
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
         // Dir handles too, as OpenSSH's sftp-server allows.
         const handle = self.findHandle(id, .file) orelse
             self.findHandle(id, .dir) orelse
-            return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
 
         const fd = switch (handle.kind) {
             .file => handle.file.?.handle,
             .dir => handle.dir.?.handle,
         };
         const info = listing.statFd(fd) catch
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "fstat failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "fstat failed");
 
         var display = self.applyListingMode(info, null);
         if (self.listing_mode == .virtual) {
@@ -438,81 +422,81 @@ const SftpState = struct {
                 },
             }
         }
-        try replyFullAttrs(self.channel, request_id, display);
+        try wire.replyFullAttrs(self.channel, request_id, display);
     }
 
     fn handleStat(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var path = wire.parseString(payload) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .stat, path.value) == .deny) {
             // Audit via `defer`, after the reply, so a slow audit
             // destination never delays the client.
             defer self.auditDenied("stat", path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
         // "/" has no parent in the jail; stat the root itself.
         if (std.mem.eql(u8, path.value, "/")) {
             var root_dir = std.Io.Dir.cwd().openDir(self.io, self.vfs.root, .{ .iterate = false }) catch {
-                return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
             };
             defer root_dir.close(self.io);
             const root_info = listing.statFd(root_dir.handle) catch
-                return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
-            return replyFullAttrs(self.channel, request_id, self.applyListingMode(root_info, "/"));
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+            return wire.replyFullAttrs(self.channel, request_id, self.applyListingMode(root_info, "/"));
         }
 
         // STAT and LSTAT both lstat the final component under the verified
         // parent fd, so a symlink is reported, never followed.
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
-            const status = parentErrorStatus(err);
-            return replyStatus(self.channel, request_id, status, "denied or not found");
+            const status = wire.parentErrorStatus(err);
+            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer parent.deinit(self.io, self.allocator);
 
         const info = listing.statAt(parent.parent.handle, parent.base) catch
-            return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
-        try replyFullAttrs(self.channel, request_id, self.applyListingMode(info, path.value));
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+        try wire.replyFullAttrs(self.channel, request_id, self.applyListingMode(info, path.value));
     }
 
     fn handleOpendir(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var path = wire.parseString(payload) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .readdir, path.value) == .deny) {
             defer self.auditDenied("opendir", path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
         // Checked before opening, so the cap path owns no fd.
         if (self.handles.items.len >= max_handles_per_session) {
             defer self.auditFailed("opendir", path.value, "handle limit reached");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "too many open handles");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "too many open handles");
         }
 
         const dir = self.vfs.openVirtualDir(self.io, self.allocator, path.value, true) catch |err| {
-            const status = parentErrorStatus(err);
+            const status = wire.parentErrorStatus(err);
             defer self.auditFailed("opendir", path.value, "open dir failed");
-            return replyStatus(self.channel, request_id, status, "open dir failed");
+            return wire.replyStatus(self.channel, request_id, status, "open dir failed");
         };
         const id = self.addDirHandle(dir, path.value) catch |err| {
             defer self.auditFailed("opendir", path.value, @errorName(err));
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open dir failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open dir failed");
         };
         defer self.auditOk("opendir", path.value, "");
-        try replyHandle(self.channel, request_id, id);
+        try wire.replyHandle(self.channel, request_id, id);
     }
 
     fn handleReaddir(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const id = parseHandleId(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
-        const handle = self.findHandle(id, .dir) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
-        if (handle.dir_failed) return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read dir failed");
-        if (handle.dir_done) return replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof");
+        const id = wire.parseHandleId(payload) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
+        const handle = self.findHandle(id, .dir) orelse return wire.replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+        if (handle.dir_failed) return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read dir failed");
+        if (handle.dir_done) return wire.replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof");
 
         // 16 entries of at most ~620 bytes fit wire.replyNames' 32 KiB.
         const batch_size = 16;
-        var entries: [batch_size]DirEntry = undefined;
+        var entries: [batch_size]wire.DirEntry = undefined;
         var count: usize = 0;
 
         const dir_fd = handle.dir.?.handle;
@@ -521,7 +505,7 @@ const SftpState = struct {
 
         // `addDirHandle` always sets it.
         const dir_vpath = handle.dir_vpath orelse {
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "internal: dir handle missing vpath");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "internal: dir handle missing vpath");
         };
 
         var vpath_buf: [std.posix.PATH_MAX]u8 = undefined;
@@ -598,20 +582,20 @@ const SftpState = struct {
 
         switch (readdirFollowup(count, handle.dir_failed)) {
             .send_batch => {},
-            .eof => return replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof"),
-            .fail => return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read dir failed"),
+            .eof => return wire.replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof"),
+            .fail => return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read dir failed"),
         }
-        try replyNames(self.channel, request_id, entries[0..count]);
+        try wire.replyNames(self.channel, request_id, entries[0..count]);
     }
 
     fn handleOpen(self: *SftpState, request_id: u32, payload: []const u8) !void {
         var cursor = payload;
-        var path = parseString(cursor) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var path = wire.parseString(cursor) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         cursor = path.rest;
         var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
-        if (cursor.len < 4) return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad flags");
-        const flags = readU32(cursor[0..4]);
+        if (cursor.len < 4) return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad flags");
+        const flags = wire.readU32(cursor[0..4]);
 
         // WRITE/APPEND/CREAT/TRUNC all imply write access.
         const want_write = (flags & @as(u32, @intCast(
@@ -623,18 +607,18 @@ const SftpState = struct {
 
         if (want_write and policy.check(self.user, .open_write, path.value) == .deny) {
             defer self.auditDenied("open_write", path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         if (want_read and policy.check(self.user, .open_read, path.value) == .deny) {
             defer self.auditDenied("open_read", path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
         const op_label: []const u8 = if (want_write) "open_write" else "open_read";
 
         if (self.handles.items.len >= max_handles_per_session) {
             defer self.auditFailed(op_label, path.value, "handle limit reached");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "too many open handles");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "too many open handles");
         }
 
         const want_creat = (flags & @as(u32, @intCast(c.SSH_FXF_CREAT))) != 0;
@@ -648,12 +632,12 @@ const SftpState = struct {
             // would learn the parent exists by comparing that with the
             // PERMISSION_DENIED a present file returns.
             const may_stat = policy.check(self.user, .stat, path.value) == .allow;
-            const status = openStatusForCaller(may_stat, parentErrorStatus(err));
+            const status = openStatusForCaller(may_stat, wire.parentErrorStatus(err));
             defer {
                 if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied(op_label, path.value) else self.auditFailed(op_label, path.value, @errorName(err));
             }
             const text: []const u8 = if (status == c.SSH_FX_PERMISSION_DENIED) "denied" else "denied or not found";
-            return replyStatus(self.channel, request_id, status, text);
+            return wire.replyStatus(self.channel, request_id, status, text);
         };
         defer parent.deinit(self.io, self.allocator);
 
@@ -677,28 +661,28 @@ const SftpState = struct {
                     const status = openExistenceStatus(may_stat, .missing);
                     if (!may_stat) {
                         defer self.auditDenied(op_label, path.value);
-                        return replyStatus(self.channel, request_id, status, "denied");
+                        return wire.replyStatus(self.channel, request_id, status, "denied");
                     }
-                    return replyStatus(self.channel, request_id, status, "not found");
+                    return wire.replyStatus(self.channel, request_id, status, "not found");
                 }
                 // A new file is written in staging and renamed into place
                 // at CLOSE, so the target is either absent or complete.
                 // An abandoned or failed upload unlinks its staging file.
                 var staging = self.ensureStagingDir() catch {
                     defer self.auditFailed(op_label, path.value, "staging dir unavailable");
-                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                    return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
 
                 var staging_name_buf: [32]u8 = undefined;
                 generateStagingName(&staging_name_buf) catch {
                     // Never fall back to a predictable name.
                     defer self.auditFailed(op_label, path.value, "no entropy for staging name");
-                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                    return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
                 const staging_name = staging_name_buf[0..];
                 self.registerStagingName(staging_name) catch {
                     defer self.auditFailed(op_label, path.value, "staging register failed");
-                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                    return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
 
                 // Created at `publish-mode`, which rename(2) keeps; the
@@ -714,18 +698,18 @@ const SftpState = struct {
                     // createFile failed, so the name is not ours to unlink.
                     self.unregisterStagingName(staging_name);
                     defer self.auditFailed(op_label, path.value, "staging create failed");
-                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                    return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
                 created.setPermissions(self.io, .fromMode(@intCast(publish_mode))) catch {
                     self.rollbackStagingCreate(staging, staging_name, created);
                     defer self.auditFailed(op_label, path.value, "staging chmod failed");
-                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                    return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
                 if (want_append) {
                     setFdAppend(created.handle) catch {
                         self.rollbackStagingCreate(staging, staging_name, created);
                         defer self.auditFailed(op_label, path.value, "append flag failed");
-                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                        return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                     };
                 }
 
@@ -742,14 +726,14 @@ const SftpState = struct {
                     // Its errdefer already closed `created`.
                     self.rollbackStagingCreate(staging, staging_name, null);
                     defer self.auditFailed(op_label, path.value, @errorName(alloc_err));
-                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                    return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
                 defer self.auditOk(op_label, path.value, "staged");
-                return replyHandle(self.channel, request_id, id);
+                return wire.replyHandle(self.channel, request_id, id);
             },
             error.SymLinkLoop => {
                 defer self.auditDenied(op_label, path.value);
-                return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
             },
             else => {
                 // A directory where a file was asked for is FAILURE.
@@ -757,10 +741,10 @@ const SftpState = struct {
                 // the missing-file reply.
                 if (err == error.IsDir and policy.check(self.user, .stat, path.value) == .deny) {
                     defer self.auditDenied(op_label, path.value);
-                    return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+                    return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
                 }
                 defer self.auditFailed(op_label, path.value, @errorName(err));
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
             },
         };
 
@@ -772,16 +756,16 @@ const SftpState = struct {
             const status = openExistenceStatus(may_stat, .excl_exists);
             if (!may_stat) {
                 defer self.auditDenied(op_label, path.value);
-                return replyStatus(self.channel, request_id, status, "denied");
+                return wire.replyStatus(self.channel, request_id, status, "denied");
             }
-            return replyStatus(self.channel, request_id, status, "exists");
+            return wire.replyStatus(self.channel, request_id, status, "exists");
         }
 
         // Defense in depth before anything is modified.
         self.vfs.verifyFile(self.io, file) catch {
             file.close(self.io);
             defer self.auditDenied(op_label, path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         };
 
         // The clobber rule: writing to an existing file (truncate,
@@ -790,7 +774,7 @@ const SftpState = struct {
         if (want_write and policy.check(self.user, .update, path.value) == .deny) {
             file.close(self.io);
             defer self.auditDenied(op_label, path.value);
-            return replyStatus(
+            return wire.replyStatus(
                 self.channel,
                 request_id,
                 openExistenceStatus(policy.check(self.user, .stat, path.value) == .allow, .present_no_update),
@@ -803,14 +787,14 @@ const SftpState = struct {
         if (!handleIdAvailable(self.next_handle)) {
             file.close(self.io);
             defer self.auditFailed(op_label, path.value, "handle id exhausted");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
         }
 
         if (want_append) {
             setFdAppend(file.handle) catch {
                 file.close(self.io);
                 defer self.auditFailed(op_label, path.value, "append flag failed");
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
             };
         }
 
@@ -818,84 +802,84 @@ const SftpState = struct {
             file.setLength(self.io, 0) catch {
                 file.close(self.io);
                 defer self.auditFailed(op_label, path.value, "truncate failed");
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "truncate failed");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "truncate failed");
             };
         }
 
         const id = self.addFileHandle(file, want_read, want_write, want_append) catch |err| {
             defer self.auditFailed(op_label, path.value, @errorName(err));
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
         };
         defer self.auditOk(op_label, path.value, "");
-        try replyHandle(self.channel, request_id, id);
+        try wire.replyHandle(self.channel, request_id, id);
     }
 
     fn handleRead(self: *SftpState, request_id: u32, payload: []const u8) !void {
         var cursor = payload;
-        const id = parseHandleId(cursor) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
+        const id = wire.parseHandleId(cursor) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
         cursor = cursor[8..];
-        if (cursor.len < 12) return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad read");
-        const offset = readU64(cursor[0..8]);
-        const len = @min(readU32(cursor[8..12]), 32 * 1024);
-        const handle = self.findHandle(id, .file) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+        if (cursor.len < 12) return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad read");
+        const offset = wire.readU64(cursor[0..8]);
+        const len = @min(wire.readU32(cursor[8..12]), 32 * 1024);
+        const handle = self.findHandle(id, .file) orelse return wire.replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
 
         // Above i64 max, std's pread path would panic in a safe build.
         if (offset > std.math.maxInt(i64)) {
-            return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad offset");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad offset");
         }
 
         if (!handle.can_read) {
             defer self.auditDenied("read", null);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
         // A 0-byte read gets empty DATA, not EOF.
-        if (len == 0) return replyData(self.channel, request_id, "");
+        if (len == 0) return wire.replyData(self.channel, request_id, "");
 
         var buf = try self.allocator.alloc(u8, len);
         defer self.allocator.free(buf);
         const n = handle.file.?.readPositionalAll(self.io, buf, offset) catch {
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read failed");
         };
-        if (n == 0) return replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof");
-        try replyData(self.channel, request_id, buf[0..n]);
+        if (n == 0) return wire.replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof");
+        try wire.replyData(self.channel, request_id, buf[0..n]);
     }
 
     fn handleWrite(self: *SftpState, request_id: u32, payload: []const u8) !void {
         var cursor = payload;
-        const id = parseHandleId(cursor) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
+        const id = wire.parseHandleId(cursor) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
         cursor = cursor[8..];
-        if (cursor.len < 8) return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad write");
-        const client_offset = readU64(cursor[0..8]);
-        const data = parseString(cursor[8..]) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad data");
-        const handle = self.findHandle(id, .file) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+        if (cursor.len < 8) return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad write");
+        const client_offset = wire.readU64(cursor[0..8]);
+        const data = wire.parseString(cursor[8..]) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad data");
+        const handle = self.findHandle(id, .file) orelse return wire.replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
 
         // Same bound as READ; append ignores the offset.
         if (!handle.is_append and client_offset > std.math.maxInt(i64)) {
-            return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad offset");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad offset");
         }
 
         if (!handle.can_write) {
             defer self.auditDenied("write", null);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
         // SSH_FXF_APPEND: write(2) honors the O_APPEND set at OPEN,
         // including writes from other sessions. pwrite does not.
         if (handle.is_append) {
             handle.file.?.writeStreamingAll(self.io, data.value) catch {
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "write failed");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "write failed");
             };
         } else {
             handle.file.?.writePositionalAll(self.io, data.value, client_offset) catch {
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "write failed");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "write failed");
             };
         }
-        try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
+        try wire.replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
     fn handleClose(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        const id = parseHandleId(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
+        const id = wire.parseHandleId(payload) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
         var i: usize = 0;
         while (i < self.handles.items.len) : (i += 1) {
             if (self.handles.items[i].id == id) {
@@ -919,7 +903,7 @@ const SftpState = struct {
                         self.closeHandle(handle);
                         _ = self.handles.swapRemove(i);
                         self.auditFailed("close", audit_target, @errorName(err));
-                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "failure");
+                        return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "failure");
                     };
                     self.closeHandle(handle);
                     _ = self.handles.swapRemove(i);
@@ -935,15 +919,15 @@ const SftpState = struct {
                     if (close_status == c.SSH_FX_OK) {
                         self.auditOk("publish", audit_target, "");
                     }
-                    return replyStatus(self.channel, request_id, close_status, reply_msg);
+                    return wire.replyStatus(self.channel, request_id, close_status, reply_msg);
                 }
 
                 self.closeHandle(handle);
                 _ = self.handles.swapRemove(i);
-                return replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
             }
         }
-        try replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+        try wire.replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
     }
 
     /// Rename the staged file to its target. Success clears
@@ -1028,28 +1012,28 @@ const SftpState = struct {
     }
 
     fn handleMkdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var path = wire.parseString(payload) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .mkdir, path.value) == .deny) {
             defer self.auditDenied("mkdir", path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         namespace_mutation_mutex.lockUncancelable(self.io);
         defer namespace_mutation_mutex.unlock(self.io);
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
-            const status = parentErrorStatus(err);
+            const status = wire.parentErrorStatus(err);
             defer {
                 if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("mkdir", path.value) else self.auditFailed("mkdir", path.value, @errorName(err));
             }
-            return replyStatus(self.channel, request_id, status, "denied or not found");
+            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer parent.deinit(self.io, self.allocator);
 
         const dir_mode = std.Io.File.Permissions.fromMode(@intCast(self.mkdir_mode));
         parent.parent.createDir(self.io, parent.base, dir_mode) catch {
             defer self.auditFailed("mkdir", path.value, "createDir failed");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
         };
         // umask applied to createDir, so set the mode again (rolling
         // back on failure). `iterate` keeps Zig off O_PATH, which cannot
@@ -1060,112 +1044,112 @@ const SftpState = struct {
         }) catch {
             parent.parent.deleteDir(self.io, parent.base) catch {};
             defer self.auditFailed("mkdir", path.value, "openDir-after-create failed");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
         };
         created_dir.setPermissions(self.io, dir_mode) catch {
             created_dir.close(self.io);
             // Fails harmlessly if something already populated it.
             parent.parent.deleteDir(self.io, parent.base) catch {};
             defer self.auditFailed("mkdir", path.value, "setPermissions failed");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
         };
         created_dir.close(self.io);
         defer self.auditOk("mkdir", path.value, "");
-        try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
+        try wire.replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
     fn handleRemove(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var path = wire.parseString(payload) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .remove, path.value) == .deny) {
             defer self.auditDenied("remove", path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         namespace_mutation_mutex.lockUncancelable(self.io);
         defer namespace_mutation_mutex.unlock(self.io);
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
-            const status = parentErrorStatus(err);
+            const status = wire.parentErrorStatus(err);
             defer {
                 if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("remove", path.value) else self.auditFailed("remove", path.value, @errorName(err));
             }
-            return replyStatus(self.channel, request_id, status, "denied or not found");
+            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer parent.deinit(self.io, self.allocator);
 
         parent.parent.deleteFile(self.io, parent.base) catch {
             defer self.auditFailed("remove", path.value, "deleteFile failed");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "remove failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "remove failed");
         };
         defer self.auditOk("remove", path.value, "");
-        try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
+        try wire.replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
     fn handleRmdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        var path = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
+        var path = wire.parseString(payload) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
         var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (policy.check(self.user, .rmdir, path.value) == .deny) {
             defer self.auditDenied("rmdir", path.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         namespace_mutation_mutex.lockUncancelable(self.io);
         defer namespace_mutation_mutex.unlock(self.io);
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
-            const status = parentErrorStatus(err);
+            const status = wire.parentErrorStatus(err);
             defer {
                 if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rmdir", path.value) else self.auditFailed("rmdir", path.value, @errorName(err));
             }
-            return replyStatus(self.channel, request_id, status, "denied or not found");
+            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer parent.deinit(self.io, self.allocator);
 
         parent.parent.deleteDir(self.io, parent.base) catch {
             defer self.auditFailed("rmdir", path.value, "deleteDir failed");
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rmdir failed");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rmdir failed");
         };
         defer self.auditOk("rmdir", path.value, "");
-        try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
+        try wire.replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
     fn handleRename(self: *SftpState, request_id: u32, payload: []const u8) !void {
-        var from = parseString(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad source");
-        var to = parseString(from.rest) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad destination");
+        var from = wire.parseString(payload) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad source");
+        var to = wire.parseString(from.rest) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad destination");
         var from_buf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         var to_buf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         from.value = (try self.normalizedPath(request_id, from.value, &from_buf)) orelse return;
         to.value = (try self.normalizedPath(request_id, to.value, &to_buf)) orelse return;
         if (policy.checkRename(self.user, from.value, to.value) == .deny) {
             defer self.auditDenied("rename", from.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
         namespace_mutation_mutex.lockUncancelable(self.io);
         defer namespace_mutation_mutex.unlock(self.io);
         var from_parent = self.vfs.openVerifiedParent(self.io, self.allocator, from.value) catch |err| {
-            const status = parentErrorStatus(err);
+            const status = wire.parentErrorStatus(err);
             defer {
                 if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", from.value) else self.auditFailed("rename", from.value, @errorName(err));
             }
-            return replyStatus(self.channel, request_id, status, "denied or not found");
+            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer from_parent.deinit(self.io, self.allocator);
         var to_parent = self.vfs.openVerifiedParent(self.io, self.allocator, to.value) catch |err| {
-            const status = parentErrorStatus(err);
+            const status = wire.parentErrorStatus(err);
             defer {
                 if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", to.value) else self.auditFailed("rename", to.value, @errorName(err));
             }
-            return replyStatus(self.channel, request_id, status, "denied or not found");
+            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
         };
         defer to_parent.deinit(self.io, self.allocator);
 
         const source_info = listing.statAt(from_parent.parent.handle, from_parent.base) catch |err| {
             defer self.auditFailed("rename", from.value, @errorName(err));
-            return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
         };
 
         self.verifyRenameNode(source_info.mode, from.value, to.value) catch {
             defer self.auditDenied("rename", from.value);
-            return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+            return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         };
 
         // A directory rename respells every descendant's path; check each
@@ -1177,7 +1161,7 @@ const SftpState = struct {
                 .follow_symlinks = false,
             }) catch |err| {
                 defer self.auditFailed("rename", from.value, @errorName(err));
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename preflight failed");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename preflight failed");
             };
             defer source_dir.close(self.io);
 
@@ -1186,11 +1170,11 @@ const SftpState = struct {
                 switch (err) {
                     error.RenameDenied, error.RenameScanLimit => {
                         defer self.auditDenied("rename", from.value);
-                        return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+                        return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
                     },
                     else => {
                         defer self.auditFailed("rename", from.value, @errorName(err));
-                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename preflight failed");
+                        return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename preflight failed");
                     },
                 }
             };
@@ -1203,13 +1187,13 @@ const SftpState = struct {
         if (may_replace) {
             std.Io.Dir.rename(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch {
                 defer self.auditFailed("rename", from.value, "rename failed");
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename failed");
+                return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename failed");
             };
         } else {
             renameNoReplace(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     defer self.auditDenied("rename", to.value);
-                    return replyStatus(
+                    return wire.replyStatus(
                         self.channel,
                         request_id,
                         c.SSH_FX_PERMISSION_DENIED,
@@ -1218,12 +1202,12 @@ const SftpState = struct {
                 },
                 else => {
                     defer self.auditFailed("rename", from.value, "rename failed");
-                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename failed");
+                    return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "rename failed");
                 },
             };
         }
         defer self.auditOk("rename", from.value, to.value);
-        try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
+        try wire.replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
     /// Require rename permission at both old and new spellings, then
@@ -1523,7 +1507,7 @@ const SftpState = struct {
     }
 
     fn fillRandomBytes(buf: []u8) !void {
-        if (@import("builtin").os.tag == .linux) {
+        if (builtin.os.tag == .linux) {
             var filled: usize = 0;
             while (filled < buf.len) {
                 const rc = std.os.linux.getrandom(
@@ -1612,15 +1596,15 @@ const SftpState = struct {
 fn readPacketTimed(state: *SftpState, payload_buf: []u8) ![]u8 {
     var len_buf: [4]u8 = undefined;
     try readExactTimed(state, &len_buf);
-    const len = readU32(&len_buf);
+    const len = wire.readU32(&len_buf);
 
     // Oversized: reply BAD_MESSAGE to the request, then end the session,
     // since resyncing would mean draining attacker-sized input.
     if (len > payload_buf.len) {
         var head: [5]u8 = undefined;
         readExactTimed(state, &head) catch return error.LibsshFailure;
-        const request_id = readU32(head[1..5]);
-        replyStatus(state.channel, request_id, c.SSH_FX_BAD_MESSAGE, "packet too large") catch {};
+        const request_id = wire.readU32(head[1..5]);
+        wire.replyStatus(state.channel, request_id, c.SSH_FX_BAD_MESSAGE, "packet too large") catch {};
         return error.LibsshFailure;
     }
 
@@ -1707,7 +1691,7 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
 
 fn acceptInitPayload(payload: []const u8) error{LibsshFailure}!void {
     if (payload.len < 5 or payload[0] != c.SSH_FXP_INIT) return error.LibsshFailure;
-    if (readU32(payload[1..5]) < 3) return error.LibsshFailure;
+    if (wire.readU32(payload[1..5]) < 3) return error.LibsshFailure;
 }
 
 fn handleIdAvailable(next_handle: u32) bool {

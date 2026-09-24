@@ -6,6 +6,7 @@
 //! and `log` are bound once at startup.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("libssh");
 const abuse = @import("abuse.zig");
 const audit = @import("audit.zig");
@@ -13,12 +14,6 @@ const config = @import("config.zig");
 const sftp = @import("sftp.zig");
 const signals = @import("signals.zig");
 const ssh = @import("ssh.zig");
-
-pub const Error = error{
-    InvalidListenAddress,
-    LibsshFailure,
-    OutOfMemory,
-};
 
 /// In-flight session threads; enforces `max-connections` and drain.
 pub var active_sessions: std.atomic.Value(u32) = .init(0);
@@ -769,7 +764,7 @@ fn configureSocket(fd: c_int) void {
         @sizeOf(c_int),
     );
 
-    if (@import("builtin").os.tag == .linux) {
+    if (builtin.os.tag == .linux) {
         const idle_seconds: c_int = 60;
         const intvl_seconds: c_int = 10;
         const probe_count: c_int = 6;

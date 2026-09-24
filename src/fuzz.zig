@@ -30,27 +30,6 @@ fn fuzzConfig(_: void, smith: *Smith) !void {
     cfg.deinit();
 }
 
-test "fuzz virtual path normalization" {
-    return std.testing.fuzz({}, fuzzVirtualPath, .{ .corpus = &.{
-        "/pending/inbox/file.txt",
-        "/../../etc/passwd",
-        "/a/b/../c/./d",
-        "/",
-        "//",
-        "/\x00bad",
-    } });
-}
-
-fn fuzzVirtualPath(_: void, smith: *Smith) !void {
-    var buf: [4096]u8 = undefined;
-    const len = smith.sliceWithHash(&buf, 0xBEEFCAFE);
-    const input = buf[0..len];
-
-    vfs_mod.Vfs.validateVirtualPath(input) catch return;
-    const normalized = vfs_mod.Vfs.normalizeVirtual(std.testing.allocator, input) catch return;
-    std.testing.allocator.free(normalized);
-}
-
 // Input is `pattern\x00value`.
 test "fuzz policy glob matching" {
     return std.testing.fuzz({}, fuzzPolicyGlob, .{ .corpus = &.{
@@ -153,6 +132,10 @@ test "fuzz normalize into buffer" {
         "/.zift/staging/x",
         "/.ZIFT/x",
         "/a/../../b",
+        "/pending/inbox/file.txt",
+        "/a/b/../c/./d",
+        "//",
+        "/\x00bad",
     } });
 }
 

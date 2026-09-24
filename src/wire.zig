@@ -30,24 +30,6 @@ pub fn parentErrorStatus(err: anyerror) c_int {
     };
 }
 
-pub fn readPacket(channel: c.ssh_channel, payload_buf: []u8) ![]u8 {
-    var len_buf: [4]u8 = undefined;
-    try readExact(channel, &len_buf);
-    const len = readU32(&len_buf);
-    if (len > payload_buf.len) return error.LibsshFailure;
-    const payload = payload_buf[0..len];
-    try readExact(channel, payload);
-    return payload;
-}
-
-pub fn readExact(channel: c.ssh_channel, out: []u8) !void {
-    var offset: usize = 0;
-    while (offset < out.len) {
-        const n = c.ssh_channel_read(channel, out[offset..].ptr, @intCast(out.len - offset), 0);
-        if (n <= 0) return error.LibsshFailure;
-        offset += @intCast(n);
-    }
-}
 pub fn writeVersion(channel: c.ssh_channel) !void {
     var buf: [9]u8 = undefined;
     writeU32(buf[0..4], 5);
@@ -96,15 +78,6 @@ pub fn replyHandle(channel: c.ssh_channel, request_id: u32, id: u32) !void {
     try writePayload(channel, w.written());
 }
 
-pub fn replyDirAttrs(channel: c.ssh_channel, request_id: u32) !void {
-    var buf: [128]u8 = undefined;
-    var w: PacketWriter = .{ .buf = &buf };
-    try w.putU8(@intCast(c.SSH_FXP_ATTRS));
-    try w.putU32(request_id);
-    try writeDirAttrs(&w);
-    try writePayload(channel, w.written());
-}
-
 pub fn replyFullAttrs(channel: c.ssh_channel, request_id: u32, info: listing.EntryInfo) !void {
     var buf: [128]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
@@ -138,19 +111,11 @@ pub fn replyStatus(channel: c.ssh_channel, request_id: u32, status: c_int, messa
     try writePayload(channel, w.written());
 }
 
-pub fn writeDirAttrs(w: *PacketWriter) !void {
-    // REALPATH has no inode at hand: claim a 0755 directory of size 0.
-    try writeBasicAttrs(w, .directory, 0);
-}
-
-pub fn writeBasicAttrs(w: *PacketWriter, kind: std.Io.File.Kind, size: u64) !void {
-    const mode: u32 = switch (kind) {
-        .directory => @intCast(c.SSH_S_IFDIR | 0o755),
-        else => @intCast(c.SSH_S_IFREG | 0o644),
-    };
+/// REALPATH has no inode at hand: claim a 0755 directory of size 0.
+fn writeDirAttrs(w: *PacketWriter) !void {
     try w.putU32(@intCast(c.SSH_FILEXFER_ATTR_SIZE | c.SSH_FILEXFER_ATTR_PERMISSIONS));
-    try w.putU64(size);
-    try w.putU32(mode);
+    try w.putU64(0);
+    try w.putU32(@intCast(c.SSH_S_IFDIR | 0o755));
 }
 
 /// SIZE, UIDGID, PERMISSIONS (with file-type bits), and ACMODTIME.

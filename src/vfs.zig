@@ -7,11 +7,10 @@
 //! operator and is unreachable over SFTP.
 
 const std = @import("std");
+const listing = @import("listing.zig");
 
 pub const Error = error{
-    EmptyRoot,
     InvalidPath,
-    NotAbsoluteRoot,
     OutOfMemory,
     PathTooLong,
     PathTraversal,
@@ -32,8 +31,7 @@ pub const Vfs = struct {
     root: [:0]const u8,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, root_path: []const u8) Error!Vfs {
-        if (root_path.len == 0) return error.EmptyRoot;
-        if (!std.Io.Dir.path.isAbsolute(root_path)) return error.NotAbsoluteRoot;
+        // config guarantees an absolute root; realPathFileAbsoluteAlloc asserts it.
         const canonical = try std.Io.Dir.realPathFileAbsoluteAlloc(io, root_path, allocator);
         return .{ .root = canonical };
     }
@@ -78,10 +76,6 @@ pub const Vfs = struct {
             return null;
         };
         return staging;
-    }
-
-    pub fn normalizeVirtual(allocator: std.mem.Allocator, virtual_path: []const u8) Error![]u8 {
-        return normalizeVirtualPath(allocator, virtual_path);
     }
 
     /// Length, no C0 control or DEL bytes, and valid UTF-8 (the audit
@@ -161,10 +155,8 @@ pub const Vfs = struct {
 
         const slash = std.mem.lastIndexOfScalar(u8, normalized, '/') orelse unreachable;
         const parent_virtual = if (slash == 0) "/" else normalized[0..slash];
+        // Normalized, so the basename is never empty, `.`, or `..`.
         const base_part = normalized[slash + 1 ..];
-        if (base_part.len == 0 or std.mem.eql(u8, base_part, ".") or std.mem.eql(u8, base_part, "..")) {
-            return error.InvalidPath;
-        }
 
         const dir = try self.openVirtualDir(io, allocator, parent_virtual, false);
         errdefer dir.close(io);
@@ -199,7 +191,7 @@ pub const legacy_staging_dir_name: []const u8 = ".zift-staging";
 pub fn legacyStagingDirExists(io: std.Io, root_path: []const u8) bool {
     var root = std.Io.Dir.openDirAbsolute(io, root_path, .{}) catch return false;
     defer root.close(io);
-    _ = @import("listing.zig").statAt(root.handle, legacy_staging_dir_name) catch return false;
+    _ = listing.statAt(root.handle, legacy_staging_dir_name) catch return false;
     return true;
 }
 
@@ -216,7 +208,7 @@ fn openOrCreateNamespaceDir(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
         error.PathAlreadyExists => {
             // lstat, then NOFOLLOW open and fstat the fd, so a swap
             // between the two cannot redirect the namespace.
-            const info = try @import("listing.zig").statAt(root.handle, namespace_dir_name);
+            const info = try listing.statAt(root.handle, namespace_dir_name);
             const file_type = info.mode & 0o170000;
             if (file_type != 0o040000) return error.NamespaceDirCorrupt;
             if ((info.mode & 0o027) != 0) return error.NamespaceDirUnsafe;
@@ -240,7 +232,7 @@ fn openOrCreateStagingSubdir(io: std.Io, ns_dir: std.Io.Dir) !std.Io.Dir {
         return dir;
     } else |err| switch (err) {
         error.PathAlreadyExists => {
-            const info = try @import("listing.zig").statAt(ns_dir.handle, staging_subdir_name);
+            const info = try listing.statAt(ns_dir.handle, staging_subdir_name);
             const file_type = info.mode & 0o170000;
             if (file_type != 0o040000) return error.StagingDirCorrupt;
             if ((info.mode & 0o077) != 0) return error.StagingDirUnsafe;
@@ -260,7 +252,7 @@ fn assertOpenedDirMode(
     corrupt: anyerror,
     unsafe: anyerror,
 ) !void {
-    const info = try @import("listing.zig").statFd(dir.handle);
+    const info = try listing.statFd(dir.handle);
     const file_type = info.mode & 0o170000;
     if (file_type != 0o040000) return corrupt;
     if ((info.mode & forbidden_mask) != 0) return unsafe;
@@ -330,66 +322,70 @@ pub fn isInsideRoot(root: []const u8, path: []const u8) bool {
     return path.len > root.len and path[root.len] == '/';
 }
 
+fn testNormalize(path: []const u8) ![]const u8 {
+    const S = struct {
+        var buf: [max_virtual_path_bytes + 2]u8 = undefined;
+    };
+    return normalizeVirtualInto(path, &S.buf);
+}
+
 test "normalize virtual path" {
-    const allocator = std.testing.allocator;
-    const normalized = try Vfs.normalizeVirtual(allocator, "/pending//./inbox/file.txt");
-    defer allocator.free(normalized);
+    const normalized = try testNormalize("/pending//./inbox/file.txt");
     try std.testing.expectEqualStrings("/pending/inbox/file.txt", normalized);
 }
 
 test "normalize rejects traversal above root" {
     try std.testing.expectError(
         error.PathTraversal,
-        Vfs.normalizeVirtual(std.testing.allocator, "/../../etc/passwd"),
+        testNormalize("/../../etc/passwd"),
     );
 }
 
 test "normalize rejects nul byte" {
     try std.testing.expectError(
         error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/pending/a\x00b"),
+        testNormalize("/pending/a\x00b"),
     );
 }
 
 test "normalize rejects /.zift namespace anywhere in path" {
     try std.testing.expectError(
         error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/.zift"),
+        testNormalize("/.zift"),
     );
     try std.testing.expectError(
         error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/.zift/staging/abc123"),
+        testNormalize("/.zift/staging/abc123"),
     );
     try std.testing.expectError(
         error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/.zift/notes.md"),
+        testNormalize("/.zift/notes.md"),
     );
     // Mid-path too.
     try std.testing.expectError(
         error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/pending/.zift/something"),
+        testNormalize("/pending/.zift/something"),
     );
     try std.testing.expectError(
         error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/.zift-staging"),
+        testNormalize("/.zift-staging"),
     );
     try std.testing.expectError(
         error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/.zift-staging/legacy.dat"),
+        testNormalize("/.zift-staging/legacy.dat"),
     );
     try std.testing.expectError(
         error.InvalidPath,
-        Vfs.normalizeVirtual(std.testing.allocator, "/pending/.zift-staging/something"),
+        testNormalize("/pending/.zift-staging/something"),
     );
     // Non-reserved dotfiles are fine.
-    const ok = try Vfs.normalizeVirtual(std.testing.allocator, "/pending/.cache/foo");
-    defer std.testing.allocator.free(ok);
+    const ok = try testNormalize("/pending/.cache/foo");
     try std.testing.expectEqualStrings("/pending/.cache/foo", ok);
 }
 
 test "reserved .zift component is case-insensitive" {
     for ([_][]const u8{ "/.ZIFT/staging/x", "/.Zift/notes", "/pending/.ZIFT-STAGING/x" }) |p| {
-        try std.testing.expectError(error.InvalidPath, Vfs.normalizeVirtual(std.testing.allocator, p));
+        try std.testing.expectError(error.InvalidPath, testNormalize(p));
     }
     try std.testing.expect(isReservedComponent(".ZIFT"));
     try std.testing.expect(isReservedComponent(".Zift"));

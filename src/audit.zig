@@ -618,20 +618,20 @@ test "audit line truncates detail when over the line cap" {
     try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
 }
 
+fn testJoin(buf: []u8, parent: []const u8, name: []const u8) [:0]u8 {
+    const n = parent.len + 1 + name.len;
+    std.debug.assert(n < buf.len);
+    @memcpy(buf[0..parent.len], parent);
+    buf[parent.len] = '/';
+    @memcpy(buf[parent.len + 1 ..][0..name.len], name);
+    buf[n] = 0;
+    return buf[0..n :0];
+}
+
 test "openLogFile refuses symlinks and non-regular files and pins 0640 only on create" {
     const io = std.testing.io;
     const Probe = struct {
         extern "c" fn mkfifo(path: [*:0]const u8, mode: std.posix.mode_t) c_int;
-
-        fn join(buf: []u8, parent: []const u8, name: []const u8) [:0]u8 {
-            const n = parent.len + 1 + name.len;
-            std.debug.assert(n < buf.len);
-            @memcpy(buf[0..parent.len], parent);
-            buf[parent.len] = '/';
-            @memcpy(buf[parent.len + 1 ..][0..name.len], name);
-            buf[n] = 0;
-            return buf[0..n :0];
-        }
 
         fn perm(path: [*:0]const u8) !u32 {
             if (builtin.os.tag == .linux) {
@@ -664,7 +664,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
 
     {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const path = Probe.join(&buf, dir, "created.log");
+        const path = testJoin(&buf, dir, "created.log");
         // Under umask 077 only the fchmod yields 0640.
         const old_mask = std.c.umask(0o077);
         defer _ = std.c.umask(old_mask);
@@ -675,7 +675,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
     }
     {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const path = Probe.join(&buf, dir, "created.log");
+        const path = testJoin(&buf, dir, "created.log");
         try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(path, 0o604));
         const fd = try openLogFile(path);
         defer _ = std.c.close(fd);
@@ -691,7 +691,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
 
     {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const path = Probe.join(&buf, dir, "existing.log");
+        const path = testJoin(&buf, dir, "existing.log");
         const raw = std.c.open(path, .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
@@ -716,7 +716,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
 
     {
         var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const target = Probe.join(&target_buf, dir, "target.log");
+        const target = testJoin(&target_buf, dir, "target.log");
         const raw = std.c.open(target, .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
@@ -730,7 +730,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
         _ = std.c.close(raw);
 
         var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const link = Probe.join(&link_buf, dir, "link.log");
+        const link = testJoin(&link_buf, dir, "link.log");
         try tmp.dir.symLink(io, target, "d/link.log", .{});
         try std.testing.expectError(error.OpenFailed, openLogFile(link));
         try std.testing.expectEqual(@as(u32, 0o600), try Probe.perm(target));
@@ -742,7 +742,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
     try tmp.dir.createDir(io, "d/subdir", .default_dir);
     {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const path = Probe.join(&buf, dir, "subdir");
+        const path = testJoin(&buf, dir, "subdir");
         try std.testing.expectError(error.OpenFailed, openLogFile(path));
     }
 
@@ -752,7 +752,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
 
     {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const path = Probe.join(&buf, dir, "audit.fifo");
+        const path = testJoin(&buf, dir, "audit.fifo");
         try std.testing.expectEqual(@as(c_int, 0), Probe.mkfifo(path, 0o640));
         try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(path, 0o612));
         const Reader = struct {
@@ -778,18 +778,6 @@ test "failed audit reopen retries on a deadline without a stderr storm" {
     defer signals.log_reopen_requested.store(saved_flag, .release);
     signals.log_reopen_requested.store(false, .release);
 
-    const Paths = struct {
-        fn join(buf: []u8, parent: []const u8, name: []const u8) [:0]u8 {
-            const n = parent.len + 1 + name.len;
-            std.debug.assert(n < buf.len);
-            @memcpy(buf[0..parent.len], parent);
-            buf[parent.len] = '/';
-            @memcpy(buf[parent.len + 1 ..][0..name.len], name);
-            buf[n] = 0;
-            return buf[0..n :0];
-        }
-    };
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(io, "d", .default_dir);
@@ -798,11 +786,11 @@ test "failed audit reopen retries on a deadline without a stderr storm" {
     const dir = dir_buf[0..dir_len];
 
     var audit_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const audit_path = Paths.join(&audit_buf, dir, "audit.jsonl");
+    const audit_path = testJoin(&audit_buf, dir, "audit.jsonl");
     var kept_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const kept_path = Paths.join(&kept_buf, dir, "kept.jsonl");
+    const kept_path = testJoin(&kept_buf, dir, "kept.jsonl");
     var other_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const other_path = Paths.join(&other_buf, dir, "other.jsonl");
+    const other_path = testJoin(&other_buf, dir, "other.jsonl");
 
     var sink = try Sink.initFromConfig(std.testing.allocator, .{ .file = audit_path });
     defer sink.deinit(std.testing.allocator);
