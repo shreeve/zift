@@ -1342,11 +1342,11 @@ fn handleIdAvailable(next_handle: u32) bool {
 }
 
 /// The status for a failed path walk or filesystem call. Only a missing
-/// entry is NO_SUCH_FILE: running out of descriptors or memory, or a
+/// entry (or a file used as a directory) is NO_SUCH_FILE: running out of descriptors or memory, or a
 /// host permission problem, is a server-side FAILURE.
 fn fsErrorStatus(err: anyerror) c_int {
     return switch (err) {
-        error.FileNotFound, error.NotFound, error.NameTooLong => c.SSH_FX_NO_SUCH_FILE,
+        error.FileNotFound, error.NotFound, error.NotDir, error.NameTooLong => c.SSH_FX_NO_SUCH_FILE,
         error.PathTraversal, error.InvalidPath, error.Reserved => c.SSH_FX_PERMISSION_DENIED,
         else => c.SSH_FX_FAILURE,
     };
@@ -1487,6 +1487,7 @@ test "only a missing entry is NO_SUCH_FILE" {
     const failure: c_int = c.SSH_FX_FAILURE;
     try std.testing.expectEqual(missing, fsErrorStatus(error.FileNotFound));
     try std.testing.expectEqual(missing, fsErrorStatus(error.NotFound));
+    try std.testing.expectEqual(missing, fsErrorStatus(error.NotDir));
     try std.testing.expectEqual(denied, fsErrorStatus(error.PathTraversal));
     try std.testing.expectEqual(denied, fsErrorStatus(error.Reserved));
     for ([_]anyerror{
