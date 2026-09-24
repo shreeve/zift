@@ -1,19 +1,17 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const zon = @import("build.zig.zon");
 
-/// Default version for local builds. The release CI workflow overrides
-/// this via `-Dversion=...` extracted from the pushed git tag, so the
-/// shipped artifact name matches the tag exactly. Local `zig build release`
-/// invocations without `-Dversion=...` use this value as a stable fallback.
-const default_version = "0.11.0";
-
-/// libssh version we vendor. Must match the tag in `build.zig.zon`'s
-/// `libssh_source` URL. Tracked here in source rather than parsed at
-/// build time because both the version header and a few CMake config
-/// fields are populated from it.
-const libssh_major: u32 = 0;
-const libssh_minor: u32 = 11;
-const libssh_patch: u32 = 5;
+/// libssh version, parsed from the `libssh_source` ref in build.zig.zon so
+/// the pinned source and the version compiled into its headers cannot
+/// drift apart.
+const libssh_version: std.SemanticVersion = blk: {
+    const url = zon.dependencies.libssh_source.url;
+    const marker = "ref=libssh-";
+    const start = std.mem.indexOf(u8, url, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, url, start, '#').?;
+    break :blk std.SemanticVersion.parse(url[start..end]) catch
+        @compileError("build.zig.zon libssh_source ref is not libssh-X.Y.Z");
+};
 
 /// Per-target shape we want to produce: a libssh static archive (built
 /// from the vendored upstream source via our own build steps), the
@@ -126,9 +124,6 @@ fn buildMbedTls(
     });
     lib.installHeadersDirectory(src.path("include/mbedtls"), "mbedtls", .{});
     lib.installHeadersDirectory(src.path("include/psa"), "psa", .{});
-    if (target.result.os.tag == .windows) {
-        lib.root_module.linkSystemLibrary("bcrypt", .{});
-    }
     return lib;
 }
 
@@ -213,8 +208,8 @@ fn buildLibssh(
     // We DO add `/` to NEW so the rewritten path reads cleanly:
     // `/libssh-0.11.5/src/packet_crypt.c` (vs `/libssh-0.11.5src/...`).
     const libssh_remap = b.fmt(
-        "-ffile-prefix-map={s}=/libssh-{d}.{d}.{d}/",
-        .{ libssh_src_abs, libssh_major, libssh_minor, libssh_patch },
+        "-ffile-prefix-map={s}=/libssh-{f}/",
+        .{ libssh_src_abs, libssh_version },
     );
     // Hardening flags for the vendored C (libssh/mbedTLS/zlib) — the
     // largest attack surface in the binary. `-fstack-protector-strong`
@@ -237,9 +232,9 @@ fn buildLibssh(
         .style = .{ .cmake = src.path("include/libssh/libssh_version.h.cmake") },
         .include_path = "libssh/libssh_version.h",
     }, .{
-        .libssh_VERSION_MAJOR = libssh_major,
-        .libssh_VERSION_MINOR = libssh_minor,
-        .libssh_VERSION_PATCH = libssh_patch,
+        .libssh_VERSION_MAJOR = @as(i64, libssh_version.major),
+        .libssh_VERSION_MINOR = @as(i64, libssh_version.minor),
+        .libssh_VERSION_PATCH = @as(i64, libssh_version.patch),
     });
 
     const config_header = b.addConfigHeader(.{
@@ -247,12 +242,13 @@ fn buildLibssh(
         .include_path = "config.h",
     }, .{
         .PROJECT_NAME = "libssh",
-        .PROJECT_VERSION = b.fmt("{d}.{d}.{d}", .{ libssh_major, libssh_minor, libssh_patch }),
-        // Most of these are paths CMake would template into the
-        // source. None are reached at runtime in our build because
-        // we never load /etc/ssh/* config files (PLAN §5: explicit
-        // config only, no /etc lookups). Setting them to harmless
-        // strings keeps the build hermetic.
+        .PROJECT_VERSION = b.fmt("{f}", .{libssh_version}),
+        // Paths CMake would template into the source. The client
+        // config paths are unreachable (Zift never runs libssh as a
+        // client), but `ssh_bind_listen` parses GLOBAL_BIND_CONFIG
+        // unless the server sets SSH_BIND_OPTIONS_PROCESS_CONFIG to
+        // false, which it must: Zift's one config file is the whole
+        // configuration.
         .SYSCONFDIR = "/etc",
         .BINARYDIR = "/usr/local/bin",
         .SOURCEDIR = "/src/libssh",
@@ -271,18 +267,18 @@ fn buildLibssh(
         .HAVE_GLOB_H = is_unix,
         .HAVE_VALGRIND_VALGRIND_H = false,
         .HAVE_PTY_H = is_linux,
-        .HAVE_UTMP_H = 1,
+        .HAVE_UTMP_H = is_unix,
         .HAVE_UTIL_H = is_macos,
         .HAVE_LIBUTIL_H = false,
         .HAVE_SYS_TIME_H = 1,
         .HAVE_SYS_UTIME_H = 0,
-        .HAVE_IO_H = 1,
+        .HAVE_IO_H = false,
         .HAVE_TERMIOS_H = is_unix,
         .HAVE_UNISTD_H = 1,
         .HAVE_STDINT_H = 1,
         .HAVE_IFADDRS_H = is_unix,
         .HAVE_OPENSSL_AES_H = false,
-        .HAVE_WSPIAPI_H = 1,
+        .HAVE_WSPIAPI_H = false,
         .HAVE_OPENSSL_DES_H = false,
         .HAVE_OPENSSL_ECDH_H = false,
         .HAVE_OPENSSL_EC_H = false,
@@ -299,11 +295,11 @@ fn buildLibssh(
 
         // Stdlib features we know exist on every modern target we ship.
         .HAVE_SNPRINTF = 1,
-        .HAVE__SNPRINTF = 1,
-        .HAVE__SNPRINTF_S = 1,
+        .HAVE__SNPRINTF = false,
+        .HAVE__SNPRINTF_S = false,
         .HAVE_VSNPRINTF = 1,
-        .HAVE__VSNPRINTF = 1,
-        .HAVE__VSNPRINTF_S = 1,
+        .HAVE__VSNPRINTF = false,
+        .HAVE__VSNPRINTF_S = false,
         .HAVE_ISBLANK = 1,
         .HAVE_STRNCPY = 1,
         .HAVE_STRNDUP = is_unix,
@@ -315,12 +311,12 @@ fn buildLibssh(
         .HAVE_NTOHLL = 0,
         .HAVE_HTONLL = 0,
         .HAVE_STRTOULL = 1,
-        .HAVE___STRTOULL = 1,
-        .HAVE__STRTOUI64 = 1,
+        .HAVE___STRTOULL = false,
+        .HAVE__STRTOUI64 = false,
         .HAVE_GLOB = is_unix,
         .HAVE_EXPLICIT_BZERO = is_linux,
         .HAVE_MEMSET_S = is_unix,
-        .HAVE_SECURE_ZERO_MEMORY = 1,
+        .HAVE_SECURE_ZERO_MEMORY = false,
         .HAVE_CMOCKA_SET_TEST_FILTER = false,
 
         // Crypto backend selection. mbedTLS only.
@@ -560,11 +556,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Release CI passes the pushed tag's version; everything else uses
+    // build.zig.zon's, so the version lives in one place.
     const zift_version = b.option(
         []const u8,
         "version",
-        "Override the version string (e.g. -Dversion=0.2.1). Defaults to the source-tree default.",
-    ) orelse default_version;
+        "Version string baked into the binary (e.g. -Dversion=0.2.1); defaults to build.zig.zon's .version",
+    ) orelse zon.version;
 
     const target_triple = b.fmt("{s}-{s}", .{
         @tagName(target.result.cpu.arch),
@@ -625,7 +623,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // ----- `zig build release` (PLAN §13) -----------------------------------
+    // ----- `zig build release` -----------------------------------------------
     //
     // Produces `./release/zift-{version}-{target}` plus a per-target
     // `SHA256SUMS-{target}` line. Always linked ReleaseSafe
@@ -710,6 +708,4 @@ pub fn build(b: *std.Build) void {
     release_step.dependOn(&install_release.step);
     release_step.dependOn(&checksum_cmd.step);
     release_step.dependOn(&verify_cmd.step);
-
-    _ = builtin; // referenced for cross-platform branches, kept around for future targets.
 }
