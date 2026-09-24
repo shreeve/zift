@@ -85,8 +85,9 @@ P-256, P-384 or P-521, or RSA of 2048 to 8192 bits, which must sign with
 refused. The host key may be any unencrypted key libssh loads, smaller
 RSA included, and never signs with SHA-1.
 
-A public-key probe for an unknown user and for a known user outside
-`from` look the same to the client; only the audit detail differs.
+A public-key probe for an unknown user and for a known user with keys
+outside `from` look the same to the client; only the audit detail
+differs. A password-only user is distinguishable (see Method narrowing).
 
 ### Method narrowing
 
@@ -138,8 +139,8 @@ the sweep skips uploads still open in this process.
 
 `<root>/.zift/` is reserved: partners cannot name it in any request or
 see it in any listing. Besides `staging/`, which only the daemon uses,
-operators may keep per-partner notes there. Zift checks both levels on
-every use, and new uploads fail with "staging dir unavailable" if
+operators may keep per-partner notes there. Zift checks both levels when
+a session starts and again before its first upload, and new uploads fail with "staging dir unavailable" if
 either is wrong; logins and downloads still work.
 
 | Path | Must be | Created as |

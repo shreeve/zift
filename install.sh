@@ -267,7 +267,7 @@ main() {
     warn "The daemon will NOT pick this up, and sudo was not available here."
     warn "To install the one it runs:"
     warn ""
-    warn "  sudo BIN=/usr/local/bin bash install.sh $tag"
+    warn "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sudo BIN=/usr/local/bin bash -s $tag"
     warn ""
     warn "Continuing — a user install is still fine for hash-password and validate."
     printf '\n'

@@ -56,7 +56,8 @@ ownership is checked against the user running it.
 - Blank lines are ignored. `#` starts a comment at the start of a line
   or after a space or tab; a `#` inside a token is literal.
 - A value runs to the end of the line or comment and may contain
-  spaces: `root /srv/sp ace #2` is `/srv/sp ace`.
+  spaces (`root /srv/sp ace`) and `#` inside a token (`root /srv/a#1`),
+  but never a blank followed by `#`, which always starts a comment.
 - User names use ASCII letters, digits, `_`, `-` and `.`, are at most 64
   bytes, and may not start with `.`.
 - Durations need a unit: `ms`, `s`, `m`, `h` or `d` (`30s`, `5m`). A bare

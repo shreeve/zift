@@ -188,9 +188,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y expect openssh-client python3-venv lsof
+          sudo apt-get install -y expect openssh-client python3-venv
 
-      # macOS runners already have expect, the OpenSSH client and lsof.
+      # macOS runners already have expect, the OpenSSH client and perl.
       - name: Create paramiko venv
         run: |
           python3 -m venv tests/.venv

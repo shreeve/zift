@@ -82,8 +82,8 @@ KeyringMode=private
 ReadWritePaths=/home/zift
 NoExecPaths=/home/zift
 
-# The defaults (max-connections 128) need 33,856 fds and peak near
-# 550 MiB. Raise LimitNOFILE with max-connections (docs/operate.md).
+# The defaults (max-connections 128) need 33,856 fds; password checks
+# peak at 512 MiB plus 256 KiB per session (docs/operate.md). Raise LimitNOFILE with max-connections (docs/operate.md).
 LimitNOFILE=65536
 MemoryMax=4G
 

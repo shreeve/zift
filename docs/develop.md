@@ -10,10 +10,10 @@ needed.
 - Zig `0.16.0`
 - a Linux or macOS host
 - for integration tests: Python 3 with Paramiko, the OpenSSH client,
-  `expect` and `lsof`
+  `expect` and `perl`
 
 ```sh
-sudo apt-get install -y expect openssh-client python3-venv lsof   # Linux; macOS has these
+sudo apt-get install -y expect openssh-client python3-venv   # Linux; macOS has these
 python3 -m venv tests/.venv
 tests/.venv/bin/pip install paramiko
 ```
@@ -116,10 +116,10 @@ The runner reads:
 | Variable | Effect |
 | --- | --- |
 | `ZIFT_BIN` | test this binary instead of building one |
-| `ZIFT_TEST_PORT_BASE` | ports start here, one per case (default 22200) |
+| `ZIFT_TEST_PORT_BASE` | case N of the run listens on base+N (default 22200) |
 | `ZIFT_REQUIRE_ALL=1` | a skipped case fails the run, except slow cases |
 | `ZIFT_TEST_SLOW=1` | also run slow cases, such as the 120 s login grace |
-| `ZIFT_TEST_TIMEOUT` | per-case timeout |
+| `ZIFT_TEST_TIMEOUT` | per-case timeout in seconds (default 180) |
 
 ## CI
 
@@ -133,8 +133,9 @@ The runner reads:
   `version` and `validate` smoke tests.
 - **Integration tests** on Linux and macOS against that release
   artifact (`ZIFT_BIN`), with `ZIFT_REQUIRE_ALL=1`.
-- **Fuzz** with `--fuzz=200K` in ReleaseSafe; anything but a clean exit
-  fails.
+- **Fuzz** with `--fuzz=200K` in ReleaseSafe. Zig 0.16 exits 0 even
+  when it finds a crash, so a non-zero exit or a log line reporting a
+  crashing input fails the job.
 
 ## Release Workflow
 

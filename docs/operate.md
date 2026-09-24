@@ -32,7 +32,8 @@ binary against `SHA256SUMS`, and installs the binary only.
   first. The download and checks never run as root. If `sudo` is
   unavailable it installs to `~/.local/bin` and warns that the service
   will not see it.
-- Anywhere else it installs to `~/.local/bin`, which is enough for
+- Anywhere else it installs to `~/.local/bin` (as root, to
+  `/usr/local/bin`), which is enough for
   `zift hash-password` and `zift validate`.
 - `BIN=/some/dir` overrides both and is never elevated.
 - `bash -s vX.Y.Z` pins a release; `bash -s -- --uninstall` removes the
@@ -56,7 +57,7 @@ cosign verify-blob \
   --certificate-identity "https://github.com/shreeve/zift/.github/workflows/release.yml@refs/tags/v${ZIFT_VERSION}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing    # macOS: shasum -a 256 -c --ignore-missing
+sha256sum -c SHA256SUMS --ignore-missing    # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
 
 sudo install -m 0755 "zift-${ZIFT_VERSION}-${ARCH}-linux" /usr/local/bin/zift
 zift version
@@ -311,8 +312,9 @@ with a file, only status lines do.
 Fields appear in this order: `time` (RFC 3339 UTC, milliseconds),
 `event` (always `zift.audit`), `user`, `operation`, `result` (`ok`,
 `denied` or `failed`), `path`, `detail`, `ip`, and `truncated` when a
-line was clipped at 4096 bytes. `user`, `path` and `detail` are omitted
-when empty; `ip` is always present.
+line was clipped at 4096 bytes. `user` and `path` are omitted when they
+do not apply and `detail` when empty; `ip` is always present. A clipped
+line shortens `detail` first, then drops `path`, then `user`.
 
 | `operation` | Meaning |
 | --- | --- |
@@ -372,7 +374,8 @@ nc -z -w2 127.0.0.1 2222
 ```
 
 Each probe is a connection: it holds a pre-auth slot for a moment and
-writes a `handshake.failed` audit line. A probe that goes further, such
+writes a `handshake.failed` audit line and a `zift: LibsshFailure:
+Socket error: …` status line. A probe that goes further, such
 as an `ssh` login attempt, writes more audit lines, and a failed
 password counts toward source suppression. `from` does not exempt a source. A monitor that must log in
 needs a real user with real credentials.

@@ -7,8 +7,8 @@ Versions marked "untagged" were released from a commit, not a git tag.
 
 To upgrade, run `zift validate` on your config with the new binary, as
 the service user (`sudo -u zift zift validate …`), before you restart.
-It catches every breaking change below and names the line and the
-reason.
+It catches every breaking change below and names the line (or the
+file) and the reason.
 
 ### Security
 
@@ -40,7 +40,9 @@ reason.
   that trips it ends at once.
 - Abuse tracking keys IPv6 sources by /64 (IPv4 by address).
 - A public-key probe for a real user outside `from` looks the same to
-  the client as one for an unknown user.
+  the client as one for an unknown user (for a user with keys; a
+  password-only user is distinguishable, see "Method narrowing" in
+  `docs/security.md`).
 - Configs that failed open or checked the wrong file are now rejected:
   dead rule patterns, IPv6 `from` prefixes that match every IPv4 peer,
   loose or hard-linked host and key files, and a relative `host-key`.
@@ -125,8 +127,8 @@ reason.
 ### Added
 
 - Trailing comments: `<whitespace># ...` ends a line. A `#` inside a
-  token is literal, and values may contain spaces: `root /srv/sp ace
-  #2` is `/srv/sp ace`.
+  token is literal (`root /srv/a#1`), and values may contain spaces
+  (`root /srv/sp ace`), but never a blank followed by `#`.
 - Symlinked `host-key` and `auth` key files. The target is checked
   (regular file, mode, owner), which fits Kubernetes Secrets and systemd
   credentials.
@@ -159,7 +161,8 @@ reason.
   restore) reloads without SIGHUP. A rejected reload's audit event
   carries the reason, and reload re-checks that the config file lies
   outside every root.
-- Policy matching is linear-time, with no step budget; `?` matches one
+- Policy matching runs in O(pattern × path) time, with no backtracking
+  and no step budget; `?` matches one
   UTF-8 character; a policy path over 4096 bytes gets no permissions.
 - `from ::ffff:a.b.c.d` matches plain IPv4 peers, and `from ::/0`
   matches IPv4 peers. IPv4-mapped peers are audited as plain IPv4.
@@ -193,8 +196,8 @@ reason.
 - macOS gets the same TCP keepalive as Linux (60 s idle, 10 s interval,
   6 probes).
 - systemd unit: `LimitNOFILE=65536` (the defaults need about 34,000
-  fds), `SystemCallErrorNumber=EPERM` (a filtered syscall fails instead
-  of killing the daemon), and a memory comment with the real arithmetic.
+  fds), an explicit allowance for raising the soft fd limit, and a
+  memory comment with the real arithmetic.
 - Release binaries are stripped (x86_64-linux 10.3 MB → 1.9 MB,
   aarch64-macos 1.6 MB → 1.2 MB), so panics print addresses without
   symbols, and no build-host paths are embedded. The dev `zig build`

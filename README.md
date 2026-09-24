@@ -36,8 +36,9 @@ first; the installer uses it to verify the release. Then:
 curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
 ```
 
-This installs the verified binary only: to `/usr/local/bin` on a host
-that runs the `zift` service, otherwise to `~/.local/bin`. Setting up the
+This installs the verified binary only: to `/usr/local/bin` when run as
+root or on a host that runs the `zift` service, otherwise to
+`~/.local/bin` (add it to `PATH` if `zift` is not found). Setting up the
 service is [`docs/operate.md`](docs/operate.md). To build from source,
 see [`docs/develop.md`](docs/develop.md).
 

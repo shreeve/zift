@@ -128,7 +128,8 @@ cover backups, and external watchers handle post-upload processing.
 
 Zift is a compact Zig codebase on libssh, with unit tests, fuzzing, and
 an integration suite that drives real OpenSSH and Paramiko clients
-against the same static release binary users run. Releases are signed
+against a release build made exactly as releases are (ReleaseSafe,
+stripped, static on Linux). Releases are signed
 with cosign.
 
 Read the [known caveats](security.md#known-caveats) before deciding. The
