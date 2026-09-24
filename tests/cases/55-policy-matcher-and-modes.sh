@@ -1,108 +1,76 @@
 #!/usr/bin/env bash
 # Test: policy globs match in linear time with `?` as one UTF-8
-# character, and virtual-mode file bits promise only what OPEN allows.
-#
-# Covers:  src/policy.zig globMatch, effective, derivedMode.
-# Oracle:  1. A 4 KiB STAT path against five `**` deny rules is judged
-#             on the rules (not found), never denied for being slow.
-#          2. `/utf/?.txt` grants `/utf/é.txt` but not `/utf/ab.txt`.
-#          3. A listed file shows `w` only with `write` and `update`;
-#             a symlink shows no permission bits.
+#       character; a rule with a trailing comment still applies; and
+#       virtual-mode file bits promise only what OPEN allows
+# Pathological `**` rules must decide on merit, never deny for slowness;
+# a listing's `w` must mean a write would succeed.
 
 source "$(dirname "$0")/../lib/common.sh"
-
 need_paramiko
 
 make_host_key
-hash=$(make_password_hash secret)
-
-mkdir -p "$TEST_TMP/data/drop" "$TEST_TMP/data/rw" "$TEST_TMP/data/utf"
+mkdir -p "$TEST_TMP/data/drop" "$TEST_TMP/data/rw" "$TEST_TMP/data/utf" "$TEST_TMP/data/up/inbox"
 echo old > "$TEST_TMP/data/drop/old.csv"
 echo data > "$TEST_TMP/data/rw/file.csv"
 ln -s file.csv "$TEST_TMP/data/rw/link"
 echo accent > "$TEST_TMP/data/utf/é.txt"
 echo two > "$TEST_TMP/data/utf/ab.txt"
-
 write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  log stderr
+$(config_head)
 
 user runner
-  auth $hash
+  auth $(make_password_hash secret)
   root $TEST_TMP/data
   allow / list
   allow /drop list write
   allow /rw read list write update
   allow /utf/?.txt read
+  allow /up full       # everything...
+  deny /up/*.exe       # ...but top-level binaries
   deny **/**/**/**/**/b
   deny **a**a**a**a**a**a**a**b
 EOF
-
 start_zift
 
-"$PY" - <<EOF
-import errno, paramiko, socket, time
+"$PY" - <<'EOF'
+import errno, io, time
+from client import *
+sftp = connect("runner")
 
-sock = socket.create_connection(("127.0.0.1", $TEST_PORT), timeout=15)
-t = paramiko.Transport(sock)
-t.connect(username="runner", password="secret")
-sftp = paramiko.SFTPClient.from_transport(t)
-
-# --- 1. pathological rules cost microseconds and decide on merit -------
 path = "".join("/" + "a" * 63 for _ in range(64))[:4095] + "c"
 assert len(path) == 4096
 start = time.monotonic()
 for _ in range(50):
-    try:
-        sftp.stat(path)
-        raise AssertionError("stat of a missing path succeeded")
-    except IOError as e:
-        assert e.errno == errno.ENOENT, f"expected not found, got {e!r}"
+    expect_quiet = outcome(sftp.stat, path)
+    if expect_quiet != "missing":
+        fail(f"STAT of a 4 KiB path against ** rules: {expect_quiet}, want missing")
 elapsed = time.monotonic() - start
-assert elapsed < 5, f"50 STATs took {elapsed:.2f}s"
-print(f"ok: 4 KiB path vs five-** rules is not found, 50 STATs in {elapsed:.2f}s")
+if elapsed >= 5:
+    fail(f"50 STATs took {elapsed:.2f}s")
+ok(f"a 4 KiB path vs five-** rules is judged not found, 50 STATs in {elapsed:.2f}s")
+expect("the same rules still deny a match", "denied", sftp.stat, path[:-1] + "b")
 
-# The same deny rules still deny what they match.
-try:
-    sftp.stat(path[:-1] + "b")
-    raise AssertionError("path matching a deny rule was allowed")
-except IOError as e:
-    assert e.errno == errno.EACCES, f"expected denied, got {e!r}"
-print("ok: deny **/**/**/**/**/b still denies a match")
-
-# --- 2. ? is one character, not one byte --------------------------------
 with sftp.open("/utf/é.txt", "rb") as f:
-    assert f.read() == b"accent\n"
-print("ok: /utf/?.txt grants /utf/é.txt")
-try:
-    sftp.open("/utf/ab.txt", "rb")
-    raise AssertionError("/utf/?.txt granted a two-character name")
-except IOError as e:
-    assert e.errno == errno.EACCES, f"expected denied, got {e!r}"
-print("ok: /utf/?.txt does not grant /utf/ab.txt")
+    if f.read() != b"accent\n":
+        fail("/utf/é.txt content")
+ok("/utf/?.txt grants /utf/é.txt")
+expect("/utf/?.txt for a two-character name", "denied", sftp.open, "/utf/ab.txt", "rb")
 
-# --- 3. virtual-mode bits ----------------------------------------------
-def modes(d):
-    return {a.filename: a.longname.split()[0] for a in sftp.listdir_attr(d)}
+put = lambda p: sftp.putfo(io.BytesIO(b"MZ"), p)
+expect("upload /up/notes.txt", "ok", put, "/up/notes.txt")
+expect("upload /up/tool.exe under a commented deny", "denied", put, "/up/tool.exe")
+expect("upload /up/inbox/tool.exe (only the top level is denied)", "ok", put, "/up/inbox/tool.exe")
 
-drop = modes("/drop")
-assert drop["old.csv"] == "----------", f"drop-box file should be ----------, got {drop['old.csv']!r}"
-print("ok: write without update shows no w on an existing file")
-
+modes = lambda d: {a.filename: a.longname.split()[0] for a in sftp.listdir_attr(d)}
+if modes("/drop")["old.csv"] != "----------":
+    fail(f"drop-box file shows {modes('/drop')['old.csv']!r}")
+ok("write without update shows no w on an existing file")
 rw = modes("/rw")
-assert rw["file.csv"] == "-rw-rw----", f"write+update file should be -rw-rw----, got {rw['file.csv']!r}"
-assert rw["link"] == "l---------", f"symlink should show no bits, got {rw['link']!r}"
-print("ok: write+update shows rw-; a symlink shows ---")
-
-root = modes("/")
-assert root["drop"] == "drwxrwx---", f"drop dir should stay drwxrwx---, got {root['drop']!r}"
-print("ok: directory bits unchanged")
-
-sftp.close()
-t.close()
+if (rw["file.csv"], rw["link"]) != ("-rw-rw----", "l---------"):
+    fail(f"/rw shows {rw}")
+ok("write+update shows rw-; a symlink shows ---")
+if modes("/")["drop"] != "drwxrwx---":
+    fail(f"drop dir shows {modes('/')['drop']!r}")
+ok("directory bits unchanged")
 EOF
-
-stop_zift TERM
-wait "$ZIFT_PID" 2>/dev/null || true
+[[ ! -e "$TEST_TMP/data/up/tool.exe" ]] || fail "/up/tool.exe landed on disk"

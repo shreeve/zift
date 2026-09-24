@@ -15,7 +15,6 @@ Exit 0 on success, 2 on a failed check, 3 on an environment error.
 
 import argparse
 import logging
-import socket
 import subprocess
 import sys
 import threading
@@ -24,6 +23,8 @@ import time
 import paramiko
 from paramiko.common import cMSG_CHANNEL_REQUEST
 from paramiko.message import Message
+
+from client import connect
 
 
 def rss_kib(pid):
@@ -67,19 +68,15 @@ def main():
     # Each refused open would otherwise log a warning.
     logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--user", required=True)
-    ap.add_argument("--password", required=True)
     ap.add_argument("--pid", type=int, required=True)
     ap.add_argument("--flood", type=int, default=4000)
     ap.add_argument("--max-growth-kib", type=int, default=24 * 1024)
     args = ap.parse_args()
 
     try:
-        sock = socket.create_connection(("127.0.0.1", args.port), timeout=30)
-        t = paramiko.Transport(sock)
-        t.connect(username=args.user, password=args.password)
-        sftp = paramiko.SFTPClient.from_transport(t)
+        sftp = connect(args.user, timeout=30)
+        t = sftp.sock.get_transport()
         sftp.listdir("/")
     except Exception as e:
         print(f"env: cannot start SFTP: {e}")

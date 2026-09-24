@@ -1,68 +1,44 @@
 #!/usr/bin/env bash
-# Regression for libssh CVE-2026-59843: an authenticated channel-open
-# request advertising a zero maximum packet size must be rejected rather
-# than sending the server into an unbounded packetization loop.
+# Test: a channel open advertising max packet size 0 is refused promptly
+# Regression for libssh CVE-2026-59843: it sent the server into an
+# unbounded packetization loop. The server must stay responsive.
 
 source "$(dirname "$0")/../lib/common.sh"
-
 need_paramiko
 
 make_host_key
-hash=$(make_password_hash secret)
 mkdir -p "$TEST_TMP/data"
-
 write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  idle-timeout 2s
-  log stderr
+$(config_head "idle-timeout 2s")
 
 user partner
-  auth $hash
+  auth $(make_password_hash secret)
   root $TEST_TMP/data
   allow / read list
 EOF
-
 start_zift
 
-"$PY" - <<EOF
-import socket
-import time
-import paramiko
-
-# Paramiko normally clamps this field to a safe minimum. Override that
-# client-side guard solely to put the malicious wire value on the test
-# connection.
-transport = paramiko.Transport(("127.0.0.1", $TEST_PORT))
-transport.connect(username="partner", password="secret")
-sanitize = transport._sanitize_packet_size
-transport._sanitize_packet_size = lambda value: 0 if value is None else sanitize(value)
-
+"$PY" - <<'EOF'
+import time, paramiko
+from client import *
+t = transport("partner")
+# Paramiko clamps this field; override the client-side guard only to put
+# the malicious value on the wire.
+sanitize = t._sanitize_packet_size
+t._sanitize_packet_size = lambda value: 0 if value is None else sanitize(value)
 started = time.monotonic()
-rejected = False
 try:
-    channel = transport.open_session(timeout=3)
-    channel.invoke_subsystem("sftp")
+    t.open_session(timeout=3).invoke_subsystem("sftp")
+    fail("server accepted a channel advertising max-packet-size=0")
 except (EOFError, OSError, paramiko.SSHException):
-    rejected = True
+    pass
 elapsed = time.monotonic() - started
-transport.close()
+t.close()
+if elapsed >= 3.0:
+    fail(f"the malformed channel took {elapsed:.2f}s to refuse")
+ok(f"zero max-packet channel refused in {elapsed:.2f}s")
 
-assert rejected, "server accepted a channel advertising max-packet-size=0"
-assert elapsed < 3.0, f"malformed channel was not rejected promptly ({elapsed:.2f}s)"
-print(f"ok: zero max-packet channel rejected in {elapsed:.2f}s")
-
-# The malformed connection must not consume a spinning worker or damage
-# process-global libssh state. A clean session should still work.
-normal = paramiko.Transport(("127.0.0.1", $TEST_PORT))
-normal.connect(username="partner", password="secret")
-sftp = paramiko.SFTPClient.from_transport(normal)
-assert sftp.listdir("/") == []
-sftp.close()
-normal.close()
-print("ok: server remains responsive after malformed channel")
+if connect("partner").listdir("/") != []:
+    fail("a clean session after the malformed one misbehaved")
+ok("server remains responsive")
 EOF
-
-stop_zift TERM
-wait "$ZIFT_PID" 2>/dev/null || true

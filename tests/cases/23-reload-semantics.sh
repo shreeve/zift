@@ -1,182 +1,64 @@
 #!/usr/bin/env bash
-# Test: PLAN §7.3 reload semantics — interval cadence, any-change stamp,
-#       stat-failure warnings, host-key check on reload
-# Covers: PLAN §7.3 (auto-reload semantics)
-# TODOS: P1 reload semantics cluster (4 items)
+# Test: config reload: any stamp change reloads, stat failures warn once,
+#       SIGHUP always reloads, and a bad host key is rejected on reload
+# Deploys that restore old mtimes (rsync -t) must not need SIGHUP, and
+# `reload-interval 0` must leave SIGHUP as the only trigger.
 
 source "$(dirname "$0")/../lib/common.sh"
 
 make_host_key
-mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it
-hash=$(make_password_hash secret)
+CONF="$TEST_TMP/zift.conf"
+reloads() { count_log 'config reloaded'; }
 
-# ---------- (a) reload-interval honored; mtime-forward triggers reload ----------
-cat > "$TEST_TMP/zift.conf" <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  reload-interval 1s
-  log stderr
-
-user ally
-  auth $hash
-  root $TEST_TMP/root
-  allow / read list
-EOF
-
+# ---------- polling: forward and rewound stamps both reload ----------
+basic_config "reload-interval 1s"
 start_zift
-sleep 1
+touch -t 203001010000 "$CONF"
+wait_for_count 'config reloaded' 1 5 || fail "a forward mtime change did not reload"
+ok "a forward mtime change reloaded within the interval"
 
-# Touch the config to bump mtime forward. The 1-second reload interval
-# should pick up the change within ~2 seconds.
-sleep 1
-touch "$TEST_TMP/zift.conf"
-sleep 2
-
-grep -q 'config reloaded' "$ZIFT_LOG" \
-    || fail "expected forward-mtime change to trigger reload, log:\n$(cat "$ZIFT_LOG")"
-ok "forward-mtime change triggered a reload within the interval"
-
-# ---------- (b) rewinding mtime also triggers a reload ----------
-# Any change to the stamp reloads (a deploy that restores old mtimes,
-# e.g. rsync -t, must not need SIGHUP), and an unchanged file does not.
-RELOADS_BEFORE=$(grep -c 'config reloaded' "$ZIFT_LOG" || true)
-touch -t 200001010000 "$TEST_TMP/zift.conf"
-sleep 2
-RELOADS_AFTER=$(grep -c 'config reloaded' "$ZIFT_LOG" || true)
-[[ "$RELOADS_AFTER" -gt "$RELOADS_BEFORE" ]] \
-    || fail "rewinding mtime should trigger a reload (before=$RELOADS_BEFORE after=$RELOADS_AFTER)"
-ok "rewinding mtime triggered a reload"
-sleep 2
-RELOADS_STILL=$(grep -c 'config reloaded' "$ZIFT_LOG" || true)
-[[ "$RELOADS_STILL" == "$RELOADS_AFTER" ]] \
-    || fail "an unchanged config reloaded again (before=$RELOADS_AFTER after=$RELOADS_STILL)"
+touch -t 200001010000 "$CONF"
+wait_for_count 'config reloaded' 2 5 || fail "a rewound mtime did not reload"
+ok "a rewound mtime reloaded"
+sleep 1.5  # at least one more poll of an unchanged file
+[[ $(reloads) == 2 ]] || fail "an unchanged config reloaded again"
 ok "an unchanged config is not reloaded"
 
-# ---------- (c) stat failure logs once, recovery logs once ----------
-# Move the file out of the way (server can't stat it), wait for the
-# warning, then move it back and observe the recovery line.
-mv "$TEST_TMP/zift.conf" "$TEST_TMP/zift.conf.hidden"
-sleep 2
-
-WARN_COUNT=$(grep -c 'cannot stat config file' "$ZIFT_LOG" || true)
-[[ "$WARN_COUNT" == "1" ]] \
-    || fail "expected exactly 1 'cannot stat config file' warning, got $WARN_COUNT"
-ok "exactly one stat-failure warning emitted"
-
-mv "$TEST_TMP/zift.conf.hidden" "$TEST_TMP/zift.conf"
-# Bump mtime so reloadIfChanged actually does something on recovery.
-touch "$TEST_TMP/zift.conf"
-sleep 2
-
-grep -q 'config file readable again' "$ZIFT_LOG" \
-    || fail "expected 'config file readable again' on recovery, log:\n$(grep -E 'config|stat' "$ZIFT_LOG")"
-ok "recovery message emitted when file became readable again"
-
+# ---------- stat failure warns once; recovery is announced ----------
+mv "$CONF" "$CONF.hidden"
+wait_for_log 'cannot stat config file' 5 || fail "no stat-failure warning"
+sleep 1.5  # at least one more failed poll
+[[ $(count_log 'cannot stat config file') == 1 ]] || fail "the stat-failure warning repeated"
+ok "exactly one stat-failure warning"
+mv "$CONF.hidden" "$CONF"
+touch -t 203101010000 "$CONF"
+wait_for_log 'config file readable again' 5 || fail "no recovery message"
+ok "recovery announced when the file became readable again"
 stop_zift TERM
 
-# ---------- (d) reload-interval=0 disables mtime polling ----------
-# Use a different port so we don't race with the previous instance's
-# socket still being in TIME_WAIT.
-DISABLED_PORT=$((TEST_PORT + 100))
-cat > "$TEST_TMP/zift_disabled.conf" <<EOF
-server
-  listen 127.0.0.1:$DISABLED_PORT
-  host-key $TEST_TMP/host_ed25519
-  reload-interval 0
-  log stderr
-
-user ally
-  auth $hash
-  root $TEST_TMP/root
-  allow / read list
-EOF
-
-# Start a second instance with reload polling disabled.
-"$ZIFT_BIN" serve "$TEST_TMP/zift_disabled.conf" >"$TEST_TMP/disabled.log" 2>&1 &
-DISABLED_PID=$!
-PIDS+=("$DISABLED_PID")
-disown
-for _ in 1 2 3 4 5; do
-    grep -q 'listening on' "$TEST_TMP/disabled.log" 2>/dev/null && break
-    sleep 0.5
-done
-
-# Forward-bump mtime; with interval=0 there should be NO reload.
-sleep 1
-touch "$TEST_TMP/zift_disabled.conf"
-sleep 3
-grep -q 'config reloaded' "$TEST_TMP/disabled.log" \
-    && fail "reload-interval=0 should disable mtime polling, but a reload happened"
-ok "reload-interval=0 suppresses mtime-driven reload"
-
-# SIGHUP must still trigger a reload even with interval=0.
-kill -HUP "$DISABLED_PID"
-sleep 2
-grep -q 'config reloaded' "$TEST_TMP/disabled.log" \
-    || fail "SIGHUP should reload even when interval=0, log:\n$(cat "$TEST_TMP/disabled.log")"
-ok "SIGHUP still forces reload when reload-interval=0"
-
-kill -TERM "$DISABLED_PID" 2>/dev/null || true
-wait "$DISABLED_PID" 2>/dev/null || true
-
-# ---------- (e) reload rejects a config with an unreadable host-key ----------
-cat > "$TEST_TMP/zift.conf" <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  reload-interval 1s
-  log stderr
-
-user ally
-  auth $hash
-  root $TEST_TMP/root
-  allow / read list
-EOF
-
+# ---------- reload-interval 0: SIGHUP is the only trigger ----------
+basic_config "reload-interval 0"
 start_zift
-sleep 1
-
-# Replace the running config with one pointing at a non-existent
-# host-key path. The reload pass must reject it (validateSemantic
-# fails on host-key readability) and keep the previous config.
-cat > "$TEST_TMP/zift.conf" <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/missing-host-key
-  reload-interval 1s
-  log stderr
-
-user ally
-  auth $hash
-  root $TEST_TMP/root
-  allow / read list
-EOF
-touch "$TEST_TMP/zift.conf"
-sleep 2
-
-grep -q 'host-key unreadable' "$ZIFT_LOG" \
-    || fail "expected 'host-key unreadable' diagnostic on reload, log:\n$(cat "$ZIFT_LOG")"
-ok "reload rejected a config with an unreadable host-key"
-
-grep -q 'config reload rejected' "$ZIFT_LOG" \
-    || fail "expected 'config reload rejected' line, log:\n$(cat "$ZIFT_LOG")"
-ok "reload-rejected diagnostic emitted (kept previous config)"
-
-# Sanity: server is still serving with the OLD config — auth still works.
-expect <<EOF >"$TEST_TMP/auth.log" 2>&1
-set timeout 10
-spawn sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-    -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 \\
-    -P $TEST_PORT ally@127.0.0.1
-expect "password:"
-send "secret\r"
-expect "sftp>"
-send "bye\r"
-expect eof
-EOF
-grep -q "Connected to" "$TEST_TMP/auth.log" \
-    || fail "server stopped serving after rejected reload — should keep previous config"
-ok "previous config still serves after rejected reload"
-
+kill -HUP "$ZIFT_PID"
+wait_for_count 'config reloaded' 1 5 || fail "SIGHUP did not reload an unchanged config"
+ok "SIGHUP forces a reload of an unchanged config"
+touch -t 203001010000 "$CONF"
+sleep 2.5  # longer than the default 2 s interval
+[[ $(reloads) == 1 ]] || fail "reload-interval 0 still polled the mtime"
+ok "reload-interval 0 suppresses mtime-driven reload"
+kill -HUP "$ZIFT_PID"
+wait_for_count 'config reloaded' 2 5 || fail "SIGHUP did not reload with reload-interval 0"
+ok "SIGHUP still reloads with reload-interval 0"
 stop_zift TERM
+
+# ---------- a reload with an unreadable host key is rejected ----------
+basic_config "reload-interval 1s"
+start_zift
+sed -i.bak "s|host-key .*|host-key $TEST_TMP/missing-host-key|" "$CONF"
+touch -t 203001010000 "$CONF"
+wait_for_log 'host-key unreadable' 5 || fail "no 'host-key unreadable' diagnostic on reload"
+log_contains 'config reload rejected' || fail "no 'config reload rejected' line"
+ok "reload rejected a config with an unreadable host key"
+sftp_password ally secret >"$TEST_TMP/auth.log" 2>&1 \
+    || fail "server stopped serving after a rejected reload"
+ok "the previous config still serves"

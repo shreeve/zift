@@ -1,99 +1,32 @@
 #!/usr/bin/env bash
-# Test: known-bad-password and unknown-user attempts both produce a
-#       fully-formed `auth.password denied` audit line on the same path.
-#       This is the *audit-side* observable for the timing-safe dummy
-#       hash work — actual timing parity isn't asserted here because
-#       wall-clock measurements are unreliable in CI; the parity is
-#       enforced in `auth.zig` and exercised by the unit tests there.
-# Covers: PLAN §8.4 audit symmetry for known vs unknown users.
-# Oracle: a) both attempts produce a denied auth.password audit line;
-#         b) both lines carry the username the client offered; c) the
-#         unknown-user line carries the documented "unknown user" detail
-#         so operators can grep for enumeration probes.
+# Test: a wrong password and an unknown user both get a full
+#       `auth.password denied` line; only the unknown one says so
+# The audit side of the timing-safe dummy hash (ssh.zig and its unit
+# tests cover the timing): operators can grep for enumeration probes.
 
 source "$(dirname "$0")/../lib/common.sh"
-
 need_paramiko
 
 make_host_key
-hash=$(make_password_hash secret)
-
-mkdir -p "$TEST_TMP/data"
-
-write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  idle-timeout 10s
-  shutdown-grace 2s
-  log $TEST_TMP/audit.jsonl
-
-user runner
-  auth $hash
-  root $TEST_TMP/data
-  allow / read list
-EOF
-
+AUDIT="$TEST_TMP/audit.jsonl"
+basic_config "log $AUDIT"
 start_zift
 
-"$PY" - <<EOF
-import paramiko, socket
-
-port = $TEST_PORT
-
-# Known user, wrong password
-try:
-    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
-    t = paramiko.Transport(sock)
-    t.connect(username="runner", password="wrongpassword")
-except paramiko.AuthenticationException:
-    pass
-except Exception:
-    pass
-finally:
-    try: t.close()
-    except: pass
-
-# Unknown user
-try:
-    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
-    t = paramiko.Transport(sock)
-    t.connect(username="nonexistent", password="anything")
-except paramiko.AuthenticationException:
-    pass
-except Exception:
-    pass
-finally:
-    try: t.close()
-    except: pass
+"$PY" - <<'EOF'
+from client import *
+for user, password in (("ally", "wrongpassword"), ("nonexistent", "anything")):
+    if can_login(user, password):
+        fail(f"{user} logged in with {password!r}")
 EOF
-
-sleep 1
-
 stop_zift TERM
-wait "$ZIFT_PID" 2>/dev/null || true
 
-# Both attempts produce auth.password denied lines. The audit JSON
-# field order is documented in audit.zig as event/user/operation/
-# result/.../ip — the regex relies on that order being stable.
-known_denied=$(grep -c '"user":"runner","operation":"auth.password","result":"denied"' "$TEST_TMP/audit.jsonl" 2>/dev/null || echo 0)
-unknown_denied=$(grep -c '"user":"nonexistent","operation":"auth.password","result":"denied"' "$TEST_TMP/audit.jsonl" 2>/dev/null || echo 0)
-
-[[ "$known_denied" -ge 1 ]] || fail "expected denied audit line for known user 'runner'"
-ok "known user bad-password produces denied audit line"
-
-[[ "$unknown_denied" -ge 1 ]] || fail "expected denied audit line for unknown user 'nonexistent'"
-ok "unknown user produces denied audit line"
-
-# Cross-reference: only the unknown-user line should carry the
-# "unknown user" detail. This is the operator-facing signal that an
-# enumeration probe is happening; without it, the symmetry of the
-# audit lines would make probes invisible.
-if grep -q '"user":"nonexistent","operation":"auth.password","result":"denied","detail":"unknown user"' "$TEST_TMP/audit.jsonl"; then
-    ok "unknown-user audit line carries 'unknown user' detail"
-else
-    fail "expected 'unknown user' detail on unknown-user audit line"
-fi
-if grep -q '"user":"runner".*"detail":"unknown user"' "$TEST_TMP/audit.jsonl"; then
-    fail "known user line should NOT carry 'unknown user' detail"
-fi
+known='"user":"ally","operation":"auth.password","result":"denied"'
+unknown='"user":"nonexistent","operation":"auth.password","result":"denied"'
+(($(count_log "$known" "$AUDIT") >= 1)) || fail "no denied line for the known user"
+ok "known user, bad password: denied line"
+(($(count_log "$unknown" "$AUDIT") >= 1)) || fail "no denied line for the unknown user"
+ok "unknown user: denied line"
+log_contains "$unknown,\"detail\":\"unknown user\"" "$AUDIT" || fail "unknown-user line lacks the 'unknown user' detail"
+ok "the unknown-user line carries 'unknown user'"
+grep -q '"user":"ally".*"detail":"unknown user"' "$AUDIT" && fail "the known user's line says 'unknown user'"
+ok "the known user's line does not"

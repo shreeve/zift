@@ -1,100 +1,70 @@
 #!/usr/bin/env bash
 # Test: an unset max-unauth-connections defaults to max-connections / 4,
 #       and `from ::ffff:a.b.c.d` admits the same peer seen as IPv4
-# Covers: S-03 default pre-auth cap (silent sockets cannot hold every
-#         slot); explicit 0 still turns the cap off; C26 IPv4-mapped
-#         `from` matching a plain IPv4 peer.
+# Silent sockets must not hold every slot by default (explicit 0 still
+# turns the cap off); an IPv4-mapped `from` must match a plain IPv4 peer.
 
 source "$(dirname "$0")/../lib/common.sh"
-
 need_paramiko
 
 make_host_key
-mkdir -p "$TEST_TMP/root"
-hash=$(make_password_hash secret)
+AUDIT="$TEST_TMP/audit.jsonl"
 
-# serve_with <extra server lines> <from line>
-serve_with() {
-    : > "$TEST_TMP/audit.jsonl"
-    write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  idle-timeout 5s
-  shutdown-grace 1s
-  log $TEST_TMP/audit.jsonl
-$1
-user runner
-  auth $hash
-  root $TEST_TMP/root
-$2
-  allow / read list
-EOF
-    start_zift
-}
-
-# Hold two silent TCP connections (never speaking SSH), then probe a third.
-probe_silent() {
-    "$PY" - <<EOF
-import socket, time
-held = [socket.create_connection(("127.0.0.1", $TEST_PORT)) for _ in range(2)]
-time.sleep(0.6)
-s = socket.create_connection(("127.0.0.1", $TEST_PORT), timeout=2)
-try: s.recv(64)
-except Exception: pass
-s.close()
-time.sleep(0.3)
-for h in held: h.close()
+# third_admitted: hold two silent pre-auth sockets, then report whether a
+# third one gets the SSH banner.
+third_admitted() {
+    "$PY" - <<'EOF'
+import socket, sys
+from client import *
+def banner(s):
+    try:
+        return s.recv(64).startswith(b"SSH-")
+    except OSError:
+        return False
+held = [socket.create_connection(("127.0.0.1", PORT), timeout=3) for _ in range(2)]
+if not all(banner(s) for s in held):
+    fail("one of the two held connections was refused")
+sys.exit(0 if banner(socket.create_connection(("127.0.0.1", PORT), timeout=3)) else 1)
 EOF
 }
+cap_line='"operation":"accept.rejected","result":"denied","detail":"max-unauth-connections reached"'
 
-cap_hits() {
-    grep -Fc '"detail":"max-unauth-connections reached"' "$TEST_TMP/audit.jsonl" || true
-}
-
-# ---------- default: max-connections 8 → pre-auth cap 2 ----------
-serve_with "  max-connections 8" ""
-probe_silent
-sleep 0.5
-[[ $(cap_hits) -ge 1 ]] || fail "default cap: third silent connection was not refused; audit: $(cat "$TEST_TMP/audit.jsonl")"
+basic_config "max-connections 8" "log $AUDIT"
+start_zift
+third_admitted && fail "default cap: a third silent connection was admitted"
+wait_for_log "$cap_line" 5 "$AUDIT" || fail "default cap: no refusal audited"
 ok "unset max-unauth-connections caps pre-auth sessions at max-connections / 4"
 stop_zift TERM
-sleep 1.5
 
-# ---------- explicit 0 keeps the cap off ----------
-serve_with "  max-connections 8
-  max-unauth-connections 0" ""
-probe_silent
-sleep 0.5
-[[ $(cap_hits) == 0 ]] || fail "explicit 0: pre-auth cap fired: $(cat "$TEST_TMP/audit.jsonl")"
-ok "explicit max-unauth-connections 0 still means no separate cap"
+: > "$AUDIT"
+basic_config "max-connections 8" "max-unauth-connections 0" "log $AUDIT"
+start_zift
+third_admitted || fail "explicit 0: a third silent connection was refused"
+log_contains '"operation":"accept.rejected"' "$AUDIT" && fail "explicit 0: a connection was refused"
+ok "explicit max-unauth-connections 0 means no separate cap"
 stop_zift TERM
-sleep 1.5
 
-# ---------- from ::ffff:127.0.0.1 admits the IPv4 peer 127.0.0.1 ----------
-login() {
-    "$PY" - <<EOF
-import socket, sys, paramiko
-sock = socket.create_connection(("127.0.0.1", $TEST_PORT), timeout=15)
-t = paramiko.Transport(sock)
-try:
-    t.connect(username="runner", password="secret")
-    paramiko.SFTPClient.from_transport(t).listdir("/")
-    print("ok")
-except paramiko.AuthenticationException:
-    print("denied")
-finally:
-    t.close()
+# from_config <from line>: user ally admitted only from there.
+from_config() {
+    write_config <<EOF
+$(config_head)
+
+user ally
+  auth $(make_password_hash secret)
+  root $TEST_TMP/root
+  $1
+  allow / read list
 EOF
 }
-
-serve_with "" "  from ::ffff:127.0.0.1"
-[[ $(login) == ok ]] || fail "from ::ffff:127.0.0.1 did not admit 127.0.0.1: $(tail -5 "$TEST_TMP/audit.jsonl")"
+from_config "from ::ffff:127.0.0.1"
+start_zift
+"$PY" -c 'from client import *; import sys; sys.exit(0 if can_login("ally") else 1)' \
+    || fail "from ::ffff:127.0.0.1 did not admit 127.0.0.1"
 ok "from ::ffff:127.0.0.1 admits the peer 127.0.0.1"
 stop_zift TERM
-sleep 1.5
 
-serve_with "" "  from ::ffff:10.9.8.7"
-[[ $(login) == denied ]] || fail "from ::ffff:10.9.8.7 admitted 127.0.0.1"
+from_config "from ::ffff:10.9.8.7"
+start_zift
+"$PY" -c 'from client import *; import sys; sys.exit(1 if can_login("ally") else 0)' \
+    || fail "from ::ffff:10.9.8.7 admitted 127.0.0.1"
 ok "from ::ffff:10.9.8.7 still refuses 127.0.0.1"
-stop_zift TERM
