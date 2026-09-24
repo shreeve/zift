@@ -119,10 +119,10 @@ debugging.
 
 ### `publish-mode` and `mkdir-mode`
 
-`publish-mode` needs owner `rw` and may not include other-write or any
-setuid, setgid or sticky bit. `mkdir-mode` needs owner `rwx`, may not
-include other-write, and may include setgid, which keeps new
-directories in the partner tree's group.
+`publish-mode` needs owner `rw` and takes only read and write bits,
+without other-write: at most `0o664`. `mkdir-mode` needs owner `rwx`,
+may not include other-write, setuid or sticky, and may include setgid,
+which keeps new directories in the partner tree's group.
 
 ## User Directives
 

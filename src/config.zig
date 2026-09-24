@@ -81,9 +81,9 @@ pub const ServerConfig = struct {
     /// `virtual` shows the partner's own name, group `sftp`, and
     /// policy-derived rwx; `reality` passes the inode's owner and mode.
     listing_mode: ListingMode = .virtual,
-    /// Mode of a published upload: owner rw, never world-writable, no
-    /// special bits. In-flight uploads are protected by the 0700 staging
-    /// dir, not by this mode.
+    /// Mode of a published upload: read and write bits only (at most
+    /// 0o664), owner rw. In-flight uploads are protected by the 0700
+    /// staging dir, not by this mode.
     publish_mode: u32 = 0o660,
     /// Mode of an SFTP MKDIR: owner rwx, never world-writable. Setgid
     /// (on by default) keeps the partner tree's group on new subdirectories.
@@ -874,9 +874,10 @@ fn parseDigits(comptime T: type, text: []const u8, base: u8) ?T {
 }
 
 /// The daemon must be able to write what it publishes, and partner data
-/// is never world-writable. No setuid, setgid, or sticky bit on files.
+/// is never world-writable. Only read and write bits: an upload is never
+/// published executable, and never setuid, setgid or sticky.
 fn parsePublishMode(d: *ParseDiag, value: []const u8) Error!u32 {
-    return parseMode(d, value, 0o600, 0o775, "needs owner rw (0o600), no world-write, and no setuid/setgid/sticky bit");
+    return parseMode(d, value, 0o600, 0o664, "needs owner rw (0o600) and only read/write bits, no world-write: at most 0o664");
 }
 
 /// Owner rwx so the daemon can use the directory, never world-writable.
@@ -1388,6 +1389,13 @@ test "publish-mode: owner rw, no world-write, no special bits" {
         // World-writable partner data is never allowed.
         .{ "0o666", @as(?u32, null) },
         .{ "0o602", @as(?u32, null) },
+        // Nor is an executable upload.
+        .{ "0o700", @as(?u32, null) },
+        .{ "0o755", @as(?u32, null) },
+        .{ "0o770", @as(?u32, null) },
+        .{ "0o670", @as(?u32, null) },
+        .{ "0o610", @as(?u32, null) },
+        .{ "0o601", @as(?u32, null) },
         // Special bits (setuid/setgid/sticky) on regular files.
         .{ "0o2660", @as(?u32, null) },
         .{ "0o4600", @as(?u32, null) },
@@ -2053,7 +2061,7 @@ test "ParseDiag: line, section, user, key, and reason" {
     try expectDiag("  listen :2222\n", "line 1: 'listen': PropertyOutsideSection");
     try expectDiag("server\n  listen\n", "line 2: [server] 'listen': MissingValue");
     try expectDiag("server\n  reload-interval 5\n", "line 2: [server] 'reload-interval': InvalidDuration: use a number with a unit (ms, s, m, h, d), or 0");
-    try expectDiag("server\n  publish-mode 0o666\n", "line 2: [server] 'publish-mode': InvalidMode: needs owner rw (0o600), no world-write, and no setuid/setgid/sticky bit");
+    try expectDiag("server\n  publish-mode 0o666\n", "line 2: [server] 'publish-mode': InvalidMode: needs owner rw (0o600) and only read/write bits, no world-write: at most 0o664");
     try expectDiag(srv ++ "user bob\n  root bob\n", "line 5: [user bob] 'root': RelativePath: must be an absolute path");
     try expectDiag("server\n  listing-mode real\n", "line 2: [server] 'listing-mode': InvalidListingMode: use 'virtual' or 'reality'");
     try expectDiag("server\n  max-connections many\n", "line 2: [server] 'max-connections': InvalidNumber: expected a whole number");

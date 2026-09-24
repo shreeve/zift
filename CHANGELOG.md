@@ -125,8 +125,9 @@ the line and the reason.
   or `rsa-sha2-512` signatures. SHA-1 signatures, smaller RSA keys and
   DSA are rejected.
 - `log` may be a FIFO or a character device such as `/dev/null`.
-- `publish-mode` accepts any mode with owner `rw`, no other-write and no
-  special bits (for example `0o644`). `mkdir-mode` accepts any mode with
+- `publish-mode` accepts any mode with owner `rw` and only read and
+  write bits, without other-write (for example `0o644`; at most
+  `0o664`). `mkdir-mode` accepts any mode with
   owner `rwx` and no other-write; setgid is allowed.
 - SETSTAT and FSETSTAT set atime and mtime, so `put -p` and WinSCP's
   timestamp preservation work. SETSTAT needs `update`; FSETSTAT is
