@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Test: parser emits line-numbered diagnostics, rejects inline comments
-#       and bare-number durations
+# Test: parser emits line-numbered diagnostics, takes trailing comments,
+#       rejects bare-number durations
 # Covers: PLAN §6.2 (line-level diagnostics, suffix-required durations,
-#                    whole-line-only comments)
+#                    trailing comments)
 # TODOS: P1 config grammar (line numbers + structured errors)
 
 source "$(dirname "$0")/../lib/common.sh"
@@ -48,7 +48,7 @@ grep -q 'UnknownKey' "$TEST_TMP/badkey.stderr" \
     || fail "badkey: expected 'UnknownKey' error name, got: $(cat "$TEST_TMP/badkey.stderr")"
 ok "unknown user property → 'line 8: [user alice] UnknownKey'"
 
-# ---------- (b) inline `#` comment is rejected ----------
+# ---------- (b) a trailing `# comment` after a blank is a comment ----------
 cat > "$TEST_TMP/inlinecomment.conf" <<EOF
 server
   listen 127.0.0.1:$TEST_PORT  # inline comment after a value
@@ -65,13 +65,10 @@ run_validate inlinecomment
 rc=$?
 set -e
 
-[[ "$rc" == "1" ]] || fail "inlinecomment: expected exit 1, got $rc"
-echo "  diag: $(cat "$TEST_TMP/inlinecomment.stderr")"
-grep -q 'line 2' "$TEST_TMP/inlinecomment.stderr" \
-    || fail "inlinecomment: expected 'line 2', got: $(cat "$TEST_TMP/inlinecomment.stderr")"
-grep -q 'InlineComment' "$TEST_TMP/inlinecomment.stderr" \
-    || fail "inlinecomment: expected 'InlineComment', got: $(cat "$TEST_TMP/inlinecomment.stderr")"
-ok "inline '#' comment → 'line 2: ... InlineComment'"
+[[ "$rc" == "0" ]] || fail "inlinecomment: expected exit 0, got $rc; stderr: $(cat "$TEST_TMP/inlinecomment.stderr")"
+grep -q "listen 127.0.0.1:$TEST_PORT)" "$TEST_TMP/inlinecomment.stdout" \
+    || fail "inlinecomment: comment leaked into the value: $(cat "$TEST_TMP/inlinecomment.stdout")"
+ok "trailing '# comment' after a value is ignored"
 
 # ---------- (c) whole-line `#` comment is still accepted ----------
 cat > "$TEST_TMP/wholelinecomment.conf" <<EOF

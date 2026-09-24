@@ -412,7 +412,6 @@ pub const Error = error{
     DuplicatePassword,
     DuplicateUser,
     EmptyUserName,
-    InlineComment,
     InvalidAuth,
     InvalidDuration,
     InvalidKeyLine,
@@ -605,15 +604,9 @@ pub fn parseWithDiag(
         line_no += 1;
         key_for_diag = null;
 
-        const no_cr = std.mem.trimEnd(u8, raw, "\r");
-        // Only whole-line comments; a `#` after a value is an error.
-        const trimmed_for_comment_check = std.mem.trimStart(u8, no_cr, " \t");
-        if (trimmed_for_comment_check.len > 0 and trimmed_for_comment_check[0] == '#') {
-            continue;
-        }
+        const no_cr = stripComment(std.mem.trimEnd(u8, raw, "\r"));
         const line = std.mem.trim(u8, no_cr, " \t");
         if (line.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, line, '#') != null) return error.InlineComment;
 
         const indent = countIndent(no_cr);
         if (indent == 0) {
@@ -1058,6 +1051,15 @@ const max_libssh_idle_timeout_ms: u64 = 2147483647;
 /// Durations are cast to i64 at runtime, so larger values must be
 /// rejected here rather than overflow later.
 pub const max_duration_ms: u64 = std.math.maxInt(i64);
+
+/// Cut a comment: a `#` at the start of the line or after a blank. A `#`
+/// inside a token is literal, so paths and patterns may contain one.
+fn stripComment(line: []const u8) []const u8 {
+    for (line, 0..) |ch, i| {
+        if (ch == '#' and (i == 0 or line[i - 1] == ' ' or line[i - 1] == '\t')) return line[0..i];
+    }
+    return line;
+}
 
 fn countIndent(line: []const u8) usize {
     var count: usize = 0;
@@ -2007,6 +2009,24 @@ test "parse: durations take each unit and reject overflow" {
     }
 }
 
+test "comments: whole-line, or '#' after a blank; a '#' inside a token is literal" {
+    const text =
+        "# top\nserver # the only one\n  # indented\n  listen :2222\t# tab before\n  host-key /k#1\n" ++
+        "\nuser u # partner\n  auth /u#.pub  # key file\n  root /r\n  deny /a#b /c   # two patterns\n  allow /#in read\n";
+    var cfg = try parse(std.testing.allocator, text);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings(":2222", cfg.server.listen);
+    try std.testing.expectEqualStrings("/k#1", cfg.server.host_key);
+    const u = cfg.findUser("u").?;
+    try std.testing.expectEqualStrings("/u#.pub", u.key_files[0]);
+    try std.testing.expectEqual(@as(usize, 3), u.rules.len);
+    try std.testing.expectEqualStrings("/a#b", u.rules[0].pattern);
+    try std.testing.expectEqualStrings("/c", u.rules[1].pattern);
+    try std.testing.expectEqualStrings("/#in", u.rules[2].pattern);
+    // `read#write` is one token: not a verb.
+    try std.testing.expectError(error.InvalidPermission, parse(std.testing.allocator, text ++ "  allow /x read#write\n"));
+}
+
 test "a repeated single-valued directive is rejected, naming the first line" {
     try expectDiag("server\n  listen :2222\n  host-key /k\n  listen :2223\n", "line 4: [server] 'listen': DuplicateDirective: already set on line 2; keep one");
     try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /a\n  root /b\n", "line 7: [user u] 'root': DuplicateDirective: already set on line 6; keep one");
@@ -2054,7 +2074,7 @@ test "rule patterns that can never match are rejected" {
         try std.testing.expectError(error.InvalidPattern, parse(std.testing.allocator, allow));
     }
 
-    const live = [_][]const u8{ "/", "/secret", "/*.exe", "**", "**.exe", "***.exe", "**/secret", "/in/**", "/a/**/b", "/a.b/..c" };
+    const live = [_][]const u8{ "/", "/secret", "/*.exe", "**", "**.exe", "***.exe", "**/secret", "/in/**", "/a/**/b", "/a.b/..c", "/#x", "/a#" };
     for (live) |pattern| {
         var buf: [256]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n  deny {s}\n", .{pattern});
