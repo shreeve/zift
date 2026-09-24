@@ -249,6 +249,42 @@ const Handle = struct {
     kind: union(enum) { file: FileHandle, dir: DirHandle },
 };
 
+/// A status reply and its audit line. Namespace changes decide one under
+/// the namespace lock and send it after releasing the lock, so a client
+/// that stops opening its channel window, which stalls the reply, cannot
+/// stall other sessions on the same root.
+const Outcome = struct {
+    code: c_int,
+    op: []const u8,
+    vpath: ?[]const u8,
+    result: audit.Result,
+    detail: []const u8 = "",
+
+    fn ok(op: []const u8, vpath: []const u8) Outcome {
+        return .{ .code = c.SSH_FX_OK, .op = op, .vpath = vpath, .result = .ok };
+    }
+
+    fn denied(op: []const u8, vpath: ?[]const u8, detail: []const u8) Outcome {
+        return .{ .code = c.SSH_FX_PERMISSION_DENIED, .op = op, .vpath = vpath, .result = .denied, .detail = detail };
+    }
+
+    /// `code`, audited as denied (PERMISSION_DENIED) or failed with
+    /// `detail`.
+    fn rejected(code: c_int, op: []const u8, vpath: ?[]const u8, detail: []const u8) Outcome {
+        if (code == c.SSH_FX_PERMISSION_DENIED) return .denied(op, vpath, "");
+        return .{ .code = code, .op = op, .vpath = vpath, .result = .failed, .detail = detail };
+    }
+
+    /// `rejected` for a caller who may stat the path. Anyone else gets
+    /// PERMISSION_DENIED for every failure, with `detail` still audited:
+    /// a missing entry, an existing one, and a host permission error
+    /// would otherwise each answer differently.
+    fn hidden(may_stat: bool, code: c_int, op: []const u8, vpath: []const u8, detail: []const u8) Outcome {
+        if (may_stat) return .rejected(code, op, vpath, detail);
+        return .denied(op, vpath, detail);
+    }
+};
+
 const SftpState = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -393,19 +429,22 @@ const SftpState = struct {
         return wire.replyStatus(self.channel, request_id, code);
     }
 
-    /// Reply PERMISSION_DENIED, then audit it. Audits follow the reply so
-    /// a slow audit destination never delays the client.
+    /// Reply with `outcome`'s status, then audit it. Audits follow the
+    /// reply so a slow audit destination never delays the client.
+    fn send(self: *SftpState, request_id: u32, outcome: Outcome) !void {
+        defer self.auditLog(outcome.op, outcome.vpath, outcome.result, outcome.detail);
+        return self.status(request_id, outcome.code);
+    }
+
+    /// Reply PERMISSION_DENIED, then audit it.
     fn deny(self: *SftpState, request_id: u32, op: []const u8, vpath: ?[]const u8) !void {
-        defer self.auditLog(op, vpath, .denied, "");
-        return self.status(request_id, c.SSH_FX_PERMISSION_DENIED);
+        return self.send(request_id, .denied(op, vpath, ""));
     }
 
     /// Reply `code`, then audit it as denied (PERMISSION_DENIED) or
     /// failed with `detail`.
     fn reject(self: *SftpState, request_id: u32, code: c_int, op: []const u8, vpath: ?[]const u8, detail: []const u8) !void {
-        if (code == c.SSH_FX_PERMISSION_DENIED) return self.deny(request_id, op, vpath);
-        defer self.auditLog(op, vpath, .failed, detail);
-        return self.status(request_id, code);
+        return self.send(request_id, .rejected(code, op, vpath, detail));
     }
 
     /// Reply `code` to a caller who may stat the path. Anyone else gets
@@ -414,16 +453,6 @@ const SftpState = struct {
     fn hide(self: *SftpState, request_id: u32, may_stat: bool, code: c_int, op: []const u8, vpath: []const u8) !void {
         if (!may_stat) return self.deny(request_id, op, vpath);
         return self.status(request_id, code);
-    }
-
-    /// `reject` for a caller who may stat the path. Anyone else gets
-    /// PERMISSION_DENIED for every failure, with `detail` still audited:
-    /// a missing entry, an existing one, and a host permission error
-    /// would otherwise each answer differently.
-    fn rejectHidden(self: *SftpState, request_id: u32, may_stat: bool, code: c_int, op: []const u8, vpath: []const u8, detail: []const u8) !void {
-        if (may_stat) return self.reject(request_id, code, op, vpath, detail);
-        defer self.auditLog(op, vpath, .denied, detail);
-        return self.status(request_id, c.SSH_FX_PERMISSION_DENIED);
     }
 
     fn mayStat(self: *const SftpState, vpath: []const u8) bool {
@@ -476,11 +505,15 @@ const SftpState = struct {
         return arg.value;
     }
 
-    /// Reply and audit a failed filesystem call on `vpath`. A caller who
+    /// The outcome of a failed filesystem call on `vpath`. A caller who
     /// may not stat it learns neither that it, or its parent, is missing
     /// nor that it exists.
+    fn fsOutcome(self: *const SftpState, op: []const u8, vpath: []const u8, err: anyerror) Outcome {
+        return .hidden(self.mayStat(vpath), fsErrorStatus(err), op, vpath, @errorName(err));
+    }
+
     fn fsFailure(self: *SftpState, request_id: u32, op: []const u8, vpath: []const u8, err: anyerror) !void {
-        return self.rejectHidden(request_id, self.mayStat(vpath), fsErrorStatus(err), op, vpath, @errorName(err));
+        return self.send(request_id, self.fsOutcome(op, vpath, err));
     }
 
     /// The verified parent of `vpath`, or null after replying and auditing.
@@ -682,7 +715,7 @@ const SftpState = struct {
             error.SymLinkLoop => return self.deny(request_id, op, path),
             // A directory, FIFO, or device where a file was asked for.
             error.IsDir, error.NotRegularFile => return self.hide(request_id, may_stat, c.SSH_FX_FAILURE, op, path),
-            else => return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, op, path, @errorName(err)),
+            else => return self.send(request_id, .hidden(may_stat, c.SSH_FX_FAILURE, op, path, @errorName(err))),
         };
         var owned: ?std.Io.File = file;
         defer if (owned) |f| f.close(self.io);
@@ -844,22 +877,19 @@ const SftpState = struct {
             .dir => null,
         } orelse return self.status(request_id, c.SSH_FX_OK);
 
-        const code = self.publish(staged, handle.vpath) catch |err| {
-            return self.reject(request_id, c.SSH_FX_FAILURE, "close", handle.vpath, @errorName(err));
-        };
-        defer if (code == c.SSH_FX_OK) self.auditLog("publish", handle.vpath, .ok, "");
-        try self.status(request_id, code);
+        return self.send(request_id, self.publish(staged, handle.vpath));
     }
 
     /// Rename a staged upload to its target, walking the target's parent
-    /// again since it may have changed during the upload. Returns OK, or
-    /// the status of an audited refusal.
-    fn publish(self: *SftpState, staged: *Staged, target: []const u8) !c_int {
+    /// again since it may have changed during the upload.
+    fn publish(self: *SftpState, staged: *Staged, target: []const u8) Outcome {
         const staging = self.staging_dir.?;
         self.namespace_lock.lockUncancelable(self.io);
         defer self.namespace_lock.unlock(self.io);
 
-        var parent = try self.vfs.openVerifiedParent(self.io, self.allocator, target);
+        var parent = self.vfs.openVerifiedParent(self.io, self.allocator, target) catch |err| {
+            return .rejected(c.SSH_FX_FAILURE, "close", target, @errorName(err));
+        };
         defer parent.deinit(self.io, self.allocator);
 
         // The clobber rule again: the target may have appeared since OPEN.
@@ -867,20 +897,24 @@ const SftpState = struct {
         // entry, even a dangling symlink, with no check-then-act window.
         const may_replace = !staged.excl and policy.check(self.user, .update, target) == .allow;
         if (may_replace) {
-            try std.Io.Dir.rename(staging, &staged.name, parent.parent, parent.base, self.io);
+            std.Io.Dir.rename(staging, &staged.name, parent.parent, parent.base, self.io) catch |err| {
+                return .rejected(c.SSH_FX_FAILURE, "close", target, @errorName(err));
+            };
         } else {
             renameNoReplace(staging, &staged.name, parent.parent, parent.base, self.io) catch |err| switch (err) {
-                error.PathAlreadyExists => {
-                    // EXCL reports FAILURE ("exists"), otherwise it is the
-                    // clobber rule.
-                    self.auditLog("close", target, .denied, "");
-                    return if (staged.excl) c.SSH_FX_FAILURE else c.SSH_FX_PERMISSION_DENIED;
+                // EXCL reports FAILURE ("exists"), otherwise it is the
+                // clobber rule. Audited as denied either way.
+                error.PathAlreadyExists => return .{
+                    .code = if (staged.excl) c.SSH_FX_FAILURE else c.SSH_FX_PERMISSION_DENIED,
+                    .op = "close",
+                    .vpath = target,
+                    .result = .denied,
                 },
-                else => return err,
+                else => return .rejected(c.SSH_FX_FAILURE, "close", target, @errorName(err)),
             };
         }
         staged.published = true;
-        return c.SSH_FX_OK;
+        return .ok("publish", target);
     }
 
     /// SETSTAT sets times where the partner holds `update`. A request
@@ -971,14 +1005,20 @@ const SftpState = struct {
     fn handleMkdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
         var buf: PathBuf = undefined;
         const path = (try self.authorizedPath(request_id, payload, &buf, .mkdir, "mkdir")) orelse return;
+        return self.send(request_id, self.mkdir(path));
+    }
+
+    fn mkdir(self: *SftpState, path: []const u8) Outcome {
         self.namespace_lock.lockUncancelable(self.io);
         defer self.namespace_lock.unlock(self.io);
-        var parent = (try self.parentOrReply(request_id, "mkdir", path)) orelse return;
+        var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path) catch |err| {
+            return self.fsOutcome("mkdir", path, err);
+        };
         defer parent.deinit(self.io, self.allocator);
 
         const permissions = std.Io.File.Permissions.fromMode(@intCast(self.mkdir_mode));
         parent.parent.createDir(self.io, parent.base, permissions) catch |err| {
-            return self.fsFailure(request_id, "mkdir", path, err);
+            return self.fsOutcome("mkdir", path, err);
         };
         // umask applied to createDir, so set the mode again, rolling back
         // on failure. `iterate` keeps Zig off O_PATH, which cannot fchmod.
@@ -994,32 +1034,38 @@ const SftpState = struct {
         if (mode_failure) |detail| {
             // Fails harmlessly if something already populated it.
             parent.parent.deleteDir(self.io, parent.base) catch {};
-            return self.reject(request_id, c.SSH_FX_FAILURE, "mkdir", path, detail);
+            return .rejected(c.SSH_FX_FAILURE, "mkdir", path, detail);
         }
-        defer self.auditLog("mkdir", path, .ok, "");
-        try self.status(request_id, c.SSH_FX_OK);
+        return .ok("mkdir", path);
     }
 
     /// REMOVE (`.file`) and RMDIR (`.dir`).
-    fn handleUnlink(self: *SftpState, request_id: u32, payload: []const u8, kind: enum { file, dir }) !void {
+    fn handleUnlink(self: *SftpState, request_id: u32, payload: []const u8, kind: UnlinkKind) !void {
         const op: policy.Operation, const label: []const u8 = switch (kind) {
             .file => .{ .remove, "remove" },
             .dir => .{ .rmdir, "rmdir" },
         };
         var buf: PathBuf = undefined;
         const path = (try self.authorizedPath(request_id, payload, &buf, op, label)) orelse return;
+        return self.send(request_id, self.unlink(kind, label, path));
+    }
+
+    const UnlinkKind = enum { file, dir };
+
+    fn unlink(self: *SftpState, kind: UnlinkKind, label: []const u8, path: []const u8) Outcome {
         self.namespace_lock.lockUncancelable(self.io);
         defer self.namespace_lock.unlock(self.io);
-        var parent = (try self.parentOrReply(request_id, label, path)) orelse return;
+        var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path) catch |err| {
+            return self.fsOutcome(label, path, err);
+        };
         defer parent.deinit(self.io, self.allocator);
 
         const removed = switch (kind) {
             .file => parent.parent.deleteFile(self.io, parent.base),
             .dir => parent.parent.deleteDir(self.io, parent.base),
         };
-        removed catch |err| return self.fsFailure(request_id, label, path, err);
-        defer self.auditLog(label, path, .ok, "");
-        try self.status(request_id, c.SSH_FX_OK);
+        removed catch |err| return self.fsOutcome(label, path, err);
+        return .ok(label, path);
     }
 
     fn handleRename(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1029,18 +1075,27 @@ const SftpState = struct {
         const from = from_arg.value;
         const to = ((try self.pathArg(request_id, from_arg.rest, &to_buf)) orelse return).value;
         if (policy.checkRename(self.user, from, to) == .deny) return self.deny(request_id, "rename", from);
+        return self.send(request_id, self.rename(from, to));
+    }
 
+    /// The directory scan and the rename share one hold of the namespace
+    /// lock, so the tree the scan authorized is the tree that moves.
+    fn rename(self: *SftpState, from: []const u8, to: []const u8) Outcome {
         self.namespace_lock.lockUncancelable(self.io);
         defer self.namespace_lock.unlock(self.io);
-        var from_parent = (try self.parentOrReply(request_id, "rename", from)) orelse return;
+        var from_parent = self.vfs.openVerifiedParent(self.io, self.allocator, from) catch |err| {
+            return self.fsOutcome("rename", from, err);
+        };
         defer from_parent.deinit(self.io, self.allocator);
-        var to_parent = (try self.parentOrReply(request_id, "rename", to)) orelse return;
+        var to_parent = self.vfs.openVerifiedParent(self.io, self.allocator, to) catch |err| {
+            return self.fsOutcome("rename", to, err);
+        };
         defer to_parent.deinit(self.io, self.allocator);
 
         const source = listing.statAt(from_parent.parent.handle, from_parent.base) catch |err| {
-            return self.fsFailure(request_id, "rename", from, err);
+            return self.fsOutcome("rename", from, err);
         };
-        if (gainsCapability(self.user, source.mode, from, to)) return self.deny(request_id, "rename", from);
+        if (gainsCapability(self.user, source.mode, from, to)) return .denied("rename", from, "");
         // Any failure from here on follows a source that exists, and may
         // hinge on a destination that does.
         const may_stat = self.mayStat(from) and self.mayStat(to);
@@ -1050,9 +1105,9 @@ const SftpState = struct {
         // an allowed subtree.
         if ((source.mode & listing.S_IFMT) == listing.S_IFDIR) {
             self.verifyRenameTree(from_parent, from, to) catch |err| switch (err) {
-                error.RenameDenied => return self.deny(request_id, "rename", from),
-                error.RenameScanLimit => return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, "rename", from, "rename scan limit"),
-                else => return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, "rename", from, @errorName(err)),
+                error.RenameDenied => return .denied("rename", from, ""),
+                error.RenameScanLimit => return .hidden(may_stat, c.SSH_FX_FAILURE, "rename", from, "rename scan limit"),
+                else => return .hidden(may_stat, c.SSH_FX_FAILURE, "rename", from, @errorName(err)),
             };
         }
 
@@ -1061,16 +1116,15 @@ const SftpState = struct {
         // rename refuses any existing entry, with no check-then-act race.
         if (policy.check(self.user, .update, to) == .allow) {
             std.Io.Dir.rename(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch |err| {
-                return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, "rename", from, @errorName(err));
+                return .hidden(may_stat, c.SSH_FX_FAILURE, "rename", from, @errorName(err));
             };
         } else {
             renameNoReplace(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch |err| {
-                if (err == error.PathAlreadyExists) return self.deny(request_id, "rename", to);
-                return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, "rename", from, @errorName(err));
+                if (err == error.PathAlreadyExists) return .denied("rename", to, "");
+                return .hidden(may_stat, c.SSH_FX_FAILURE, "rename", from, @errorName(err));
             };
         }
-        defer self.auditLog("rename", from, .ok, to);
-        try self.status(request_id, c.SSH_FX_OK);
+        return .{ .code = c.SSH_FX_OK, .op = "rename", .vpath = from, .result = .ok, .detail = to };
     }
 
     fn verifyRenameTree(self: *SftpState, parent: vfs_mod.ParentResolution, from: []const u8, to: []const u8) !void {
