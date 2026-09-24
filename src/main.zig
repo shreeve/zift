@@ -231,6 +231,11 @@ fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !void {
     defer gpa.free(input);
 
     const password = std.mem.trimEnd(u8, input, "\r\n");
+    if (password.len == 0) {
+        const stderr = std.Io.File.stderr();
+        try stderr.writeStreamingAll(io, "zift: password must not be empty\n");
+        std.process.exit(1);
+    }
     var hash_buffer: [128]u8 = undefined;
     const hash = try auth.hashPassword(io, gpa, password, &hash_buffer);
     try stdout.writeStreamingAll(io, hash);

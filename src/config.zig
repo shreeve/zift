@@ -248,13 +248,42 @@ pub fn validateSemantic(
         return err;
     };
 
-    // 2. Host-key file must exist and be readable.
-    _ = std.Io.Dir.cwd().statFile(io, cfg.server.host_key, .{}) catch {
-        stderr.writeStreamingAll(io, "zift: host-key unreadable: ") catch {};
-        stderr.writeStreamingAll(io, cfg.server.host_key) catch {};
-        stderr.writeStreamingAll(io, "\n") catch {};
+    // 2. Host key is held to the authorized-key bar, plus secrecy:
+    // a regular file (symlinks are not followed), no group-write,
+    // group-exec, or any "other" bit (`mode & 0o037 != 0`). Group-read
+    // stays legal so `0640` root:zift works; `0600` and `0400` too.
+    // Then open read-only with `follow_symlinks = false` and close.
+    // Key bytes are never written to the diagnostic.
+    const host_key = cfg.server.host_key;
+    const host_stat = std.Io.Dir.cwd().statFile(io, host_key, .{
+        .follow_symlinks = false,
+    }) catch |err| {
+        const reason: []const u8 = if (err == error.SymLinkLoop) "symlink" else "unreadable";
+        writeHostKeyDiag(io, stderr, reason, host_key);
         return error.HostKeyUnreadable;
     };
+    if (host_stat.kind == .sym_link) {
+        writeHostKeyDiag(io, stderr, "symlink", host_key);
+        return error.HostKeyUnreadable;
+    }
+    if (host_stat.kind != .file) {
+        writeHostKeyDiag(io, stderr, "not a regular file", host_key);
+        return error.HostKeyUnreadable;
+    }
+    const host_mode: u32 = @intCast(host_stat.permissions.toMode() & 0o7777);
+    if ((host_mode & 0o037) != 0) {
+        writeHostKeyDiag(io, stderr, "mode", host_key);
+        return error.HostKeyUnreadable;
+    }
+    var host_file = std.Io.Dir.cwd().openFile(io, host_key, .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    }) catch |err| {
+        const reason: []const u8 = if (err == error.SymLinkLoop) "symlink" else "unreadable";
+        writeHostKeyDiag(io, stderr, reason, host_key);
+        return error.HostKeyUnreadable;
+    };
+    host_file.close(io);
 
     // 2. Each user root must exist, be a directory, and canonicalize
     // through symlinks. We canonicalize via realPath so the overlap
@@ -485,6 +514,14 @@ fn resolveOneKeyFile(
         writeKeyFileDiag(io, stderr, user_name, path, 0, "no public-key lines found");
         return error.AuthKeyFileEmpty;
     }
+}
+
+fn writeHostKeyDiag(io: std.Io, stderr: std.Io.File, reason: []const u8, path: []const u8) void {
+    stderr.writeStreamingAll(io, "zift: host-key ") catch {};
+    stderr.writeStreamingAll(io, reason) catch {};
+    stderr.writeStreamingAll(io, ": ") catch {};
+    stderr.writeStreamingAll(io, path) catch {};
+    stderr.writeStreamingAll(io, "\n") catch {};
 }
 
 /// Format a key-file diagnostic in the same shape as parse errors:
@@ -853,7 +890,13 @@ fn parseServerProperty(
     } else if (std.mem.eql(u8, key, "reload-interval")) {
         server.reload_interval_ms = try parseDurationMs(value);
     } else if (std.mem.eql(u8, key, "idle-timeout")) {
-        server.idle_timeout_ms = try parseDurationMs(value);
+        const ms = try parseDurationMs(value);
+        // libssh stores the blocking-read timeout as a signed 32-bit
+        // millisecond count and treats anything above this as
+        // wait-forever, which would silently disable the timeout.
+        // `0` remains the documented disabled sentinel.
+        if (ms > max_libssh_idle_timeout_ms) return error.InvalidConfig;
+        server.idle_timeout_ms = ms;
     } else if (std.mem.eql(u8, key, "max-connections")) {
         server.max_connections = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidConfig;
     } else if (std.mem.eql(u8, key, "max-unauth-connections")) {
@@ -958,6 +1001,11 @@ fn parseUserProperty(
     if (std.mem.eql(u8, key, "auth")) {
         try parseAuth(allocator, user, value);
     } else if (std.mem.eql(u8, key, "root")) {
+        // Absolute only, same rule as `partner-root` and `log`.
+        // `validateSemantic` calls `realPathFileAbsoluteAlloc`, which
+        // asserts the path is absolute and aborts (ReleaseSafe) instead
+        // of returning an error. A bad reload must not reach that assert.
+        if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
         user.root = try dupNonEmpty(allocator, value);
     } else if (std.mem.eql(u8, key, "from")) {
         try parseFrom(allocator, user, value);
@@ -1165,7 +1213,7 @@ fn parseDurationMs(value: []const u8) Error!u64 {
     if (std.mem.eql(u8, value, "0")) return 0;
 
     // PLAN §6.2: any non-zero duration requires a unit suffix
-    // (`ms`, `s`, `m`, `h`). A bare number is ambiguous (operators
+    // (`ms`, `s`, `m`, `h`, `d`). A bare number is ambiguous (operators
     // expect seconds; the implementation used to treat it as
     // milliseconds) so we reject it rather than guess.
     if (std.mem.endsWith(u8, value, "ms")) {
@@ -1184,8 +1232,16 @@ fn parseDurationMs(value: []const u8) Error!u64 {
         const hours = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
         return scaleDurationMs(hours, 60 * 60 * 1000);
     }
+    if (std.mem.endsWith(u8, value, "d")) {
+        const days = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
+        return scaleDurationMs(days, 24 * 60 * 60 * 1000);
+    }
     return error.InvalidDuration;
 }
+
+/// libssh stores the blocking-read timeout as a signed 32-bit
+/// millisecond count. Anything above this is treated as wait-forever.
+const max_libssh_idle_timeout_ms: u64 = 2147483647;
 
 /// Largest accepted duration in milliseconds. Every duration is stored
 /// as `u64` in the config but converted to `i64` at runtime (idle,
@@ -1959,6 +2015,13 @@ test "partner-root: relative path rejected at parse time" {
     try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
 }
 
+test "root: relative path rejected at parse time" {
+    const text =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  auth " ++ valid_test_passhash ++ "\n  root home/ally\n";
+    try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
+}
+
 test "server defaults applied when properties omitted" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n";
@@ -1978,6 +2041,26 @@ test "idle-timeout and max-connections parse" {
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u64, 30_000), cfg.server.idle_timeout_ms);
     try std.testing.expectEqual(@as(u32, 64), cfg.server.max_connections);
+}
+
+test "idle-timeout above libssh signed-32ms cap (25d) is InvalidConfig" {
+    // 25d = 2_160_000_000 ms. libssh treats a millisecond count above
+    // 2147483647 as wait-forever. `5m` stays 300000; `0` stays disabled.
+    const over =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  idle-timeout 25d\n";
+    try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, over));
+
+    const five =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  idle-timeout 5m\n";
+    var cfg = try parse(std.testing.allocator, five);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u64, 300_000), cfg.server.idle_timeout_ms);
+
+    const off =
+        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  idle-timeout 0\n";
+    var disabled = try parse(std.testing.allocator, off);
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(u64, 0), disabled.server.idle_timeout_ms);
 }
 
 test "max-unauth-connections parses as a non-negative integer" {
@@ -2042,6 +2125,63 @@ test "validatePureNumeric: unauth cap at u32 max boundary rejected" {
     });
     defer cfg.deinit();
     try std.testing.expectError(error.UnauthCapExceedsTotal, validatePureNumeric(&cfg));
+}
+
+test "validateSemantic: host-key mode, symlink, and non-regular file rejected" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    const dir_path = dir_buf[0..dir_len];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "hostkey", .data = "not-logged" });
+    const key_path = try std.fmt.allocPrint(alloc, "{s}/hostkey", .{dir_path});
+    defer alloc.free(key_path);
+
+    const legal = [_]u32{ 0o600, 0o400, 0o640 };
+    for (legal) |mode| {
+        try tmp.dir.setFilePermissions(io, "hostkey", .fromMode(@intCast(mode)), .{
+            .follow_symlinks = false,
+        });
+        var cfg = makeNumericTestConfig(.{ .max_total = 128, .max_unauth = 0 });
+        defer cfg.deinit();
+        cfg.server.host_key = key_path;
+        try validateSemantic(io, alloc, &cfg);
+    }
+
+    const illegal = [_]u32{ 0o644, 0o660, 0o664, 0o777 };
+    for (illegal) |mode| {
+        try tmp.dir.setFilePermissions(io, "hostkey", .fromMode(@intCast(mode)), .{
+            .follow_symlinks = false,
+        });
+        var cfg = makeNumericTestConfig(.{ .max_total = 128, .max_unauth = 0 });
+        defer cfg.deinit();
+        cfg.server.host_key = key_path;
+        try std.testing.expectError(error.HostKeyUnreadable, validateSemantic(io, alloc, &cfg));
+    }
+
+    try tmp.dir.symLink(io, "hostkey", "hostlink", .{});
+    const link_path = try std.fmt.allocPrint(alloc, "{s}/hostlink", .{dir_path});
+    defer alloc.free(link_path);
+    {
+        var cfg = makeNumericTestConfig(.{ .max_total = 128, .max_unauth = 0 });
+        defer cfg.deinit();
+        cfg.server.host_key = link_path;
+        try std.testing.expectError(error.HostKeyUnreadable, validateSemantic(io, alloc, &cfg));
+    }
+
+    try tmp.dir.createDir(io, "notfile", .default_dir);
+    const dir_key = try std.fmt.allocPrint(alloc, "{s}/notfile", .{dir_path});
+    defer alloc.free(dir_key);
+    {
+        var cfg = makeNumericTestConfig(.{ .max_total = 128, .max_unauth = 0 });
+        defer cfg.deinit();
+        cfg.server.host_key = dir_key;
+        try std.testing.expectError(error.HostKeyUnreadable, validateSemantic(io, alloc, &cfg));
+    }
 }
 
 const NumericTestArgs = struct { max_total: u32, max_unauth: u32 };
