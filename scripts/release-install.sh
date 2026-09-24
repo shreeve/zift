@@ -8,7 +8,9 @@
 # As root, zift goes to /usr/local/bin. On a host that runs zift as a
 # service it goes there too, the path the unit runs, using sudo for that
 # one write and saying so first. BIN=... overrides both and never
-# elevates.
+# elevates. Before replacing the binary the service runs, it checks the
+# service's config with the new version, as the service's user, and keeps
+# the old binary if the config is rejected.
 #
 # This installs the binary only. zift.service here is the unit that
 # docs/operate.md installs; the service user, host key and config are set
@@ -130,6 +132,31 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 staged=$($SUDO mktemp "$BIN/.$NAME.install.XXXXXX") || fail "cannot write to $(tildify "$BIN")"
 $SUDO install -m 0755 "$NAME" "$staged" || fail "cannot write to $(tildify "$BIN")"
+
+# Replacing the binary a service runs: check the service's config with the
+# new version, as the service's user, before it can land. A config the new
+# version rejects keeps the old binary. The staged copy is what runs, since
+# the service user cannot read this user's temp directory.
+if host_runs_service; then
+  exec_start=$(systemctl show "$NAME" -p ExecStart --value 2>/dev/null || true)
+  case "$exec_start" in
+    *"path=$dest ;"*)
+      argv=$(printf '%s' "$exec_start" | sed -n 's/.*argv\[\]=\([^;]*\);.*/\1/p')
+      conf=$(printf '%s' "$argv" | sed -n 's/.* serve \([^ ]*\).*/\1/p')
+      user=$(systemctl show "$NAME" -p User --value 2>/dev/null || true)
+      if [ -n "$conf" ]; then
+        as_user=()
+        if [ -n "$user" ] && [ "$user" != root ]; then
+          if [ "$(id -u)" = 0 ]; then as_user=(runuser -u "$user" --); else as_user=(${SUDO:-sudo} -u "$user"); fi
+        fi
+        info "checking $conf with the new version${user:+ as $user}"
+        ${as_user[@]+"${as_user[@]}"} "$staged" validate "$conf" \
+          || fail "the new $NAME rejects $conf (above); nothing was installed"
+      fi
+      ;;
+  esac
+fi
+
 $SUDO mv -f "$staged" "$dest" || fail "cannot install to $(tildify "$dest")"
 staged=""
 printf "${Green}$NAME was installed to ${Bold_Green}%s${Color_Off}\n" "$(tildify "$dest")"

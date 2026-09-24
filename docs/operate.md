@@ -45,7 +45,7 @@ the checksums, install [by hand](#by-hand).
 The examples below use `ZIFT_VERSION`; set it to the release you want.
 
 ```sh
-ZIFT_VERSION=0.12.0
+ZIFT_VERSION=0.12.1
 PLAT=linux-amd64          # linux-arm64, osx-arm64 or osx-amd64
 NAME=zift-v${ZIFT_VERSION}-${PLAT}
 BASE=https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}
@@ -73,23 +73,33 @@ Linux binaries are static and need no libraries on the host.
 
 ### Upgrade and rollback
 
-Read the [changelog](../CHANGELOG.md) first, and run `zift validate` on
-your config with the new binary before restarting. Replace the binary
-with `install` (or the installer), never `cp`: `cp` writes into the
-running file and fails with "Text file busy".
+Read the [changelog](../CHANGELOG.md), then on the host:
 
 ```sh
 sudo cp /usr/local/bin/zift /usr/local/bin/zift.prev
-sudo install -m 0755 "$NAME/zift" /usr/local/bin/zift
-sudo -u zift zift validate /home/zift/zift.conf
+curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
 sudo systemctl restart zift
 ```
 
-The running daemon keeps executing the old binary until it restarts
-(`readlink /proc/<pid>/exe` shows `(deleted)`), and a restart drops live
-sessions. `systemctl reload` does not load a new binary. The journal's
-`zift: starting zift X.Y.Z` line records what each start ran. To roll
-back, install `zift.prev` the same way and restart.
+Before it replaces the binary the service runs, the installer checks the
+service's config with the new version, as the service's user; if the new
+version rejects it, the installer says why and installs nothing. The
+running daemon keeps executing the old binary until it restarts, and a
+restart drops live sessions (`ss -tn state established '( sport = :2222 )'`
+shows them). `systemctl reload` does not load a new binary. The
+journal's `zift: starting zift X.Y.Z` line records what each start ran.
+
+To roll back, put the previous binary back the same way, never with
+`cp` onto the running file ("Text file busy"):
+
+```sh
+sudo install -m 0755 /usr/local/bin/zift.prev /usr/local/bin/zift
+sudo systemctl restart zift
+```
+
+By hand, install the binary with `sudo install -m 0755 "$NAME/zift"
+/usr/local/bin/zift` and run `sudo -u zift zift validate` on your config
+before restarting.
 
 ## Set Up The Host
 
