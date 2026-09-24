@@ -44,40 +44,29 @@ pub const Vfs = struct {
     }
 
     /// Open, creating if needed, `<root>/.zift/staging/` (caller closes).
-    ///
-    /// `<root>/.zift/` is the reserved namespace: `staging/` belongs to
-    /// the daemon and anything else there to the operator. Both must be
-    /// real directories, never symlinks that could move staging out of
-    /// the jail. `.zift` may not grant group-write or other access (a
-    /// group member could swap `staging`); `staging` may grant no group
-    /// or other access at all (in-flight uploads). New dirs get 0750 and
-    /// 0700, set after create because createDir honors umask.
+    /// See `PrivateDir` for what each level must be; a pre-existing
+    /// `.zift` keeps its owner and mode.
     pub fn openStagingDir(self: Vfs, io: std.Io) !std.Io.Dir {
-        var root = try std.Io.Dir.openDirAbsolute(io, self.root, .{});
-        defer root.close(io);
-
-        // A pre-existing `.zift` keeps its owner and mode.
-        var ns_dir = try openOrCreateNamespaceDir(io, root);
-        errdefer ns_dir.close(io);
-
-        const staging = try openOrCreateStagingSubdir(io, ns_dir);
-        ns_dir.close(io);
-        return staging;
+        return self.openStaging(io, true);
     }
 
     /// Staging dir if it exists and passes the checks; never creates it.
     pub fn tryOpenExistingStagingDir(self: Vfs, io: std.Io) ?std.Io.Dir {
-        var root = std.Io.Dir.openDirAbsolute(io, self.root, .{}) catch return null;
+        return self.openStaging(io, false) catch null;
+    }
+
+    fn openStaging(self: Vfs, io: std.Io, create: bool) !std.Io.Dir {
+        var root = try self.openRoot(io, false);
         defer root.close(io);
-        var ns_dir = root.openDir(io, namespace_dir_name, .{ .iterate = true, .follow_symlinks = false }) catch return null;
+        var ns_dir = try openPrivateDir(io, root, namespace_dir, create);
         defer ns_dir.close(io);
-        assertOpenedDirMode(ns_dir, 0o027, error.NamespaceDirCorrupt, error.NamespaceDirUnsafe) catch return null;
-        var staging = ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true, .follow_symlinks = false }) catch return null;
-        assertOpenedDirMode(staging, 0o077, error.StagingDirCorrupt, error.StagingDirUnsafe) catch {
-            staging.close(io);
-            return null;
-        };
-        return staging;
+        return openPrivateDir(io, ns_dir, staging_dir, create);
+    }
+
+    /// The root itself, NOFOLLOW like every step below it. The root is
+    /// canonical, so this only keeps a swapped-in symlink from counting.
+    pub fn openRoot(self: Vfs, io: std.Io, iterate: bool) std.Io.Dir.OpenError!std.Io.Dir {
+        return std.Io.Dir.openDirAbsolute(io, self.root, .{ .iterate = iterate, .follow_symlinks = false });
     }
 
     /// Length, no C0 control or DEL bytes, and valid UTF-8 (the audit
@@ -120,10 +109,7 @@ pub const Vfs = struct {
         const normalized = try normalizeVirtualPath(allocator, virtual_path);
         defer allocator.free(normalized);
 
-        var current = try std.Io.Dir.openDirAbsolute(io, self.root, .{
-            .iterate = iterate,
-            .follow_symlinks = false,
-        });
+        var current = try self.openRoot(io, iterate);
         errdefer current.close(io);
 
         var parts = std.mem.tokenizeScalar(u8, normalized, '/');
@@ -188,8 +174,6 @@ pub const ParentResolution = struct {
 /// Reserved in every virtual path; see `isReservedComponent`.
 pub const namespace_dir_name: []const u8 = ".zift";
 
-const staging_subdir_name: []const u8 = "staging";
-
 /// Former staging dir, unused but still reserved and hidden so a
 /// partner cannot create it where an operator may still have one.
 pub const legacy_staging_dir_name: []const u8 = ".zift-staging";
@@ -203,64 +187,63 @@ pub fn legacyStagingDirExists(io: std.Io, root_path: []const u8) bool {
     return true;
 }
 
-fn openOrCreateNamespaceDir(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
-    const namespace_perm = std.Io.File.Permissions.fromMode(0o750);
-    const create_status = root.createDir(io, namespace_dir_name, namespace_perm);
-    if (create_status) |_| {
-        var dir = try root.openDir(io, namespace_dir_name, .{ .iterate = true, .follow_symlinks = false });
-        errdefer dir.close(io);
-        try dir.setPermissions(io, namespace_perm);
-        try assertOpenedDirMode(dir, 0o027, error.NamespaceDirCorrupt, error.NamespaceDirUnsafe);
-        return dir;
-    } else |err| switch (err) {
-        error.PathAlreadyExists => {
-            // lstat, then NOFOLLOW open and fstat the fd, so a swap
-            // between the two cannot redirect the namespace.
-            const info = try listing.statAt(root.handle, namespace_dir_name);
-            if ((info.mode & listing.S_IFMT) != listing.S_IFDIR) return error.NamespaceDirCorrupt;
-            if ((info.mode & 0o027) != 0) return error.NamespaceDirUnsafe;
-            var dir = try root.openDir(io, namespace_dir_name, .{ .iterate = true, .follow_symlinks = false });
-            errdefer dir.close(io);
-            try assertOpenedDirMode(dir, 0o027, error.NamespaceDirCorrupt, error.NamespaceDirUnsafe);
-            return dir;
-        },
-        else => return err,
-    }
-}
+/// A reserved directory Zift keeps under the partner root. Both levels
+/// must be real directories, never symlinks that could move staging out
+/// of the jail. `.zift` holds `staging` (the daemon's) and anything else
+/// the operator puts there: no group-write or other access, or a group
+/// member could swap `staging`, and owned by the daemon or root.
+/// `staging` holds in-flight uploads: no group or other access at all,
+/// and owned by the daemon.
+const PrivateDir = struct {
+    name: []const u8,
+    /// For a new directory; set after create because createDir honors umask.
+    mode: std.posix.mode_t,
+    forbidden: u32,
+    root_may_own: bool,
+    corrupt: Error,
+    unsafe: Error,
+};
 
-fn openOrCreateStagingSubdir(io: std.Io, ns_dir: std.Io.Dir) !std.Io.Dir {
-    const private_dir = std.Io.File.Permissions.fromMode(0o700);
-    const create_status = ns_dir.createDir(io, staging_subdir_name, private_dir);
-    if (create_status) |_| {
-        var dir = try ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true, .follow_symlinks = false });
-        errdefer dir.close(io);
-        try dir.setPermissions(io, private_dir);
-        try assertOpenedDirMode(dir, 0o077, error.StagingDirCorrupt, error.StagingDirUnsafe);
-        return dir;
-    } else |err| switch (err) {
-        error.PathAlreadyExists => {
-            const info = try listing.statAt(ns_dir.handle, staging_subdir_name);
-            if ((info.mode & listing.S_IFMT) != listing.S_IFDIR) return error.StagingDirCorrupt;
-            if ((info.mode & 0o077) != 0) return error.StagingDirUnsafe;
-            var dir = try ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true, .follow_symlinks = false });
-            errdefer dir.close(io);
-            try assertOpenedDirMode(dir, 0o077, error.StagingDirCorrupt, error.StagingDirUnsafe);
-            return dir;
-        },
-        else => return err,
-    }
-}
+const namespace_dir: PrivateDir = .{
+    .name = namespace_dir_name,
+    .mode = 0o750,
+    .forbidden = 0o027,
+    .root_may_own = true,
+    .corrupt = error.NamespaceDirCorrupt,
+    .unsafe = error.NamespaceDirUnsafe,
+};
 
-/// Re-check the opened fd: a directory without `forbidden_mask` bits.
-fn assertOpenedDirMode(
-    dir: std.Io.Dir,
-    forbidden_mask: u32,
-    corrupt: anyerror,
-    unsafe: anyerror,
-) !void {
+const staging_dir: PrivateDir = .{
+    .name = "staging",
+    .mode = 0o700,
+    .forbidden = 0o077,
+    .root_may_own = false,
+    .corrupt = error.StagingDirCorrupt,
+    .unsafe = error.StagingDirUnsafe,
+};
+
+/// Open `spec` under `parent`, creating it first if `create`. The open is
+/// NOFOLLOW and the checks run on the opened fd, so nothing swapped in
+/// between can pass them.
+fn openPrivateDir(io: std.Io, parent: std.Io.Dir, spec: PrivateDir, create: bool) !std.Io.Dir {
+    var created = false;
+    if (create) {
+        if (parent.createDir(io, spec.name, .fromMode(spec.mode))) |_| {
+            created = true;
+        } else |err| if (err != error.PathAlreadyExists) return err;
+    }
+    var dir = parent.openDir(io, spec.name, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.SymLinkLoop, error.NotDir => return spec.corrupt,
+        else => |e| return e,
+    };
+    errdefer dir.close(io);
+    if (created) try dir.setPermissions(io, .fromMode(spec.mode));
+
     const info = try listing.statFd(dir.handle);
-    if ((info.mode & listing.S_IFMT) != listing.S_IFDIR) return corrupt;
-    if ((info.mode & forbidden_mask) != 0) return unsafe;
+    if (info.mode & listing.S_IFMT != listing.S_IFDIR) return spec.corrupt;
+    if (info.mode & spec.forbidden != 0) return spec.unsafe;
+    if (info.uid != std.c.geteuid() and !(spec.root_may_own and info.uid == 0)) return spec.unsafe;
+    return dir;
 }
 
 /// `.zift` or `.zift-staging`, ASCII case-insensitively: on APFS/HFS+
@@ -501,6 +484,75 @@ test "a file used as a directory is not found, not a traversal" {
     try std.testing.expectError(error.NotDir, vfs.openVirtualDir(io, gpa, "/file.txt", false));
     // A symlink stays a traversal whatever it points at.
     try std.testing.expectError(error.PathTraversal, vfs.openVerifiedParent(io, gpa, "/link/x"));
+}
+
+test "staging dir: created private, and refused when anything is off" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "root", .default_dir);
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPathFile(io, "root", &root_buf);
+    var vfs = try Vfs.init(io, std.testing.allocator, root_buf[0..root_len]);
+    defer vfs.deinit(std.testing.allocator);
+
+    // Missing: only openStagingDir creates it, at 0750 and 0700.
+    try std.testing.expectEqual(null, vfs.tryOpenExistingStagingDir(io));
+    (try vfs.openStagingDir(io)).close(io);
+    try std.testing.expectEqual(@as(u32, 0o750), (try listing.statAt(tmp.dir.handle, "root/.zift")).mode & 0o7777);
+    try std.testing.expectEqual(@as(u32, 0o700), (try listing.statAt(tmp.dir.handle, "root/.zift/staging")).mode & 0o7777);
+    vfs.tryOpenExistingStagingDir(io).?.close(io);
+
+    const Case = struct { mode: std.posix.mode_t, err: anyerror };
+    for ([_]Case{
+        .{ .mode = 0o770, .err = error.NamespaceDirUnsafe },
+        .{ .mode = 0o755, .err = error.NamespaceDirUnsafe },
+    }) |case| {
+        try tmp.dir.setFilePermissions(io, "root/.zift", .fromMode(case.mode), .{});
+        try std.testing.expectError(case.err, vfs.openStagingDir(io));
+        try std.testing.expectEqual(null, vfs.tryOpenExistingStagingDir(io));
+    }
+    try tmp.dir.setFilePermissions(io, "root/.zift", .fromMode(0o750), .{});
+    try tmp.dir.setFilePermissions(io, "root/.zift/staging", .fromMode(0o740), .{});
+    try std.testing.expectError(error.StagingDirUnsafe, vfs.openStagingDir(io));
+
+    // A symlink or a file where a directory belongs is corrupt.
+    try tmp.dir.deleteDir(io, "root/.zift/staging");
+    try tmp.dir.createDir(io, "elsewhere", .fromMode(0o700));
+    try tmp.dir.symLink(io, "../../elsewhere", "root/.zift/staging", .{});
+    try std.testing.expectError(error.StagingDirCorrupt, vfs.openStagingDir(io));
+    try tmp.dir.deleteFile(io, "root/.zift/staging");
+    try tmp.dir.deleteDir(io, "root/.zift");
+    (try tmp.dir.createFile(io, "root/.zift", .{})).close(io);
+    try std.testing.expectError(error.NamespaceDirCorrupt, vfs.openStagingDir(io));
+    try tmp.dir.deleteFile(io, "root/.zift");
+    try tmp.dir.symLink(io, "../elsewhere", "root/.zift", .{});
+    try std.testing.expectError(error.NamespaceDirCorrupt, vfs.openStagingDir(io));
+    try std.testing.expectEqual(null, vfs.tryOpenExistingStagingDir(io));
+}
+
+test "staging dir: another user's .zift or staging is refused" {
+    // Only root can hand a directory to another user.
+    if (std.c.geteuid() != 0) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "root", .default_dir);
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPathFile(io, "root", &root_buf);
+    var vfs = try Vfs.init(io, std.testing.allocator, root_buf[0..root_len]);
+    defer vfs.deinit(std.testing.allocator);
+    (try vfs.openStagingDir(io)).close(io);
+
+    var staging = try tmp.dir.openDir(io, "root/.zift/staging", .{});
+    try staging.setOwner(io, 65534, null);
+    staging.close(io);
+    try std.testing.expectError(error.StagingDirUnsafe, vfs.openStagingDir(io));
+
+    var ns = try tmp.dir.openDir(io, "root/.zift", .{});
+    try ns.setOwner(io, 65534, null);
+    ns.close(io);
+    try std.testing.expectError(error.NamespaceDirUnsafe, vfs.openStagingDir(io));
 }
 
 test "openVerifiedParent rejects every parent symlink" {
