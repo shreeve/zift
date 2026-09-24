@@ -208,9 +208,12 @@ provenance.
 - **Overwrites are not atomic.** Only new uploads are staged. A partner
   with `update` who overwrites a file writes it in place, so a reader
   can see it half-written.
-- **Bad key signatures are not counted.** libssh drops a public-key
-  request with an invalid signature before Zift sees it, so those do not
-  count toward the auth ceiling; the login grace still bounds them.
+- **Bad key signatures are not counted or answered.** libssh drops a
+  public-key request with an invalid signature, or a SHA-1 `ssh-rsa`
+  signature, before Zift sees it: the client gets no reply and waits
+  for its own timeout, and the attempt does not count toward the auth
+  ceiling. The login grace still frees the slot. Clients that can only
+  sign RSA with SHA-1 cannot log in with an RSA key.
 - **Case and Unicode on macOS.** Matching is byte-exact and
   case-sensitive, but APFS and HFS+ are case-insensitive and treat
   Unicode normalization forms as the same name. There, `deny **.exe`

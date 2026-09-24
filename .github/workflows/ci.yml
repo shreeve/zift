@@ -194,20 +194,10 @@ jobs:
           python3 -m venv tests/.venv
           tests/.venv/bin/pip install paramiko
 
-      # No Zig in this job: tests/run.sh's `zig build` then fails
-      # harmlessly and the suite runs the downloaded release binary.
-      # The checksum comparison proves the binary under test was not
-      # replaced by a local debug build.
+      # ZIFT_BIN makes the runner test the downloaded release binary
+      # instead of building (and without Zig, a build would fail the run).
       - name: Run integration tests
-        run: |
-          before=$(shasum -a 256 bin/zift)
-          export PATH="$PWD/bin:$PATH"
-          bash tests/run.sh
-          after=$(shasum -a 256 bin/zift)
-          if [ "$before" != "$after" ]; then
-            echo "FAIL: bin/zift changed during the run; the suite did not test the release binary"
-            exit 1
-          fi
+        run: ZIFT_BIN="$PWD/bin/zift" bash tests/run.sh
 
       - name: Upload test logs on failure
         if: failure()
