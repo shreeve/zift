@@ -416,6 +416,20 @@ const SftpState = struct {
         return self.status(request_id, code);
     }
 
+    /// `reject` for a caller who may stat the path. Anyone else gets
+    /// PERMISSION_DENIED for every failure, with `detail` still audited:
+    /// a missing entry, an existing one, and a host permission error
+    /// would otherwise each answer differently.
+    fn rejectHidden(self: *SftpState, request_id: u32, may_stat: bool, code: c_int, op: []const u8, vpath: []const u8, detail: []const u8) !void {
+        if (may_stat) return self.reject(request_id, code, op, vpath, detail);
+        defer self.auditLog(op, vpath, .denied, detail);
+        return self.status(request_id, c.SSH_FX_PERMISSION_DENIED);
+    }
+
+    fn mayStat(self: *const SftpState, vpath: []const u8) bool {
+        return policy.check(self.user, .stat, vpath) == .allow;
+    }
+
     fn auditLog(self: *SftpState, op: []const u8, vpath: ?[]const u8, result: audit.Result, detail: []const u8) void {
         audit.log(self.io, self.user.name, op, vpath, result, detail, self.peer_ip);
     }
@@ -461,10 +475,7 @@ const SftpState = struct {
     /// may not stat it learns neither that it, or its parent, is missing
     /// nor that it exists.
     fn fsFailure(self: *SftpState, request_id: u32, op: []const u8, vpath: []const u8, err: anyerror) !void {
-        const code = fsErrorStatus(err);
-        const reveals = code == c.SSH_FX_NO_SUCH_FILE or err == error.PathAlreadyExists;
-        if (reveals and policy.check(self.user, .stat, vpath) == .deny) return self.deny(request_id, op, vpath);
-        return self.reject(request_id, code, op, vpath, @errorName(err));
+        return self.rejectHidden(request_id, self.mayStat(vpath), fsErrorStatus(err), op, vpath, @errorName(err));
     }
 
     /// The verified parent of `vpath`, or null after replying and auditing.
@@ -655,7 +666,7 @@ const SftpState = struct {
         defer parent.deinit(self.io, self.allocator);
         // Write without read or list must not tell a missing path from a
         // present one.
-        const may_stat = policy.check(self.user, .stat, path) == .allow;
+        const may_stat = self.mayStat(path);
 
         const mode: std.Io.Dir.OpenFileOptions.Mode = if (!want_write) .read_only else if (want_read) .read_write else .write_only;
         const file = openRegular(parent.parent, parent.base, mode, want_append) catch |err| switch (err) {
@@ -666,7 +677,7 @@ const SftpState = struct {
             error.SymLinkLoop => return self.deny(request_id, op, path),
             // A directory, FIFO, or device where a file was asked for.
             error.IsDir, error.NotRegularFile => return self.hide(request_id, may_stat, c.SSH_FX_FAILURE, op, path),
-            else => return self.reject(request_id, c.SSH_FX_FAILURE, op, path, @errorName(err)),
+            else => return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, op, path, @errorName(err)),
         };
         var owned: ?std.Io.File = file;
         defer if (owned) |f| f.close(self.io);
@@ -1003,6 +1014,9 @@ const SftpState = struct {
             return self.fsFailure(request_id, "rename", from, err);
         };
         if (gainsCapability(self.user, source.mode, from, to)) return self.deny(request_id, "rename", from);
+        // Any failure from here on follows a source that exists, and may
+        // hinge on a destination that does.
+        const may_stat = self.mayStat(from) and self.mayStat(to);
 
         // A directory rename respells every descendant's path; check each
         // one at both spellings so denied children cannot be carried into
@@ -1010,8 +1024,8 @@ const SftpState = struct {
         if ((source.mode & listing.S_IFMT) == listing.S_IFDIR) {
             self.verifyRenameTree(from_parent, from, to) catch |err| switch (err) {
                 error.RenameDenied => return self.deny(request_id, "rename", from),
-                error.RenameScanLimit => return self.reject(request_id, c.SSH_FX_FAILURE, "rename", from, "rename scan limit"),
-                else => return self.reject(request_id, c.SSH_FX_FAILURE, "rename", from, @errorName(err)),
+                error.RenameScanLimit => return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, "rename", from, "rename scan limit"),
+                else => return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, "rename", from, @errorName(err)),
             };
         }
 
@@ -1019,13 +1033,13 @@ const SftpState = struct {
         // `update` there (the clobber rule). Without it, a no-replace
         // rename refuses any existing entry, with no check-then-act race.
         if (policy.check(self.user, .update, to) == .allow) {
-            std.Io.Dir.rename(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch {
-                return self.reject(request_id, c.SSH_FX_FAILURE, "rename", from, "rename failed");
+            std.Io.Dir.rename(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch |err| {
+                return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, "rename", from, @errorName(err));
             };
         } else {
             renameNoReplace(from_parent.parent, from_parent.base, to_parent.parent, to_parent.base, self.io) catch |err| {
                 if (err == error.PathAlreadyExists) return self.deny(request_id, "rename", to);
-                return self.reject(request_id, c.SSH_FX_FAILURE, "rename", from, "rename failed");
+                return self.rejectHidden(request_id, may_stat, c.SSH_FX_FAILURE, "rename", from, @errorName(err));
             };
         }
         defer self.auditLog("rename", from, .ok, to);
