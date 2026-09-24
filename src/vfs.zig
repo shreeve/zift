@@ -312,11 +312,10 @@ fn normalizeVirtualPath(allocator: std.mem.Allocator, virtual_path: []const u8) 
 }
 
 /// `path` is `root` or below it at a component boundary (`/foobar` is
-/// not inside `/foo`).
+/// not inside `/foo`; everything absolute is inside `/`).
 pub fn isInsideRoot(root: []const u8, path: []const u8) bool {
-    if (std.mem.eql(u8, root, path)) return true;
     if (!std.mem.startsWith(u8, path, root)) return false;
-    return path.len > root.len and path[root.len] == '/';
+    return path.len == root.len or path[root.len] == '/' or std.mem.endsWith(u8, root, "/");
 }
 
 fn testNormalize(path: []const u8) ![]const u8 {
@@ -404,6 +403,16 @@ test "normalizeVirtualInto resolves .. before authorization" {
         try std.testing.expectEqualStrings(case.want, got);
     }
     try std.testing.expectError(error.PathTraversal, normalizeVirtualInto("/a/../../b", &out));
+}
+
+test "isInsideRoot splits at component boundaries, and `/` holds everything" {
+    try std.testing.expect(isInsideRoot("/srv/a", "/srv/a"));
+    try std.testing.expect(isInsideRoot("/srv/a", "/srv/a/b"));
+    try std.testing.expect(!isInsideRoot("/srv/a", "/srv/ab"));
+    try std.testing.expect(!isInsideRoot("/srv/a", "/srv"));
+    try std.testing.expect(isInsideRoot("/", "/"));
+    try std.testing.expect(isInsideRoot("/", "/etc"));
+    try std.testing.expect(isInsideRoot("/", "/etc/passwd"));
 }
 
 test "directory walk rejects symlinks inside the jail" {
