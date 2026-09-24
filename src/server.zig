@@ -110,6 +110,11 @@ pub fn run(
     defer c.ssh_bind_free(bind);
 
     var config_mtime = try currentConfigMtime(io, config_path);
+    // Baseline for authorized-key files referenced by the running
+    // config. Kept beside `config_mtime`: a later reload attempt,
+    // including a rejected one, advances both so the poll does not spin.
+    var key_stamps = try KeyStamps.collect(allocator, io, active.current.config);
+    defer key_stamps.deinit(allocator);
 
     const listen = try parseListen(allocator, active.current.config.server.listen);
     defer listen.deinit(allocator);
@@ -157,17 +162,18 @@ pub fn run(
 
         // SIGHUP forces a reload regardless of mtime (PLAN §7.2).
         if (signals.reload_requested.swap(false, .acq_rel)) {
-            active.forceReload(config_path, &config_mtime);
+            active.forceReload(config_path, &config_mtime, &key_stamps);
             next_reload_ms = audit.nowMonotonicMs() +
                 @as(i64, @intCast(active.current.config.server.reload_interval_ms));
         }
 
         // mtime watcher fires only on a per-config-interval cadence.
         // `reload_interval_ms == 0` disables it (PLAN §7.3); only
-        // SIGHUP can re-read the file in that mode.
+        // SIGHUP can re-read the file in that mode. The same call also
+        // stats authorized-key files of the running config.
         const reload_interval = active.current.config.server.reload_interval_ms;
         if (reload_interval > 0 and audit.nowMonotonicMs() >= next_reload_ms) {
-            try active.reloadIfChanged(config_path, &config_mtime);
+            active.reloadIfChanged(config_path, &config_mtime, &key_stamps);
             next_reload_ms = audit.nowMonotonicMs() +
                 @as(i64, @intCast(active.current.config.server.reload_interval_ms));
         }
@@ -266,7 +272,11 @@ pub fn run(
     // connections land during the grace window. The `defer
     // ssh_bind_free` at function entry still tears down libssh's bind
     // state on return; this just unbinds the port immediately.
+    // `ssh_bind_free` closes `bindfd` again when it is >= 0. Workers
+    // still open files during grace, so that second close can hit a
+    // reused descriptor. Drop libssh's copy after the real close.
     _ = std.c.close(bind_fd);
+    c.ssh_bind_set_fd(bind, @as(@TypeOf(bind_fd), -1));
 
     const grace_ms: i64 = @intCast(active.current.config.server.shutdown_grace_ms);
     const drain_deadline = audit.nowMonotonicMs() + grace_ms;
@@ -426,7 +436,8 @@ const ActiveConfig = struct {
         self: *ActiveConfig,
         path: []const u8,
         known_mtime: *std.Io.Timestamp,
-    ) !void {
+        key_stamps: *KeyStamps,
+    ) void {
         const mtime = currentConfigMtime(self.io, path) catch |err| {
             // PLAN §7.3: a deleted or unreadable config logs a single
             // warning and keeps the previous config running. Repeated
@@ -450,11 +461,19 @@ const ActiveConfig = struct {
             self.stat_warned = false;
         }
 
-        // PLAN §7.3: reload triggers only when mtime moves forward.
-        // Atomic-deploy patterns that preserve or rewind mtime rely on
-        // SIGHUP (which uses `forceReload` and skips this check).
-        if (mtime.nanoseconds <= known_mtime.nanoseconds) return;
-        try self.applyReload(path, mtime, known_mtime);
+        // PLAN §7.3: config reload triggers only when mtime moves
+        // forward. Atomic-deploy patterns that preserve or rewind
+        // mtime rely on SIGHUP (which uses `forceReload` and skips
+        // this check). Authorized-key files are outside that mtime, so
+        // a newer stamp — or a stat failure — takes the same path.
+        // Stderr and allocation failures stay in this function: leaving
+        // `run` would drop every live session.
+        if (mtime.nanoseconds <= known_mtime.nanoseconds and
+            !key_stamps.changed(self.io, self.current.config))
+        {
+            return;
+        }
+        self.applyReload(path, mtime, known_mtime, key_stamps);
     }
 
     /// Reload triggered by SIGHUP. Skips the mtime comparison so atomic
@@ -464,9 +483,10 @@ const ActiveConfig = struct {
         self: *ActiveConfig,
         path: []const u8,
         known_mtime: *std.Io.Timestamp,
+        key_stamps: *KeyStamps,
     ) void {
         const mtime = currentConfigMtime(self.io, path) catch std.Io.Timestamp.zero;
-        self.applyReload(path, mtime, known_mtime) catch {};
+        self.applyReload(path, mtime, known_mtime, key_stamps);
     }
 
     fn applyReload(
@@ -474,17 +494,19 @@ const ActiveConfig = struct {
         path: []const u8,
         mtime: std.Io.Timestamp,
         known_mtime: *std.Io.Timestamp,
-    ) !void {
+        key_stamps: *KeyStamps,
+    ) void {
         const stderr = std.Io.File.stderr();
 
         const contents = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1 << 20)) catch |err| {
             // A *read* failure may be transient (EMFILE/EACCES/transient
-            // I/O). Do NOT advance `known_mtime` here: a later `chmod
-            // 000`->`644` (which does not bump mtime) or easing fd
-            // pressure must be retried on the next `reload-interval`.
-            try stderr.writeStreamingAll(self.io, "zift: config reload read failed: ");
-            try stderr.writeStreamingAll(self.io, @errorName(err));
-            try stderr.writeStreamingAll(self.io, "\n");
+            // I/O). Do NOT advance `known_mtime` (or the key-file
+            // snapshot) here: a later `chmod 000`->`644` (which does
+            // not bump mtime) or easing fd pressure must be retried on
+            // the next `reload-interval`.
+            stderr.writeStreamingAll(self.io, "zift: config reload read failed: ") catch return;
+            stderr.writeStreamingAll(self.io, @errorName(err)) catch return;
+            stderr.writeStreamingAll(self.io, "\n") catch {};
             return;
         };
         defer self.allocator.free(contents);
@@ -494,8 +516,12 @@ const ActiveConfig = struct {
         // saved typo) must not be re-read, re-parsed, and re-logged every
         // `reload-interval` forever. The next genuine edit moves mtime
         // forward again and triggers a fresh attempt. SIGHUP always
-        // retries regardless.
+        // retries regardless. The key-file snapshot moves with it,
+        // including failed stats, so a stable bad key file does not
+        // reload every poll either. Paths are those of the config still
+        // in service; a successful swap re-snapshots below.
         known_mtime.* = mtime;
+        key_stamps.remember(self.allocator, self.io, self.current.config);
 
         var diag: config.ParseDiag = .{};
         var next_config = config.parseWithDiag(self.allocator, contents, &diag) catch |err| {
@@ -505,7 +531,6 @@ const ActiveConfig = struct {
             self.noteReloadRejected(stderr, path, w.buffered());
             return;
         };
-        errdefer next_config.deinit();
 
         // Cross-cutting semantic checks (PLAN.md §6.2). On failure, the
         // running config keeps serving; validateSemantic has already
@@ -523,19 +548,31 @@ const ActiveConfig = struct {
         // reloaded" would mislead an operator who just repointed the
         // audit log or the listen address. The reload still applies to
         // users/rules/timeouts; these three keep their startup values
-        // until a full restart.
-        try self.warnRestartOnly(stderr, "listen", self.bound_listen, next_config.server.listen);
-        try self.warnRestartOnly(stderr, "host-key", self.bound_host_key, next_config.server.host_key);
-        try self.warnRestartOnly(stderr, "log", self.bound_log, logTargetLabel(next_config.server.log));
+        // until a full restart. A warning that cannot be printed must
+        // not discard a good config or stop the accept loop.
+        self.warnRestartOnly(stderr, "listen", self.bound_listen, next_config.server.listen);
+        self.warnRestartOnly(stderr, "host-key", self.bound_host_key, next_config.server.host_key);
+        self.warnRestartOnly(stderr, "log", self.bound_log, logTargetLabel(next_config.server.log));
 
-        const next_ref = try ConfigRef.create(self.allocator, next_config);
+        const next_ref = ConfigRef.create(self.allocator, next_config) catch |err| {
+            next_config.deinit();
+            stderr.writeStreamingAll(self.io, "zift: config reload failed: ") catch return;
+            stderr.writeStreamingAll(self.io, @errorName(err)) catch return;
+            stderr.writeStreamingAll(self.io, " (keeping previous config)\n") catch {};
+            return;
+        };
 
+        // `next_ref` owns `next_config` from here. Do not deinit it if a
+        // later status write fails, and do not put the previous ref back:
+        // sessions may already observe `self.current`, and a good config
+        // whose announcement could not be printed stays in service.
         self.mutex.lockUncancelable(self.io);
         const old_ref = self.current;
         self.current = next_ref;
         self.mutex.unlock(self.io);
 
         old_ref.release(self.allocator);
+        key_stamps.remember(self.allocator, self.io, self.current.config);
 
         // If we were serving a stale config because earlier edits were
         // rejected, this successful load ends the divergence. Announce the
@@ -543,11 +580,11 @@ const ActiveConfig = struct {
         // has a visible close, then clear the flag.
         if (self.reload_degraded) {
             self.reload_degraded = false;
-            try stderr.writeStreamingAll(self.io, "zift: config reload recovered — on-disk config valid again; now serving it\n");
+            stderr.writeStreamingAll(self.io, "zift: config reload recovered — on-disk config valid again; now serving it\n") catch {};
             audit.log(self.io, null, "config.reload", path, .ok, "recovered; on-disk config now serving", "");
         }
 
-        try stderr.writeStreamingAll(self.io, "zift: config reloaded (users/rules/timeouts applied to new sessions)\n");
+        stderr.writeStreamingAll(self.io, "zift: config reloaded (users/rules/timeouts applied to new sessions)\n") catch {};
     }
 
     /// Emit the loud, monitorable signal for a rejected reload and mark
@@ -591,13 +628,13 @@ const ActiveConfig = struct {
         name: []const u8,
         bound: []const u8,
         proposed: []const u8,
-    ) !void {
+    ) void {
         if (std.mem.eql(u8, bound, proposed)) return;
-        try stderr.writeStreamingAll(self.io, "zift: warning: '");
-        try stderr.writeStreamingAll(self.io, name);
-        try stderr.writeStreamingAll(self.io, "' changed in config but is applied only at startup; still using '");
-        try stderr.writeStreamingAll(self.io, bound);
-        try stderr.writeStreamingAll(self.io, "' — restart zift to apply\n");
+        stderr.writeStreamingAll(self.io, "zift: warning: '") catch return;
+        stderr.writeStreamingAll(self.io, name) catch return;
+        stderr.writeStreamingAll(self.io, "' changed in config but is applied only at startup; still using '") catch return;
+        stderr.writeStreamingAll(self.io, bound) catch return;
+        stderr.writeStreamingAll(self.io, "' — restart zift to apply\n") catch {};
     }
 };
 
@@ -652,6 +689,134 @@ fn currentConfigMtime(io: std.Io, path: []const u8) !std.Io.Timestamp {
     const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
     return stat.mtime;
 }
+
+fn statKeyMtime(io: std.Io, path: []const u8) ?std.Io.Timestamp {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    return stat.mtime;
+}
+
+/// Mtimes of authorized-key files referenced by the config currently in
+/// service. Stored beside the config mtime and advanced on every reload
+/// attempt whose config read succeeded — including rejects — so a stable
+/// bad key file does not trigger another reload on the next poll.
+const KeyStamps = struct {
+    entries: []Entry = &.{},
+
+    const Entry = struct {
+        path: []u8,
+        /// null when the last stat failed. A later success reloads; a
+        /// repeated failure does not.
+        mtime: ?std.Io.Timestamp,
+    };
+
+    const Lookup = union(enum) {
+        absent,
+        failed,
+        mtime: std.Io.Timestamp,
+    };
+
+    fn deinit(self: *KeyStamps, allocator: std.mem.Allocator) void {
+        for (self.entries) |e| allocator.free(e.path);
+        allocator.free(self.entries);
+        self.* = .{};
+    }
+
+    fn lookup(self: *const KeyStamps, path: []const u8) Lookup {
+        for (self.entries) |e| {
+            if (!std.mem.eql(u8, e.path, path)) continue;
+            if (e.mtime) |ts| return .{ .mtime = ts };
+            return .failed;
+        }
+        return .absent;
+    }
+
+    /// Newer than the last recorded stamp, missing after a successful
+    /// stamp, present after a failed stamp, or not recorded yet.
+    fn changed(self: *const KeyStamps, io: std.Io, cfg: config.Config) bool {
+        for (cfg.users) |user| {
+            for (user.key_files) |kpath| {
+                switch (self.lookup(kpath)) {
+                    .absent => return true,
+                    .failed => {
+                        if (statKeyMtime(io, kpath) != null) return true;
+                    },
+                    .mtime => |prev| {
+                        const now = statKeyMtime(io, kpath) orelse return true;
+                        if (now.nanoseconds > prev.nanoseconds) return true;
+                    },
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Restat key files of `cfg`. An unchanged path set is updated in
+    /// place so a rejected reload remembers a bad file even when a
+    /// fresh allocation fails. A changed path set allocates; on
+    /// `OutOfMemory` the previous entries are left as they were (the
+    /// intersection already restatted).
+    fn remember(self: *KeyStamps, allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) void {
+        for (self.entries) |*e| {
+            if (configHasKeyFile(cfg, e.path)) e.mtime = statKeyMtime(io, e.path);
+        }
+        if (self.samePaths(cfg)) return;
+        const fresh = collect(allocator, io, cfg) catch return;
+        self.deinit(allocator);
+        self.* = fresh;
+    }
+
+    fn samePaths(self: *const KeyStamps, cfg: config.Config) bool {
+        for (cfg.users) |user| {
+            for (user.key_files) |p| {
+                switch (self.lookup(p)) {
+                    .absent => return false,
+                    else => {},
+                }
+            }
+        }
+        for (self.entries) |e| {
+            if (!configHasKeyFile(cfg, e.path)) return false;
+        }
+        return true;
+    }
+
+    fn collect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !KeyStamps {
+        var list: std.ArrayList(Entry) = .empty;
+        errdefer {
+            for (list.items) |e| allocator.free(e.path);
+            list.deinit(allocator);
+        }
+        for (cfg.users) |user| {
+            for (user.key_files) |p| {
+                if (listHas(list.items, p)) continue;
+                const owned = try allocator.dupe(u8, p);
+                const mtime = statKeyMtime(io, p);
+                list.append(allocator, .{ .path = owned, .mtime = mtime }) catch |err| {
+                    allocator.free(owned);
+                    return err;
+                };
+            }
+        }
+        if (list.items.len == 0) return .{};
+        return .{ .entries = try list.toOwnedSlice(allocator) };
+    }
+
+    fn listHas(entries: []const Entry, path: []const u8) bool {
+        for (entries) |e| {
+            if (std.mem.eql(u8, e.path, path)) return true;
+        }
+        return false;
+    }
+
+    fn configHasKeyFile(cfg: config.Config, path: []const u8) bool {
+        for (cfg.users) |user| {
+            for (user.key_files) |p| {
+                if (std.mem.eql(u8, p, path)) return true;
+            }
+        }
+        return false;
+    }
+};
 
 fn handleSession(
     io: std.Io,
