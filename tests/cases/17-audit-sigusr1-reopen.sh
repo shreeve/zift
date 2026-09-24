@@ -46,7 +46,7 @@ mv "$AUDIT_PATH" "$AUDIT_PATH.1"
 : > "$AUDIT_PATH"
 
 # Send SIGUSR1 to the running zift binary (NOT the wrapper shell).
-ZIFT_BINARY_PID=$(pgrep -x zift | head -1)
+ZIFT_BINARY_PID=$ZIFT_PID # not pgrep: other checkouts may run zift too
 [[ -n "$ZIFT_BINARY_PID" ]] || fail "could not find running zift binary pid"
 kill -USR1 "$ZIFT_BINARY_PID"
 sleep 1

@@ -103,7 +103,7 @@ grep -q 'config reloaded' "$TEST_TMP/disabled.log" \
 ok "reload-interval=0 suppresses mtime-driven reload"
 
 # SIGHUP must still trigger a reload even with interval=0.
-DISABLED_BIN_PID=$(pgrep -x zift | head -1)
+DISABLED_BIN_PID=$DISABLED_PID # not pgrep: other checkouts may run zift too
 [[ -n "$DISABLED_BIN_PID" ]] || fail "could not find disabled zift binary pid"
 kill -HUP "$DISABLED_BIN_PID"
 sleep 2
