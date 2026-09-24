@@ -164,6 +164,9 @@ validate_err "$T/not_dir.conf" "is not a directory"
 conf no_host_key "$alice"
 sed -i.bak "s|host-key .*|host-key $T/no_such_host_key|" "$T/no_host_key.conf"
 validate_err "$T/no_host_key.conf" "host-key unreadable"
+# Relative, it would name one file here and another under systemd (cwd /).
+(cd "$(dirname "$HOST_KEY")" && sed "s|host-key .*|host-key $(basename "$HOST_KEY")|" "$T/happy.conf" > "$T/rel_host_key.conf")
+validate_err "$T/rel_host_key.conf" "'host-key': RelativePath"
 conf overlap "$(user outer "root $T/shared" "allow / read list")
 $(user inner "root $T/shared/sub" "allow / read list")"
 validate_err "$T/overlap.conf" "overlapping roots"

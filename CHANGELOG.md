@@ -102,8 +102,10 @@ the line and the reason.
   /path` is `InvalidAuth`. Migration: update any script that matches
   on the old names. Diagnostics now end with `: <reason>` and name the
   right line and user.
-- A relative `root` is rejected at parse time. Before, it aborted the
-  daemon. Migration: use an absolute path.
+- A relative `root` or `host-key` is rejected at parse time. Before, a
+  relative root aborted the daemon, and a relative host key was read
+  from the cwd, so `validate` could check another file than `serve`
+  under systemd (cwd `/`) loads. Migration: use an absolute path.
 - An IPv6 `from` prefix under /96 that covers `::ffff:0:0/96` is
   `InvalidFrom`. Migration: write `::ffff:203.0.113.0/24` as
   `203.0.113.0/24`, or use `::/0` for any source.

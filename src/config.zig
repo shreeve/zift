@@ -808,7 +808,7 @@ fn parseServerProperty(
                 return d.fail(error.InvalidListen, "use host:port, :port, or [ipv6]:port with a port from 1 to 65535", .{});
             server.cfg.listen = try allocator.dupe(u8, value);
         },
-        .@"host-key" => server.cfg.host_key = try allocator.dupe(u8, value),
+        .@"host-key" => server.cfg.host_key = try dupeAbsolute(allocator, d, value),
         // Floors: a shorter poll re-stats every key file on each accept-loop
         // wake-up, and a shorter idle timeout fails every handshake.
         .@"reload-interval" => server.cfg.reload_interval_ms = try parseDurationAtLeast(d, value, 100, "100ms"),
@@ -849,9 +849,11 @@ fn firstSetting(d: *ParseDiag, seen_line: *u32, line: u32) Error!void {
     seen_line.* = line;
 }
 
-/// Paths must be absolute: a relative one would depend on the daemon's
-/// cwd, and `realPathFileAbsoluteAlloc` in validateSemantic asserts it
-/// (a bad reload must not reach that assert).
+/// Paths must be absolute: a relative one would depend on the cwd, so
+/// `validate` run elsewhere would check another file than `serve` under
+/// systemd (cwd `/`) opens, and `realPathFileAbsoluteAlloc` in
+/// validateSemantic asserts it for roots (a bad reload must not reach
+/// that assert).
 fn dupeAbsolute(allocator: std.mem.Allocator, d: *ParseDiag, value: []const u8) Error![]const u8 {
     if (value[0] != '/') return d.fail(error.RelativePath, "must be an absolute path", .{});
     return allocator.dupe(u8, value);
@@ -2063,6 +2065,7 @@ test "ParseDiag: line, section, user, key, and reason" {
     try expectDiag("server\n  reload-interval 5\n", "line 2: [server] 'reload-interval': InvalidDuration: use a number with a unit (ms, s, m, h, d), or 0");
     try expectDiag("server\n  publish-mode 0o666\n", "line 2: [server] 'publish-mode': InvalidMode: needs owner rw (0o600) and only read/write bits, no world-write: at most 0o664");
     try expectDiag(srv ++ "user bob\n  root bob\n", "line 5: [user bob] 'root': RelativePath: must be an absolute path");
+    try expectDiag("server\n  listen :2222\n  host-key host_ed25519\n", "line 3: [server] 'host-key': RelativePath: must be an absolute path");
     try expectDiag("server\n  listing-mode real\n", "line 2: [server] 'listing-mode': InvalidListingMode: use 'virtual' or 'reality'");
     try expectDiag("server\n  max-connections many\n", "line 2: [server] 'max-connections': InvalidNumber: expected a whole number");
     try expectDiag("server\nserver\n", "line 2: DuplicateServerSection");
