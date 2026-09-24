@@ -101,8 +101,12 @@ jobs:
 
       # No libssh / mbedTLS / zlib install step needed since v0.2.0 —
       # `zig build release` compiles all three from vendored source via
-      # build.zig.zon. Hermetic build, reproducible from a clean
-      # checkout on any host with Zig 0.16.0 installed.
+      # build.zig.zon.
+
+      # A tag can be pushed on a commit CI never saw; do not ship it
+      # untested.
+      - name: Unit tests
+        run: zig build test
 
       - name: Build release artifacts
         env:
@@ -179,12 +183,10 @@ jobs:
         with:
           cosign-release: 'v3.1.2'
 
+      # Keyless signing uses Sigstore's public-good instance, cosign's
+      # default. (COSIGN_EXPERIMENTAL, which this step used to set, is a
+      # legacy feature toggle and never selected an instance.)
       - name: Sign SHA256SUMS (cosign keyless via OIDC)
-        env:
-          # Tell cosign to use Sigstore's public good instance. This
-          # is the default; we set it explicitly so a future Sigstore
-          # config change doesn't silently switch trust roots.
-          COSIGN_EXPERIMENTAL: "0"
         run: |
           cd release
           cosign sign-blob \
