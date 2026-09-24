@@ -389,6 +389,8 @@ const ServerBuilder = struct {
 
 const UserBuilder = struct {
     name: []const u8,
+    /// The `user` header line, for errors found after the whole file.
+    line: u32,
     password_hash: ?[]const u8 = null,
     key_files: std.ArrayList([]const u8) = .empty,
     from: std.ArrayList(netmatch.Cidr) = .empty,
@@ -409,10 +411,12 @@ pub const Error = error{
     EmptyUserName,
     InlineComment,
     InvalidAuth,
-    InvalidConfig,
     InvalidDuration,
     InvalidKeyLine,
     InvalidListen,
+    InvalidListingMode,
+    InvalidMode,
+    InvalidNumber,
     InvalidPermission,
     InvalidUserName,
     KeyDirectiveRemoved,
@@ -425,11 +429,13 @@ pub const Error = error{
     MissingRulePattern,
     MissingRulePermissions,
     MissingServerSection,
+    MissingValue,
     OutOfMemory,
     PasswordDirectiveRemoved,
     PasswordPhcRemoved,
     InvalidPasshash,
     PropertyOutsideSection,
+    RelativePath,
     UnknownKey,
     UnknownSection,
     UnsupportedKeyAlgorithm,
@@ -440,8 +446,9 @@ pub const Error = error{
 pub const max_username_bytes: usize = 64;
 pub const max_keyline_bytes: usize = 8192;
 
-/// Where a parse failed: line, section, user, and key. Strings are copied
-/// into inline buffers because the parser's arena is freed on error.
+/// Where and why a parse failed: line, section, user, key, and a reason.
+/// Strings are copied into inline buffers because the parser's arena is
+/// freed on error.
 pub const ParseDiag = struct {
     line: u32 = 0,
     section_kind: ?Section = null,
@@ -449,6 +456,22 @@ pub const ParseDiag = struct {
     user_name_len: usize = 0,
     key_buf: [64]u8 = [_]u8{0} ** 64,
     key_len: usize = 0,
+    reason_buf: [256]u8 = undefined,
+    reason_len: usize = 0,
+
+    /// What to change, when the error name alone does not say.
+    pub fn reason(self: *const ParseDiag) ?[]const u8 {
+        if (self.reason_len == 0) return null;
+        return self.reason_buf[0..self.reason_len];
+    }
+
+    /// Record a reason (truncated to the buffer) and return `err`.
+    fn fail(self: *ParseDiag, err: Error, comptime fmt: []const u8, args: anytype) Error {
+        var w = std.Io.Writer.fixed(&self.reason_buf);
+        w.print(fmt, args) catch {};
+        self.reason_len = w.end;
+        return err;
+    }
 
     pub fn userName(self: *const ParseDiag) ?[]const u8 {
         if (self.user_name_len == 0) return null;
@@ -472,7 +495,7 @@ pub const ParseDiag = struct {
         self.key_len = n;
     }
 
-    /// `line N: [section] 'key': ErrorName` (caller prints the file).
+    /// `line N: [section] 'key': ErrorName[: reason]` (caller prints the file).
     pub fn format(self: *const ParseDiag, err: anyerror, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.line != 0) {
             try writer.print("line {d}: ", .{self.line});
@@ -490,6 +513,7 @@ pub const ParseDiag = struct {
         }
         if (self.keyName()) |k| try writer.print("'{s}': ", .{k});
         try writer.writeAll(@errorName(err));
+        if (self.reason()) |r| try writer.print(": {s}", .{r});
     }
 };
 
@@ -552,23 +576,24 @@ pub fn parseWithDiag(
     errdefer arena.deinit();
     const allocator = arena.allocator();
 
+    var scratch: ParseDiag = .{};
+    const d = diag orelse &scratch;
+
     var server: ServerBuilder = .{};
-    var seen_server = false;
+    var server_line: u32 = 0;
     var users: std.ArrayList(UserBuilder) = .empty;
 
     var section: Section = .none;
     var current_user: ?*UserBuilder = null;
 
-    // Snapshotted into `diag` on any error.
+    // Snapshotted into `d` on any error.
     var line_no: u32 = 0;
     var key_for_diag: ?[]const u8 = null;
     errdefer {
-        if (diag) |d| {
-            d.line = line_no;
-            d.section_kind = section;
-            if (current_user) |u| d.setUserName(u.name);
-            if (key_for_diag) |k| d.setKey(k);
-        }
+        d.line = line_no;
+        d.section_kind = section;
+        if (current_user) |u| d.setUserName(u.name);
+        if (key_for_diag) |k| d.setKey(k);
     }
 
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -588,23 +613,28 @@ pub fn parseWithDiag(
 
         const indent = countIndent(no_cr);
         if (indent == 0) {
+            // A bad header belongs to no section, not the one before it.
             current_user = null;
+            section = .none;
+            const head, const rest = splitKeyValue(line);
             if (std.mem.eql(u8, line, "server")) {
-                if (seen_server) return error.DuplicateServerSection;
-                seen_server = true;
+                if (server_line != 0) return error.DuplicateServerSection;
+                server_line = line_no;
                 section = .server;
                 continue;
             }
 
-            if (std.mem.startsWith(u8, line, "user ")) {
-                const name = std.mem.trim(u8, line["user ".len..], " \t");
+            if (std.mem.eql(u8, head, "user")) {
+                const name = rest;
                 if (name.len == 0) return error.EmptyUserName;
                 if (name.len > max_username_bytes) return error.UsernameTooLong;
                 if (!validUserName(name)) return error.InvalidUserName;
-                if (findUserBuilder(users.items, name) != null) return error.DuplicateUser;
+                for (users.items) |u| {
+                    if (std.mem.eql(u8, u.name, name)) return error.DuplicateUser;
+                }
 
                 const stored_name = try allocator.dupe(u8, name);
-                try users.append(allocator, .{ .name = stored_name });
+                try users.append(allocator, .{ .name = stored_name, .line = line_no });
                 current_user = &users.items[users.items.len - 1];
                 section = .user;
                 continue;
@@ -613,24 +643,34 @@ pub fn parseWithDiag(
             return error.UnknownSection;
         }
 
-        const key, const value = splitKeyValue(line) orelse return error.InvalidConfig;
+        const key, const value = splitKeyValue(line);
         key_for_diag = key;
+        if (value.len == 0) return error.MissingValue;
         switch (section) {
             .none => return error.PropertyOutsideSection,
-            .server => try parseServerProperty(allocator, &server, key, value),
-            .user => {
-                const user = current_user orelse return error.PropertyOutsideSection;
-                try parseUserProperty(allocator, user, key, value);
-            },
+            .server => try parseServerProperty(allocator, d, &server, key, value),
+            .user => try parseUserProperty(allocator, d, current_user.?, key, value),
         }
     }
 
-    if (!seen_server) return error.MissingServerSection;
+    // Errors found after the last line point at the header they concern.
+    key_for_diag = null;
+    section = .server;
+    line_no = server_line;
+    if (server_line == 0) {
+        section = .none;
+        return error.MissingServerSection;
+    }
+    const listen = server.listen orelse return error.MissingListen;
+    const host_key = server.host_key orelse return error.MissingHostKey;
 
+    section = .user;
     const final_users = try allocator.alloc(UserConfig, users.items.len);
     for (users.items, 0..) |*builder, i| {
+        current_user = builder;
+        line_no = builder.line;
         if (builder.password_hash == null and builder.key_files.items.len == 0) {
-            return error.MissingCredentials;
+            return d.fail(error.MissingCredentials, "add an 'auth' line (passhash or key file)", .{});
         }
 
         // Default the root from `partner-root`. Never build `//name`:
@@ -643,7 +683,7 @@ pub fn parseWithDiag(
             else
                 try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pr, builder.name })
         else
-            return error.MissingRoot;
+            return d.fail(error.MissingRoot, "add 'root /path' or a server 'partner-root'", .{});
 
         final_users[i] = .{
             .name = builder.name,
@@ -659,8 +699,8 @@ pub fn parseWithDiag(
     return .{
         .arena = arena,
         .server = .{
-            .listen = server.listen orelse return error.MissingListen,
-            .host_key = server.host_key orelse return error.MissingHostKey,
+            .listen = listen,
+            .host_key = host_key,
             .reload_interval_ms = server.reload_interval_ms,
             .idle_timeout_ms = server.idle_timeout_ms,
             .max_connections = server.max_connections,
@@ -677,6 +717,7 @@ pub fn parseWithDiag(
 
 fn parseServerProperty(
     allocator: std.mem.Allocator,
+    d: *ParseDiag,
     server: *ServerBuilder,
     key: []const u8,
     value: []const u8,
@@ -687,80 +728,84 @@ fn parseServerProperty(
     } else if (std.mem.eql(u8, key, "host-key")) {
         server.host_key = try allocator.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "reload-interval")) {
-        server.reload_interval_ms = try parseDurationMs(value);
+        server.reload_interval_ms = try parseDurationMs(d, value);
     } else if (std.mem.eql(u8, key, "idle-timeout")) {
-        const ms = try parseDurationMs(value);
+        const ms = try parseDurationMs(d, value);
         // Above libssh's signed 32-bit ms limit it waits forever.
-        if (ms > max_libssh_idle_timeout_ms) return error.InvalidConfig;
+        if (ms > max_libssh_idle_timeout_ms) return d.fail(error.InvalidDuration, "at most 24d (libssh's limit)", .{});
         server.idle_timeout_ms = ms;
     } else if (std.mem.eql(u8, key, "max-connections")) {
-        server.max_connections = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidConfig;
+        server.max_connections = try parseCount(d, value);
     } else if (std.mem.eql(u8, key, "max-unauth-connections")) {
-        server.max_unauth_connections = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidConfig;
+        server.max_unauth_connections = try parseCount(d, value);
     } else if (std.mem.eql(u8, key, "shutdown-grace")) {
-        server.shutdown_grace_ms = try parseDurationMs(value);
+        server.shutdown_grace_ms = try parseDurationMs(d, value);
     } else if (std.mem.eql(u8, key, "log")) {
-        if (std.mem.eql(u8, value, "stderr")) {
-            server.log = .stderr;
-        } else {
-            // Absolute only: a relative path depends on the daemon's cwd.
-            if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
-            server.log = .{ .file = try allocator.dupe(u8, value) };
-        }
+        server.log = if (std.mem.eql(u8, value, "stderr"))
+            .stderr
+        else
+            .{ .file = try dupeAbsolute(allocator, d, value) };
     } else if (std.mem.eql(u8, key, "listing-mode")) {
-        if (std.mem.eql(u8, value, "virtual")) {
-            server.listing_mode = .virtual;
-        } else if (std.mem.eql(u8, value, "reality")) {
-            server.listing_mode = .reality;
-        } else {
-            return error.InvalidConfig;
-        }
+        server.listing_mode = std.meta.stringToEnum(ListingMode, value) orelse
+            return d.fail(error.InvalidListingMode, "use 'virtual' or 'reality'", .{});
     } else if (std.mem.eql(u8, key, "publish-mode")) {
-        server.publish_mode = try parsePublishMode(value);
+        server.publish_mode = try parsePublishMode(d, value);
     } else if (std.mem.eql(u8, key, "mkdir-mode")) {
-        server.mkdir_mode = try parseMkdirMode(value);
+        server.mkdir_mode = try parseMkdirMode(d, value);
     } else if (std.mem.eql(u8, key, "partner-root")) {
-        // Absolute only. Trailing `/` is trimmed, except for `/` itself.
-        if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
-        var pr = value;
+        // Trailing `/` is trimmed, except for `/` itself.
+        var pr = try dupeAbsolute(allocator, d, value);
         while (pr.len > 1 and pr[pr.len - 1] == '/') pr = pr[0 .. pr.len - 1];
-        server.partner_root = try allocator.dupe(u8, pr);
+        server.partner_root = pr;
     } else {
         return error.UnknownKey;
     }
 }
 
+/// Paths must be absolute: a relative one would depend on the daemon's
+/// cwd, and `realPathFileAbsoluteAlloc` in validateSemantic asserts it
+/// (a bad reload must not reach that assert).
+fn dupeAbsolute(allocator: std.mem.Allocator, d: *ParseDiag, value: []const u8) Error![]const u8 {
+    if (value[0] != '/') return d.fail(error.RelativePath, "must be an absolute path", .{});
+    return allocator.dupe(u8, value);
+}
+
+/// A decimal count.
+fn parseCount(d: *ParseDiag, value: []const u8) Error!u32 {
+    return std.fmt.parseUnsigned(u32, value, 10) catch
+        d.fail(error.InvalidNumber, "expected a whole number", .{});
+}
+
 /// Only 0o600, 0o640, or 0o660: partner data never gets world bits.
-fn parsePublishMode(value: []const u8) Error!u32 {
-    const mode = parseOctalMode(value) catch return error.InvalidConfig;
+fn parsePublishMode(d: *ParseDiag, value: []const u8) Error!u32 {
+    const mode = parseOctalMode(value) catch 0;
     if (mode != 0o600 and mode != 0o640 and mode != 0o660) {
-        return error.InvalidConfig;
+        return d.fail(error.InvalidMode, "use 0o600, 0o640, or 0o660", .{});
     }
     return mode;
 }
 
 /// Only 0o2700, 0o2750, or 0o2770: setgid, never world bits.
-fn parseMkdirMode(value: []const u8) Error!u32 {
-    const mode = parseOctalMode(value) catch return error.InvalidConfig;
+fn parseMkdirMode(d: *ParseDiag, value: []const u8) Error!u32 {
+    const mode = parseOctalMode(value) catch 0;
     if (mode != 0o2700 and mode != 0o2750 and mode != 0o2770) {
-        return error.InvalidConfig;
+        return d.fail(error.InvalidMode, "use 0o2700, 0o2750, or 0o2770", .{});
     }
     return mode;
 }
 
 /// `0o660`, `0660`, and `660` are all octal, as with chmod.
 fn parseOctalMode(value: []const u8) !u32 {
-    if (value.len == 0) return error.InvalidConfig;
     const slice = if (std.mem.startsWith(u8, value, "0o") or std.mem.startsWith(u8, value, "0O"))
         value[2..]
     else
         value;
-    if (slice.len == 0) return error.InvalidConfig;
     return std.fmt.parseUnsigned(u32, slice, 8);
 }
 
 fn parseUserProperty(
     allocator: std.mem.Allocator,
+    d: *ParseDiag,
     user: *UserBuilder,
     key: []const u8,
     value: []const u8,
@@ -768,10 +813,7 @@ fn parseUserProperty(
     if (std.mem.eql(u8, key, "auth")) {
         try parseAuth(allocator, user, value);
     } else if (std.mem.eql(u8, key, "root")) {
-        // Absolute only: `realPathFileAbsoluteAlloc` in validateSemantic
-        // asserts it, and a bad reload must not reach that assert.
-        if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
-        user.root = try allocator.dupe(u8, value);
+        user.root = try dupeAbsolute(allocator, d, value);
     } else if (std.mem.eql(u8, key, "from")) {
         try parseFrom(allocator, user, value);
     } else if (std.mem.eql(u8, key, "allow")) {
@@ -915,34 +957,28 @@ fn validateListen(value: []const u8) Error!void {
     if (parsed == 0) return error.InvalidListen;
 }
 
-fn parseDurationMs(value: []const u8) Error!u64 {
-    if (value.len == 0) return error.InvalidDuration;
+/// Unit suffixes, longest first so `ms` is not read as `s`.
+const duration_units = [_]struct { []const u8, u64 }{
+    .{ "ms", 1 },
+    .{ "s", std.time.ms_per_s },
+    .{ "m", std.time.ms_per_min },
+    .{ "h", std.time.ms_per_hour },
+    .{ "d", std.time.ms_per_day },
+};
 
-    // Bare `0` means disabled. Any other value needs a unit (`ms`, `s`,
-    // `m`, `h`, `d`): a bare number is ambiguous, so it is rejected.
+/// Bare `0` means disabled. Any other value needs a unit: a bare number
+/// is ambiguous (ms or s?), so it is rejected.
+fn parseDurationMs(d: *ParseDiag, value: []const u8) Error!u64 {
     if (std.mem.eql(u8, value, "0")) return 0;
-
-    if (std.mem.endsWith(u8, value, "ms")) {
-        const ms = std.fmt.parseUnsigned(u64, value[0 .. value.len - 2], 10) catch return error.InvalidDuration;
-        return capDurationMs(ms);
+    for (duration_units) |unit| {
+        const suffix, const factor = unit;
+        if (!std.mem.endsWith(u8, value, suffix)) continue;
+        const count = std.fmt.parseUnsigned(u64, value[0 .. value.len - suffix.len], 10) catch break;
+        const ms = std.math.mul(u64, count, factor) catch max_duration_ms + 1;
+        if (ms > max_duration_ms) return d.fail(error.InvalidDuration, "too long", .{});
+        return ms;
     }
-    if (std.mem.endsWith(u8, value, "s")) {
-        const seconds = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
-        return scaleDurationMs(seconds, 1000);
-    }
-    if (std.mem.endsWith(u8, value, "m")) {
-        const minutes = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
-        return scaleDurationMs(minutes, 60 * 1000);
-    }
-    if (std.mem.endsWith(u8, value, "h")) {
-        const hours = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
-        return scaleDurationMs(hours, 60 * 60 * 1000);
-    }
-    if (std.mem.endsWith(u8, value, "d")) {
-        const days = std.fmt.parseUnsigned(u64, value[0 .. value.len - 1], 10) catch return error.InvalidDuration;
-        return scaleDurationMs(days, 24 * 60 * 60 * 1000);
-    }
-    return error.InvalidDuration;
+    return d.fail(error.InvalidDuration, "use a number with a unit (ms, s, m, h, d), or 0", .{});
 }
 
 /// libssh stores the blocking-read timeout as a signed 32-bit
@@ -953,28 +989,17 @@ const max_libssh_idle_timeout_ms: u64 = 2147483647;
 /// rejected here rather than overflow later.
 pub const max_duration_ms: u64 = std.math.maxInt(i64);
 
-fn capDurationMs(ms: u64) Error!u64 {
-    if (ms > max_duration_ms) return error.InvalidDuration;
-    return ms;
-}
-
-fn scaleDurationMs(count: u64, factor: u64) Error!u64 {
-    const product = std.math.mul(u64, count, factor) catch return error.InvalidDuration;
-    return capDurationMs(product);
-}
-
 fn countIndent(line: []const u8) usize {
     var count: usize = 0;
     while (count < line.len and (line[count] == ' ' or line[count] == '\t')) : (count += 1) {}
     return count;
 }
 
-fn splitKeyValue(line: []const u8) ?struct { []const u8, []const u8 } {
-    const idx = std.mem.indexOfAny(u8, line, " \t") orelse return null;
-    const key = line[0..idx];
-    const value = std.mem.trim(u8, line[idx..], " \t");
-    if (key.len == 0 or value.len == 0) return null;
-    return .{ key, value };
+/// Split a trimmed line at its first blank into a key and the trimmed
+/// rest (empty when there is none).
+fn splitKeyValue(line: []const u8) struct { []const u8, []const u8 } {
+    const idx = std.mem.indexOfAny(u8, line, " \t") orelse return .{ line, "" };
+    return .{ line[0..idx], std.mem.trim(u8, line[idx..], " \t") };
 }
 
 fn validUserName(name: []const u8) bool {
@@ -988,13 +1013,6 @@ fn validUserName(name: []const u8) bool {
         if (!ok) return false;
     }
     return true;
-}
-
-fn findUserBuilder(users: []const UserBuilder, name: []const u8) ?usize {
-    for (users, 0..) |user, i| {
-        if (std.mem.eql(u8, user.name, name)) return i;
-    }
-    return null;
 }
 
 test "parse valid config" {
@@ -1331,7 +1349,6 @@ test "publish-mode: accepts 0o600, 0o640, 0o660 — rejects everything else" {
         .{ "0o060", @as(?u32, null) },
         // Decimal nonsense.
         .{ "abc", @as(?u32, null) },
-        .{ "", @as(?u32, null) },
     };
     inline for (cases) |case| {
         const text =
@@ -1342,7 +1359,7 @@ test "publish-mode: accepts 0o600, 0o640, 0o660 — rejects everything else" {
             defer cfg.deinit();
             try std.testing.expectEqual(expected, cfg.server.publish_mode);
         } else {
-            try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
+            try std.testing.expectError(error.InvalidMode, parse(std.testing.allocator, text));
         }
     }
 }
@@ -1370,7 +1387,6 @@ test "mkdir-mode: accepts 0o2700, 0o2750, 0o2770 — rejects everything else" {
         .{ "0o2775", @as(?u32, null) },
         // Decimal nonsense.
         .{ "xyz", @as(?u32, null) },
-        .{ "", @as(?u32, null) },
     };
     inline for (cases) |case| {
         const text =
@@ -1381,7 +1397,7 @@ test "mkdir-mode: accepts 0o2700, 0o2750, 0o2770 — rejects everything else" {
             defer cfg.deinit();
             try std.testing.expectEqual(expected, cfg.server.mkdir_mode);
         } else {
-            try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
+            try std.testing.expectError(error.InvalidMode, parse(std.testing.allocator, text));
         }
     }
 }
@@ -1545,12 +1561,14 @@ test "partner-root '/' derives single-slash user root (POSIX-safe)" {
 }
 
 test "auth value that is neither valid passhash nor /path rejected" {
-    const inputs = [_][]const u8{
-        "./relative",
-        "wat",
-        "",
+    // Letter-leading junk is attempted as a passhash.
+    const cases = [_]struct { []const u8, Error }{
+        .{ "./relative", error.InvalidAuth },
+        .{ "wat", error.InvalidPasshash },
+        .{ "", error.MissingValue },
     };
-    for (inputs) |val| {
+    for (cases) |case| {
+        const val, const want = case;
         const text = try std.fmt.allocPrint(
             std.testing.allocator,
             "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
@@ -1558,10 +1576,7 @@ test "auth value that is neither valid passhash nor /path rejected" {
             .{val},
         );
         defer std.testing.allocator.free(text);
-        const got = parse(std.testing.allocator, text);
-        // Letter-leading junk is attempted as a passhash (InvalidPasshash);
-        // anything else is InvalidAuth / InvalidConfig.
-        try std.testing.expect(got == error.InvalidAuth or got == error.InvalidConfig or got == error.InvalidPasshash);
+        try std.testing.expectError(want, parse(std.testing.allocator, text));
     }
 }
 
@@ -1655,14 +1670,14 @@ test "partner-root: relative path rejected at parse time" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root home/zift\n\n" ++
         "user ally\n  auth " ++ valid_test_passhash ++ "\n";
-    try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
+    try std.testing.expectError(error.RelativePath, parse(std.testing.allocator, text));
 }
 
 test "root: relative path rejected at parse time" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
         "user ally\n  auth " ++ valid_test_passhash ++ "\n  root home/ally\n";
-    try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, text));
+    try std.testing.expectError(error.RelativePath, parse(std.testing.allocator, text));
 }
 
 test "server defaults applied when properties omitted" {
@@ -1684,12 +1699,12 @@ test "idle-timeout and max-connections parse" {
     try std.testing.expectEqual(@as(u32, 64), cfg.server.max_connections);
 }
 
-test "idle-timeout above libssh signed-32ms cap (25d) is InvalidConfig" {
+test "idle-timeout above libssh signed-32ms cap (25d) is InvalidDuration" {
     // 25d = 2_160_000_000 ms. libssh treats a millisecond count above
     // 2147483647 as wait-forever. `5m` stays 300000; `0` stays disabled.
     const over =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  idle-timeout 25d\n";
-    try std.testing.expectError(error.InvalidConfig, parse(std.testing.allocator, over));
+    try std.testing.expectError(error.InvalidDuration, parse(std.testing.allocator, over));
 
     const five =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  idle-timeout 5m\n";
@@ -1810,6 +1825,74 @@ test "validateSemantic: host-key mode, symlink, and non-regular file rejected" {
         defer cfg.deinit();
         cfg.server.host_key = dir_key;
         try std.testing.expectError(error.HostKeyUnreadable, validateSemantic(io, alloc, &cfg));
+    }
+}
+
+/// Parse `text`, which must fail, and compare the rendered diagnostic.
+fn expectDiag(text: []const u8, want: []const u8) !void {
+    var diag: ParseDiag = .{};
+    var cfg = parseWithDiag(std.testing.allocator, text, &diag) catch |err| {
+        var buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try diag.format(err, &w);
+        return std.testing.expectEqualStrings(want, w.buffered());
+    };
+    cfg.deinit();
+    return error.TestUnexpectedResult;
+}
+
+test "ParseDiag: line, section, user, key, and reason" {
+    const srv = "server\n  listen 127.0.0.1:2222\n  host-key /k\n";
+    // Post-loop errors name the user whose block is wrong, at its header.
+    try expectDiag(srv ++ "\nuser ally\n  root /a\n\nuser bob\n  auth /b.pub\n  root /b\n", "line 5: [user ally] MissingCredentials: add an 'auth' line (passhash or key file)");
+    try expectDiag(srv ++ "\nuser ally\n  auth /a.pub\n\nuser bob\n  auth /b.pub\n  root /b\n", "line 5: [user ally] MissingRoot: add 'root /path' or a server 'partner-root'");
+    try expectDiag("server\n  host-key /k\n\nuser bob\n  auth /b.pub\n  root /b\n", "line 1: [server] MissingListen");
+    try expectDiag("\nserver\n  listen :2222\n", "line 2: [server] MissingHostKey");
+    try expectDiag("user bob\n  auth /b.pub\n  root /b\n", "MissingServerSection");
+    // A bad header belongs to no section; a key with no value is named.
+    try expectDiag(srv ++ "users bob\n", "line 4: UnknownSection");
+    try expectDiag("  listen :2222\n", "line 1: 'listen': PropertyOutsideSection");
+    try expectDiag("server\n  listen\n", "line 2: [server] 'listen': MissingValue");
+    try expectDiag("server\n  reload-interval 5\n", "line 2: [server] 'reload-interval': InvalidDuration: use a number with a unit (ms, s, m, h, d), or 0");
+    try expectDiag("server\n  publish-mode 0o644\n", "line 2: [server] 'publish-mode': InvalidMode: use 0o600, 0o640, or 0o660");
+    try expectDiag(srv ++ "user bob\n  root bob\n", "line 5: [user bob] 'root': RelativePath: must be an absolute path");
+    try expectDiag("server\n  listing-mode real\n", "line 2: [server] 'listing-mode': InvalidListingMode: use 'virtual' or 'reality'");
+    try expectDiag("server\n  max-connections many\n", "line 2: [server] 'max-connections': InvalidNumber: expected a whole number");
+    try expectDiag("server\nserver\n", "line 2: DuplicateServerSection");
+}
+
+test "parse: a tab may separate 'user' from the name" {
+    var cfg = try parse(std.testing.allocator, "server\n  listen :2222\n  host-key /k\nuser\tbob\n  auth /b.pub\n  root /b\n");
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("bob", cfg.users[0].name);
+}
+
+test "parse: durations take each unit and reject overflow" {
+    const cases = [_]struct { []const u8, ?u64 }{
+        .{ "250ms", 250 },
+        .{ "2s", 2_000 },
+        .{ "3m", 180_000 },
+        .{ "4h", 14_400_000 },
+        .{ "5d", 432_000_000 },
+        .{ "0", 0 },
+        .{ "5", null },
+        .{ "s", null },
+        .{ "5x", null },
+        .{ "-5s", null },
+        .{ "106751991167301d", null }, // > maxInt(i64) ms
+        .{ "99999999999999999999ms", null }, // > maxInt(u64)
+    };
+    for (cases) |case| {
+        const value, const want = case;
+        var buf: [128]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\n  shutdown-grace {s}\n", .{value});
+        if (want) |ms| {
+            var cfg = try parse(std.testing.allocator, text);
+            defer cfg.deinit();
+            try std.testing.expectEqual(ms, cfg.server.shutdown_grace_ms);
+        } else {
+            try std.testing.expectError(error.InvalidDuration, parse(std.testing.allocator, text));
+        }
     }
 }
 
