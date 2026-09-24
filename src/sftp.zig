@@ -925,11 +925,16 @@ const SftpState = struct {
         // the basename string — never on a real-path string that the
         // OS could follow back outside the jail. PLAN §8.3.
         var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
-            const status = parentErrorStatus(err);
+            // A missing parent is NO_SUCH_FILE. A caller who cannot stat
+            // would learn the parent exists by comparing that with the
+            // PERMISSION_DENIED a present file returns.
+            const may_stat = policy.check(self.user, .stat, path.value) == .allow;
+            const status = openStatusForCaller(may_stat, parentErrorStatus(err));
             defer {
                 if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied(op_label, path.value) else self.auditFailed(op_label, path.value, @errorName(err));
             }
-            return replyStatus(self.channel, request_id, status, "denied or not found");
+            const text: []const u8 = if (status == c.SSH_FX_PERMISSION_DENIED) "denied" else "denied or not found";
+            return replyStatus(self.channel, request_id, status, text);
         };
         defer parent.deinit(self.io, self.allocator);
 
@@ -1064,6 +1069,13 @@ const SftpState = struct {
                 return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
             },
             else => {
+                // A directory where a file was asked for is FAILURE.
+                // Concealing that from a caller who cannot stat matches
+                // the missing-file reply.
+                if (err == error.IsDir and policy.check(self.user, .stat, path.value) == .deny) {
+                    defer self.auditDenied(op_label, path.value);
+                    return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+                }
                 defer self.auditFailed(op_label, path.value, @errorName(err));
                 return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
             },
@@ -2285,6 +2297,18 @@ fn openExistenceStatus(may_stat: bool, kind: OpenExistence) c_int {
     };
 }
 
+/// A caller who cannot stat must not learn that a parent or a
+/// directory-shaped final component is absent versus present.
+/// Statuses that are already permission-denied stay that way.
+/// Out-of-memory stays a failure.
+fn openStatusForCaller(may_stat: bool, status: c_int) c_int {
+    if (may_stat) return status;
+    return switch (status) {
+        c.SSH_FX_NO_SUCH_FILE => c.SSH_FX_PERMISSION_DENIED,
+        else => status,
+    };
+}
+
 const ReaddirFollowup = enum { send_batch, eof, fail };
 
 fn readdirFollowup(copied: usize, failed: bool) ReaddirFollowup {
@@ -2392,6 +2416,9 @@ test "write-only open conceals existence unless stat is allowed" {
     try std.testing.expectEqual(missing, openExistenceStatus(true, .missing));
     try std.testing.expectEqual(failure, openExistenceStatus(true, .excl_exists));
     try std.testing.expectEqual(denied, openExistenceStatus(true, .present_no_update));
+    try std.testing.expectEqual(denied, openStatusForCaller(false, missing));
+    try std.testing.expectEqual(missing, openStatusForCaller(true, missing));
+    try std.testing.expectEqual(failure, openStatusForCaller(false, failure));
 }
 
 test "readdir keeps a partial batch and fails the empty one" {
