@@ -25,8 +25,11 @@ pub const EntryInfo = struct {
 
 pub const StatError = error{ NotFound, AccessDenied, NameTooLong, Unexpected };
 
-/// NAME_MAX on Linux and macOS. APFS can hold longer UTF-8 names; those
-/// are refused rather than cut, since a cut name addresses nothing.
+/// The one limit on a file name, for every request and every listing:
+/// NAME_MAX on Linux and macOS. APFS can hold up to 765 bytes of UTF-8
+/// (255 UTF-16 units), but a name STAT and READDIR cannot see must not
+/// be creatable either, so longer names are refused everywhere rather
+/// than cut, since a cut name addresses nothing.
 pub const max_name_bytes = 255;
 
 /// lstat of `name` under `dir_fd`: a symlink reports itself, never its
@@ -179,10 +182,10 @@ fn lookupName(
     }
 }
 
-/// Longest line `formatLongname` writes: mode, nlink, a 64-byte user,
-/// a 32-byte group, size, date, and a `max_name_bytes` name, with room
-/// to spare. A shorter `out` truncates at a UTF-8 boundary.
-pub const max_longname_bytes = 512;
+/// Longest line `formatLongname` writes: the fixed-width fields (under
+/// 160 bytes even with a 64-byte user and a 32-byte group), then a
+/// `max_name_bytes` name. A shorter `out` truncates at a UTF-8 boundary.
+pub const max_longname_bytes = 256 + max_name_bytes;
 
 /// A GNU `ls -l` style line (see the module doc) into `out`. Long fields
 /// push columns right.

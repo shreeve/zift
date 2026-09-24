@@ -63,6 +63,20 @@ else:
         expect(f"rename out of a mode-000 parent in {root}", want, sftp.rename, f"{lk}/inner.txt", f"{root}/out.txt")
         expect(f"rename into a mode-000 parent in {root}", want, sftp.rename, f"{root}/file.txt", f"{lk}/in.txt")
 
+# One 255-byte name limit for every request. APFS would store 256 bytes
+# of UTF-8 (128 UTF-16 units), which STAT and READDIR could not show.
+fits, too_long = "é" * 127 + "x", "é" * 128
+expect("mkdir of a 255-byte name", "ok", sftp.mkdir, f"/box/{fits}")
+if fits not in sftp.listdir("/box"):
+    fail("a 255-byte name is missing from the listing")
+expect("stat of a 255-byte name", "ok", sftp.stat, f"/box/{fits}")
+expect("mkdir of a 256-byte name", "failure", sftp.mkdir, f"/box/{too_long}")
+expect("open for writing of a 256-byte name", "failure", sftp.open, f"/box/{too_long}", "w")
+expect("rename to a 256-byte name", "failure", sftp.rename, "/box/file.txt", f"/box/{too_long}")
+expect("stat of a 256-byte name", "failure", sftp.stat, f"/box/{too_long}")
+if os.path.lexists(host(f"jail/box/{too_long}")):
+    fail("a 256-byte name was created")
+
 # A FIFO would block open(2) until a writer (or reader) appeared.
 sftp.get_channel().settimeout(5)
 expect("open of a FIFO for reading in /box", "failure", sftp.open, "/box/fifo", "r")

@@ -222,7 +222,7 @@ provenance.
   affected, and Linux filesystems are not affected. Prefer
   case-sensitive filesystems for partner roots.
 - **Unreachable names.** Names that are not valid UTF-8, contain control
-  bytes, or (on macOS) exceed 255 bytes cannot be named over SFTP and
+  bytes, or exceed 255 bytes cannot be named over SFTP and
   are left out of listings.
 - **Shared addresses share a counter.** Partners behind one NAT, or in
   one IPv6 /64, share suppression and the per-source pre-auth cap. One

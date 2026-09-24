@@ -2,22 +2,14 @@
 //! length-prefixed string parser (client-controlled, so bounds-checked).
 
 const std = @import("std");
-const builtin = @import("builtin");
 const c = @import("libssh");
 const listing = @import("listing.zig");
 
 pub const sftp_max_packet_bytes: usize = 256 * 1024;
 
-/// The longest file name READDIR can meet: NAME_MAX bytes, except that
-/// APFS counts 255 UTF-16 units, which is up to 765 bytes of UTF-8.
-pub const max_name_bytes: usize = if (builtin.os.tag.isDarwin()) 255 * 3 else std.fs.max_name_bytes;
-
-/// A READDIR longname: fixed-width `ls -l` fields (under 160 bytes even
-/// with a 64-byte user name), then the name.
-pub const max_longname_bytes: usize = 256 + max_name_bytes;
-
-/// Name, longname, and a full attribute block, each length-prefixed.
-const max_name_entry_bytes: usize = 4 + max_name_bytes + 4 + max_longname_bytes + 32;
+/// A READDIR entry: name, longname, and a full attribute block, each
+/// length-prefixed.
+const max_name_entry_bytes: usize = 4 + listing.max_name_bytes + 4 + listing.max_longname_bytes + 32;
 
 /// Where a DATA reply's payload starts in its frame (length, type,
 /// request id, data length).

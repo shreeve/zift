@@ -370,7 +370,7 @@ Fixed in the binary; none is configurable.
 | READ reply | 256 KiB − 13 bytes |
 | READDIR reply | about 64 KiB |
 | Virtual path | 4096 bytes |
-| File name shown in a listing | 255 bytes |
+| File name, in any request or listing | 255 bytes |
 | Directory rename scan | 100,000 entries, 256 levels |
 | Config file | 1 MiB |
 | Key file | 32 KiB, and 8 KiB per line |

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Test: a path through a regular file is "no such file", not a denial,
 #       while a path through a symlink stays denied; and REALPATH never
-#       returns a path longer than the server accepts
+#       returns a path or name longer than the server accepts
 # Only symlinks are jail questions; a file used as a directory is just
 # missing, and audited as a failure.
 
@@ -31,11 +31,14 @@ expect("listdir /file.txt", "missing", sftp.listdir, "/file.txt")
 expect("stat /link/x", "denied", sftp.stat, "/link/x")
 expect("listdir /link", "denied", sftp.listdir, "/link")
 
-name = "a" * 4095
+# Sixteen 255-byte names: every name within the limit.
+name = "/".join(["a" * 255] * 16)
 if sftp.normalize(name) != "/" + name:
     fail("realpath of a 4095-byte relative path is not the 4096-byte absolute one")
 ok("realpath of a 4095-byte relative path is 4096 bytes")
-expect("realpath of a result over 4096 bytes", "failure", sftp.normalize, name + "a")
+# 4096 bytes in seventeen 240-byte names; the leading "/" makes 4097.
+expect("realpath of a result over 4096 bytes", "failure", sftp.normalize, "/".join(["a" * 240] * 17))
+expect("realpath of a name over 255 bytes", "failure", sftp.normalize, "a" * 256)
 EOF
 
 grep '"path":"/file.txt/x"' "$ZIFT_LOG" | grep '"operation":"open_write"' | grep -q '"result":"failed"' \

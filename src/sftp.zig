@@ -436,8 +436,9 @@ const SftpState = struct {
 
     /// Parse and normalize a path argument into `buf`, or reply and return
     /// null. The policy must see the same string the filesystem resolves,
-    /// or `/pending/../secret` slips past a rule. Bad bytes or length:
-    /// BAD_MESSAGE. Traversal or `.zift`: PERMISSION_DENIED.
+    /// or `/pending/../secret` slips past a rule. Bad bytes or length,
+    /// including a name past `listing.max_name_bytes`: BAD_MESSAGE.
+    /// Traversal or `.zift`: PERMISSION_DENIED.
     fn pathArg(self: *SftpState, request_id: u32, payload: []const u8, buf: *PathBuf) !?wire.ParsedString {
         var arg = wire.parseString(payload) catch {
             try self.status(request_id, c.SSH_FX_BAD_MESSAGE);
@@ -450,6 +451,10 @@ const SftpState = struct {
             });
             return null;
         };
+        if (!namesFit(arg.value)) {
+            try self.status(request_id, c.SSH_FX_BAD_MESSAGE);
+            return null;
+        }
         return arg;
     }
 
@@ -623,7 +628,7 @@ const SftpState = struct {
                     self.name_resolver.group(info.gid, &numeric_group),
                 },
             };
-            var longname_buf: [wire.max_longname_bytes]u8 = undefined;
+            var longname_buf: [listing.max_longname_bytes]u8 = undefined;
             const longname = listing.formatLongname(&longname_buf, display, owner, group, entry.name, now_secs);
             try batch.add(entry.name, longname, display);
         }
@@ -1251,8 +1256,8 @@ fn renameNoReplace(
     io: std.Io,
 ) !void {
     if (builtin.os.tag == .macos) {
-        var old_buf: [std.fs.max_name_bytes + 1]u8 = undefined;
-        var new_buf: [std.fs.max_name_bytes + 1]u8 = undefined;
+        var old_buf: [listing.max_name_bytes + 1]u8 = undefined;
+        var new_buf: [listing.max_name_bytes + 1]u8 = undefined;
         if (old_sub_path.len >= old_buf.len or new_sub_path.len >= new_buf.len)
             return error.NameTooLong;
         @memcpy(old_buf[0..old_sub_path.len], old_sub_path);
@@ -1301,10 +1306,20 @@ fn childPath(buf: *PathBuf, len: usize, name: []const u8) ?[]const u8 {
     return buf[0..end];
 }
 
+/// Every component of `vpath` is within `listing.max_name_bytes`. APFS
+/// would store a longer name that STAT and READDIR then cannot see.
+fn namesFit(vpath: []const u8) bool {
+    var parts = std.mem.tokenizeScalar(u8, vpath, '/');
+    while (parts.next()) |part| {
+        if (part.len > listing.max_name_bytes) return false;
+    }
+    return true;
+}
+
 /// utimensat under `dir_fd`, NOFOLLOW so a symlink's own times are set,
 /// never its target's. (std reports a missing file as Unexpected.)
 fn setTimesAt(dir_fd: std.posix.fd_t, name: []const u8, times: *const [2]std.c.timespec) !void {
-    var name_buf: [wire.max_name_bytes + 1]u8 = undefined;
+    var name_buf: [listing.max_name_bytes + 1]u8 = undefined;
     if (name.len >= name_buf.len) return error.NameTooLong;
     @memcpy(name_buf[0..name.len], name);
     name_buf[name.len] = 0;
@@ -1444,7 +1459,7 @@ fn isStagingOrphan(live: bool, info: listing.EntryInfo, cutoff_secs: i64) bool {
 /// operator can create, from blocking the session in open(2); anything
 /// but a regular file is then refused, and the flag cleared.
 fn openRegular(dir: std.Io.Dir, name: []const u8, mode: std.Io.Dir.OpenFileOptions.Mode, append: bool) !std.Io.File {
-    var name_buf: [wire.max_name_bytes + 1]u8 = undefined;
+    var name_buf: [listing.max_name_bytes + 1]u8 = undefined;
     if (name.len >= name_buf.len) return error.NameTooLong;
     @memcpy(name_buf[0..name.len], name);
     name_buf[name.len] = 0;
@@ -1630,4 +1645,14 @@ test "namespace locks: one per root, shared by its sessions, freed with the last
     releaseNamespaceLock(io, gpa, b);
     releaseNamespaceLock(io, gpa, a2);
     try std.testing.expectEqual(@as(usize, 0), namespace_locks.capacity);
+}
+
+test "every component must fit the one name limit" {
+    const at_limit = "\xc3\xa9" ** 127 ++ "x";
+    const past_limit = "\xc3\xa9" ** 128;
+    try std.testing.expectEqual(listing.max_name_bytes, at_limit.len);
+    try std.testing.expect(namesFit("/"));
+    try std.testing.expect(namesFit("/a/" ++ at_limit ++ "/b"));
+    try std.testing.expect(!namesFit("/a/" ++ past_limit));
+    try std.testing.expect(!namesFit("/" ++ past_limit ++ "/b"));
 }
