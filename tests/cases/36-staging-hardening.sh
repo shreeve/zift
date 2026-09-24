@@ -29,7 +29,7 @@
 #     `/.zift-staging/*` must be rejected — partners must never reach
 #     anything inside the namespace via the SFTP wire surface.
 #
-# Covers:  src/vfs.zig openOrCreateNamespaceDir + openOrCreateStagingSubdir
+# Covers:  src/vfs.zig openPrivateDir (namespace and staging)
 #          hardening; src/vfs.zig normalizeVirtualPath reservation against
 #          ALL ops, not just listing.
 

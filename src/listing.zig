@@ -1,9 +1,11 @@
 //! Directory-listing support: lstat under a jailed dir fd, uid/gid name
 //! lookup, and the `ls -l` style longname that SFTP clients display
-//! verbatim (instead of their `?`-filled fallback), e.g.
+//! verbatim (instead of their `?`-filled fallback). In the default
+//! `listing-mode virtual`, for partner `ally` with `read list` on
+//! `/inbox` and `read` on `hey.txt`:
 //!
-//!     drwxr-s---   4 ally     sftp             - Apr 24 16:34 inbox
-//!     -rw-r-----   1 ally     sftp           41K Apr 27 06:55 hey.txt
+//!     dr-xr-x---   4 ally     sftp             - Apr 24 16:34 inbox
+//!     -r--r-----   1 ally     sftp           41K Apr 27 06:55 hey.txt
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,93 +23,40 @@ pub const EntryInfo = struct {
     mtime_secs: i64,
 };
 
-pub const StatError = error{ NotFound, AccessDenied, Unexpected };
+pub const StatError = error{ NotFound, AccessDenied, NameTooLong, Unexpected };
+
+/// NAME_MAX on Linux and macOS. APFS can hold longer UTF-8 names; those
+/// are refused rather than cut, since a cut name addresses nothing.
+pub const max_name_bytes = 255;
 
 /// lstat of `name` under `dir_fd`: a symlink reports itself, never its
 /// target. `dir_fd` must already be inside the jail; this does not check.
 pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
-    if (name.len >= 256) return error.Unexpected;
-    var name_buf: [256]u8 = undefined;
-    @memcpy(name_buf[0..name.len], name);
-    name_buf[name.len] = 0;
-    const cname: [*:0]const u8 = @ptrCast(&name_buf);
-
-    const at_flags: u32 = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
-
-    if (builtin.os.tag == .linux) {
-        // Raw statx: decode with `std.os.linux.errno`. With libc linked,
-        // `std.posix.errno` expects libc's -1/errno convention and reads
-        // every raw -errno return as SUCCESS.
-        var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
-        const mask: std.os.linux.STATX = .{
-            .TYPE = true,
-            .MODE = true,
-            .NLINK = true,
-            .UID = true,
-            .GID = true,
-            .SIZE = true,
-            .MTIME = true,
-        };
-        const rc = std.os.linux.statx(dir_fd, cname, at_flags, mask, &sx);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied,
-            .NOENT, .NOTDIR => return error.NotFound,
-            else => return error.Unexpected,
-        }
-        return EntryInfo{
-            .mode = sx.mode,
-            .nlink = sx.nlink,
-            .uid = sx.uid,
-            .gid = sx.gid,
-            .size = sx.size,
-            .mtime_secs = sx.mtime.sec,
-        };
-    } else {
-        var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
-        const rc = std.c.fstatat(dir_fd, cname, &st, at_flags);
-        if (rc != 0) {
-            return switch (std.posix.errno(rc)) {
-                .ACCES, .PERM => error.AccessDenied,
-                .NOENT, .NOTDIR => error.NotFound,
-                else => error.Unexpected,
-            };
-        }
-        return EntryInfo{
-            .mode = @intCast(st.mode),
-            .nlink = @intCast(st.nlink),
-            .uid = st.uid,
-            .gid = st.gid,
-            .size = @intCast(st.size),
-            .mtime_secs = st.mtime().sec,
-        };
-    }
+    if (name.len > max_name_bytes) return error.NameTooLong;
+    var buf: [max_name_bytes + 1]u8 = undefined;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    return stat(dir_fd, buf[0..name.len :0], std.posix.AT.SYMLINK_NOFOLLOW);
 }
 
 /// `statAt` for an open fd.
 pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
+    return stat(fd, "", if (builtin.os.tag == .linux) std.os.linux.AT.EMPTY_PATH else 0);
+}
+
+/// An empty `name` stats `fd` itself.
+fn stat(fd: std.posix.fd_t, name: [*:0]const u8, flags: u32) StatError!EntryInfo {
     if (builtin.os.tag == .linux) {
-        // Raw statx: `std.os.linux.errno`, as in `statAt`.
-        var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
-        const mask: std.os.linux.STATX = .{
-            .TYPE = true,
-            .MODE = true,
-            .NLINK = true,
-            .UID = true,
-            .GID = true,
-            .SIZE = true,
-            .MTIME = true,
-        };
-        const empty: [*:0]const u8 = "";
-        const at_empty: u32 = @intCast(std.posix.AT.EMPTY_PATH);
-        const rc = std.os.linux.statx(fd, empty, at_empty, mask, &sx);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {},
-            .ACCES, .PERM => return error.AccessDenied,
-            .BADF, .NOENT => return error.NotFound,
-            else => return error.Unexpected,
-        }
-        return EntryInfo{
+        // Raw statx, decoded with `linux.errno`: with libc linked,
+        // `std.posix.errno` expects -1/errno and reads a raw -errno as
+        // SUCCESS. libc's fstat is not used because std leaves it empty
+        // on Linux.
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .NLINK = true, .UID = true, .GID = true, .SIZE = true, .MTIME = true };
+        const errno = linux.errno(linux.statx(fd, name, flags, mask, &sx));
+        if (errno != .SUCCESS) return statError(errno);
+        return .{
             .mode = sx.mode,
             .nlink = sx.nlink,
             .uid = sx.uid,
@@ -116,18 +65,12 @@ pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
             .mtime_secs = sx.mtime.sec,
         };
     } else {
-        var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
-        const rc = std.c.fstat(fd, &st);
-        if (rc != 0) {
-            return switch (std.posix.errno(rc)) {
-                .ACCES, .PERM => error.AccessDenied,
-                .BADF => error.NotFound,
-                else => error.Unexpected,
-            };
-        }
-        return EntryInfo{
-            .mode = @intCast(st.mode),
-            .nlink = @intCast(st.nlink),
+        var st: std.c.Stat = undefined;
+        const rc = if (name[0] == 0) std.c.fstat(fd, &st) else std.c.fstatat(fd, name, &st, flags);
+        if (rc != 0) return statError(std.posix.errno(rc));
+        return .{
+            .mode = st.mode,
+            .nlink = st.nlink,
             .uid = st.uid,
             .gid = st.gid,
             .size = @intCast(st.size),
@@ -136,125 +79,113 @@ pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
     }
 }
 
-/// Per-session uid/gid name cache, inline and allocation-free. Hosts have
-/// few owners, so a full cache just stops caching; nothing is evicted.
+fn statError(errno: anytype) StatError {
+    return switch (errno) {
+        .ACCES, .PERM => error.AccessDenied,
+        .NOENT, .NOTDIR, .BADF => error.NotFound,
+        else => error.Unexpected,
+    };
+}
+
+/// Per-session uid/gid name cache for `listing-mode reality`, inline and
+/// allocation-free. Hosts have few owners, so a full cache stops caching
+/// and renders further ids as numbers; a name longer than
+/// `max_name_len` or a failed lookup renders as a number too.
 pub const NameResolver = struct {
     pub const max_entries: usize = 64;
     pub const max_name_len: usize = 32;
 
-    const Entry = struct {
-        id: u32,
-        len: u8,
-        valid: bool,
-        name: [max_name_len]u8,
-    };
-
-    user_count: u8 = 0,
-    user_entries: [max_entries]Entry = std.mem.zeroes([max_entries]Entry),
-    group_count: u8 = 0,
-    group_entries: [max_entries]Entry = std.mem.zeroes([max_entries]Entry),
+    users: Cache = .{},
+    groups: Cache = .{},
 
     /// The user name, or the number rendered into `numeric_buf`.
     pub fn user(self: *NameResolver, uid: u32, numeric_buf: []u8) []const u8 {
-        // Index, don't iterate by value: the returned slice must point
-        // into the cache, not a loop-local copy.
-        var i: usize = 0;
-        while (i < self.user_count) : (i += 1) {
-            if (self.user_entries[i].id == uid) {
-                if (!self.user_entries[i].valid) {
-                    return std.fmt.bufPrint(numeric_buf, "{d}", .{uid}) catch numeric_buf[0..0];
-                }
-                return self.user_entries[i].name[0..self.user_entries[i].len];
-            }
-        }
-        const name = lookupUid(uid);
-        if (self.user_count < self.user_entries.len) {
-            const slot_index = self.user_count;
-            self.user_count += 1;
-            const slot = &self.user_entries[slot_index];
-            slot.id = uid;
-            slot.valid = name != null;
-            if (name) |n| {
-                const copy = @min(n.len, max_name_len);
-                @memcpy(slot.name[0..copy], n[0..copy]);
-                slot.len = @intCast(copy);
-                return self.user_entries[slot_index].name[0..self.user_entries[slot_index].len];
-            }
-        } else if (name) |n| {
-            return copyToBuf(numeric_buf, n);
-        }
-        return std.fmt.bufPrint(numeric_buf, "{d}", .{uid}) catch numeric_buf[0..0];
+        return self.users.name(uid, numeric_buf, lookupUser);
     }
 
     pub fn group(self: *NameResolver, gid: u32, numeric_buf: []u8) []const u8 {
-        var i: usize = 0;
-        while (i < self.group_count) : (i += 1) {
-            if (self.group_entries[i].id == gid) {
-                if (!self.group_entries[i].valid) {
-                    return std.fmt.bufPrint(numeric_buf, "{d}", .{gid}) catch numeric_buf[0..0];
-                }
-                return self.group_entries[i].name[0..self.group_entries[i].len];
-            }
-        }
-        const name = lookupGid(gid);
-        if (self.group_count < self.group_entries.len) {
-            const slot_index = self.group_count;
-            self.group_count += 1;
-            const slot = &self.group_entries[slot_index];
-            slot.id = gid;
-            slot.valid = name != null;
-            if (name) |n| {
-                const copy = @min(n.len, max_name_len);
-                @memcpy(slot.name[0..copy], n[0..copy]);
-                slot.len = @intCast(copy);
-                return self.group_entries[slot_index].name[0..self.group_entries[slot_index].len];
-            }
-        } else if (name) |n| {
-            return copyToBuf(numeric_buf, n);
-        }
-        return std.fmt.bufPrint(numeric_buf, "{d}", .{gid}) catch numeric_buf[0..0];
+        return self.groups.name(gid, numeric_buf, lookupGroup);
     }
+
+    const Cache = struct {
+        count: usize = 0,
+        entries: [max_entries]Entry = undefined,
+
+        const Entry = struct {
+            id: u32,
+            /// 0 when the lookup failed.
+            len: u8,
+            name: [max_name_len]u8,
+        };
+
+        fn name(
+            self: *Cache,
+            id: u32,
+            numeric_buf: []u8,
+            comptime lookup: fn (u32, *[max_name_len]u8) ?[]const u8,
+        ) []const u8 {
+            const entry = for (self.entries[0..self.count]) |*e| {
+                if (e.id == id) break e;
+            } else blk: {
+                if (self.count == max_entries) break :blk null;
+                const e = &self.entries[self.count];
+                self.count += 1;
+                e.id = id;
+                e.len = if (lookup(id, &e.name)) |found| @intCast(found.len) else 0;
+                break :blk e;
+            };
+            if (entry) |e| if (e.len > 0) return e.name[0..e.len];
+            return std.fmt.bufPrint(numeric_buf, "{d}", .{id}) catch numeric_buf[0..0];
+        }
+    };
 };
 
-fn copyToBuf(buf: []u8, src: []const u8) []const u8 {
-    const n = @min(buf.len, src.len);
-    @memcpy(buf[0..n], src[0..n]);
-    return buf[0..n];
+fn lookupUser(uid: u32, out: *[NameResolver.max_name_len]u8) ?[]const u8 {
+    return lookupName(std.c.passwd, std.c.getpwuid_r, uid, out, 4096);
 }
 
-/// `getpwuid_r` into thread-local buffers; null on any failure.
-fn lookupUid(uid: u32) ?[]const u8 {
-    const S = struct {
-        threadlocal var pwd: std.c.passwd = undefined;
-        threadlocal var buf: [1024]u8 = undefined;
-        threadlocal var name: [NameResolver.max_name_len]u8 = undefined;
-    };
-    var result: ?*std.c.passwd = null;
-    if (std.c.getpwuid_r(uid, &S.pwd, &S.buf, S.buf.len, &result) != 0) return null;
-    const r = result orelse return null;
-    const pw_name = std.mem.span(@as([*:0]const u8, @ptrCast(r.name)));
-    if (pw_name.len == 0 or pw_name.len > S.name.len) return null;
-    @memcpy(S.name[0..pw_name.len], pw_name);
-    return S.name[0..pw_name.len];
+fn lookupGroup(gid: u32, out: *[NameResolver.max_name_len]u8) ?[]const u8 {
+    return lookupName(std.c.group, std.c.getgrgid_r, gid, out, 4096);
 }
 
-fn lookupGid(gid: u32) ?[]const u8 {
-    const S = struct {
-        threadlocal var grp: std.c.group = undefined;
-        threadlocal var buf: [1024]u8 = undefined;
-        threadlocal var name: [NameResolver.max_name_len]u8 = undefined;
-    };
-    var result: ?*std.c.group = null;
-    if (std.c.getgrgid_r(gid, &S.grp, &S.buf, S.buf.len, &result) != 0) return null;
-    const r = result orelse return null;
-    const gr_name = std.mem.span(@as([*:0]const u8, @ptrCast(r.name)));
-    if (gr_name.len == 0 or gr_name.len > S.name.len) return null;
-    @memcpy(S.name[0..gr_name.len], gr_name);
-    return S.name[0..gr_name.len];
+/// `getpwuid_r`/`getgrgid_r` into `out`. A record that overflows the
+/// scratch buffer (a group with many members) retries with a larger
+/// heap buffer, up to 1 MiB. Null on any failure.
+fn lookupName(
+    comptime Record: type,
+    comptime getById: anytype,
+    id: u32,
+    out: *[NameResolver.max_name_len]u8,
+    comptime initial_len: usize,
+) ?[]const u8 {
+    var stack_buf: [initial_len]u8 = undefined;
+    var buf: []u8 = &stack_buf;
+    defer if (buf.len > initial_len) std.heap.page_allocator.free(buf);
+    while (true) {
+        var record: Record = undefined;
+        var result: ?*Record = null;
+        const rc = getById(id, &record, buf.ptr, buf.len, &result);
+        if (rc == @intFromEnum(std.posix.E.RANGE) and buf.len < 1 << 20) {
+            const bigger = std.heap.page_allocator.alloc(u8, buf.len * 4) catch return null;
+            if (buf.len > initial_len) std.heap.page_allocator.free(buf);
+            buf = bigger;
+            continue;
+        }
+        if (rc != 0) return null;
+        const name = std.mem.span((result orelse return null).name orelse return null);
+        if (name.len == 0 or name.len > out.len) return null;
+        @memcpy(out[0..name.len], name);
+        return out[0..name.len];
+    }
 }
 
-/// A GNU `ls -l` style line (see the module doc) into `out`, which
-/// should hold at least 256 bytes. Long fields push columns right.
+/// Longest line `formatLongname` writes: mode, nlink, a 64-byte user,
+/// a 32-byte group, size, date, and a `max_name_bytes` name, with room
+/// to spare. A shorter `out` truncates at a UTF-8 boundary.
+pub const max_longname_bytes = 512;
+
+/// A GNU `ls -l` style line (see the module doc) into `out`. Long fields
+/// push columns right.
 pub fn formatLongname(
     out: []u8,
     info: EntryInfo,
@@ -263,23 +194,33 @@ pub fn formatLongname(
     entry_name: []const u8,
     now_secs: i64,
 ) []const u8 {
-    var w = std.Io.Writer.fixed(out);
-
     var mode_buf: [10]u8 = undefined;
     formatModeString(&mode_buf, info.mode);
-
-    var size_buf: [12]u8 = undefined;
-    const size_str = formatSize(&size_buf, info.mode, info.size);
-
+    var size_buf: [24]u8 = undefined;
     var time_buf: [20]u8 = undefined;
-    const time_str = formatMtime(&time_buf, info.mtime_secs, now_secs);
 
-    w.print(
-        "{s} {d:>3} {s:<8} {s:<8} {s:>9} {s} {s}",
-        .{ mode_buf[0..], info.nlink, user_name, group_name, size_str, time_str, entry_name },
-    ) catch return w.buffered();
-
+    var w = std.Io.Writer.fixed(out);
+    w.print("{s} {d:>3} {s:<8} {s:<8} {s:>9} {s} {s}", .{
+        &mode_buf,
+        info.nlink,
+        user_name,
+        group_name,
+        formatSize(&size_buf, info.mode, info.size),
+        formatMtime(&time_buf, info.mtime_secs, now_secs),
+        entry_name,
+    }) catch return dropPartialChar(w.buffered());
     return w.buffered();
+}
+
+/// `s` without a UTF-8 sequence cut off at its end.
+fn dropPartialChar(s: []const u8) []const u8 {
+    var lead = s.len;
+    while (lead > 0) {
+        lead -= 1;
+        if (s[lead] & 0xC0 != 0x80) break;
+    }
+    const n = std.unicode.utf8ByteSequenceLength(if (s.len > 0) s[lead] else 0) catch return s;
+    return if (lead + n > s.len) s[0..lead] else s;
 }
 
 /// `drwxr-xr-x` style, including setuid/setgid/sticky letters.
@@ -293,68 +234,40 @@ pub fn formatModeString(out: *[10]u8, mode: u32) void {
         S_IFSOCK => 's',
         else => '-',
     };
-
-    const r = "r-";
-    const w = "w-";
-    const x = "x-";
-
-    out[1] = r[if ((mode & 0o400) != 0) 0 else 1];
-    out[2] = w[if ((mode & 0o200) != 0) 0 else 1];
-    out[3] = blk: {
-        const has_x = (mode & 0o100) != 0;
-        const has_setuid = (mode & 0o4000) != 0;
-        if (has_setuid and has_x) break :blk 's';
-        if (has_setuid) break :blk 'S';
-        break :blk x[if (has_x) 0 else 1];
+    // Owner, group, other; each with its special bit and letter.
+    const specials = [3]struct { bit: u32, letter: u8 }{
+        .{ .bit = 0o4000, .letter = 's' },
+        .{ .bit = 0o2000, .letter = 's' },
+        .{ .bit = 0o1000, .letter = 't' },
     };
-
-    out[4] = r[if ((mode & 0o040) != 0) 0 else 1];
-    out[5] = w[if ((mode & 0o020) != 0) 0 else 1];
-    out[6] = blk: {
-        const has_x = (mode & 0o010) != 0;
-        const has_setgid = (mode & 0o2000) != 0;
-        if (has_setgid and has_x) break :blk 's';
-        if (has_setgid) break :blk 'S';
-        break :blk x[if (has_x) 0 else 1];
-    };
-
-    out[7] = r[if ((mode & 0o004) != 0) 0 else 1];
-    out[8] = w[if ((mode & 0o002) != 0) 0 else 1];
-    out[9] = blk: {
-        const has_x = (mode & 0o001) != 0;
-        const has_sticky = (mode & 0o1000) != 0;
-        if (has_sticky and has_x) break :blk 't';
-        if (has_sticky) break :blk 'T';
-        break :blk x[if (has_x) 0 else 1];
-    };
+    for (specials, 0..) |special, i| {
+        const bits = mode >> @intCast(6 - 3 * i);
+        const x = bits & 1 != 0;
+        out[1 + 3 * i] = if (bits & 4 != 0) 'r' else '-';
+        out[2 + 3 * i] = if (bits & 2 != 0) 'w' else '-';
+        out[3 + 3 * i] = if (mode & special.bit == 0)
+            (if (x) 'x' else '-')
+        else if (x) special.letter else std.ascii.toUpper(special.letter);
+    }
 }
 
 /// `-` for directories and special files, else bytes or `1.5K`, `41K`, ...
 fn formatSize(out: []u8, mode: u32, size: u64) []const u8 {
     switch (mode & S_IFMT) {
-        S_IFDIR, S_IFIFO, S_IFSOCK, S_IFCHR, S_IFBLK => return std.fmt.bufPrint(out, "-", .{}) catch out[0..0],
+        S_IFDIR, S_IFIFO, S_IFSOCK, S_IFCHR, S_IFBLK => return "-",
         else => {},
     }
+    if (size < 1024) return std.fmt.bufPrint(out, "{d}", .{size}) catch unreachable;
 
-    if (size < 1024) {
-        return std.fmt.bufPrint(out, "{d}", .{size}) catch out[0..0];
-    }
-
-    const units = [_]u8{ 'K', 'M', 'G', 'T', 'P' };
+    const units = "KMGTP";
     var value: f64 = @floatFromInt(size);
-    var unit: u8 = 'B';
-    inline for (units) |u| {
-        if (value < 1024.0) break;
+    var unit: usize = 0;
+    while (true) : (unit += 1) {
         value /= 1024.0;
-        unit = u;
+        if (value < 1024.0 or unit == units.len - 1) break;
     }
-    if (unit == 'B') {
-        return std.fmt.bufPrint(out, "{d}", .{size}) catch out[0..0];
-    }
-    if (value < 10.0) {
-        return std.fmt.bufPrint(out, "{d:.1}{c}", .{ value, unit }) catch out[0..0];
-    }
-    return std.fmt.bufPrint(out, "{d:.0}{c}", .{ value, unit }) catch out[0..0];
+    if (value < 10.0) return std.fmt.bufPrint(out, "{d:.1}{c}", .{ value, units[unit] }) catch unreachable;
+    return std.fmt.bufPrint(out, "{d:.0}{c}", .{ value, units[unit] }) catch unreachable;
 }
 
 /// `Mon DD HH:MM` within ~6 months of now, else `Mon DD  YYYY` (the
@@ -364,25 +277,15 @@ fn formatMtime(out: []u8, mtime_secs: i64, now_secs: i64) []const u8 {
     const six_months_secs: i64 = 6 * 30 * 24 * 60 * 60;
     // i128: a junk mtime (e.g. i64 min) must not overflow.
     const diff: i128 = @as(i128, now_secs) - @as(i128, mtime_secs);
-    const recent = diff < @as(i128, six_months_secs) and
-        diff > -@as(i128, six_months_secs / 2);
+    const recent = diff < six_months_secs and diff > -@divExact(six_months_secs, 2);
 
     const month = month_abbrev[t.month - 1];
-    // Clamped so a junk year prints a bounded number.
-    const year: i32 = @intCast(std.math.clamp(t.year, std.math.minInt(i32), std.math.maxInt(i32)));
-
     if (recent) {
-        return std.fmt.bufPrint(
-            out,
-            "{s} {d:>2} {d:0>2}:{d:0>2}",
-            .{ month, t.day, t.hour, t.minute },
-        ) catch out[0..0];
+        return std.fmt.bufPrint(out, "{s} {d:>2} {d:0>2}:{d:0>2}", .{ month, t.day, t.hour, t.minute }) catch unreachable;
     }
-    return std.fmt.bufPrint(
-        out,
-        "{s} {d:>2}  {d}",
-        .{ month, t.day, year },
-    ) catch out[0..0];
+    // Clamped so a junk year prints a bounded number.
+    const year = std.math.clamp(t.year, std.math.minInt(i32), std.math.maxInt(i32));
+    return std.fmt.bufPrint(out, "{s} {d:>2}  {d}", .{ month, t.day, year }) catch unreachable;
 }
 
 const month_abbrev = [_][]const u8{
@@ -399,7 +302,6 @@ pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFBLK: u32 = 0o060000;
 pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFSOCK: u32 = 0o140000;
-
 // -------- tests --------------------------------------------------------------
 
 test "formatModeString: regular file" {
@@ -508,4 +410,80 @@ test "formatLongname: file line shows size" {
     try std.testing.expect(std.mem.indexOf(u8, line, "-rw-r--r--") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "41K") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "hey.txt") != null);
+}
+
+test "formatLongname: the module doc's virtual-mode lines, byte for byte" {
+    var out: [max_longname_bytes]u8 = undefined;
+    const now: i64 = 1777305600; // 2026-04-27 16:00 UTC
+    const dir: EntryInfo = .{ .mode = S_IFDIR | 0o550, .nlink = 4, .uid = 0, .gid = 0, .size = 4096, .mtime_secs = 1777048440 };
+    try std.testing.expectEqualStrings(
+        "dr-xr-x---   4 ally     sftp             - Apr 24 16:34 inbox",
+        formatLongname(&out, dir, "ally", "sftp", "inbox", now),
+    );
+    const file: EntryInfo = .{ .mode = S_IFREG | 0o440, .nlink = 1, .uid = 0, .gid = 0, .size = 41 * 1024, .mtime_secs = 1777272900 };
+    try std.testing.expectEqualStrings(
+        "-r--r-----   1 ally     sftp           41K Apr 27 06:55 hey.txt",
+        formatLongname(&out, file, "ally", "sftp", "hey.txt", now),
+    );
+}
+
+test "formatLongname: the longest fields fit, and a short buffer cuts whole characters" {
+    const info: EntryInfo = .{ .mode = S_IFREG | 0o644, .nlink = std.math.maxInt(u32), .uid = 0, .gid = 0, .size = std.math.maxInt(u64), .mtime_secs = std.math.minInt(i64) };
+    var out: [max_longname_bytes]u8 = undefined;
+    const name = "\xc3\xa9" ** (max_name_bytes / 2);
+    const line = formatLongname(&out, info, "u" ** 64, "g" ** NameResolver.max_name_len, name, 0);
+    try std.testing.expect(std.mem.endsWith(u8, line, name));
+
+    var short: [64]u8 = undefined;
+    for (40..64) |len| {
+        const cut = formatLongname(short[0..len], info, "ally", "sftp", name, 0);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+        try std.testing.expect(cut.len + 1 >= len);
+    }
+}
+
+test "statAt and statFd report the same entry, and map errors" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "f", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "hello");
+
+    const by_name = try statAt(tmp.dir.handle, "f");
+    const by_fd = try statFd(file.handle);
+    try std.testing.expectEqual(by_name, by_fd);
+    try std.testing.expectEqual(S_IFREG, by_name.mode & S_IFMT);
+    try std.testing.expectEqual(@as(u64, 5), by_name.size);
+
+    try tmp.dir.symLink(io, "f", "link", .{});
+    try std.testing.expectEqual(S_IFLNK, (try statAt(tmp.dir.handle, "link")).mode & S_IFMT);
+    try std.testing.expectError(error.NotFound, statAt(tmp.dir.handle, "missing"));
+    try std.testing.expectError(error.NotFound, statAt(tmp.dir.handle, "f/under-a-file"));
+    try std.testing.expectError(error.NameTooLong, statAt(tmp.dir.handle, "n" ** (max_name_bytes + 1)));
+    try std.testing.expectError(error.NotFound, statAt(tmp.dir.handle, "n" ** max_name_bytes));
+}
+
+test "NameResolver: names, numbers, and a scratch buffer too small to start" {
+    var resolver: NameResolver = .{};
+    var numeric: [16]u8 = undefined;
+    const uid = std.c.getuid();
+    var expected_buf: [NameResolver.max_name_len]u8 = undefined;
+    const expected = lookupUser(uid, &expected_buf) orelse return error.SkipZigTest;
+
+    try std.testing.expectEqualStrings(expected, resolver.user(uid, &numeric));
+    // Cached: the same bytes come back without a lookup.
+    try std.testing.expectEqual(resolver.user(uid, &numeric).ptr, resolver.user(uid, &numeric).ptr);
+    // No such id: rendered as a number, and remembered as such.
+    try std.testing.expectEqualStrings("4000000000", resolver.group(4_000_000_000, &numeric));
+    try std.testing.expectEqualStrings("4000000000", resolver.group(4_000_000_000, &numeric));
+
+    // ERANGE from an 8-byte scratch buffer retries with a larger one.
+    var small_buf: [NameResolver.max_name_len]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, lookupName(std.c.passwd, std.c.getpwuid_r, uid, &small_buf, 8).?);
+    var group_buf: [NameResolver.max_name_len]u8 = undefined;
+    var group_small: [NameResolver.max_name_len]u8 = undefined;
+    if (lookupGroup(std.c.getgid(), &group_buf)) |group_name| {
+        try std.testing.expectEqualStrings(group_name, lookupName(std.c.group, std.c.getgrgid_r, std.c.getgid(), &group_small, 8).?);
+    }
 }
