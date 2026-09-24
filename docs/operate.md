@@ -28,6 +28,13 @@ release's checksums file, and runs the installer inside the archive,
 which installs the binary only. To also verify the cosign signature on
 the checksums, install [by hand](#by-hand).
 
+Do not install a server with Homebrew. Linuxbrew puts `zift` under
+`/home/linuxbrew`, which the unit neither runs (`ExecStart` names
+`/usr/local/bin/zift`) nor can see (`ProtectHome=tmpfs`); that prefix is
+writable by an ordinary user; and `brew upgrade` replaces the binary
+without first validating the service's config. Homebrew suits macOS and
+workstations that only run `zift validate` and `zift hash-password`.
+
 - On a host with a `zift.service` unit it installs to `/usr/local/bin`,
   the path the unit runs, and uses `sudo` for that one write, saying so
   first. The download and check never run as root. If `sudo` is

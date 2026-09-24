@@ -82,6 +82,13 @@ does with the tag minus its leading `v`. To release:
    to pass: the release workflow runs unit tests only.
 4. Tag and push: `git tag -a vX.Y.Z -m "Zift X.Y.Z" && git push origin
    vX.Y.Z`.
+5. For a final release, once it is published, bump the Homebrew formula
+   in a clone of `shreeve/homebrew-tap` and open a pull request there:
+
+   ```sh
+   gh release download vX.Y.Z -p 'zift-vX.Y.Z-checksums.txt'
+   scripts/bump-homebrew-formula.py ../homebrew-tap/Formula/zift.rb X.Y.Z zift-vX.Y.Z-checksums.txt
+   ```
 
 ## Unit Tests And Fuzzing
 
@@ -157,8 +164,10 @@ Artifacts: `zift-vX.Y.Z-{linux-amd64,linux-arm64,osx-arm64,osx-amd64}.tar.gz`,
 
 ### The installer
 
-`install.sh` is shared with janus and harbor: the three copies differ
-only in `REPO` and `NAME`, so change all three together. It picks the
+janus and harbor publish the same archives and install in the same two
+steps, but their `install.sh` copies still carry project-specific code
+(janus: setcap, code signing; harbor: libduckdb), so zift's is not yet
+a drop-in for them. It picks the
 platform and version, checks the archive against the checksums file and
 runs the archive's own `install.sh` (`scripts/release-install.sh`),
 passing `--uninstall` through. Everything zift-specific, such as where
