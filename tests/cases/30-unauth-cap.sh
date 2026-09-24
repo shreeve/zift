@@ -13,7 +13,7 @@ write_config <<EOF
 $(config_head "idle-timeout 30s" "max-connections 8" "max-unauth-connections 2" "log $AUDIT")
 
 user runner
-  auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/data
   allow / read write list mkdir
 EOF

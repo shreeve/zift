@@ -24,7 +24,7 @@ write_config <<EOF
 $(config_head "idle-timeout 30s")
 
 user runner
-  auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/jail
   allow /drop write mkdir delete rename
   allow /box full

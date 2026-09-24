@@ -13,7 +13,7 @@ write_config <<EOF
 $(config_head "max-connections 64" "max-unauth-connections 64")
 
 user ally
-  auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/root
   allow / read list
 EOF

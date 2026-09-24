@@ -14,7 +14,7 @@ write_config <<EOF
 $(config_head)
 
 user partner
-  auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/data
   allow / full
 EOF

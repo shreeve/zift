@@ -16,6 +16,7 @@ set -euo pipefail
 LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PY="$LIB_DIR/../.venv/bin/python3"
 CACHE="${ZIFT_TEST_CACHE:-$TEST_TMP}"  # shared by the run's cases
+export ZIFT_TEST_KEY="$CACHE/user_ed25519"
 HOST_KEY="$TEST_TMP/host_ed25519"
 ZIFT_LOG="$TEST_TMP/zift.log"
 ZIFT_PID=""
@@ -98,6 +99,14 @@ make_password_hash() {
     local cache="$CACHE/hash-$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')"
     [[ -s "$cache" ]] || printf '%s\n' "$1" | "$ZIFT_BIN" hash-password > "$cache"
     cat "$cache"
+}
+
+# `user_key`: the path of the run's shared ed25519 user public key, for
+# an `auth` line. client.py's connect() logs in with it by default: a
+# key login skips the 0.7 s Argon2id a password login costs in Debug.
+user_key() {
+    [[ -s "$ZIFT_TEST_KEY.pub" ]] || ssh-keygen -q -t ed25519 -N "" -C zift-test -f "$ZIFT_TEST_KEY" <<<y >/dev/null
+    echo "$ZIFT_TEST_KEY.pub"
 }
 
 write_config() { cat > "${1:-$TEST_TMP/zift.conf}"; }

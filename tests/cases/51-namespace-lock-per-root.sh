@@ -20,18 +20,18 @@ EOF
 # Unrelated rules make every policy check, and so the rename scan, slow
 # enough to observe on any machine.
 padding=$(for i in $(seq 300); do echo "  allow /unrelated-$i/**/*.dat read"; done)
-hash=$(make_password_hash secret)
+key=$(user_key)
 write_config <<EOF
 $(config_head "idle-timeout 120s")
 
 user alice
-  auth $hash
+  auth $key
   root $TEST_TMP/alice
   allow / full
 $padding
 
 user bob
-  auth $hash
+  auth $key
   root $TEST_TMP/bob
   allow / full
 EOF

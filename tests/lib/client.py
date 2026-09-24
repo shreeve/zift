@@ -1,7 +1,8 @@
 """Paramiko helpers for Zift cases (`need_paramiko` puts this on PYTHONPATH).
 
     from client import *
-    sftp = connect("ally")          # password "secret", this case's port
+    sftp = connect("ally")            # the run's shared key (`auth $(user_key)`)
+    sftp = connect("ally", "secret")  # a password
     code = status(sftp, CMD_READLINK, "/x")
 """
 
@@ -37,19 +38,26 @@ def fail(msg):
     sys.exit(1)
 
 
-def transport(user, password="secret", key=None, host="127.0.0.1", timeout=15):
-    """A logged-in transport, by key if given, else by password; raises
-    paramiko.AuthenticationException."""
+def user_key():
+    """The run's shared key (common.sh `user_key` puts it in a config)."""
+    return paramiko.Ed25519Key.from_private_key_file(os.environ["ZIFT_TEST_KEY"])
+
+
+def transport(user, password=None, key=None, host="127.0.0.1", timeout=15):
+    """A logged-in transport, by password if given, else by key (the
+    shared one by default); raises paramiko.AuthenticationException."""
+    if password is None and key is None:
+        key = user_key()
     t = paramiko.Transport(socket.create_connection((host, PORT), timeout=timeout))
     try:
-        t.connect(username=user, password=None if key else password, pkey=key)
+        t.connect(username=user, password=password, pkey=key)
     except BaseException:
         t.close()
         raise
     return t
 
 
-def connect(user, password="secret", timeout=15, **kw):
+def connect(user, password=None, timeout=15, **kw):
     """An SFTP client; `sftp.sock.get_transport()` is its transport."""
     sftp = paramiko.SFTPClient.from_transport(transport(user, password, timeout=timeout, **kw))
     sftp.get_channel().settimeout(timeout)
@@ -60,7 +68,7 @@ def close(sftp):
     sftp.sock.get_transport().close()
 
 
-def can_login(user, password="secret", **kw):
+def can_login(user, password=None, **kw):
     try:
         transport(user, password, **kw).close()
         return True

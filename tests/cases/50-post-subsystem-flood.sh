@@ -13,7 +13,7 @@ write_config <<EOF
 $(config_head "idle-timeout 60s")
 
 user flood
-  auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/jail
   allow / full
 EOF

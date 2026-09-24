@@ -9,7 +9,7 @@ source "$(dirname "$0")/../lib/common.sh"
 need_paramiko
 
 make_host_key
-hash=$(make_password_hash secret)
+key=$(user_key)
 for who in dropper renamer updater; do
     mkdir -p "$TEST_TMP/$who"
     echo "OPERATOR-CONTRACT-VERSION-1" > "$TEST_TMP/$who/contract.csv"
@@ -19,17 +19,17 @@ write_config <<EOF
 $(config_head)
 
 user dropper
-  auth $hash
+  auth $key
   root $TEST_TMP/dropper
   allow / read list write
 
 user renamer
-  auth $hash
+  auth $key
   root $TEST_TMP/renamer
   allow / read list write rename
 
 user updater
-  auth $hash
+  auth $key
   root $TEST_TMP/updater
   allow / read list write rename update
 EOF

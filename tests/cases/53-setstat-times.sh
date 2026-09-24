@@ -23,6 +23,7 @@ $(config_head)
 
 user runner
   auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/jail
   allow / list
   allow /inbox read write list update

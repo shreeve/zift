@@ -13,7 +13,7 @@ write_config <<EOF
 $(config_head "log $AUDIT")
 
 user ally
-  auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/data
   allow / read write list
 EOF

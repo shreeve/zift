@@ -14,7 +14,7 @@ write_config <<EOF
 $(config_head "publish-mode 0o640" "mkdir-mode 0o2750")
 
 user partner
-  auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/data
   allow / read write mkdir
 EOF

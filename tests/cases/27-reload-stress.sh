@@ -8,12 +8,12 @@ source "$(dirname "$0")/../lib/common.sh"
 need_paramiko
 
 make_host_key
-runner_hash=$(make_password_hash secret)
+runner_key=$(user_key)
 later_hash=$(make_password_hash later-secret)
 mkdir -p "$TEST_TMP/data/uploads" "$TEST_TMP/data2"
 
 v1="user runner
-  auth $runner_hash
+  auth $runner_key
   root $TEST_TMP/data
   allow / read list
   allow /uploads read write list"
@@ -29,7 +29,7 @@ write_config "$TEST_TMP/v2.conf" <<EOF
 $(config_head "reload-interval 0")
 
 user runner
-  auth $runner_hash
+  auth $runner_key
   root $TEST_TMP/data
   allow / read list
 

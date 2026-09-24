@@ -20,7 +20,7 @@ write_config <<EOF
 $(config_head)
 
 user $user
-  auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/jail
   allow / read list
   deny **/.ssh/**

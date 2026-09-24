@@ -17,7 +17,7 @@ write_config <<EOF
 $(config_head)
 
 user partner
-  auth $(make_password_hash secret)
+  auth $(user_key)
   root $TEST_TMP/jail
   allow /inbox write update list mkdir
 EOF
