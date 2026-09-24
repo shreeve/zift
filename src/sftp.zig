@@ -451,7 +451,7 @@ const SftpState = struct {
     /// jail; it is the root itself.
     fn lstatVirtual(self: *SftpState, vpath: []const u8) !listing.EntryInfo {
         if (std.mem.eql(u8, vpath, "/")) {
-            var root = try std.Io.Dir.openDirAbsolute(self.io, self.vfs.root, .{});
+            var root = try self.vfs.openRoot(self.io, false);
             defer root.close(self.io);
             return listing.statFd(root.handle);
         }
