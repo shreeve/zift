@@ -295,7 +295,12 @@ fn checkLogPath(ck: Checker, path: []const u8) SemanticError!void {
         error.FileNotFound => return,
         else => return ck.fail(error.LogPathUnusable, "log unreadable: {s}", .{path}),
     };
-    if (st.kind != .file) return ck.fail(error.LogPathUnusable, "log is not a regular file (symlinks are refused): {s}", .{path});
+    // Same inode kinds the audit sink opens: a file, a FIFO for a log
+    // shipper, or a character device such as /dev/null. Never a symlink.
+    switch (st.kind) {
+        .file, .named_pipe, .character_device => {},
+        else => return ck.fail(error.LogPathUnusable, "log must be a regular file, FIFO or character device (symlinks are refused): {s}", .{path}),
+    }
 }
 
 /// Fail if `path`, as named (its directory resolved) or as it resolves,
