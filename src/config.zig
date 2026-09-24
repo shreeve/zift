@@ -426,7 +426,7 @@ pub const Error = error{
     MissingHostKey,
     MissingListen,
     MissingRoot,
-    MissingRulePattern,
+    InvalidPattern,
     MissingRulePermissions,
     MissingServerSection,
     MissingValue,
@@ -817,9 +817,9 @@ fn parseUserProperty(
     } else if (std.mem.eql(u8, key, "from")) {
         try parseFrom(allocator, user, value);
     } else if (std.mem.eql(u8, key, "allow")) {
-        try parseAllowRule(allocator, user, value);
+        try parseAllowRule(allocator, d, user, value);
     } else if (std.mem.eql(u8, key, "deny")) {
-        try parseDenyRules(allocator, user, value);
+        try parseDenyRules(allocator, d, user, value);
     } else if (std.mem.eql(u8, key, "password")) {
         // Removed directives get a specific error, not `UnknownKey`.
         return error.PasswordDirectiveRemoved;
@@ -889,9 +889,32 @@ fn parseFrom(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8
     try user.from.append(allocator, cidr);
 }
 
-fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
+/// Reject a pattern that can never match. Policy matches the normalized
+/// virtual path, which starts with `/` and has no empty, `.`, `..`, or
+/// trailing components; a dead `deny` would silently fail open.
+fn checkPattern(d: *ParseDiag, pattern: []const u8) Error!void {
+    if (pattern[0] != '/' and !std.mem.startsWith(u8, pattern, "**")) {
+        return d.fail(error.InvalidPattern, "'{s}' never matches: start it with '/' (top level) or '**/' (any depth)", .{pattern});
+    }
+    if (pattern.len > 1 and pattern[pattern.len - 1] == '/') {
+        return d.fail(error.InvalidPattern, "'{s}' never matches: drop the trailing '/' (a directory pattern already covers its contents)", .{pattern});
+    }
+    var parts = std.mem.splitScalar(u8, pattern, '/');
+    _ = parts.first();
+    while (parts.next()) |part| {
+        if (part.len == 0 and pattern.len > 1) {
+            return d.fail(error.InvalidPattern, "'{s}' never matches: it has an empty component ('//')", .{pattern});
+        }
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) {
+            return d.fail(error.InvalidPattern, "'{s}' never matches: paths are matched without '.' or '..' components", .{pattern});
+        }
+    }
+}
+
+fn parseAllowRule(allocator: std.mem.Allocator, d: *ParseDiag, user: *UserBuilder, value: []const u8) Error!void {
     var parts = std.mem.tokenizeAny(u8, value, " \t");
-    const pattern = parts.next() orelse return error.MissingRulePattern;
+    const pattern = parts.next().?; // `value` is never empty
+    try checkPattern(d, pattern);
 
     var permissions = PermissionSet.initEmpty();
     var saw_permission = false;
@@ -925,18 +948,16 @@ fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []con
     });
 }
 
-fn parseDenyRules(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
+fn parseDenyRules(allocator: std.mem.Allocator, d: *ParseDiag, user: *UserBuilder, value: []const u8) Error!void {
     var parts = std.mem.tokenizeAny(u8, value, " \t");
-    var saw_pattern = false;
     while (parts.next()) |pattern| {
-        saw_pattern = true;
+        try checkPattern(d, pattern);
         try user.rules.append(allocator, .{
             .effect = .deny,
             .pattern = try allocator.dupe(u8, pattern),
             .permissions = PermissionSet.initFull(),
         });
     }
-    if (!saw_pattern) return error.MissingRulePattern;
 }
 
 fn parsePermission(token: []const u8) ?Permission {
@@ -1028,7 +1049,7 @@ test "parse valid config" {
         \\  root /tmp/zift/ally
         \\  allow /pending read write list mkdir delete rename update
         \\  allow /archive read list
-        \\  deny *
+        \\  deny /archive/private
         \\
     ;
 
@@ -1894,6 +1915,36 @@ test "parse: durations take each unit and reject overflow" {
             try std.testing.expectError(error.InvalidDuration, parse(std.testing.allocator, text));
         }
     }
+}
+
+test "rule patterns that can never match are rejected" {
+    // Each of these is a silent no-op in policy.check: as a `deny` it
+    // would fail open. `*` never crosses `/`, and every path starts with it.
+    const dead = [_][]const u8{
+        "*", "*.exe", "secret", "?x", "pending/*", // no leading `/` or `**`
+        "/secret/", "/in/*/", "**/", // trailing `/`
+        "//x", "/a//b", // empty component
+        "/a/./b", "/a/..", "/../etc", "**/..", "/.", // `.` / `..` component
+    };
+    for (dead) |pattern| {
+        var buf: [256]u8 = undefined;
+        const deny = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n  deny /ok {s}\n", .{pattern});
+        try std.testing.expectError(error.InvalidPattern, parse(std.testing.allocator, deny));
+        var buf2: [256]u8 = undefined;
+        const allow = try std.fmt.bufPrint(&buf2, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n  allow {s} read\n", .{pattern});
+        try std.testing.expectError(error.InvalidPattern, parse(std.testing.allocator, allow));
+    }
+
+    const live = [_][]const u8{ "/", "/secret", "/*.exe", "**", "**.exe", "***.exe", "**/secret", "/in/**", "/a/**/b", "/a.b/..c" };
+    for (live) |pattern| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n  deny {s}\n", .{pattern});
+        var cfg = try parse(std.testing.allocator, text);
+        defer cfg.deinit();
+        try std.testing.expectEqualStrings(pattern, cfg.users[0].rules[0].pattern);
+    }
+
+    try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  deny *.exe\n", "line 5: [user u] 'deny': InvalidPattern: '*.exe' never matches: start it with '/' (top level) or '**/' (any depth)");
 }
 
 const NumericTestArgs = struct { max_total: u32, max_unauth: u32 };
