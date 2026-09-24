@@ -28,7 +28,7 @@ config "$TEST_TMP/root" lsit "" 200101010000
 wait_for_log 'config reload rejected' 5 || fail "no 'config reload rejected' line: $(cat "$ZIFT_LOG")"
 log_contains 'SERVING PREVIOUS CONFIG' || fail "no loud 'SERVING PREVIOUS CONFIG' framing"
 ok "the rejected reload is logged loudly"
-log_contains '"operation":"config.reload","result":"failed"' || fail "no config.reload failed audit event"
+wait_for_log '"operation":"config.reload","result":"failed"' || fail "no config.reload failed audit event"
 ok "the rejected reload is a config.reload audit event"
 sftp_password ally secret >"$TEST_TMP/stale.log" 2>&1 || fail "the previous config stopped serving"
 ok "the previous config still serves"
@@ -39,7 +39,7 @@ user late
   root $TEST_TMP/late_root
   allow / read list" 200201010000
 wait_for_log 'config reload recovered' 5 || fail "no 'config reload recovered' line"
-log_contains '"operation":"config.reload","result":"ok"' || fail "no config.reload ok audit event"
+wait_for_log '"operation":"config.reload","result":"ok"' || fail "no config.reload ok audit event"
 ok "recovery is announced on stderr and in the audit stream"
 sftp_password late later-secret >"$TEST_TMP/late.log" 2>&1 || fail "user 'late' from the recovered config cannot log in"
 ok "the recovered config applies to new sessions"

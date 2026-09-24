@@ -168,6 +168,8 @@ jobs:
     env:
       # A case whose prerequisites are missing fails instead of skipping.
       ZIFT_REQUIRE_ALL: "1"
+      # The 2-minute login-grace case runs once, on Linux.
+      ZIFT_TEST_SLOW: ${{ matrix.os == 'ubuntu-latest' && '1' || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -223,9 +225,14 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      # A fixed iteration budget instead of a wall-clock cap, so a slow
-      # compile can never be mistaken for a fuzz run, and anything but
-      # a clean exit (compile error, crash, finding) fails the job.
-      # 100K took about 90 s locally after compiling.
+      # A fixed iteration budget, so a slow compile is never mistaken for
+      # a fuzz run. Zig 0.16 exits 0 even when the fuzzer finds a crash
+      # (it prints "input saved to ..."), so the log decides.
       - name: Fuzz
-        run: zig build test -Doptimize=ReleaseSafe --fuzz=200K
+        run: |
+          set -o pipefail
+          zig build test -Doptimize=ReleaseSafe --fuzz=200K 2>&1 | tee fuzz.log
+          if grep -qE 'input saved to|test process unexpectedly' fuzz.log; then
+            echo "FAIL: the fuzzer found a crashing input"
+            exit 1
+          fi

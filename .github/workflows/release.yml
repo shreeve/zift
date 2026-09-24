@@ -103,8 +103,9 @@ jobs:
       # `zig build release` compiles all three from vendored source via
       # build.zig.zon.
 
-      # A tag can be pushed on a commit CI never saw; do not ship it
-      # untested.
+      # A tag can be pushed on a commit CI never saw, so at least the unit
+      # tests run here. The integration suite runs only in CI: tag a
+      # commit whose CI run on main is green.
       - name: Unit tests
         run: zig build test
 

@@ -128,10 +128,15 @@ uninstall() {
   resolve_dest
   if [ ! -e "$BIN/$NAME" ] && [ -z "$explicit" ]; then
     for dir in /usr/local/bin "$HOME/.local/bin"; do
-      if [ -e "$dir/$NAME" ]; then BIN=$dir; break; fi
+      # resolve_dest may have armed sudo for the other directory; a
+      # fallback decides elevation afresh below.
+      if [ -e "$dir/$NAME" ]; then BIN=$dir; SUDO=""; break; fi
     done
   fi
   [ -e "$BIN/$NAME" ] || fail "$NAME is not installed at $(tildify "$BIN/$NAME") (BIN= if it lives elsewhere)"
+  # Never delete, least of all with sudo, a file that is not a zift binary.
+  "$BIN/$NAME" version 2>/dev/null | head -1 | grep -q "^$NAME " \
+    || fail "$(tildify "$BIN/$NAME") is not a $NAME binary; not removing it"
   # An explicit BIN= never elevates, same as install.
   if [ -z "$SUDO" ] && [ -z "$explicit" ] && [ ! -w "$BIN" ] && try_sudo; then
     info "using sudo to remove $BIN/$NAME"

@@ -18,7 +18,6 @@ user runner
   allow / read write list mkdir
 EOF
 start_zift
-rejected() { count_log '"operation":"accept.rejected"' "$AUDIT"; }
 
 # `hold <n> <marker>`: n raw sockets that take the banner and never speak
 # SSH, held until $TEST_TMP/release appears.
@@ -60,10 +59,9 @@ ok "the third pre-auth connection was refused by the pre-auth cap, not the globa
 touch "$TEST_TMP/release"
 wait_bg || fail "holder errored"
 wait_for_count '"operation":"handshake.failed"' 2 10 "$AUDIT" || fail "held sessions never ended"
-sleep 0.2  # the slot is released just after that audit line
-before=$(rejected)
-probe || fail "a fresh connection was refused after the held ones closed"
-[[ $(rejected) == "$before" ]] || fail "a fresh connection was rejected: unauth_sessions leaked"
+# The slot is released just after that audit line; a leaked slot would
+# refuse every retry.
+wait_until 5 probe || fail "fresh connections stay refused after the held ones closed: unauth_sessions leaked"
 ok "a fresh connection is admitted once the held ones close"
 
 # ---------- logged-in sessions do not count against the cap ----------

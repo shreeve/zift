@@ -116,7 +116,7 @@ for path in "${CASES[@]}"; do
         echo "${GREEN}PASS${RESET} $took"
         PASS=$((PASS + 1))
         ((KEEP)) || rm -rf "$tmp"
-    elif ((rc == 77)); then
+    elif ((rc == 77)) && [[ -e "$tmp/.skip" ]]; then
         reason=$(cat "$tmp/.skip" 2>/dev/null || echo "no reason given")
         echo "${YELLOW}SKIP${RESET} ($reason)"
         SKIP=$((SKIP + 1))
