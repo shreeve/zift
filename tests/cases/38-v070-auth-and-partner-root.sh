@@ -152,10 +152,10 @@ grep -q "user 'runner'" "$TEST_TMP/m.err" \
     || fail "expected user name in diagnostic, got: $(cat "$TEST_TMP/m.err")"
 ok "missing \`auth /path\` key file rejected with operator-facing diagnostic"
 
-# ---------- (5b) symlink-to-real-file rejected ----------
-# Defense in depth: an attacker with parent-dir write access could
-# replace alice.pub with a symlink to their own properly-permissioned
-# key file. We reject symlinks regardless of target.
+# ---------- (5b) symlink followed; the target is what is checked ----------
+# Kubernetes Secrets and systemd credentials are symlinks, so a key file
+# may be one. The target must pass the same checks as a plain file (and
+# anyone who can swap the link could equally swap a plain file there).
 ln -s "$TEST_TMP/runner_key.pub" "$TEST_TMP/runner_link.pub"
 
 cat > "$TEST_TMP/sym.conf" <<EOF
@@ -176,11 +176,23 @@ set +e
 rc=$?
 set -e
 
+[[ "$rc" == "0" ]] \
+    || fail "symlink key file: expected exit 0, got $rc; stderr=$(cat "$TEST_TMP/s.err")"
+ok "\`auth /path\` symlink to a good key file accepted"
+
+cp "$TEST_TMP/runner_key.pub" "$TEST_TMP/writable_key.pub"
+chmod 0664 "$TEST_TMP/writable_key.pub"
+ln -sf "$TEST_TMP/writable_key.pub" "$TEST_TMP/runner_link.pub"
+set +e
+"$ZIFT_BIN" validate "$TEST_TMP/sym.conf" \
+    > "$TEST_TMP/s.out" 2> "$TEST_TMP/s.err"
+rc=$?
+set -e
 [[ "$rc" == "1" ]] \
-    || fail "symlink key file: expected exit 1, got $rc"
-grep -q 'symlinks not allowed' "$TEST_TMP/s.err" \
-    || fail "expected 'symlinks not allowed' in stderr, got: $(cat "$TEST_TMP/s.err")"
-ok "\`auth /path\` symlink rejected (defense vs symlink-swap attack)"
+    || fail "symlink to group-writable key file: expected exit 1, got $rc"
+grep -q 'writable by group/world' "$TEST_TMP/s.err" \
+    || fail "expected 'writable by group/world' in stderr, got: $(cat "$TEST_TMP/s.err")"
+ok "\`auth /path\` symlink to a group-writable key file rejected (target checked)"
 
 # ---------- (6) duplicate password auth lines rejected ----------
 cat > "$TEST_TMP/dupe.conf" <<EOF

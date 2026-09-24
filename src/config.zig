@@ -1,10 +1,13 @@
 //! Config file parser and filesystem validation.
 //!
 //! `parse` checks syntax and internal consistency only; `validateSemantic`
-//! then checks the live filesystem (host key, roots, key files) before a
-//! config may take effect. Grammar and directives: docs/configure.md.
+//! then checks the live filesystem (host key, log, roots, key files)
+//! before a config may take effect. Grammar and directives:
+//! docs/configure.md.
 
 const std = @import("std");
+const c = @import("libssh");
+const listing = @import("listing.zig");
 const passhash = @import("passhash.zig");
 const netmatch = @import("netmatch.zig");
 const sys = @import("sys.zig");
@@ -14,6 +17,7 @@ const vfs = @import("vfs.zig");
 /// specific stderr line, which integration tests grep for.
 pub const SemanticError = error{
     HostKeyUnreadable,
+    LogPathUnusable,
     UserRootMissing,
     UserRootNotDirectory,
     OverlappingRoots,
@@ -23,6 +27,7 @@ pub const SemanticError = error{
     AuthKeyFileEmpty,
     AuthKeyFileNotRegular,
     AuthKeyFileWritableByOthers,
+    AuthKeyFileUntrustedOwner,
     OutOfMemory,
 };
 
@@ -130,176 +135,186 @@ pub const Config = struct {
     }
 };
 
-/// Check a parsed config against the live filesystem: host key, user
-/// roots (exist, are directories, do not overlap), and key files.
-/// Used by `zift validate`, `zift serve`, and reload, so each rejection
-/// prints the same `zift: ...` line on stderr wherever it happens.
+/// Check a parsed config against the live filesystem: the host key, the
+/// log path, user roots (exist, are directories, do not overlap), and key
+/// files. Used by `zift validate`, `zift serve`, and reload, so each
+/// rejection prints the same `zift: ...` line on stderr wherever it
+/// happens; it is also kept in `diag`.
 pub fn validateSemantic(
     io: std.Io,
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     cfg: *Config,
+    diag: *LoadDiag,
 ) SemanticError!void {
-    // 1. Host key: a regular file (not a symlink) with no group-write,
-    // group-exec, or other bits, so 0600, 0400, and 0640 root:zift pass.
-    // Key bytes never reach the diagnostic.
-    const host_key = cfg.server.host_key;
-    const host_stat = std.Io.Dir.cwd().statFile(io, host_key, .{
-        .follow_symlinks = false,
-    }) catch |err| {
-        const reason: []const u8 = if (err == error.SymLinkLoop) "symlink" else "unreadable";
-        writeHostKeyDiag(io, reason, host_key);
-        return error.HostKeyUnreadable;
-    };
-    if (host_stat.kind == .sym_link) {
-        writeHostKeyDiag(io, "symlink", host_key);
-        return error.HostKeyUnreadable;
+    const ck: Checker = .{ .io = io, .diag = diag };
+
+    // 1. What `serve` opens before it listens: host key and log.
+    try checkHostKey(ck, gpa, cfg.server.host_key);
+    switch (cfg.server.log) {
+        .stderr => {},
+        .file => |path| try checkLogPath(ck, path),
     }
-    if (host_stat.kind != .file) {
-        writeHostKeyDiag(io, "not a regular file", host_key);
-        return error.HostKeyUnreadable;
-    }
-    const host_mode: u32 = @intCast(host_stat.permissions.toMode() & 0o7777);
-    if ((host_mode & 0o037) != 0) {
-        writeHostKeyDiag(io, "mode", host_key);
-        return error.HostKeyUnreadable;
-    }
-    var host_file = std.Io.Dir.cwd().openFile(io, host_key, .{
-        .mode = .read_only,
-        .follow_symlinks = false,
-    }) catch |err| {
-        const reason: []const u8 = if (err == error.SymLinkLoop) "symlink" else "unreadable";
-        writeHostKeyDiag(io, reason, host_key);
-        return error.HostKeyUnreadable;
-    };
-    host_file.close(io);
 
     // 2. Each root must exist and be a directory. Overlap is checked on
     // the canonical (symlink-resolved) paths. Keep the `[:0]` type: freeing
     // without the sentinel is an invalid free.
-    var canonical_roots = try allocator.alloc([:0]const u8, cfg.users.len);
-    var canonical_count: usize = 0;
+    const roots = try gpa.alloc([:0]const u8, cfg.users.len);
+    var root_count: usize = 0;
     defer {
-        for (canonical_roots[0..canonical_count]) |path| allocator.free(path);
-        allocator.free(canonical_roots);
+        for (roots[0..root_count]) |path| gpa.free(path);
+        gpa.free(roots);
     }
-
     for (cfg.users) |*user| {
-        const real = std.Io.Dir.realPathFileAbsoluteAlloc(io, user.root, allocator) catch {
-            sys.note(io, "zift: user '{s}' root does not exist or is unreadable: {s}\n", .{ user.name, user.root }) catch {};
-            return error.UserRootMissing;
-        };
-        const dir = std.Io.Dir.openDirAbsolute(io, real, .{}) catch {
-            allocator.free(real);
-            sys.note(io, "zift: user '{s}' root is not a directory: {s}\n", .{ user.name, user.root }) catch {};
-            return error.UserRootNotDirectory;
-        };
+        roots[root_count] = std.Io.Dir.realPathFileAbsoluteAlloc(io, user.root, gpa) catch
+            return ck.fail(error.UserRootMissing, "user '{s}' root does not exist or is unreadable: {s}", .{ user.name, user.root });
+        root_count += 1;
+        const dir = std.Io.Dir.openDirAbsolute(io, roots[root_count - 1], .{}) catch
+            return ck.fail(error.UserRootNotDirectory, "user '{s}' root is not a directory: {s}", .{ user.name, user.root });
         dir.close(io);
-
-        canonical_roots[canonical_count] = real;
-        canonical_count += 1;
     }
 
     // 3. No root may equal or contain another.
-    for (canonical_roots[0..canonical_count], 0..) |a, i| {
-        for (canonical_roots[i + 1 .. canonical_count], i + 1..) |b, j| {
+    for (roots, 0..) |a, i| {
+        for (roots[i + 1 ..], i + 1..) |b, j| {
             if (vfs.isInsideRoot(a, b) or vfs.isInsideRoot(b, a)) {
-                sys.note(io, "zift: overlapping roots for users '{s}' and '{s}': {s} vs {s}\n", .{
+                return ck.fail(error.OverlappingRoots, "overlapping roots for users '{s}' and '{s}': {s} vs {s}", .{
                     cfg.users[i].name, cfg.users[j].name, a, b,
-                }) catch {};
-                return error.OverlappingRoots;
+                });
             }
         }
     }
 
     // 4. Load every `auth /path` key file.
-    try resolveAuthKeyFiles(io, allocator, cfg);
+    try resolveAuthKeyFiles(ck, gpa, cfg);
+}
+
+/// Reports a semantic failure: `zift: <message>` on stderr, and the
+/// message in the LoadDiag.
+const Checker = struct {
+    io: std.Io,
+    diag: *LoadDiag,
+
+    fn fail(self: Checker, err: SemanticError, comptime fmt: []const u8, args: anytype) SemanticError {
+        var w = std.Io.Writer.fixed(&self.diag.semantic_buf);
+        w.print(fmt, args) catch {};
+        self.diag.semantic_len = w.end;
+        sys.note(self.io, "zift: " ++ fmt ++ "\n", args) catch {};
+        return err;
+    }
+};
+
+const TrustError = error{ Unreadable, NotRegular, BadMode, BadOwner };
+
+/// Open a file the daemon trusts (host key, key file). Symlinks are
+/// followed (Kubernetes Secrets and systemd credentials are symlinks);
+/// the file itself must be regular, owned by root or the daemon's user
+/// (another local user could rewrite it), with no `forbidden_mode` bits.
+/// The checks run on the open fd, so the inode checked is the inode read.
+fn openTrusted(io: std.Io, path: []const u8, forbidden_mode: u32) TrustError!std.Io.File {
+    // Opening a FIFO would block, so refuse anything else first.
+    const pre = std.Io.Dir.cwd().statFile(io, path, .{}) catch return error.Unreadable;
+    if (pre.kind != .file) return error.NotRegular;
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.Unreadable;
+    errdefer file.close(io);
+    const st = listing.statFd(file.handle) catch return error.Unreadable;
+    if (st.mode & listing.S_IFMT != listing.S_IFREG) return error.NotRegular;
+    if (st.mode & forbidden_mode != 0) return error.BadMode;
+    if (st.uid != 0 and st.uid != std.c.geteuid()) return error.BadOwner;
+    return file;
+}
+
+/// Room for any private key file (an 8192-bit RSA PEM is about 6 KiB).
+const max_host_key_bytes = 64 * 1024;
+
+/// The host key must be a private key libssh loads without a passphrase,
+/// in a trusted file with no group-write, group-exec, or other bits, so
+/// 0600, 0400, and 0640 root:zift pass. Key bytes never reach a diagnostic.
+fn checkHostKey(ck: Checker, gpa: std.mem.Allocator, path: []const u8) SemanticError!void {
+    var file = openTrusted(ck.io, path, 0o037) catch |err| return switch (err) {
+        error.Unreadable => ck.fail(error.HostKeyUnreadable, "host-key unreadable: {s}", .{path}),
+        error.NotRegular => ck.fail(error.HostKeyUnreadable, "host-key not a regular file: {s}", .{path}),
+        error.BadMode => ck.fail(error.HostKeyUnreadable, "host-key mode allows group-write, group-exec, or other access: {s}", .{path}),
+        error.BadOwner => ck.fail(error.HostKeyUnreadable, "host-key owned by neither root nor the daemon's user: {s}", .{path}),
+    };
+    defer file.close(ck.io);
+
+    var reader = file.reader(ck.io, &.{});
+    const text = reader.interface.allocRemaining(gpa, .limited(max_host_key_bytes)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return ck.fail(error.HostKeyUnreadable, "host-key unreadable or too large: {s}", .{path}),
+    };
+    defer {
+        std.crypto.secureZero(u8, text);
+        gpa.free(text);
+    }
+    const text_z = try gpa.dupeZ(u8, text);
+    defer {
+        std.crypto.secureZero(u8, text_z);
+        gpa.free(text_z);
+    }
+    var key: c.ssh_key = null;
+    if (c.ssh_pki_import_privkey_base64(text_z.ptr, null, null, null, &key) != c.SSH_OK) {
+        return ck.fail(error.HostKeyUnreadable, "host-key is not a private key libssh can load without a passphrase: {s}", .{path});
+    }
+    c.ssh_key_free(key);
+}
+
+/// `serve` opens the log (append, O_NOFOLLOW) before it listens, so its
+/// directory must exist and an existing log must be a regular file.
+fn checkLogPath(ck: Checker, path: []const u8) SemanticError!void {
+    const dir = std.fs.path.dirname(path) orelse "/";
+    const dir_stat = std.Io.Dir.cwd().statFile(ck.io, dir, .{}) catch
+        return ck.fail(error.LogPathUnusable, "log directory does not exist: {s}", .{path});
+    if (dir_stat.kind != .directory) return ck.fail(error.LogPathUnusable, "log directory is not a directory: {s}", .{path});
+    const st = std.Io.Dir.cwd().statFile(ck.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return ck.fail(error.LogPathUnusable, "log unreadable: {s}", .{path}),
+    };
+    if (st.kind != .file) return ck.fail(error.LogPathUnusable, "log is not a regular file (symlinks are refused): {s}", .{path});
 }
 
 /// Parse every user's key files into `keys` (strings in the config
 /// arena; file contents in `gpa`, freed here).
-///
-/// A file that grants login must be a regular file (not a symlink) with
-/// no group- or world-write bit. The parent directory is the operator's
-/// responsibility, so layouts like a group-rwx keys directory still work.
-fn resolveAuthKeyFiles(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    cfg: *Config,
-) SemanticError!void {
+fn resolveAuthKeyFiles(ck: Checker, gpa: std.mem.Allocator, cfg: *Config) SemanticError!void {
     const arena_alloc = cfg.arena.allocator();
-
     for (cfg.users) |*user| {
-        if (user.key_files.len == 0) continue;
-
         var combined: std.ArrayList(PublicKey) = .empty;
-
         for (user.key_files) |path| {
-            try resolveOneKeyFile(io, gpa, arena_alloc, &combined, user.name, path);
+            try resolveOneKeyFile(ck, gpa, arena_alloc, &combined, user.name, path);
         }
-
         user.keys = try combined.toOwnedSlice(arena_alloc);
     }
 }
 
 /// Check and parse one key file, appending each key line to `combined`.
+/// A file that grants login must be trusted (see `openTrusted`) and have
+/// no group- or world-write bit: public keys need tamper resistance, not
+/// secrecy. The parent directory is the operator's responsibility, so
+/// layouts like a group-rwx keys directory still work.
 fn resolveOneKeyFile(
-    io: std.Io,
+    ck: Checker,
     gpa: std.mem.Allocator,
     arena_alloc: std.mem.Allocator,
     combined: *std.ArrayList(PublicKey),
     user_name: []const u8,
     path: []const u8,
 ) SemanticError!void {
-    // One NOFOLLOW open; stat and read use that fd, so the inode we
-    // check is the inode we parse (no swap between two path lookups).
-    var file = std.Io.Dir.cwd().openFile(io, path, .{
-        .mode = .read_only,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.SymLinkLoop => {
-            writeKeyFileDiag(io, user_name, path, 0, "symlinks not allowed (use in-place rename for rotation)");
-            return error.AuthKeyFileNotRegular;
-        },
-        else => {
-            writeKeyFileDiag(io, user_name, path, 0, "unreadable");
-            return error.AuthKeyFileUnreadable;
-        },
+    var file = openTrusted(ck.io, path, 0o022) catch |err| return switch (err) {
+        error.Unreadable => keyFileFail(ck, error.AuthKeyFileUnreadable, user_name, path, 0, "unreadable"),
+        error.NotRegular => keyFileFail(ck, error.AuthKeyFileNotRegular, user_name, path, 0, "not a regular file"),
+        error.BadMode => keyFileFail(ck, error.AuthKeyFileWritableByOthers, user_name, path, 0, "writable by group/world (mode)"),
+        error.BadOwner => keyFileFail(ck, error.AuthKeyFileUntrustedOwner, user_name, path, 0, "owned by neither root nor the daemon's user"),
     };
-    defer file.close(io);
-
-    const stat = file.stat(io) catch {
-        writeKeyFileDiag(io, user_name, path, 0, "stat failed");
-        return error.AuthKeyFileUnreadable;
-    };
-    switch (stat.kind) {
-        .file => {},
-        else => {
-            writeKeyFileDiag(io, user_name, path, 0, "not a regular file");
-            return error.AuthKeyFileNotRegular;
-        },
-    }
-    // Public keys need tamper resistance, not secrecy: only write bits matter.
-    const file_mode: u32 = @intCast(stat.permissions.toMode() & 0o7777);
-    const writable_by_others_mask: u32 = 0o022;
-    if ((file_mode & writable_by_others_mask) != 0) {
-        writeKeyFileDiag(io, user_name, path, 0, "writable by group/world (mode)");
-        return error.AuthKeyFileWritableByOthers;
-    }
+    defer file.close(ck.io);
 
     // Room for several keys and comments; larger files get "too large".
     const file_read_cap: usize = max_keyline_bytes * 4;
 
-    var file_reader = file.reader(io, &.{});
+    var file_reader = file.reader(ck.io, &.{});
     const contents = file_reader.interface.allocRemaining(gpa, .limited(file_read_cap)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.StreamTooLong => {
-            writeKeyFileDiag(io, user_name, path, 0, "too large");
-            return error.AuthKeyFileTooLarge;
-        },
-        error.ReadFailed => {
-            writeKeyFileDiag(io, user_name, path, 0, "read failed");
-            return error.AuthKeyFileUnreadable;
-        },
+        error.StreamTooLong => return keyFileFail(ck, error.AuthKeyFileTooLarge, user_name, path, 0, "too large"),
+        error.ReadFailed => return keyFileFail(ck, error.AuthKeyFileUnreadable, user_name, path, 0, "read failed"),
     };
     defer gpa.free(contents);
 
@@ -308,53 +323,40 @@ fn resolveOneKeyFile(
     var iter = std.mem.splitScalar(u8, contents, '\n');
     while (iter.next()) |raw| {
         line_no += 1;
-        const no_cr = std.mem.trimEnd(u8, raw, "\r");
-        const trimmed = std.mem.trim(u8, no_cr, " \t");
-        if (trimmed.len == 0) continue;
-        if (trimmed[0] == '#') continue;
-        if (trimmed.len > max_keyline_bytes) {
-            writeKeyFileDiag(io, user_name, path, line_no, "key line too long");
-            return error.AuthKeyFileMalformed;
-        }
+        const trimmed = std.mem.trim(u8, raw, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
         const pubkey = parsePublicKeyLine(arena_alloc, trimmed) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            writeKeyFileDiag(io, user_name, path, line_no, switch (err) {
+            return keyFileFail(ck, error.AuthKeyFileMalformed, user_name, path, line_no, switch (err) {
+                error.KeyLineTooLong => "key line too long",
                 error.UnsupportedKeyAlgorithm => "malformed public-key line: unsupported algorithm " ++
                     "(use ssh-ed25519, ecdsa-sha2-nistp256/384/521, or ssh-rsa; no option prefixes)",
                 error.KeyAlgorithmMismatch => "malformed public-key line: the key does not match its algorithm name",
                 error.InvalidRsaKeySize => "malformed public-key line: RSA keys must be 2048 to 8192 bits",
                 else => "malformed public-key line",
             });
-            return error.AuthKeyFileMalformed;
         };
         try combined.append(arena_alloc, pubkey);
         parsed += 1;
     }
 
-    if (parsed == 0) {
-        writeKeyFileDiag(io, user_name, path, 0, "no public-key lines found");
-        return error.AuthKeyFileEmpty;
-    }
+    if (parsed == 0) return keyFileFail(ck, error.AuthKeyFileEmpty, user_name, path, 0, "no public-key lines found");
 }
 
-fn writeHostKeyDiag(io: std.Io, reason: []const u8, path: []const u8) void {
-    sys.note(io, "zift: host-key {s}: {s}\n", .{ reason, path }) catch {};
-}
-
-/// `zift: user '<name>': auth key file '<path>'[ line N]: <reason>`;
-/// `line_no` 0 means the whole file.
-fn writeKeyFileDiag(
-    io: std.Io,
+/// `user '<name>': auth key file '<path>'[ line N]: <reason>`; `line_no`
+/// 0 means the whole file.
+fn keyFileFail(
+    ck: Checker,
+    err: SemanticError,
     user_name: []const u8,
     path: []const u8,
     line_no: u32,
     reason: []const u8,
-) void {
+) SemanticError {
     if (line_no != 0) {
-        sys.note(io, "zift: user '{s}': auth key file '{s}' line {d}: {s}\n", .{ user_name, path, line_no, reason }) catch {};
-    } else {
-        sys.note(io, "zift: user '{s}': auth key file '{s}': {s}\n", .{ user_name, path, reason }) catch {};
+        return ck.fail(err, "user '{s}': auth key file '{s}' line {d}: {s}", .{ user_name, path, line_no, reason });
     }
+    return ck.fail(err, "user '{s}': auth key file '{s}': {s}", .{ user_name, path, reason });
 }
 
 const ServerBuilder = struct {
@@ -546,20 +548,27 @@ fn keyMaterialLen(algorithm: []const u8) ?usize {
     return null;
 }
 
-/// Read a config file (at most 1 MiB).
+/// Largest config file read.
+pub const max_file_bytes = 1 << 20;
+
+/// Read a config file (at most `max_file_bytes`).
 pub fn readFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file_bytes));
 }
 
-/// Why `load` rejected a config. Only a parse failure carries a message:
-/// `validateSemantic` prints its own.
+/// Why `load` rejected a config. A parse failure is only recorded here;
+/// a semantic failure is also printed on stderr when it happens.
 pub const LoadDiag = struct {
     parse: ParseDiag = .{},
     parse_err: ?Error = null,
+    semantic_buf: [512]u8 = undefined,
+    semantic_len: usize = 0,
 
-    /// `line N: [section] 'key': Error`; valid when `parse_err` is set.
+    /// The parse diagnostic (`line N: [section] 'key': Error[: reason]`)
+    /// or else the semantic one (as printed, without `zift: `).
     pub fn format(self: LoadDiag, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try self.parse.format(self.parse_err.?, w);
+        if (self.parse_err) |err| return self.parse.format(err, w);
+        try w.writeAll(self.semantic_buf[0..self.semantic_len]);
     }
 };
 
@@ -572,7 +581,7 @@ pub fn load(io: std.Io, gpa: std.mem.Allocator, contents: []const u8, diag: *Loa
         return err;
     };
     errdefer cfg.deinit();
-    try validateSemantic(io, gpa, &cfg);
+    try validateSemantic(io, gpa, &cfg, diag);
     return cfg;
 }
 
@@ -1955,8 +1964,8 @@ test "numbers: plain digits only, and no zero max-connections" {
         var buf: [128]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\n  {s}\n", .{line});
         if (parse(std.testing.allocator, text)) |cfg| {
-            var c = cfg;
-            c.deinit();
+            var parsed = cfg;
+            parsed.deinit();
             return error.TestUnexpectedResult;
         } else |_| {}
     }
@@ -1988,61 +1997,134 @@ test "idle-timeout and reload-interval: 0 or a sane floor" {
     try expectDiag("server\n  idle-timeout 10ms\n", "line 2: [server] 'idle-timeout': InvalidDuration: must be 0 (off) or at least 1s");
 }
 
-test "validateSemantic: host-key mode, symlink, and non-regular file rejected" {
+/// A scratch tree for filesystem validation: `etc/host` (a fresh ed25519
+/// host key, 0600), `etc/u.pub` (0644), `log/`, and root `r/`.
+const TestTree = struct {
+    tmp: std.testing.TmpDir,
+    /// Canonical path of the tree; `@` in configs stands for it.
+    path: []const u8,
+
+    const config =
+        \\server
+        \\  listen :2222
+        \\  host-key @/etc/host
+        \\  log @/log/audit.log
+        \\user u
+        \\  auth @/etc/u.pub
+        \\  root @/r
+        \\
+    ;
+
+    fn init() !TestTree {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        for ([_][]const u8{ "etc", "log", "r" }) |sub| try tmp.dir.createDir(io, sub, .default_dir);
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = try tmp.dir.realPath(io, &buf);
+        var tree: TestTree = .{ .tmp = tmp, .path = try std.testing.allocator.dupe(u8, buf[0..len]) };
+        try tree.hostKey("etc/host", null);
+        try tmp.dir.writeFile(io, .{ .sub_path = "etc/u.pub", .data = "ssh-ed25519 " ++ valid_ed25519_blob ++ "\n" });
+        try tree.chmod("etc/u.pub", 0o644);
+        return tree;
+    }
+
+    fn deinit(self: *TestTree) void {
+        std.testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+
+    /// Write a new ed25519 private key, encrypted when `passphrase` is set.
+    fn hostKey(self: *TestTree, sub: []const u8, passphrase: ?[*:0]const u8) !void {
+        var key: c.ssh_key = null;
+        if (c.ssh_pki_generate(c.SSH_KEYTYPE_ED25519, 0, &key) != c.SSH_OK) return error.KeygenFailed;
+        defer c.ssh_key_free(key);
+        const full = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/{s}", .{ self.path, sub }, 0);
+        defer std.testing.allocator.free(full);
+        if (c.ssh_pki_export_privkey_file(key, passphrase, null, null, full.ptr) != c.SSH_OK) return error.KeyExportFailed;
+        try self.chmod(sub, 0o600);
+    }
+
+    fn chmod(self: *TestTree, sub: []const u8, mode: u32) !void {
+        try self.tmp.dir.setFilePermissions(std.testing.io, sub, .fromMode(@intCast(mode)), .{});
+    }
+
+    /// Parse `text` with `@` expanded, then run validateSemantic.
+    fn check(self: *TestTree, text: []const u8) !void {
+        const alloc = std.testing.allocator;
+        const expanded = try std.mem.replaceOwned(u8, alloc, text, "@", self.path);
+        defer alloc.free(expanded);
+        var cfg = try parse(alloc, expanded);
+        defer cfg.deinit();
+        var diag: LoadDiag = .{};
+        try validateSemantic(std.testing.io, alloc, &cfg, &diag);
+    }
+
+    /// `check` with `from` in the base config replaced by `to`.
+    fn checkWith(self: *TestTree, from: []const u8, to: []const u8) !void {
+        const text = try std.mem.replaceOwned(u8, std.testing.allocator, config, from, to);
+        defer std.testing.allocator.free(text);
+        return self.check(text);
+    }
+};
+
+test "validateSemantic: a well-formed tree passes" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.check(TestTree.config);
+}
+
+test "validateSemantic: host key mode, type, and content" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    for ([_]u32{ 0o600, 0o400, 0o640 }) |mode| {
+        try tree.chmod("etc/host", mode);
+        try tree.check(TestTree.config);
+    }
+    for ([_]u32{ 0o644, 0o660, 0o604, 0o610, 0o777 }) |mode| {
+        try tree.chmod("etc/host", mode);
+        try std.testing.expectError(error.HostKeyUnreadable, tree.check(TestTree.config));
+    }
+    try tree.chmod("etc/host", 0o600);
+
+    // A directory, a missing file, garbage, and a passphrase-protected key
+    // all passed `validate` before and failed only at `serve`.
+    try std.testing.expectError(error.HostKeyUnreadable, tree.checkWith("@/etc/host", "@/etc"));
+    try std.testing.expectError(error.HostKeyUnreadable, tree.checkWith("@/etc/host", "@/etc/none"));
+    try tree.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "etc/junk", .data = "garbage" });
+    try tree.chmod("etc/junk", 0o600);
+    try std.testing.expectError(error.HostKeyUnreadable, tree.checkWith("@/etc/host", "@/etc/junk"));
+    try tree.hostKey("etc/locked", "secret");
+    try std.testing.expectError(error.HostKeyUnreadable, tree.checkWith("@/etc/host", "@/etc/locked"));
+}
+
+test "validateSemantic: host key and key file symlinks are followed, and the target checked" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
     const io = std.testing.io;
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    // Kubernetes Secrets and systemd credentials are symlinks.
+    try tree.tmp.dir.symLink(io, "host", "etc/host-link", .{});
+    try tree.tmp.dir.symLink(io, "u.pub", "etc/u-link.pub", .{});
+    const linked = "server\n  listen :2222\n  host-key @/etc/host-link\nuser u\n  auth @/etc/u-link.pub\n  root @/r\n";
+    try tree.check(linked);
 
-    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dir_len = try tmp.dir.realPath(io, &dir_buf);
-    const dir_path = dir_buf[0..dir_len];
+    try tree.chmod("etc/host", 0o644);
+    try std.testing.expectError(error.HostKeyUnreadable, tree.check(linked));
+    try tree.chmod("etc/host", 0o600);
+    try tree.chmod("etc/u.pub", 0o664);
+    try std.testing.expectError(error.AuthKeyFileWritableByOthers, tree.check(linked));
+}
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "hostkey", .data = "not-logged" });
-    const key_path = try std.fmt.allocPrint(alloc, "{s}/hostkey", .{dir_path});
-    defer alloc.free(key_path);
-
-    const legal = [_]u32{ 0o600, 0o400, 0o640 };
-    for (legal) |mode| {
-        try tmp.dir.setFilePermissions(io, "hostkey", .fromMode(@intCast(mode)), .{
-            .follow_symlinks = false,
-        });
-        var cfg = makeNumericTestConfig(.{ .max_total = 128, .max_unauth = 0 });
-        defer cfg.deinit();
-        cfg.server.host_key = key_path;
-        try validateSemantic(io, alloc, &cfg);
-    }
-
-    const illegal = [_]u32{ 0o644, 0o660, 0o664, 0o777 };
-    for (illegal) |mode| {
-        try tmp.dir.setFilePermissions(io, "hostkey", .fromMode(@intCast(mode)), .{
-            .follow_symlinks = false,
-        });
-        var cfg = makeNumericTestConfig(.{ .max_total = 128, .max_unauth = 0 });
-        defer cfg.deinit();
-        cfg.server.host_key = key_path;
-        try std.testing.expectError(error.HostKeyUnreadable, validateSemantic(io, alloc, &cfg));
-    }
-
-    try tmp.dir.symLink(io, "hostkey", "hostlink", .{});
-    const link_path = try std.fmt.allocPrint(alloc, "{s}/hostlink", .{dir_path});
-    defer alloc.free(link_path);
-    {
-        var cfg = makeNumericTestConfig(.{ .max_total = 128, .max_unauth = 0 });
-        defer cfg.deinit();
-        cfg.server.host_key = link_path;
-        try std.testing.expectError(error.HostKeyUnreadable, validateSemantic(io, alloc, &cfg));
-    }
-
-    try tmp.dir.createDir(io, "notfile", .default_dir);
-    const dir_key = try std.fmt.allocPrint(alloc, "{s}/notfile", .{dir_path});
-    defer alloc.free(dir_key);
-    {
-        var cfg = makeNumericTestConfig(.{ .max_total = 128, .max_unauth = 0 });
-        defer cfg.deinit();
-        cfg.server.host_key = dir_key;
-        try std.testing.expectError(error.HostKeyUnreadable, validateSemantic(io, alloc, &cfg));
-    }
+test "validateSemantic: the log directory must exist and a log must be a regular file" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try std.testing.expectError(error.LogPathUnusable, tree.checkWith("@/log/audit.log", "@/nodir/audit.log"));
+    try std.testing.expectError(error.LogPathUnusable, tree.checkWith("@/log/audit.log", "@/etc/u.pub/audit.log"));
+    try std.testing.expectError(error.LogPathUnusable, tree.checkWith("@/log/audit.log", "@/log"));
+    try tree.tmp.dir.symLink(std.testing.io, "../etc/u.pub", "log/link.log", .{});
+    try std.testing.expectError(error.LogPathUnusable, tree.checkWith("@/log/audit.log", "@/log/link.log"));
+    try tree.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "log/audit.log", .data = "" });
+    try tree.check(TestTree.config);
 }
 
 /// Parse `text`, which must fail, and compare the rendered diagnostic.
@@ -2188,25 +2270,4 @@ test "rule patterns that can never match are rejected" {
     }
 
     try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  deny *.exe\n", "line 5: [user u] 'deny': InvalidPattern: '*.exe' never matches: start it with '/' (top level) or '**/' (any depth)");
-}
-
-const NumericTestArgs = struct { max_total: u32, max_unauth: u32 };
-fn makeNumericTestConfig(args: NumericTestArgs) Config {
-    return .{
-        .server = .{
-            .listen = "127.0.0.1:2222",
-            .host_key = "/dev/null",
-            .reload_interval_ms = 0,
-            .idle_timeout_ms = 0,
-            .max_connections = args.max_total,
-            .max_unauth_connections = args.max_unauth,
-            .shutdown_grace_ms = 0,
-            .log = .stderr,
-            .listing_mode = .virtual,
-            .publish_mode = 0o660,
-            .mkdir_mode = 0o2770,
-        },
-        .users = &.{},
-        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
-    };
 }
