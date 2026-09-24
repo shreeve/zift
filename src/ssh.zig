@@ -9,9 +9,9 @@ const std = @import("std");
 const c = @import("libssh");
 const abuse = @import("abuse.zig");
 const audit = @import("audit.zig");
-const auth = @import("auth.zig");
 const config = @import("config.zig");
 const netmatch = @import("netmatch.zig");
+const passhash = @import("passhash.zig");
 const sys = @import("sys.zig");
 
 pub fn authenticate(
@@ -81,10 +81,10 @@ pub fn authenticate(
                 if (cfg.findUser(username)) |user| {
                     if (!netmatch.allowed(user.from, ip_str)) {
                         // Pay the KDF anyway so timing hides the username.
-                        auth.runDummyVerify(io, allocator, password);
+                        runDummyVerify(io, allocator, password);
                         audit.log(io, username, "auth.password", null, .denied, "source not allowed", ip_str);
                         is_hard = true;
-                    } else if (auth.verifyPassword(io, allocator, user, password)) {
+                    } else if (verifyPassword(io, allocator, user, password)) {
                         _ = c.ssh_message_auth_reply_success(msg, 0);
                         audit.log(io, username, "auth.password", null, .ok, "", ip_str);
                         abuse.recordSuccess(io, ip_str);
@@ -94,7 +94,7 @@ pub fn authenticate(
                         is_hard = true;
                     }
                 } else {
-                    _ = auth.verifyLogin(io, allocator, cfg, username, password);
+                    runDummyVerify(io, allocator, password);
                     audit.log(io, username, "auth.password", null, .denied, "unknown user", ip_str);
                     is_hard = true;
                 }
@@ -146,6 +146,47 @@ pub fn authenticate(
         _ = c.ssh_message_auth_set_methods(msg, methodsForUser(cfg, username_for_methods));
         _ = c.ssh_message_reply_default(msg);
     }
+}
+
+fn verifyPassword(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    user: *const config.UserConfig,
+    password: []const u8,
+) bool {
+    const hash = user.password_hash orelse {
+        // Key-only user: pay the KDF so timing matches the other denials.
+        runDummyVerify(io, allocator, password);
+        return false;
+    };
+    return passhash.verify(io, allocator, password, hash);
+}
+
+/// One Argon2id against a cached dummy credential, so every password
+/// denial costs the same as a real verify.
+fn runDummyVerify(io: std.Io, allocator: std.mem.Allocator, password: []const u8) void {
+    ensureDummy(io, allocator);
+    _ = passhash.verify(io, allocator, password, dummy_blob[0..passhash.blob_len]);
+}
+
+var dummy_blob: [passhash.blob_len]u8 = undefined;
+var dummy_ready: std.atomic.Value(bool) = .init(false);
+var dummy_mutex: std.Io.Mutex = .init;
+
+fn ensureDummy(io: std.Io, allocator: std.mem.Allocator) void {
+    if (dummy_ready.load(.acquire)) return;
+
+    dummy_mutex.lockUncancelable(io);
+    defer dummy_mutex.unlock(io);
+    if (dummy_ready.load(.acquire)) return;
+
+    _ = passhash.mint(io, allocator, "zift-dummy-password", &dummy_blob) catch {
+        // Fall back to a structurally valid but unverifiable blob so
+        // the verify path still runs KDF work against a real salt.
+        @memcpy(dummy_blob[0..passhash.prefix.len], passhash.prefix);
+        @memset(dummy_blob[passhash.prefix.len..], '0');
+    };
+    dummy_ready.store(true, .release);
 }
 
 /// Methods list for a `userauth_failure` reply. A password-only user
@@ -294,4 +335,29 @@ fn matchAgainstDummyKey(allocator: std.mem.Allocator, presented: c.ssh_key) bool
 
     _ = c.ssh_key_cmp(presented, parsed, c.SSH_KEY_CMP_PUBLIC);
     return false;
+}
+
+fn testUser(password_hash: ?[]const u8) config.UserConfig {
+    return .{
+        .name = "ally",
+        .password_hash = password_hash,
+        .keys = &.{},
+        .key_files = &.{},
+        .from = &.{},
+        .root = "/tmp",
+        .rules = &.{},
+    };
+}
+
+test "verifyPassword accepts only the right password" {
+    var out: [passhash.blob_len]u8 = undefined;
+    const hash = try passhash.mint(std.testing.io, std.testing.allocator, "correct horse", &out);
+    const user = testUser(hash);
+    try std.testing.expect(verifyPassword(std.testing.io, std.testing.allocator, &user, "correct horse"));
+    try std.testing.expect(!verifyPassword(std.testing.io, std.testing.allocator, &user, "wrong horse"));
+}
+
+test "verifyPassword returns false when user has no password" {
+    const user = testUser(null);
+    try std.testing.expect(!verifyPassword(std.testing.io, std.testing.allocator, &user, "anything"));
 }

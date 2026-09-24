@@ -7,8 +7,8 @@ const std = @import("std");
 const c = @import("libssh");
 const build_options = @import("build_options");
 const audit = @import("audit.zig");
-const auth = @import("auth.zig");
 const config = @import("config.zig");
+const passhash = @import("passhash.zig");
 const server = @import("server.zig");
 const signals = @import("signals.zig");
 const vfs = @import("vfs.zig");
@@ -209,7 +209,7 @@ fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !void {
         std.process.exit(1);
     }
     var hash_buffer: [128]u8 = undefined;
-    const hash = try auth.hashPassword(io, gpa, password, &hash_buffer);
+    const hash = try passhash.mint(io, gpa, password, &hash_buffer);
     try stdout.writeStreamingAll(io, hash);
     try stdout.writeStreamingAll(io, "\n");
 }
