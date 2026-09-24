@@ -1,13 +1,16 @@
+//! Config file parser and filesystem validation.
+//!
+//! `parse` checks syntax and internal consistency only; `validateSemantic`
+//! then checks the live filesystem (host key, roots, key files) before a
+//! config may take effect. Grammar and directives: docs/configure.md.
+
 const std = @import("std");
 const passhash = @import("passhash.zig");
 const netmatch = @import("netmatch.zig");
 const vfs = @import("vfs.zig");
 
-/// Errors produced by `validateSemantic` for cross-cutting checks that
-/// can only be performed against a live filesystem (PLAN.md §6.2). The
-/// individual error names are also written to stderr verbatim by the
-/// validator for operator-facing diagnostics; integration tests grep for
-/// the specific phrase next to the error to assert the right rejection.
+/// Filesystem checks that fail `validateSemantic`. Each also writes a
+/// specific stderr line, which integration tests grep for.
 pub const SemanticError = error{
     HostKeyUnreadable,
     UserRootMissing,
@@ -30,13 +33,8 @@ pub const Permission = enum {
     mkdir,
     delete,
     rename,
-    // `update` splits "may destroy an existing entry" into its two
-    // distinct intents. Without it, one verb would mean BOTH "delete an
-    // entry" and "overwrite an existing one" — which makes a common
-    // policy unwritable: a partner who re-sends `daily.csv` every
-    // morning must replace it, and would thereby also gain the right to
-    // delete everything in the directory. `update` gates the clobber
-    // rule; `delete` gates only removal.
+    // Overwrite (the clobber rule), separate from `delete` so a partner
+    // who re-sends `daily.csv` can replace it without gaining deletion.
     update,
 };
 
@@ -62,62 +60,25 @@ pub const ServerConfig = struct {
     listen: []const u8,
     host_key: []const u8,
     reload_interval_ms: u64,
-    /// Per PLAN.md §6.2 default 300_000 (5 minutes). 0 disables the timeout.
+    /// 0 disables the timeout.
     idle_timeout_ms: u64,
-    /// Per PLAN.md §6.2 default 128. Excess accepted connections are
-    /// disconnected immediately at the SSH layer with an audit line.
     max_connections: u32,
-    /// Per PLAN.md §8.4. Independent cap on the number of pre-auth
-    /// (unauthenticated) sessions. Bounds handshake-storm pressure so
-    /// an attacker cannot consume the entire `max_connections` pool
-    /// with stuck pre-auth sockets, leaving authenticated partner
-    /// sessions DoS'd. `0` disables the separate cap (= behavior is
-    /// the same as having only `max_connections` enforced). When set,
-    /// must be ≤ `max_connections`. A value of `max_connections / 4`
-    /// is a reasonable starting point for partner deployments.
+    /// Separate cap on pre-auth sessions so a handshake storm cannot
+    /// fill `max_connections`. 0 = no separate cap; else ≤ max_connections.
     max_unauth_connections: u32,
-    /// Per PLAN.md §7.1 default 30_000 (30 seconds). Time the server
-    /// waits for in-flight sessions to finish naturally on SIGTERM/SIGINT
-    /// before actively shutting down their sockets and exiting. Exposed
-    /// primarily so integration tests can run drain scenarios in
-    /// seconds rather than minutes.
+    /// How long SIGTERM waits for sessions before force-closing them.
     shutdown_grace_ms: u64,
     log: LogTarget,
-    /// How `sftp> ls -la` renders entries to the partner. `virtual`
-    /// (default in v0.3.0+) shows the partner's own virtual-user
-    /// name, a fixed group of `sftp`, policy-derived rwx bits in the
-    /// owner+group triplets, and `---` for world; setuid/setgid/sticky
-    /// bits are always cleared. `reality` is the v0.2.x behavior:
-    /// the inode's real owner, group, and mode pass through
-    /// unchanged — including any setuid/setgid/sticky bits. PLAN
-    /// §7.6 (default flipped between v0.2.x and v0.3.0).
+    /// `virtual` shows the partner's own name, group `sftp`, and
+    /// policy-derived rwx; `reality` passes the inode's owner and mode.
     listing_mode: ListingMode,
-    /// Mode applied to atomically-published files (the result of
-    /// alice's `put report.csv`). v0.6.0 default `0o660` — group
-    /// `zift` can read+write, world has nothing. Confidentiality of
-    /// partial uploads during transfer is enforced by the
-    /// `<root>/.zift/staging/` directory being mode `0o700` regardless
-    /// of this setting; it only controls what the file lands at after
-    /// the atomic rename. Allowed values: `0o600`, `0o640`, `0o660`.
-    /// Anything else is rejected at parse time to prevent operators
-    /// from accidentally configuring world-readable or world-writable
-    /// modes. PLAN §6.2.
+    /// Mode of a published upload (0o600, 0o640, or 0o660). In-flight
+    /// uploads are protected by the 0700 staging dir, not by this mode.
     publish_mode: u32,
-    /// Mode applied to directories created via SFTP `MKDIR`. v0.6.0
-    /// default `0o2770` — setgid + group rwx + world none, matching
-    /// the partner-tree posture set up by the deploy. The setgid bit
-    /// ensures any subdirectories alice creates inside also inherit
-    /// `group=zift`, so operators in the `zift` group can manage the
-    /// whole subtree without UID gymnastics. Allowed values:
-    /// `0o2700`, `0o2750`, `0o2770`. PLAN §6.2.
+    /// Mode of an SFTP MKDIR (0o2700, 0o2750, or 0o2770). Setgid keeps
+    /// the partner tree's group on every new subdirectory.
     mkdir_mode: u32,
-    /// Optional. When set, a user block without an explicit `root`
-    /// directive defaults its root to `${partner-root}/${user-name}`.
-    /// Operators pointing every partner at `/home/zift/<name>` no
-    /// longer have to copy-paste the same line into every user
-    /// block. There is deliberately NO hardcoded default — leaving
-    /// `partner-root` unset preserves the v0.6.x behavior where
-    /// every user must declare `root` explicitly. v0.7.0.
+    /// Default root for users without `root`: `<partner-root>/<name>`.
     partner_root: ?[]const u8,
 };
 
@@ -126,40 +87,25 @@ pub const ListingMode = enum {
     reality,
 };
 
-/// A public key authorized for a virtual user. Stored as the raw OpenSSH
-/// algorithm name and base64 blob from the config; libssh re-parses these
-/// into `ssh_key` values when matching a presented key at auth time.
+/// An authorized key as text from a key file; libssh re-imports it when
+/// matching a presented key.
 pub const PublicKey = struct {
-    /// One of "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
-    /// "ecdsa-sha2-nistp521" (PLAN.md §8.4 accepted algorithms).
+    /// One of `accepted_key_algorithms`.
     algorithm: []const u8,
-    /// Base64 blob (the second field of an OpenSSH public-key line).
+    /// Base64 wire blob (second field of an OpenSSH key line).
     blob: []const u8,
 };
 
 pub const UserConfig = struct {
     name: []const u8,
-    /// Janus-identical `a…` passhash credential when password auth is
-    /// provisioned, else null.
+    /// Janus-identical `a…` passhash, or null for key-only users.
     password_hash: ?[]const u8,
-    /// Public keys authorized for this user. Empty after `parse`
-    /// because v0.7.0 removed inline keys (the `key ssh-ed25519 ...`
-    /// directive). Populated by `validateSemantic`, which opens
-    /// every `key_files[i]`, parses each non-comment line as a
-    /// public key, and stores the merged result here. The runtime
-    /// auth path reads only this field.
+    /// Empty after `parse`; filled by `validateSemantic` from `key_files`.
     keys: []const PublicKey,
-    /// Absolute paths to OpenSSH public-key files referenced by
-    /// `auth /path/to/key.pub` lines. Recorded by `parse` and
-    /// opened by `validateSemantic`. Kept on the resolved config
-    /// so a future reload-diff can detect when the operator has
-    /// added or removed a key file even when `zift.conf` itself
-    /// was unchanged.
+    /// Paths from `auth /path` lines. Kept so reload can notice a key
+    /// file change even when the config file itself did not change.
     key_files: []const []const u8,
-    /// Optional source CIDRs from `from` lines. Empty means any
-    /// source IP may attempt auth for this user (still subject to
-    /// credentials + built-in abuse suppression). When non-empty,
-    /// the peer must match at least one entry.
+    /// Source CIDRs from `from` lines; empty allows any source.
     from: []const netmatch.Cidr,
     root: []const u8,
     rules: []const Rule,
@@ -168,10 +114,7 @@ pub const UserConfig = struct {
 pub const Config = struct {
     arena: std.heap.ArenaAllocator,
     server: ServerConfig,
-    /// Mutable so `validateSemantic` can replace each user's `keys`
-    /// after resolving `auth /path/...` references. Treat this as
-    /// `[]const UserConfig` everywhere except inside the validate
-    /// pass — the lifetime is the config arena either way.
+    /// Mutable only so `validateSemantic` can fill each user's `keys`.
     users: []UserConfig,
 
     pub fn deinit(self: *Config) void {
@@ -187,33 +130,9 @@ pub const Config = struct {
     }
 };
 
-/// Cross-cutting semantic validation against the live filesystem.
-///
-/// `parse` only proves the config is *syntactically* well-formed and
-/// internally consistent (valid passhash credentials, accepted key
-/// algorithms, no users without credentials). PLAN.md §6.2 also
-/// requires that, before a config is allowed to take effect:
-///
-///   - the configured `host-key` path is readable,
-///   - every user's `root` exists and is a directory,
-///   - no two user roots overlap (one is `==` or path-prefix of another).
-///
-/// Called from `zift validate`, from `zift serve` startup, and from the
-/// runtime reload path. Diagnostics are written to stderr in the
-/// canonical `zift: ...` form so the same message appears whether the
-/// rejection happens at validate time, startup time, or reload time.
-/// Pure-numeric subset of `validateSemantic` — the part that doesn't
-/// touch the filesystem and so can be unit-tested directly without
-/// having to construct a `std.Io`. Always called first by
-/// `validateSemantic` so an obviously-wrong cap arrangement fails
-/// before we waste a stat() on the host-key path. Not `pub`; tests
-/// in this file can reach it without expanding the public surface.
+/// The checks of `validateSemantic` that need no filesystem.
 fn validatePureNumeric(cfg: *const Config) error{UnauthCapExceedsTotal}!void {
-    // The pre-auth cap, if configured (>0), must be ≤ the total cap.
-    // A pre-auth cap LARGER than the total cap can't ever fire (the
-    // total cap rejects first) and silently letting it slide hides
-    // an operator misconfig that's more likely a typo for
-    // `max-connections` than intent.
+    // A pre-auth cap above the total cap can never fire; it is a typo.
     if (cfg.server.max_unauth_connections != 0 and
         cfg.server.max_unauth_connections > cfg.server.max_connections)
     {
@@ -221,6 +140,10 @@ fn validatePureNumeric(cfg: *const Config) error{UnauthCapExceedsTotal}!void {
     }
 }
 
+/// Check a parsed config against the live filesystem: host key, user
+/// roots (exist, are directories, do not overlap), and key files.
+/// Used by `zift validate`, `zift serve`, and reload, so each rejection
+/// prints the same `zift: ...` line on stderr wherever it happens.
 pub fn validateSemantic(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -228,10 +151,7 @@ pub fn validateSemantic(
 ) SemanticError!void {
     const stderr = std.Io.File.stderr();
 
-    // 1. Pure-numeric checks first: a config that has them wrong
-    // shouldn't even try to stat the filesystem. Split into a pure
-    // function so unit tests can cover the rejection logic without
-    // having to construct a `std.Io` (the test surface).
+    // 1. Numeric checks, before touching the filesystem.
     validatePureNumeric(cfg) catch |err| {
         switch (err) {
             error.UnauthCapExceedsTotal => {
@@ -248,12 +168,9 @@ pub fn validateSemantic(
         return err;
     };
 
-    // 2. Host key is held to the authorized-key bar, plus secrecy:
-    // a regular file (symlinks are not followed), no group-write,
-    // group-exec, or any "other" bit (`mode & 0o037 != 0`). Group-read
-    // stays legal so `0640` root:zift works; `0600` and `0400` too.
-    // Then open read-only with `follow_symlinks = false` and close.
-    // Key bytes are never written to the diagnostic.
+    // 2. Host key: a regular file (not a symlink) with no group-write,
+    // group-exec, or other bits, so 0600, 0400, and 0640 root:zift pass.
+    // Key bytes never reach the diagnostic.
     const host_key = cfg.server.host_key;
     const host_stat = std.Io.Dir.cwd().statFile(io, host_key, .{
         .follow_symlinks = false,
@@ -285,15 +202,9 @@ pub fn validateSemantic(
     };
     host_file.close(io);
 
-    // 2. Each user root must exist, be a directory, and canonicalize
-    // through symlinks. We canonicalize via realPath so the overlap
-    // check below operates on absolute symlink-resolved paths, the
-    // same form the per-request `vfs.isInsideRoot` check uses.
-    // `realPathFileAbsoluteAlloc` returns a sentinel-terminated slice
-    // (`[:0]const u8`), and `Allocator.free` requires the freeing call
-    // to use the same sentinel-typed slice it was allocated with — the
-    // backing allocation length includes the trailing null. Storing as
-    // `[]const u8` strips the sentinel and triggers `Invalid free`.
+    // 3. Each root must exist and be a directory. Overlap is checked on
+    // the canonical (symlink-resolved) paths. Keep the `[:0]` type: freeing
+    // without the sentinel is an invalid free.
     var canonical_roots = try allocator.alloc([:0]const u8, cfg.users.len);
     var canonical_count: usize = 0;
     defer {
@@ -302,7 +213,6 @@ pub fn validateSemantic(
     }
 
     for (cfg.users) |*user| {
-        // Resolve the user's root (follows symlinks; fails on missing).
         const real = std.Io.Dir.realPathFileAbsoluteAlloc(io, user.root, allocator) catch {
             stderr.writeStreamingAll(io, "zift: user '") catch {};
             stderr.writeStreamingAll(io, user.name) catch {};
@@ -311,7 +221,6 @@ pub fn validateSemantic(
             stderr.writeStreamingAll(io, "\n") catch {};
             return error.UserRootMissing;
         };
-        // Verify the resolved target is actually a directory.
         const dir = std.Io.Dir.openDirAbsolute(io, real, .{}) catch {
             allocator.free(real);
             stderr.writeStreamingAll(io, "zift: user '") catch {};
@@ -327,10 +236,7 @@ pub fn validateSemantic(
         canonical_count += 1;
     }
 
-    // 3. Overlap detection on the canonicalized paths. Two roots
-    // overlap iff one is equal to or a path-component prefix of the
-    // other (PLAN.md §6.2). Equal roots are caught by `isInsideRoot`'s
-    // `eql` short-circuit, so the symmetric check is enough.
+    // 4. No root may equal or contain another.
     for (canonical_roots[0..canonical_count], 0..) |a, i| {
         for (canonical_roots[i + 1 .. canonical_count], i + 1..) |b, j| {
             if (vfs.isInsideRoot(a, b) or vfs.isInsideRoot(b, a)) {
@@ -348,30 +254,16 @@ pub fn validateSemantic(
         }
     }
 
-    // 4. v0.7.0 — resolve every `auth /path/to/key.pub` reference.
-    // Each file is opened, permission-checked, and parsed; every
-    // non-empty/non-comment line becomes an authorized public key.
-    // Errors are user-facing; the diagnostic names the user and
-    // the path so operators know exactly which line to fix.
+    // 5. Load every `auth /path` key file.
     try resolveAuthKeyFiles(io, allocator, cfg);
 }
 
-/// Open every key file referenced by an `auth /path/...` line,
-/// parse it, and merge the result into the user's `keys` list. The
-/// resolved `PublicKey` strings are allocated in `cfg.arena`; the
-/// raw file contents are allocated in the validate-time `gpa` and
-/// freed before this function returns so the config arena only
-/// holds the parsed data.
+/// Parse every user's key files into `keys` (strings in the config
+/// arena; file contents in `gpa`, freed here).
 ///
-/// Permission posture (PLAN §6.2 / DEPLOY guidance): a key file
-/// that grants login shouldn't be writable by anyone the daemon's
-/// service account doesn't already trust. We reject any key file
-/// whose mode has the world-write or group-write bit set, and any
-/// non-regular file (so symlinks pointing at attacker-controlled
-/// paths can't slip past the parent-dir mode). Parent-directory
-/// writability is the operator's responsibility (documented in
-/// operate.md); enforcing it here would conflict with
-/// reasonable layouts like `/home/zift/keys/` group-rwx.
+/// A file that grants login must be a regular file (not a symlink) with
+/// no group- or world-write bit. The parent directory is the operator's
+/// responsibility, so layouts like a group-rwx keys directory still work.
 fn resolveAuthKeyFiles(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -384,10 +276,6 @@ fn resolveAuthKeyFiles(
         if (user.key_files.len == 0) continue;
 
         var combined: std.ArrayList(PublicKey) = .empty;
-        // `user.keys` is empty in v0.7.0 (no inline key directive),
-        // but copying through here keeps the structure resilient
-        // if a future entry point pre-populates keys before
-        // validate runs.
         for (user.keys) |existing| try combined.append(arena_alloc, existing);
 
         for (user.key_files) |path| {
@@ -398,9 +286,7 @@ fn resolveAuthKeyFiles(
     }
 }
 
-/// Read+permission-check+parse a single key file, appending each
-/// well-formed public-key line to `combined`. Caller owns lifetime
-/// of `combined` (allocated in the config arena).
+/// Check and parse one key file, appending each key line to `combined`.
 fn resolveOneKeyFile(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -410,21 +296,12 @@ fn resolveOneKeyFile(
     user_name: []const u8,
     path: []const u8,
 ) SemanticError!void {
-    // Open with `follow_symlinks = false` so the open fails early
-    // if the path is a symlink — this closes the
-    // statFile-then-readFileAlloc TOCTOU window where an attacker
-    // could swap a checked regular file for a symlink between the
-    // two path resolutions. The single open here gives us a stable
-    // fd; both stat and read happen against that fd, so the inode
-    // we validate is byte-for-byte the inode we parse.
+    // One NOFOLLOW open; stat and read use that fd, so the inode we
+    // check is the inode we parse (no swap between two path lookups).
     var file = std.Io.Dir.cwd().openFile(io, path, .{
         .mode = .read_only,
         .follow_symlinks = false,
     }) catch |err| switch (err) {
-        // POSIX/Linux: open() with O_NOFOLLOW on a symlink returns
-        // ELOOP, which Zig surfaces as `SymLinkLoop`. We translate
-        // that to the more operator-facing "symlinks not allowed"
-        // diagnostic + the dedicated `AuthKeyFileNotRegular` tag.
         error.SymLinkLoop => {
             writeKeyFileDiag(io, stderr, user_name, path, 0, "symlinks not allowed (use in-place rename for rotation)");
             return error.AuthKeyFileNotRegular;
@@ -436,10 +313,6 @@ fn resolveOneKeyFile(
     };
     defer file.close(io);
 
-    // fstat on the opened fd. Because we passed `follow_symlinks =
-    // false` to `openFile`, a symlink-at-path would have already
-    // errored out above; this fstat checks the regular-file +
-    // permission invariants on the actual inode we'll read from.
     const stat = file.stat(io) catch {
         writeKeyFileDiag(io, stderr, user_name, path, 0, "stat failed");
         return error.AuthKeyFileUnreadable;
@@ -451,9 +324,7 @@ fn resolveOneKeyFile(
             return error.AuthKeyFileNotRegular;
         },
     }
-    // Reject any group-write or world-write bit. Group-read /
-    // world-read are fine — public keys are public; the value is
-    // in tamper-resistance, not secrecy.
+    // Public keys need tamper resistance, not secrecy: only write bits matter.
     const file_mode: u32 = @intCast(stat.permissions.toMode() & 0o7777);
     const writable_by_others_mask: u32 = 0o022;
     if ((file_mode & writable_by_others_mask) != 0) {
@@ -461,17 +332,9 @@ fn resolveOneKeyFile(
         return error.AuthKeyFileWritableByOthers;
     }
 
-    // Generous slack above `max_keyline_bytes` so the formatter's
-    // line cap applies per-line, not per-file. A 4 KiB key plus
-    // up to 4 KiB of comment headers and trailing whitespace
-    // comfortably fits; pathological files exceeding the cap are
-    // rejected with a precise diagnostic instead of being treated
-    // as "unreadable".
+    // Room for several keys and comments; larger files get "too large".
     const file_read_cap: usize = max_keyline_bytes * 4;
 
-    // Read from the open fd (NOT by re-resolving `path`). This is
-    // what closes the TOCTOU: the inode we just fstat'd is the
-    // inode we're now slurping bytes out of.
     var file_reader = file.reader(io, &.{});
     const contents = file_reader.interface.allocRemaining(gpa, .limited(file_read_cap)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -524,13 +387,8 @@ fn writeHostKeyDiag(io: std.Io, stderr: std.Io.File, reason: []const u8, path: [
     stderr.writeStreamingAll(io, "\n") catch {};
 }
 
-/// Format a key-file diagnostic in the same shape as parse errors:
-///
-///   `zift: user '<name>': auth key file '<path>': <reason>`           (file-level)
-///   `zift: user '<name>': auth key file '<path>' line N: <reason>`    (per-line)
-///
-/// `line_no = 0` means "no specific line" — used for whole-file
-/// failures (mode, regular-file, readability, empty-file).
+/// `zift: user '<name>': auth key file '<path>'[ line N]: <reason>`;
+/// `line_no` 0 means the whole file.
 fn writeKeyFileDiag(
     io: std.Io,
     stderr: std.Io.File,
@@ -575,11 +433,6 @@ const UserBuilder = struct {
     name: []const u8,
     password_hash: ?[]const u8 = null,
     keys: std.ArrayList(PublicKey) = .empty,
-    /// Public-key files referenced by `auth /path/to/key.pub` lines.
-    /// The parser only records the path; `validateSemantic` opens
-    /// each file, parses its first non-empty/non-comment line as a
-    /// public key, and merges the result into `keys`. See
-    /// `resolveAuthKeyFiles`.
     key_files: std.ArrayList([]const u8) = .empty,
     from: std.ArrayList(netmatch.Cidr) = .empty,
     root: ?[]const u8 = null,
@@ -627,24 +480,12 @@ pub const Error = error{
     InvalidFrom,
 };
 
-/// PLAN §7.6 fixed implementation limits. Reject at parse time so a
-/// malformed config never reaches runtime; reject during request
-/// dispatch (path) so a malicious peer cannot spend server CPU on
-/// pathological inputs before we say no.
+/// Fixed limits, enforced at parse time.
 pub const max_username_bytes: usize = 64;
 pub const max_keyline_bytes: usize = 8192;
 
-/// Diagnostic context captured by `parse` on any error. Callers (zift
-/// validate, zift serve startup, runtime reload) read `line`,
-/// `section_kind`, `userName()`, and `key()` after a `catch` to emit a
-/// precise stderr diagnostic — `zift: <file>:<line>: <reason>` —
-/// rather than the raw error name. PLAN §6.2 / §7.3 require errors
-/// that identify file, line, section/user, and key.
-///
-/// Strings are stored in fixed inline buffers (sized at PLAN §7.6
-/// limits) so the diag survives the arena's `deinit` on the error
-/// path. A `?[]const u8` here would dangle once the parser's arena is
-/// torn down.
+/// Where a parse failed: line, section, user, and key. Strings are copied
+/// into inline buffers because the parser's arena is freed on error.
 pub const ParseDiag = struct {
     line: u32 = 0,
     section_kind: ?Section = null,
@@ -675,8 +516,7 @@ pub const ParseDiag = struct {
         self.key_len = n;
     }
 
-    /// Format the captured context plus an `@errorName` suffix into
-    /// `writer`. Caller already has `<file>:` prefix; we add the rest.
+    /// `line N: [section] 'key': ErrorName` (caller prints the file).
     pub fn format(self: *const ParseDiag, err: anyerror, writer: *std.Io.Writer) !void {
         if (self.line != 0) {
             try writer.print("line {d}: ", .{self.line});
@@ -697,8 +537,7 @@ pub const ParseDiag = struct {
     }
 };
 
-/// Public-key algorithms accepted in `key` lines, per PLAN.md §8.4.
-/// RSA and DSA are deliberately not on this list.
+/// RSA and DSA are deliberately absent.
 const accepted_key_algorithms = [_][]const u8{
     "ssh-ed25519",
     "ecdsa-sha2-nistp256",
@@ -717,9 +556,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
     return parseWithDiag(gpa, text, null);
 }
 
-/// Same as `parse` but also populates `diag` (when non-null) with the
-/// line/section/user context of any failure. Callers use this when
-/// they want operator-facing diagnostics with file:line precision.
+/// `parse`, also recording where any failure happened into `diag`.
 pub fn parseWithDiag(
     gpa: std.mem.Allocator,
     text: []const u8,
@@ -736,13 +573,7 @@ pub fn parseWithDiag(
     var section: Section = .none;
     var current_user: ?*UserBuilder = null;
 
-    // Mutable trackers updated as we walk; `errdefer` snapshots them
-    // into `diag` on any error path so callers see the location of
-    // the failing line, the section it's in, and which user was
-    // active (if applicable). The diag's string buffers are inline
-    // so they survive the arena's `deinit` that runs on this error
-    // path (LIFO errdefer order — both run, but slices into the
-    // arena would dangle by the time the caller reads them).
+    // Snapshotted into `diag` on any error.
     var line_no: u32 = 0;
     var key_for_diag: ?[]const u8 = null;
     errdefer {
@@ -760,10 +591,7 @@ pub fn parseWithDiag(
         key_for_diag = null;
 
         const no_cr = std.mem.trimEnd(u8, raw, "\r");
-        // PLAN §6.2: only whole-line comments are recognized. A line
-        // whose first non-whitespace character is `#` is treated as a
-        // comment and skipped; a `#` after a value is a syntax error,
-        // not a comment delimiter.
+        // Only whole-line comments; a `#` after a value is an error.
         const trimmed_for_comment_check = std.mem.trimStart(u8, no_cr, " \t");
         if (trimmed_for_comment_check.len > 0 and trimmed_for_comment_check[0] == '#') {
             continue;
@@ -817,9 +645,6 @@ pub fn parseWithDiag(
 
     const final_users = try allocator.alloc(UserConfig, users.items.len);
     for (users.items, 0..) |*builder, i| {
-        // A user must declare at least one credential: either a
-        // password (`auth a…`) or a public-key file (`auth /…`).
-        // Pure key-only and pure password-only users remain valid.
         if (builder.password_hash == null and
             builder.keys.items.len == 0 and
             builder.key_files.items.len == 0)
@@ -827,14 +652,8 @@ pub fn parseWithDiag(
             return error.MissingCredentials;
         }
 
-        // v0.7.0: derive a default root from `partner-root` when
-        // the user didn't declare one explicitly. Skipping this
-        // when both are unset preserves the v0.6.x rejection
-        // (`error.MissingRoot`) for legacy configs that didn't
-        // adopt the new directive. The `partner-root /` edge case
-        // is special-cased so a derived root never becomes `//foo`
-        // — POSIX leaves leading-`//` paths implementation-defined
-        // and we don't want a jail boundary depending on that.
+        // Default the root from `partner-root`. Never build `//name`:
+        // POSIX leaves a leading `//` implementation-defined.
         const root_value: []const u8 = if (builder.root) |r|
             r
         else if (server.partner_root) |pr|
@@ -891,10 +710,7 @@ fn parseServerProperty(
         server.reload_interval_ms = try parseDurationMs(value);
     } else if (std.mem.eql(u8, key, "idle-timeout")) {
         const ms = try parseDurationMs(value);
-        // libssh stores the blocking-read timeout as a signed 32-bit
-        // millisecond count and treats anything above this as
-        // wait-forever, which would silently disable the timeout.
-        // `0` remains the documented disabled sentinel.
+        // Above libssh's signed 32-bit ms limit it waits forever.
         if (ms > max_libssh_idle_timeout_ms) return error.InvalidConfig;
         server.idle_timeout_ms = ms;
     } else if (std.mem.eql(u8, key, "max-connections")) {
@@ -907,11 +723,7 @@ fn parseServerProperty(
         if (std.mem.eql(u8, value, "stderr")) {
             server.log = .stderr;
         } else {
-            // PLAN §7.4: file destinations must be absolute paths so
-            // logrotate's "rename old, signal SIGUSR1, recreate" cycle
-            // operates on a known stable target. Relative paths are
-            // ambiguous (relative to whose cwd?) and rejected at parse
-            // time rather than discovered at first reload.
+            // Absolute only: a relative path depends on the daemon's cwd.
             if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
             server.log = .{ .file = try dupNonEmpty(allocator, value) };
         }
@@ -928,16 +740,8 @@ fn parseServerProperty(
     } else if (std.mem.eql(u8, key, "mkdir-mode")) {
         server.mkdir_mode = try parseMkdirMode(value);
     } else if (std.mem.eql(u8, key, "partner-root")) {
-        // PLAN §6.2 (v0.7.0): absolute path only — relative paths
-        // are ambiguous (relative to whose cwd?) and would silently
-        // re-resolve depending on how the daemon was invoked. The
-        // path itself is not stat'd here; per-user roots derived
-        // from it are validated by `validateSemantic` exactly the
-        // same way an explicit `root` directive would be.
+        // Absolute only. Trailing `/` is trimmed, except for `/` itself.
         if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
-        // Trim trailing `/` so `partner-root /home/zift/` and
-        // `partner-root /home/zift` both produce the same derived
-        // root. The lone `/` (root) is intentionally preserved.
         var pr = value;
         while (pr.len > 1 and pr[pr.len - 1] == '/') pr = pr[0 .. pr.len - 1];
         server.partner_root = try dupNonEmpty(allocator, pr);
@@ -946,14 +750,7 @@ fn parseServerProperty(
     }
 }
 
-/// Parse `publish-mode` from a config value. Accepts an octal literal
-/// with optional `0o` or `0` prefix. The allowed-set is restricted to
-/// `0o600 | 0o640 | 0o660` so a config typo can't accidentally produce
-/// world-readable or world-writable partner data files. Operators who
-/// genuinely want a stricter mode (e.g., `0o600` to keep files
-/// daemon-private) can opt in; anything outside the set is rejected
-/// at parse time so a regression is caught at validation, not at
-/// publish time.
+/// Only 0o600, 0o640, or 0o660: partner data never gets world bits.
 fn parsePublishMode(value: []const u8) Error!u32 {
     const mode = parseOctalMode(value) catch return error.InvalidConfig;
     if (mode != 0o600 and mode != 0o640 and mode != 0o660) {
@@ -962,13 +759,7 @@ fn parsePublishMode(value: []const u8) Error!u32 {
     return mode;
 }
 
-/// Parse `mkdir-mode` from a config value. Same shape as
-/// `parsePublishMode` but for SFTP-created directories. The allowed
-/// set carries the setgid bit (`02000`) so child entries inherit
-/// `group=zift` automatically — matching the deploy posture where
-/// `<root>/<partner>/` itself is `2770`. Allowed: `0o2700 | 0o2750 |
-/// 0o2770`. Rejecting other values prevents operators from creating
-/// world-traversable directory trees by accident.
+/// Only 0o2700, 0o2750, or 0o2770: setgid, never world bits.
 fn parseMkdirMode(value: []const u8) Error!u32 {
     const mode = parseOctalMode(value) catch return error.InvalidConfig;
     if (mode != 0o2700 and mode != 0o2750 and mode != 0o2770) {
@@ -977,11 +768,7 @@ fn parseMkdirMode(value: []const u8) Error!u32 {
     return mode;
 }
 
-/// Parse an octal mode literal. Accepts `0o660`, `0660`, and `660`
-/// — all three are equivalent. The `0o` prefix is the modern Zig-
-/// canonical form; bare values are interpreted as octal exactly the
-/// way `chmod` accepts them (`660` means `0o660`, not decimal 660).
-/// PLAN §6.2 octal-literal grammar.
+/// `0o660`, `0660`, and `660` are all octal, as with chmod.
 fn parseOctalMode(value: []const u8) !u32 {
     if (value.len == 0) return error.InvalidConfig;
     const slice = if (std.mem.startsWith(u8, value, "0o") or std.mem.startsWith(u8, value, "0O"))
@@ -1001,10 +788,8 @@ fn parseUserProperty(
     if (std.mem.eql(u8, key, "auth")) {
         try parseAuth(allocator, user, value);
     } else if (std.mem.eql(u8, key, "root")) {
-        // Absolute only, same rule as `partner-root` and `log`.
-        // `validateSemantic` calls `realPathFileAbsoluteAlloc`, which
-        // asserts the path is absolute and aborts (ReleaseSafe) instead
-        // of returning an error. A bad reload must not reach that assert.
+        // Absolute only: `realPathFileAbsoluteAlloc` in validateSemantic
+        // asserts it, and a bad reload must not reach that assert.
         if (value.len == 0 or value[0] != '/') return error.InvalidConfig;
         user.root = try dupNonEmpty(allocator, value);
     } else if (std.mem.eql(u8, key, "from")) {
@@ -1014,31 +799,20 @@ fn parseUserProperty(
     } else if (std.mem.eql(u8, key, "deny")) {
         try parseDenyRules(allocator, user, value);
     } else if (std.mem.eql(u8, key, "password")) {
-        // v0.7.0 removed `password` in favor of unified `auth`.
-        // A v0.6.x config that still uses it deserves a precise
-        // migration diagnostic, not the generic `UnknownKey`.
+        // Removed directives get a specific error, not `UnknownKey`.
         return error.PasswordDirectiveRemoved;
     } else if (std.mem.eql(u8, key, "key")) {
-        // v0.7.0 removed inline `key` lines; public keys now live
-        // in operator-managed files referenced by `auth /path/...`.
         return error.KeyDirectiveRemoved;
     } else {
         return error.UnknownKey;
     }
 }
 
-/// Dispatch a single `auth <value>` line:
-///
-///   - `a…` → Janus-identical password credential (fixed argon2id).
-///     At most one per user (`error.DuplicatePassword` on a second).
-///   - `$…` → legacy PHC string. Rejected with `PasswordPhcRemoved`
-///     so operators remint via `zift hash-password`.
-///   - `/…` → absolute path to a public-key file (opened by
-///     `validateSemantic`). Multiple lines accumulate.
-///   - anything else → `error.InvalidAuth`.
+/// `auth a…` is a passhash (at most one); `auth /…` names a key file
+/// (any number); a legacy `$…` PHC string must be reminted.
 fn parseAuth(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
     if (value.len == 0) return error.InvalidAuth;
-    // Versioned passhash: leading `a`–`z` (currently only `a` is defined).
+    // A leading letter is a passhash version tag.
     if (value.len > 0 and value[0] >= 'a' and value[0] <= 'z') {
         if (user.password_hash != null) return error.DuplicatePassword;
         passhash.validate(value) catch return error.InvalidPasshash;
@@ -1046,8 +820,6 @@ fn parseAuth(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8
         return;
     }
     if (value[0] == '$') {
-        // Prefer DuplicatePassword when a passhash credential is already
-        // present — more actionable than "PHC removed".
         if (user.password_hash != null) return error.DuplicatePassword;
         return error.PasswordPhcRemoved;
     }
@@ -1059,14 +831,7 @@ fn parseAuth(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8
     return error.InvalidAuth;
 }
 
-/// Parse a single OpenSSH public-key line — `<algorithm> <blob>
-/// [comment]`. Pure (no I/O); used both for unit tests and as the
-/// per-line parser inside the file-loader called from
-/// `validateSemantic`. `algorithm` and `blob` are allocator-duped so
-/// the result outlives the input slice. Returns the same errors the
-/// v0.6.x inline `key` directive produced (`InvalidKeyLine`,
-/// `UnsupportedKeyAlgorithm`, `KeyLineTooLong`) — operator-facing
-/// behavior is unchanged from v0.6.x for malformed key content.
+/// Parse `<algorithm> <blob> [comment]`; the result is allocator-owned.
 pub fn parsePublicKeyLine(allocator: std.mem.Allocator, line: []const u8) Error!PublicKey {
     if (line.len > max_keyline_bytes) return error.KeyLineTooLong;
 
@@ -1077,8 +842,6 @@ pub fn parsePublicKeyLine(allocator: std.mem.Allocator, line: []const u8) Error!
     if (!isAcceptedKeyAlgorithm(algorithm)) return error.UnsupportedKeyAlgorithm;
     if (blob.len == 0) return error.InvalidKeyLine;
 
-    // Strict RFC 4648 standard base64. Same accept/reject behavior
-    // libssh applies on the wire when the partner sends a key.
     if (!isValidStandardBase64(blob)) return error.InvalidKeyLine;
 
     return .{
@@ -1087,11 +850,7 @@ pub fn parsePublicKeyLine(allocator: std.mem.Allocator, line: []const u8) Error!
     };
 }
 
-/// Strict RFC 4648 standard base64 used for OpenSSH wire blobs:
-/// alphabet [A-Za-z0-9+/], length must be %4==0, padding is required
-/// where the byte count would otherwise leave 1 or 2 trailing chars.
-/// We round-trip through `std.base64.standard.Decoder` so the parser
-/// makes the same accept/reject decision libssh would.
+/// Strict padded RFC 4648 base64, the form libssh accepts for key blobs.
 fn isValidStandardBase64(data: []const u8) bool {
     if (data.len == 0 or data.len % 4 != 0) return false;
     const decoder = std.base64.standard.Decoder;
@@ -1102,9 +861,7 @@ fn isValidStandardBase64(data: []const u8) bool {
     return true;
 }
 
-/// Parse one `from <ip-or-cidr>` line. Multiple lines accumulate.
-/// Value must be a single token (no spaces); use one directive per
-/// source network.
+/// One IP or CIDR per `from` line; lines accumulate.
 fn parseFrom(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
     const token = std.mem.trim(u8, value, " \t");
     if (token.len == 0) return error.InvalidFrom;
@@ -1121,19 +878,12 @@ fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []con
     var saw_permission = false;
     while (parts.next()) |token| {
         if (std.mem.eql(u8, token, "read")) {
-            // `read` grants both download and directory listing. There is
-            // deliberately no download-without-listing verb — that
-            // asymmetry ("can `get` a known name but can't `ls`") is a
-            // security-through-obscurity footgun real partner workflows
-            // never want. The narrow `list` verb (browse without
-            // download) still exists for the rare inverse case.
+            // `read` implies `list`: download-without-listing is only
+            // obscurity. `list` alone (browse, no download) still exists.
             permissions.insert(.read);
             permissions.insert(.list);
         } else if (std.mem.eql(u8, token, "full")) {
-            // `full` = the complete CRUD set plus directory structure:
-            // read + list + write (create) + update (overwrite) +
-            // delete + mkdir + rename. Opt-in per path; the
-            // deny-by-default floor is unchanged.
+            // Every permission.
             permissions.insert(.read);
             permissions.insert(.list);
             permissions.insert(.write);
@@ -1142,11 +892,7 @@ fn parseAllowRule(allocator: std.mem.Allocator, user: *UserBuilder, value: []con
             permissions.insert(.mkdir);
             permissions.insert(.rename);
         } else {
-            // Every other verb is a single granular capability whose
-            // token matches its name: write (create a new file), update
-            // (overwrite an existing one), delete, list, mkdir, rename.
-            // `read` and `full` above are the only multi-capability
-            // words — there are no aliases.
+            // Every other verb is exactly one permission of that name.
             permissions.insert(parsePermission(token) orelse return error.InvalidPermission);
         }
         saw_permission = true;
@@ -1181,21 +927,9 @@ fn parsePermission(token: []const u8) ?Permission {
     return null;
 }
 
-/// Reject a `listen` value that cannot possibly bind, at PARSE time.
-///
-/// This check previously existed only in server.zig's parseListen(),
-/// which runs at bind time. `zift validate` therefore reported `ok:`
-/// for a config that killed the daemon on the next start -- exactly the
-/// failure the validate-then-reload workflow exists to prevent. It is
-/// worse than it sounds: `listen` is startup-only and is ignored by a
-/// reload, so the breakage surfaces on a restart or a reboot, which is
-/// when nobody is watching.
-///
-/// The HOST half is deliberately left to libssh. Hostnames and
-/// bracketed IPv6 forms are both legitimate here, and re-implementing
-/// that resolution would risk rejecting valid configs -- a worse
-/// failure than the one being fixed. The port is unambiguous, and a
-/// value with no colon at all cannot bind under any reading.
+/// Reject a `listen` that cannot bind, so `zift validate` catches it
+/// instead of the next restart (`listen` is not applied on reload). Only
+/// the port is checked; host resolution is left to libssh.
 fn validateListen(value: []const u8) Error!void {
     const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidListen;
     const port = value[colon + 1 ..];
@@ -1207,15 +941,10 @@ fn validateListen(value: []const u8) Error!void {
 fn parseDurationMs(value: []const u8) Error!u64 {
     if (value.len == 0) return error.InvalidDuration;
 
-    // Bare `0` is the documented sentinel for "disabled" (idle-timeout,
-    // reload-interval) and means the same thing in any unit — special-
-    // cased here so operators don't have to write `0s`.
+    // Bare `0` means disabled. Any other value needs a unit (`ms`, `s`,
+    // `m`, `h`, `d`): a bare number is ambiguous, so it is rejected.
     if (std.mem.eql(u8, value, "0")) return 0;
 
-    // PLAN §6.2: any non-zero duration requires a unit suffix
-    // (`ms`, `s`, `m`, `h`, `d`). A bare number is ambiguous (operators
-    // expect seconds; the implementation used to treat it as
-    // milliseconds) so we reject it rather than guess.
     if (std.mem.endsWith(u8, value, "ms")) {
         const ms = std.fmt.parseUnsigned(u64, value[0 .. value.len - 2], 10) catch return error.InvalidDuration;
         return capDurationMs(ms);
@@ -1243,15 +972,8 @@ fn parseDurationMs(value: []const u8) Error!u64 {
 /// millisecond count. Anything above this is treated as wait-forever.
 const max_libssh_idle_timeout_ms: u64 = 2147483647;
 
-/// Largest accepted duration in milliseconds. Every duration is stored
-/// as `u64` in the config but converted to `i64` at runtime (idle,
-/// reload, drain timers), so the ceiling is `maxInt(i64)` — this keeps
-/// both the parse-time multiply and the runtime `@intCast` from ever
-/// overflowing. Without this bound, `idle-timeout 99999999999999h`
-/// panicked `zift validate`, and `reload-interval <huge>ms` passed
-/// validation and then crash-looped the daemon right after it bound the
-/// listener. ~292 million years is not a limit any real deployment
-/// meets.
+/// Durations are cast to i64 at runtime, so larger values must be
+/// rejected here rather than overflow later.
 pub const max_duration_ms: u64 = std.math.maxInt(i64);
 
 fn capDurationMs(ms: u64) Error!u64 {
@@ -1284,22 +1006,8 @@ fn splitKeyValue(line: []const u8) ?struct { []const u8, []const u8 } {
 }
 
 fn validUserName(name: []const u8) bool {
-    // v0.7.0: `partner-root <pr>` derives a user root by joining
-    // `<pr>/<user-name>` (see the user-finalize loop in `parse`).
-    // Reject the two filesystem-reserved component names that
-    // would let a hostile config name escape the partner-root:
-    //
-    //   - `.`  → derived root is `<pr>/.` ≡ `<pr>` (collides with
-    //            other partners' roots, breaks isolation)
-    //   - `..` → derived root is `<pr>/..` (escapes partner-root)
-    //
-    // We also reject names that *start* with `.` so dotfile-style
-    // names that confuse listing tools and obscure ops dashboards
-    // don't sneak through. None of these were valid as a real
-    // username anyway (POSIX `.` and `..` are reserved in every
-    // directory). Doing the check at parse time makes the bug
-    // unreachable from validateSemantic regardless of whether
-    // partner-root is in use.
+    // The name becomes a path component under `partner-root`, so `.`
+    // and `..` (and any leading dot) would alias or escape it.
     if (name.len == 0) return false;
     if (name[0] == '.') return false;
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
@@ -1366,11 +1074,8 @@ test "parse: 'write' is create-only — no mkdir, update, delete, or rename" {
     try std.testing.expectEqual(@as(usize, 1), alice.rules.len);
     const rule = alice.rules[0];
     try std.testing.expectEqualStrings("/pending", rule.pattern);
-    // `write` grants ONLY new-file creation. It does not silently bundle
-    // directory creation (that's `mkdir`/`full`), overwrite of an
-    // existing file (that's `update` — the clobber rule), deletion, or
-    // rename. This is the append-only drop-box the retired `add` verb
-    // could not express cleanly, because `add` always bundled `mkdir`.
+    // `write` is create-only: a drop box without mkdir, overwrite,
+    // delete, or rename.
     try std.testing.expect(rule.permissions.contains(.read));
     try std.testing.expect(rule.permissions.contains(.list));
     try std.testing.expect(rule.permissions.contains(.write));
@@ -1380,10 +1085,7 @@ test "parse: 'write' is create-only — no mkdir, update, delete, or rename" {
     try std.testing.expect(!rule.permissions.contains(.rename));
 }
 
-test "parse: listen is validated at parse time (v0.9.4)" {
-    // Regression: `zift validate` used to report `ok:` for these and the
-    // daemon then died at bind with InvalidListenAddress. `listen` is
-    // startup-only, so that lands on a restart or a reboot.
+test "parse: listen is validated at parse time" {
     const bad = [_][]const u8{
         "NOT-AN-ADDRESS", // no colon at all
         "127.0.0.1:", // empty port
@@ -1404,7 +1106,7 @@ test "parse: listen is validated at parse time (v0.9.4)" {
     }
 }
 
-test "parse: legitimate listen forms still accepted (v0.9.4)" {
+test "parse: legitimate listen forms accepted" {
     const good = [_][]const u8{
         "0.0.0.0:2222",
         "127.0.0.1:2222",
@@ -1429,9 +1131,7 @@ test "parse: legitimate listen forms still accepted (v0.9.4)" {
 }
 
 test "parse: 'update' grants clobber without granting deletion" {
-    // The policy that was unwritable before the create/update/delete
-    // split: a partner who re-sends the same filename on a schedule may
-    // replace their own file, and may never delete anything.
+    // A partner who re-sends the same filename may replace it but never delete.
     const text =
         \\server
         \\  listen 127.0.0.1:2222
@@ -1481,12 +1181,7 @@ test "parse: 'delete' grants deletion without granting clobber" {
 }
 
 test "parse: retired verbs add/create/remove are rejected" {
-    // These were pre-CRUD aliases (`add`/`create` = write+mkdir,
-    // `remove` = delete+update). They were confusing — `add` silently
-    // bundled `mkdir`, and `remove` was a near-synonym of `delete` — so
-    // they were retired in favor of the CRUD verbs. There is no
-    // back-compat mode: a config using them is a hard error, never a
-    // silent reinterpretation.
+    // A retired verb is a hard error, never silently reinterpreted.
     for ([_][]const u8{ "add", "create", "remove" }) |verb| {
         var buf: [256]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf,
@@ -1505,7 +1200,7 @@ test "parse: retired verbs add/create/remove are rejected" {
     }
 }
 
-test "parse: 'full' includes update (v0.9.2)" {
+test "parse: 'full' includes update" {
     const text =
         \\server
         \\  listen 127.0.0.1:2222
@@ -1527,12 +1222,7 @@ test "parse: 'full' includes update (v0.9.2)" {
     }
 }
 
-test "parse: 'read' is now a superset of 'list' (v0.4.0)" {
-    // `read` should grant both `.read` (open-for-read, stat) AND
-    // `.list` (readdir). This closes the v0.3.x asymmetry where
-    // `allow X read` would let a partner `get` known filenames but
-    // refuse `ls`. If a future refactor forgets the `.list` insert,
-    // this test catches it.
+test "parse: 'read' is a superset of 'list'" {
     const text =
         \\server
         \\  listen 127.0.0.1:2222
@@ -1551,20 +1241,14 @@ test "parse: 'read' is now a superset of 'list' (v0.4.0)" {
     const rule = alice.rules[0];
     try std.testing.expect(rule.permissions.contains(.read));
     try std.testing.expect(rule.permissions.contains(.list));
-    // But `read` should NOT silently grant any mutation.
+    // ...and no mutation.
     try std.testing.expect(!rule.permissions.contains(.write));
     try std.testing.expect(!rule.permissions.contains(.mkdir));
     try std.testing.expect(!rule.permissions.contains(.rename));
     try std.testing.expect(!rule.permissions.contains(.delete));
 }
 
-test "parse: bare 'list' keeps its narrow v0.3.x meaning" {
-    // `list` alone grants only `.list` — no `.read`, no download.
-    // This preserves the rare but valid "see filenames but can't
-    // download" workflow (e.g. tokenized-name delivery) and
-    // ensures pre-v0.4.0 configs that wrote `allow X list`
-    // intending "metadata only" don't silently gain download
-    // capability after the upgrade.
+test "parse: bare 'list' grants no download" {
     const text =
         \\server
         \\  listen 127.0.0.1:2222
@@ -1602,7 +1286,6 @@ test "parse: 'full' grants every permission" {
     defer cfg.deinit();
     const alice = cfg.findUser("alice").?;
     const rule = alice.rules[0];
-    // All six granular permissions should be set.
     try std.testing.expect(rule.permissions.contains(.read));
     try std.testing.expect(rule.permissions.contains(.list));
     try std.testing.expect(rule.permissions.contains(.write));
@@ -1776,11 +1459,6 @@ const valid_ed25519_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIPHj7SuD0g1xj0ZqLELSQ7Ux8RSj
 const valid_ecdsa_blob =
     "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPHj7SuD0g1xj0ZqLELSQ7Ux8RSjGlYBhVMxbfBhPXMd";
 
-// Public-key file parsing is now exercised through `parsePublicKeyLine`
-// directly. The full file-loading round-trip (file open + first-line
-// extraction + parsing) is covered by the integration tests under
-// test/cases/ which stand up real key files.
-
 test "parsePublicKeyLine: valid ed25519 line" {
     const line = "ssh-ed25519 " ++ valid_ed25519_blob ++ " comment";
     const pk = try parsePublicKeyLine(std.testing.allocator, line);
@@ -1886,10 +1564,6 @@ test "duplicate-password check fires before PasswordPhcRemoved" {
 }
 
 test "partner-root '/' derives single-slash user root (POSIX-safe)" {
-    // The lone-`/` partner-root is allowed but the derived user
-    // root must NOT be `//ally` — POSIX leaves leading-`//` paths
-    // implementation-defined and we don't want a jail boundary
-    // depending on that. Joiner special-cases this.
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /\n\n" ++
         "user ally\n  auth " ++ valid_test_passhash ++ "\n";
@@ -2029,8 +1703,6 @@ test "server defaults applied when properties omitted" {
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u64, 300_000), cfg.server.idle_timeout_ms);
     try std.testing.expectEqual(@as(u32, 128), cfg.server.max_connections);
-    // Pre-auth cap defaults to 0 = no separate cap (preserves the
-    // behavior operators see when they don't tune this knob).
     try std.testing.expectEqual(@as(u32, 0), cfg.server.max_unauth_connections);
 }
 
@@ -2074,9 +1746,6 @@ test "max-unauth-connections parses as a non-negative integer" {
 }
 
 test "max-unauth-connections explicit 0 parses (operator-documented opt-out)" {
-    // The docs say `0` is the "no separate cap" value. Operators may
-    // set it explicitly to document the choice rather than omit the
-    // directive. This test pins the parser's acceptance of that form.
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n" ++
         "  max-connections 64\n  max-unauth-connections 0\n";
@@ -2084,10 +1753,6 @@ test "max-unauth-connections explicit 0 parses (operator-documented opt-out)" {
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u32, 0), cfg.server.max_unauth_connections);
 }
-
-// The pure-numeric semantic check is called from `validateSemantic`
-// before any I/O. We exercise it directly here so unit tests don't
-// need a `std.Io` to assert the right rejection behavior.
 
 test "validatePureNumeric: zero unauth cap accepted (no separate cap)" {
     var cfg = makeNumericTestConfig(.{ .max_total = 64, .max_unauth = 0 });
@@ -2114,11 +1779,6 @@ test "validatePureNumeric: unauth cap exceeding total rejected" {
 }
 
 test "validatePureNumeric: unauth cap at u32 max boundary rejected" {
-    // The diagnostic formatter in `validateSemantic` writes the two
-    // cap values into a `[16]u8` buffer via `bufPrint("{d}", ...)`.
-    // 4_294_967_295 (u32 max) is 10 digits and fits easily, but
-    // pinning the boundary value here protects us from a future
-    // refactor that picks too small a buffer.
     var cfg = makeNumericTestConfig(.{
         .max_total = 64,
         .max_unauth = std.math.maxInt(u32),

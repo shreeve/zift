@@ -1,3 +1,8 @@
+//! Command-line entry point: `serve`, `validate`, `hash-password`, `version`.
+//!
+//! Operational status goes to stderr; stdout carries only what scripts
+//! consume (the passhash and the version).
+
 const std = @import("std");
 const c = @import("libssh");
 const build_options = @import("build_options");
@@ -100,17 +105,10 @@ fn validate(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
     };
     defer cfg.deinit();
 
-    // Cross-cutting semantic checks against the live filesystem
-    // (PLAN.md §6.2). Diagnostics already written to stderr by the
-    // validator; we only need to translate the error into the exit
-    // code.
+    // validateSemantic has already printed the diagnostic.
     config.validateSemantic(io, gpa, &cfg) catch return 1;
 
     const stdout = std.Io.File.stdout();
-    // 4 KiB upper bound is plenty for `path` (PATH_MAX) plus the
-    // small fixed envelope. Big enough that paths inside a deeply
-    // nested test scratch dir don't overflow; still small enough
-    // to live happily on the stack of the validate helper.
     var buf: [4096]u8 = undefined;
     const summary = std.fmt.bufPrint(&buf, "ok: {s} ({d} user{s}, listen {s})\n", .{
         path,
@@ -132,23 +130,14 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     if (rc != c.SSH_OK) return error.LibsshInitFailed;
     defer _ = c.ssh_finalize();
 
-    // Install operational signal handlers before any worker threads exist.
+    // Before any worker thread exists.
     signals.install();
 
     const stderr = std.Io.File.stderr();
 
-    // Announce identity FIRST, before the config is even read.
-    //
-    // `zift version` reports the binary on disk, which is not
-    // necessarily the one this process is executing: installing an
-    // upgrade replaces the inode, and a daemon that is already running
-    // keeps serving the old code until it is restarted. This line is
-    // therefore the only durable record of what a given process
-    // actually was, and it timestamps every version transition in the
-    // journal for free.
-    //
-    // Emitted before readFileAlloc/parseWithDiag on purpose: a startup
-    // that dies on a bad config should still say which version died.
+    // Announce the running version before reading the config. After an
+    // upgrade `zift version` reports the file on disk, not this process;
+    // this line is the journal's record, even when startup then fails.
     try stderr.writeStreamingAll(io, "zift: starting zift ");
     try stderr.writeStreamingAll(io, build_options.version);
     try stderr.writeStreamingAll(io, " (");
@@ -160,9 +149,6 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 20));
     defer gpa.free(contents);
 
-    // Use parseWithDiag so a config syntax error emits a structured
-    // `zift: <file>:line N: <reason>` line instead of just an error
-    // name. PLAN §6.2 expects line-level diagnostics on startup.
     var diag: config.ParseDiag = .{};
     var cfg = config.parseWithDiag(gpa, contents, &diag) catch |err| {
         var msg_buf: [512]u8 = undefined;
@@ -176,19 +162,12 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
         return err;
     };
 
-    // Refuse to start serving until the live-filesystem invariants
-    // hold (PLAN.md §6.2). Diagnostics already written to stderr.
     config.validateSemantic(io, gpa, &cfg) catch |err| {
         cfg.deinit();
         return err;
     };
 
-    // v0.8.0 upgrade UX: warn (one stderr line per partner root) if a
-    // legacy `<root>/.zift-staging/` directory is still on disk from a
-    // v0.5.0–v0.7.x install. The v0.8.0 daemon never reads or writes
-    // it, but operators who upgraded without cleaning up should know.
-    // This is informational only — does not affect startup or partner
-    // traffic.
+    // Informational: the legacy staging dir is never used any more.
     for (cfg.users) |*user| {
         if (vfs.legacyStagingDirExists(io, user.root)) {
             try stderr.writeStreamingAll(io, "zift: warning: legacy staging dir at ");
@@ -198,16 +177,10 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    // Audit destination is determined by `server.log` (default stderr,
-    // or an absolute path that is opened O_APPEND and reopened on
-    // SIGUSR1). PLAN §7.4. Initialized AFTER semantic validation but
-    // BEFORE server.run starts spawning worker threads.
+    // After validation, before any worker thread.
     try audit.initGlobal(gpa, cfg.server.log);
     defer audit.deinitGlobal(gpa);
 
-    // Operational status goes to stderr (PLAN §7.4); stdout is
-    // reserved for things a script genuinely consumes (the passhash
-    // from `zift hash-password`, the `version` output).
     try stderr.writeStreamingAll(io, "zift: libssh initialized\n");
     try stderr.writeStreamingAll(io, "zift: config path: ");
     try stderr.writeStreamingAll(io, args[2]);
@@ -219,9 +192,8 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !void {
-    // Pipeline-friendly: read the password from stdin, write the
-    // passhash + newline to stdout, no prompt or framing of any kind.
-    // ("printf '%s\n' "$pw" | zift hash-password").
+    // Password on stdin, passhash on stdout, no prompt:
+    // `printf '%s\n' "$pw" | zift hash-password`.
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
 

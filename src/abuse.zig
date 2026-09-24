@@ -1,14 +1,8 @@
-//! Built-in source abuse controls for Internet-facing partner SFTP.
+//! Built-in source abuse control, so a normal deploy needs no fail2ban.
 //!
-//! Keeps the normal deploy free of fail2ban/CrowdSec by tracking failed
-//! authentication pressure per source IP inside the process:
-//!
-//!   - temporary suppression after a burst of failures
-//!   - cleared on successful authentication
-//!
-//! This is intentionally small: fixed table, coarse mutex, hardcoded
-//! defaults. Operators who need threat feeds or fleet-wide bans are
-//! outside Zift's niche.
+//! Tracks failed authentications per source IP in a fixed table behind
+//! one mutex. A burst of failures suppresses the source for a while; a
+//! successful login clears it. Defaults are hardcoded on purpose.
 
 const std = @import("std");
 
@@ -18,9 +12,8 @@ pub const failure_threshold: u32 = 10;
 pub const window_ms: i64 = 10 * 60 * 1000;
 /// How long a source stays rejected after tripping the threshold.
 pub const suppress_ms: i64 = 15 * 60 * 1000;
-/// Cap concurrent tracked sources. Sized generously (each Entry is
-/// ~88 bytes, so 4096 entries ≈ 360 KiB static) to raise the bar for
-/// the table-exhaustion attack described below.
+/// Tracked sources (~88 bytes each, ~360 KiB static). Large enough that
+/// filling the table to evict a suppressed source is expensive.
 const max_entries: usize = 4096;
 const max_ip_len: usize = 64;
 
@@ -30,10 +23,8 @@ const Entry = struct {
     failures: u32 = 0,
     window_start_ms: i64 = 0,
     suppressed_until_ms: i64 = 0,
-    /// Last time this slot was touched (insert or failure). Drives the
-    /// eviction victim choice so we evict the genuinely
-    /// least-recently-active source, not the one closest to tripping
-    /// the threshold.
+    /// Last insert or failure. Eviction picks the least-recently-active
+    /// source, not the one closest to tripping the threshold.
     last_seen_ms: i64 = 0,
 
     fn ipSlice(self: *const Entry) []const u8 {
@@ -111,20 +102,11 @@ fn findOrInsert(ip: []const u8, now_ms: i64) ?*Entry {
         }
     }
 
-    // Table full. Prefer to evict a NOT-currently-suppressed slot,
-    // picking the least-recently-active one (true LRU on `last_seen_ms`
-    // — the old code scored on `window_start_ms`, which is set at the
-    // START of a failure window, so it preferentially evicted the
-    // sources CLOSEST to tripping the threshold).
+    // Table full: evict the least-recently-active unsuppressed slot. If
+    // every slot is suppressed, evict the one expiring soonest; losing
+    // that suppression is a smaller harm than ignoring new sources.
     var lru_unsuppressed: ?*Entry = null;
     var lru_seen: i64 = std.math.maxInt(i64);
-    // Fallback if EVERY slot is suppressed: evict the one whose
-    // suppression expires soonest. This is graceful degradation —
-    // previously the whole table filling with suppressed sources meant
-    // `recordFailure` silently dropped every new source, permanently
-    // disabling suppression process-wide until entries aged out. Losing
-    // the soonest-to-expire suppression is a far smaller harm than
-    // going blind.
     var soonest_expiry: ?*Entry = null;
     var soonest_until: i64 = std.math.maxInt(i64);
     for (&entries) |*entry| {

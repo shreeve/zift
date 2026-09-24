@@ -19,24 +19,15 @@ pub fn verifyPassword(
     password: []const u8,
 ) bool {
     const hash = user.password_hash orelse {
-        // Known user, but key-only (no password credential). Returning
-        // `false` immediately here would take ~0 ms while a real verify
-        // or the unknown-user dummy takes a full argon2id (~58 ms),
-        // handing an attacker a timing oracle that distinguishes
-        // "exists, key-only" from "exists, has password" / "unknown".
-        // Run the same dummy work so all password-denial paths cost the
-        // same. (See also the `from`-denied path in ssh.zig.)
+        // Key-only user: pay the KDF so timing matches the other denials.
         runDummyVerify(io, allocator, password);
         return false;
     };
     return passhash.verify(io, allocator, password, hash);
 }
 
-/// Run one argon2id verification against the cached dummy credential
-/// and discard the result. Used to keep every password-denial path
-/// (unknown user, key-only user, source-not-allowed) at the same cost
-/// as a real verify so timing cannot enumerate usernames or auth
-/// shapes. PLAN §8.4.
+/// One Argon2id against a cached dummy credential, so every password
+/// denial costs the same as a real verify.
 pub fn runDummyVerify(io: std.Io, allocator: std.mem.Allocator, password: []const u8) void {
     ensureDummy(io, allocator);
     _ = passhash.verify(io, allocator, password, dummy_blob[0..passhash.blob_len]);

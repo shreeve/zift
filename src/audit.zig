@@ -1,35 +1,14 @@
-//! Structured audit log for Zift (PLAN §8.5).
+//! Structured audit log: one JSON object per line (see docs/operate.md).
 //!
-//! One JSON object per line, single-write to a destination shared by
-//! every worker thread. Default destination is stderr; an absolute file
-//! path may be configured (`server.log`) and is reopened on SIGUSR1.
+//! Field order is fixed so awk/jq recipes can anchor on it:
+//!   time, event, user?, operation, result, path?, detail?, ip, truncated?
+//! `ip` is always present ("" when unknown); `truncated` marks a line
+//! clipped to 4096 bytes.
 //!
-//! Schema and field order are FIXED by PLAN §7.4. The composition
-//! recipes in PLAN §11 (awk, jq, log shippers) anchor on this order:
-//!
-//!   {"event":"zift.audit",
-//!    "user":      "<virtual-user>",        -- when known (post-auth)
-//!    "operation": "<op-name>",
-//!    "result":    "ok"|"denied"|"failed",
-//!    "path":      "<virtual-path>",        -- when applicable
-//!    "detail":    "<short-message>",       -- when non-empty
-//!    "ip":        "<peer-ip>",             -- always present; "" when unknown
-//!    "truncated": true                     -- iff line was clipped to 4096 B
-//!   }
-//!
-//! `ip` is mandatory in every line so source-policy and log tools
-//! always match. The only path that legitimately emits an empty `ip`
-//! is the catch-all formatter fallback when the line is too long even
-//! after truncation.
-//!
-//! Threading: writes are serialized by a process-wide mutex so JSON
-//! objects never interleave on stderr or in the file. For file
-//! destinations we additionally open with `O_APPEND` so each `write(2)`
-//! is positioned atomically by the kernel; this matters under
-//! logrotate's "rename old, signal, recreate" sequence and under any
-//! other writer touching the same path. The final component is opened
-//! `O_NOFOLLOW`; a symlink or any non-regular inode is refused. Mode
-//! `0640` is pinned with `fchmod` only when this call created the file.
+//! Each line is a single write(2) under a process-wide mutex, so lines
+//! never interleave. The destination is stderr or an absolute file opened
+//! O_APPEND|O_NOFOLLOW and reopened on SIGUSR1. A symlink or non-regular
+//! file is refused; mode 0640 is set only on a file this process created.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,8 +17,7 @@ const signals = @import("signals.zig");
 
 pub const Result = enum { ok, denied, failed };
 
-/// PLAN §8.5: 4096-byte cap on each audit line. Lines that would exceed
-/// this are truncated with a `"truncated":true` marker.
+/// Longer lines are shortened and marked `"truncated":true`.
 const max_line_bytes: usize = 4096;
 
 /// Where audit lines go. Matches `config.LogTarget` shape but owns the
@@ -52,23 +30,16 @@ pub const Target = union(enum) {
 
 pub const Sink = struct {
     target: Target = .stderr,
-    /// File fd when target is `.file`; -1 otherwise. Loaded with
-    /// `acquire` ordering on every write so SIGUSR1-driven reopens
-    /// are visible to other threads without a per-write mutex on the
-    /// fd itself (the mutex below already serializes writes).
+    /// File fd when target is `.file`; -1 otherwise. Swapped atomically
+    /// on reopen.
     fd: std.atomic.Value(c_int) = .init(-1),
-    /// Serializes writes so concurrent worker threads cannot interleave
-    /// JSON objects in a single audit line. Also held during reopen.
+    /// Serializes writes and reopen.
     mutex: std.Io.Mutex = .init,
-    /// Stable storage for the file-target path so the Sink owns its
-    /// strings — the config snapshot may be torn down underneath us.
+    /// Owned copy of the file path; the config may be freed on reload.
     owned_path: ?[]const u8 = null,
-    /// Monotonic ms when a failed reopen may be tried again. 0 means
-    /// no retry is pending. A failed SIGUSR1 must not put
-    /// `log_reopen_requested` back: that retries on every audit line
-    /// and writes a stderr line per event. The deadline is one
-    /// `warn_min_interval_ms` out, and `maybeReopen` honors it even
-    /// when no new signal has arrived.
+    /// Monotonic ms when a failed reopen is retried; 0 = none pending.
+    /// A deadline, not a re-raised signal flag, so a broken path does
+    /// not retry (and warn) on every audit line.
     reopen_retry_at_ms: std.atomic.Value(i64) = .init(0),
     /// Monotonic ms of the last reopen-failure stderr line. Guarded
     /// by `mutex`. 0 means a failure has not been reported yet.
@@ -100,16 +71,9 @@ pub const Sink = struct {
         self.* = .{};
     }
 
-    /// Honor SIGUSR1 (PLAN §7.2) by atomically swapping in a fresh fd
-    /// pointing at the configured path. Called from `log` so the next
-    /// write after the signal goes to the new fd — no separate
-    /// log-rotator thread. Lazy semantics: a low-traffic server with
-    /// SIGUSR1 pending holds the old fd open until the next audit
-    /// line; logrotate operators should account for that.
-    ///
-    /// On open failure the old fd stays in use (the line is not
-    /// dropped and is not written twice). The retry deadline, not the
-    /// signal flag, schedules the next attempt.
+    /// Honor SIGUSR1 lazily: the next audit line after the signal swaps
+    /// in a fresh fd, so an idle server keeps the old fd until then. On
+    /// open failure the old fd stays in use and a retry is scheduled.
     fn maybeReopen(self: *Sink, io: std.Io) void {
         const signaled = signals.log_reopen_requested.load(.acquire);
         const retry_at = self.reopen_retry_at_ms.load(.acquire);
@@ -117,7 +81,6 @@ pub const Sink = struct {
             if (retry_at == 0 or nowMonotonicMs() < retry_at) return;
         }
 
-        // Only file targets have a fd to reopen; stderr is always open.
         const path = switch (self.target) {
             .stderr => {
                 _ = signals.log_reopen_requested.swap(false, .acq_rel);
@@ -128,9 +91,8 @@ pub const Sink = struct {
         };
 
         self.mutex.lockUncancelable(io);
-        // Consume the signal inside the mutex so two writers cannot
-        // both open. A signal that arrives during the open stays set
-        // and is honored on the next line.
+        // Consume the signal under the mutex so two writers cannot both
+        // open; a signal arriving during the open is honored next line.
         const signaled_now = signals.log_reopen_requested.swap(false, .acq_rel);
         const now = nowMonotonicMs();
         const retry_at_now = self.reopen_retry_at_ms.load(.acquire);
@@ -158,8 +120,7 @@ pub const Sink = struct {
         const old_fd = self.fd.swap(new_fd, .acq_rel);
         self.mutex.unlock(io);
 
-        // Close only after the swap. `log` writes the audit line after
-        // we return, so the line hits the new fd and not both.
+        // Close after the swap; the caller's line goes to the new fd.
         if (old_fd >= 0) _ = std.c.close(old_fd);
         writeStderrRaw("zift: audit log reopened\n");
     }
@@ -180,10 +141,8 @@ pub const Sink = struct {
         self.write(io, line);
     }
 
-    /// Single-`write(2)` emission for both targets. PLAN §7.4 requires
-    /// each audit line to land in one syscall so concurrent threads
-    /// (and concurrent processes, on file destinations with `O_APPEND`)
-    /// cannot interleave inside a single JSON object.
+    /// One write(2) per line, so concurrent threads (and other O_APPEND
+    /// writers) cannot interleave inside a JSON object.
     fn write(self: *Sink, io: std.Io, line: []const u8) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -204,16 +163,9 @@ pub const Sink = struct {
     }
 };
 
-/// Non-JSON, single-syscall stderr complaint when audit writes fail.
-/// We deliberately do not try to recurse through the audit pipeline
-/// for self-reporting — that would risk recursive lock/format errors
-/// during a real outage. Operators see the bare line on stderr.
-///
-/// Rate-limited to at most one stderr line per `warn_min_interval_ms`
-/// (default 5 s) so a runaway destination (full disk, broken pipe to
-/// supervisor) can't itself cause a stderr storm. The first failure
-/// in any window is always logged; subsequent failures within the
-/// window are silently dropped.
+/// Audit-write failures are reported as bare stderr lines, never through
+/// the audit pipeline itself, at most once per `warn_min_interval_ms` so
+/// a full disk cannot turn into a stderr storm.
 const warn_min_interval_ms: i64 = 5_000;
 var last_warn_ms: std.atomic.Value(i64) = .init(0);
 
@@ -228,23 +180,18 @@ fn warnWriteFailure(name: []const u8) void {
     writeStderrRaw("\n");
 }
 
-/// Monotonic-clock milliseconds. Shared by accept/reload, auth backoff,
-/// and SFTP idle timing — CLOCK_MONOTONIC is unaffected by wall-clock
-/// changes.
+/// CLOCK_MONOTONIC milliseconds (immune to wall-clock changes).
 pub fn nowMonotonicMs() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
 }
 
-/// Single-syscall raw stderr write. Used for audit-pipeline diagnostic
-/// output so we never recurse through the audit pipeline itself.
 fn writeStderrRaw(text: []const u8) void {
     _ = std.c.write(2, text.ptr, text.len);
 }
 
 fn openLogFile(path: []const u8) !c_int {
-    // Local null-terminated copy for libc open().
     var path_z: [4096]u8 = undefined;
     if (path.len >= path_z.len) return error.PathTooLong;
     @memcpy(path_z[0..path.len], path);
@@ -252,11 +199,9 @@ fn openLogFile(path: []const u8) !c_int {
     const path_c: [*:0]const u8 = @ptrCast(&path_z);
 
     const mode: std.posix.mode_t = 0o640;
-    // EXCL distinguishes "this call created the inode" from "it was
-    // already there". O_CREAT|O_EXCL on a final-component symlink
-    // returns EEXIST (Linux) rather than following it, so the NOFOLLOW
-    // open below is what actually rejects the symlink. A pre-existing
-    // regular file is appended to and not fchmod'd.
+    // EXCL tells "created here" (pin 0640) from "already there" (leave
+    // its mode). O_CREAT|O_EXCL returns EEXIST on a symlink, so the
+    // NOFOLLOW open below is what rejects one.
     const created = std.c.open(path_c, .{
         .ACCMODE = .WRONLY,
         .APPEND = true,
@@ -287,9 +232,7 @@ fn openLogFile(path: []const u8) !c_int {
     return fd;
 }
 
-/// Mode bits of an already-open fd, or null when stat fails.
-/// `std.c.fstat` is empty on Linux (no stable libc stat layout); statx
-/// with `AT_EMPTY_PATH` is the fd stat that build already uses elsewhere.
+/// Mode bits of an open fd, or null when stat fails.
 fn fdFileMode(fd: c_int) ?u32 {
     if (builtin.os.tag == .linux) {
         var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
@@ -329,14 +272,8 @@ pub fn deinitGlobal(allocator: std.mem.Allocator) void {
     global_sink.deinit(allocator);
 }
 
-/// Process-wide audit log call. Defaults to stderr until `initGlobal`
-/// runs, so unit tests and any pre-init failure path still produce
-/// audit lines.
-///
-/// Argument order matches PLAN §7.4's stable JSON field order so the
-/// call site reads top-to-bottom in the same order the line emits.
-/// `ip` is mandatory (pass "" when unknown — only legitimate at the
-/// formatter's catch-all fallback path).
+/// Process-wide audit log call; stderr until `initGlobal` runs.
+/// Arguments follow the JSON field order. Pass `ip` "" when unknown.
 pub fn log(
     io: std.Io,
     user: ?[]const u8,
@@ -360,7 +297,7 @@ fn formatLine(
     detail: []const u8,
     ip: []const u8,
 ) []const u8 {
-    // First attempt: full line, no truncation marker.
+    // Full line first; then drop detail, then path, then user.
     {
         var w = std.Io.Writer.fixed(buf);
         if (formatLineImpl(&w, user, operation, path, result, detail, ip, false)) |_| {
@@ -368,9 +305,6 @@ fn formatLine(
         } else |_| {}
     }
 
-    // Second attempt: detail is the most likely offender — replace it
-    // with a sentinel and set `truncated`. Preserves all required
-    // PLAN §7.4 fields (event/user/operation/result/ip).
     {
         var w = std.Io.Writer.fixed(buf);
         if (formatLineImpl(&w, user, operation, path, result, "[truncated]", ip, true)) |_| {
@@ -378,8 +312,6 @@ fn formatLine(
         } else |_| {}
     }
 
-    // Third attempt: also drop `path` (rare — only triggers when the
-    // virtual path is huge AND detail was already gone).
     {
         var w = std.Io.Writer.fixed(buf);
         if (formatLineImpl(&w, user, operation, null, result, "", ip, true)) |_| {
@@ -387,9 +319,6 @@ fn formatLine(
         } else |_| {}
     }
 
-    // Fourth attempt: minimal line preserving only the required fields
-    // PLAN §7.4 mandates. `ip` is preserved so source-aware tools and
-    // regexes still match an over-budget line.
     {
         var w = std.Io.Writer.fixed(buf);
         if (formatLineImpl(&w, null, operation, null, result, "", ip, true)) |_| {
@@ -397,9 +326,7 @@ fn formatLine(
         } else |_| {}
     }
 
-    // Last-resort hard-coded sentinel. Used only if `operation` itself
-    // is huge and even the minimal line won't fit. Emits valid JSON so
-    // log-line consumers don't choke.
+    // Only a huge `operation` gets here. Still valid JSON.
     const fallback = "{\"event\":\"zift.audit\",\"operation\":\"?\",\"result\":\"failed\",\"ip\":\"\",\"truncated\":true}\n";
     const len = @min(fallback.len, buf.len);
     @memcpy(buf[0..len], fallback[0..len]);
@@ -416,12 +343,7 @@ fn formatLineImpl(
     ip: []const u8,
     truncated: bool,
 ) !void {
-    // v0.7.0 stable order: time, event, user, operation, result,
-    // path, detail, ip, [truncated]. `time` is required and emitted
-    // first so log readers can sort/filter by event time without
-    // parsing the rest of the line — and so off-host log shippers
-    // (rsyslog, vector, etc.) get a real timestamp instead of
-    // falling back on file mtime.
+    // `time` leads so shippers and sort(1) get it without parsing.
     var time_buf: [time_buf_len]u8 = undefined;
     const time_str = formatNowRfc3339Utc(&time_buf);
     try w.writeAll("{\"time\":\"");
@@ -450,18 +372,12 @@ fn formatLineImpl(
     try w.writeAll("}\n");
 }
 
-/// Emit `s` as a JSON string, escaping control/quote/backslash bytes
-/// exactly like a conformant encoder AND replacing any invalid UTF-8
-/// sequence with U+FFFD.
+/// Emit `s` as a JSON string, replacing invalid UTF-8 with U+FFFD.
 ///
-/// SFTP paths and usernames are byte strings; nothing upstream forces
-/// them to be valid UTF-8. `std.json.Stringify.encodeJsonString` with
-/// default options passes high bytes through verbatim, so an invalid
-/// byte (e.g. a lone 0xFF in a filename) produced an audit LINE that is
-/// not valid JSON — which `jq` and strict log shippers drop, letting a
-/// partner make their own operations invisible to the operator's
-/// tooling. Turning on `escape_unicode` is NOT the fix: that path
-/// `@panic`s on invalid UTF-8. So we sanitize as we encode.
+/// Usernames and some audited strings are raw bytes. std's encoder
+/// passes invalid UTF-8 through (making the line invalid JSON, which jq
+/// and strict shippers drop, hiding the event) or panics with
+/// `escape_unicode`, so we sanitize while encoding.
 fn writeJsonStringLossy(w: *std.Io.Writer, s: []const u8) !void {
     const replacement = "\u{FFFD}"; // 3 bytes: EF BF BD
     try w.writeByte('"');
@@ -519,48 +435,20 @@ test "audit line stays valid JSON for invalid-UTF-8 path" {
     try std.testing.expect(std.mem.indexOf(u8, line, "\u{FFFD}") != null);
 }
 
-/// Length of an RFC 3339 UTC timestamp with millisecond precision:
-/// `YYYY-MM-DDTHH:MM:SS.mmmZ` is exactly 24 bytes.
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 const time_buf_len: usize = 24;
 
-/// Format the current wall-clock time as RFC 3339 / ISO 8601 UTC
-/// with millisecond precision. Writes exactly `time_buf_len` bytes
-/// to `buf` and returns the same slice. The result is lexically
-/// sortable and used as the leading field of every audit line.
-///
-/// Reads `clock_gettime(CLOCK_REALTIME)` and falls back to the
-/// epoch sentinel `1970-01-01T00:00:00.000Z` if the syscall fails
-/// (extremely rare in practice — Linux/macOS guarantee `REALTIME`
-/// — but skipping the timestamp on failure would give us undefined
-/// stack bytes formatted as digits, which is worse).
+/// Current wall-clock time as RFC 3339 UTC with milliseconds. A failed
+/// clock read yields the epoch rather than garbage digits.
 fn formatNowRfc3339Utc(buf: *[time_buf_len]u8) []const u8 {
     var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
     _ = std.c.clock_gettime(.REALTIME, &ts);
     return formatRfc3339Utc(buf, ts.sec, ts.nsec);
 }
 
-/// Same as `formatNowRfc3339Utc` but takes the timestamp as input
-/// — pure (no `clock_gettime`), test-friendly. Production callers
-/// use the `Now` wrapper above.
-///
-/// Date math uses Howard Hinnant's `civil_from_days` algorithm
-/// (same one `listing.zig` uses for `breakTime` formatting). O(1),
-/// works for any `i64` second count we'll plausibly encounter.
-/// Year is clamped to `[0, 9999]` so the output stays at exactly
-/// 24 bytes even for absurd input — RFC 3339 doesn't define
-/// negative years and we'd rather emit `0000` or `9999` than
-/// silently produce a wrong-length line that breaks the field-
-/// position invariants the rest of the audit pipeline relies on.
-///
-/// The hand-rolled digit emission below is deliberate: by writing
-/// the exact 24-byte layout one field at a time, the buffer-size
-/// invariant becomes obvious by inspection and we don't depend on
-/// any quirks of `std.fmt`'s width handling in this hot audit path.
+/// Pure form of `formatNowRfc3339Utc`. The year is clamped to
+/// [0, 9999] so the field is always exactly 24 bytes.
 fn formatRfc3339Utc(buf: *[time_buf_len]u8, sec: i64, nsec_in: i64) []const u8 {
-    // Normalize nsec into [0, 1_000_000_000) without panicking on
-    // negative nsec. `clock_gettime` shouldn't ever return that
-    // shape, but we accept it as a defensive measure for the
-    // test-friendly entry point.
     var nsec: i64 = nsec_in;
     if (nsec < 0) nsec = 0;
     if (nsec >= std.time.ns_per_s) nsec = std.time.ns_per_s - 1;
@@ -572,8 +460,6 @@ fn formatRfc3339Utc(buf: *[time_buf_len]u8, sec: i64, nsec_in: i64) []const u8 {
     const minute: u32 = @divTrunc(@mod(sec_of_day, 3600), 60);
     const second: u32 = @mod(sec_of_day, 60);
 
-    // Clamp the year into [0, 9999] so the output stays exactly
-    // 4 digits. For sane Unix timestamps this is a no-op.
     const year_clamped: i32 = if (civil.year < 0) 0 else if (civil.year > 9999) 9999 else civil.year;
     const year_u: u32 = @intCast(year_clamped);
 
@@ -594,10 +480,7 @@ fn formatRfc3339Utc(buf: *[time_buf_len]u8, sec: i64, nsec_in: i64) []const u8 {
     return buf;
 }
 
-/// Write a fixed-width zero-padded decimal into `dst`. Caller
-/// guarantees `value` fits in `dst.len` digits. Used by
-/// `formatNowRfc3339Utc` for the year/month/day/hour/min/sec/ms
-/// fields, all of which have known small ranges.
+/// Zero-padded decimal filling `dst`; `value` must fit.
 fn writeFixedDigits(dst: []u8, value_in: u32) void {
     var value = value_in;
     var i: usize = dst.len;
@@ -610,10 +493,7 @@ fn writeFixedDigits(dst: []u8, value_in: u32) void {
 
 const Civil = struct { year: i32, month: u8, day: u8 };
 
-/// Howard Hinnant's `civil_from_days` algorithm, adapted for Unix
-/// epoch input. Floor-division semantics handle pre-1970 input
-/// correctly. Same algorithm as `listing.breakTime`; duplicated here
-/// to avoid an audit-on-formatting cross-module dependency.
+/// Howard Hinnant's `civil_from_days` for Unix seconds.
 fn civilFromUnix(unix_secs: i64) Civil {
     const z: i64 = @divFloor(unix_secs, 86400) + 719468;
     const era: i64 = if (z >= 0) @divTrunc(z, 146097) else @divTrunc(z - 146096, 146097);
@@ -652,7 +532,7 @@ test "audit line always includes ip" {
     try std.testing.expect(std.mem.indexOf(u8, line_empty_ip, "\"ip\":\"\"") != null);
 }
 
-test "audit line follows PLAN field order" {
+test "audit line follows the fixed field order" {
     var buf: [256]u8 = undefined;
     const line = formatLine(&buf, "ally", "write", "/inbox/x", .ok, "size=10", "10.0.0.1");
     // time must be the leading field; event next; ip after detail.
@@ -671,9 +551,8 @@ test "audit line follows PLAN field order" {
     try std.testing.expect(result_idx < path_idx);
     try std.testing.expect(path_idx < detail_idx);
     try std.testing.expect(detail_idx < ip_idx);
-    // The leading time field is exactly time_buf_len bytes between the quotes.
+    // `{"time":"` is 9 bytes; the timestamp then ends with `Z"`.
     try std.testing.expect(std.mem.startsWith(u8, line, "{\"time\":\""));
-    // After `{"time":"` (9 bytes), the timestamp ends with `Z"`.
     try std.testing.expectEqual(@as(u8, 'Z'), line[9 + time_buf_len - 1]);
     try std.testing.expectEqual(@as(u8, '"'), line[9 + time_buf_len]);
 }
@@ -786,8 +665,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
     {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const path = Probe.join(&buf, dir, "created.log");
-        // umask 077 would leave the open() mode at 0600. fchmod is what
-        // pins 0640, and only for the inode this call creates.
+        // Under umask 077 only the fchmod yields 0640.
         const old_mask = std.c.umask(0o077);
         defer _ = std.c.umask(old_mask);
         const fd = try openLogFile(path);
@@ -801,7 +679,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
         try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(path, 0o604));
         const fd = try openLogFile(path);
         defer _ = std.c.close(fd);
-        // Pre-existing regular file: append, do not fchmod back to 0640.
+        // Pre-existing file: append, keep its mode.
         try std.testing.expectEqual(@as(u32, 0o604), try Probe.fdPerm(fd));
         try std.testing.expectEqual(@as(isize, 3), std.c.write(fd, "end", 3));
     }
@@ -888,8 +766,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
         };
         const thr = try std.Thread.spawn(.{}, Reader.run, .{path});
         defer thr.join();
-        // Open succeeds far enough to unblock the reader, then fstat
-        // rejects the fifo. A hang here means the writer never opened.
+        // The open unblocks the reader; fstat then rejects the fifo.
         try std.testing.expectError(error.OpenFailed, openLogFile(path));
         try std.testing.expectEqual(@as(u32, 0o612), try Probe.perm(path));
     }

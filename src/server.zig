@@ -1,3 +1,10 @@
+//! Accept loop, config reload, graceful drain, and per-session threads.
+//!
+//! Each accepted connection gets a detached worker thread holding a
+//! reference to the config that was current at accept time; a reload
+//! swaps in a new config for later sessions only. `listen`, `host-key`,
+//! and `log` are bound once at startup.
+
 const std = @import("std");
 const c = @import("libssh");
 const abuse = @import("abuse.zig");
@@ -13,23 +20,13 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Live count of in-flight session worker threads. Bumped by accept,
-/// decremented when each detached worker exits. Enforces
-/// `max-connections` and graceful drain.
+/// In-flight session threads; enforces `max-connections` and drain.
 pub var active_sessions: std.atomic.Value(u32) = .init(0);
 
-/// Live count of pre-auth workers. Bumped at accept; decremented at
-/// successful auth or session exit. Enforces `max-unauth-connections`
-/// independently so handshake storms cannot starve authenticated
-/// partners (PLAN §8.4).
+/// Sessions not yet authenticated; enforces `max-unauth-connections`.
 pub var unauth_sessions: std.atomic.Value(u32) = .init(0);
 
-/// Format the peer IP of `session`'s underlying TCP socket into `buf`.
-/// Returns a slice into `buf` on success, `null` on any error (no
-/// socket, getpeername fails, unknown family). The returned slice
-/// contains only the address — no port, no brackets — so the audit
-/// schema's `ip` field is consistent across IPv4/IPv6 and lookup-able
-/// by jq/awk and Zift's own source policy.
+/// The peer address (no port, no brackets) formatted into `buf`, or null.
 fn capturePeerIp(session: c.ssh_session, buf: []u8) ?[]const u8 {
     const fd = c.ssh_get_fd(session);
     if (fd < 0) return null;
@@ -55,9 +52,7 @@ fn capturePeerIp(session: c.ssh_session, buf: []u8) ?[]const u8 {
     }
 }
 
-/// Minimal IPv6 address formatter. Produces colon-hex form without
-/// `::` zero-run compression — operationally fine for audit logs and
-/// keeps the helper allocation-free.
+/// Colon-hex IPv6 without `::` compression (netmatch accepts this form).
 fn formatIPv6(addr: *const [16]u8, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
         std.mem.readInt(u16, addr[0..2], .big),
@@ -84,9 +79,7 @@ pub fn run(
     };
     defer active.releaseActive();
 
-    // Snapshot the restart-only settings that are bound exactly once,
-    // below, so `applyReload` can tell the operator when a reload tries
-    // to change one and is silently ineffective.
+    // Restart-only settings, so a reload that changes one can warn.
     active.bound_listen = try allocator.dupe(u8, active.current.config.server.listen);
     active.bound_host_key = try allocator.dupe(u8, active.current.config.server.host_key);
     active.bound_log = try allocator.dupe(u8, logTargetLabel(active.current.config.server.log));
@@ -96,23 +89,16 @@ pub fn run(
         allocator.free(active.bound_log);
     }
 
-    // Size the process file-descriptor limit against the worst case:
-    // every session holding its socket plus the per-session handle cap.
-    // Without this, `max-connections × max_handles_per_session` (128 ×
-    // 256 by default) dwarfs a typical soft `RLIMIT_NOFILE` (1024 on
-    // Linux, 256 on macOS), so a few busy partners exhaust the fd table
-    // and every other session's OPEN/OPENDIR fails. Best-effort: raise
-    // the soft limit toward the hard limit; warn (don't fail) if the
-    // ceiling is still short.
+    // 128 sessions × 256 handles dwarfs a typical soft RLIMIT_NOFILE, so
+    // a few busy partners could starve everyone's OPEN. Raise it, or warn.
     ensureFdBudget(io, active.current.config.server.max_connections);
 
     const bind = c.ssh_bind_new() orelse return error.LibsshFailure;
     defer c.ssh_bind_free(bind);
 
     var config_mtime = try currentConfigMtime(io, config_path);
-    // Baseline for authorized-key files referenced by the running
-    // config. Kept beside `config_mtime`: a later reload attempt,
-    // including a rejected one, advances both so the poll does not spin.
+    // Advanced together with `config_mtime` on every reload attempt,
+    // even a rejected one, so the poll does not spin.
     var key_stamps = try KeyStamps.collect(allocator, io, active.current.config);
     defer key_stamps.deinit(allocator);
 
@@ -131,9 +117,8 @@ pub fn run(
         return error.LibsshFailure;
     }
 
-    // Drive the accept loop with poll() against libssh's listening fd so
-    // operational signals (SIGTERM / SIGHUP) interrupt within ~poll-timeout
-    // ms instead of being trapped behind a blocking ssh_bind_accept.
+    // Poll libssh's listening fd so signals are seen within a second
+    // instead of waiting behind a blocking ssh_bind_accept.
     c.ssh_bind_set_blocking(bind, 0);
     const bind_fd = c.ssh_bind_get_fd(bind);
     var pfd = [1]std.posix.pollfd{.{
@@ -142,35 +127,26 @@ pub fn run(
         .revents = 0,
     }};
 
-    // PLAN §7.4: human-readable status goes to stderr; stdout is
-    // reserved for things scripts genuinely consume.
     const status = std.Io.File.stderr();
     try status.writeStreamingAll(io, "zift: listening on ");
     try status.writeStreamingAll(io, active.current.config.server.listen);
     try status.writeStreamingAll(io, "\n");
 
-    // Mtime-based reload polling: PLAN §7.3 says the polling interval
-    // is `reload-interval` (default 2 s); `0` disables runtime mtime
-    // polling entirely (SIGHUP still works). We track a next-deadline
-    // in monotonic-ms and only call `reloadIfChanged` when it's hit,
-    // independent of how busy the accept fd is.
+    // mtime polling every `reload-interval`; 0 leaves only SIGHUP.
     var next_reload_ms: i64 = audit.nowMonotonicMs() +
         @as(i64, @intCast(active.current.config.server.reload_interval_ms));
 
     accept_loop: while (true) {
         if (signals.shutdown_requested.load(.acquire)) break :accept_loop;
 
-        // SIGHUP forces a reload regardless of mtime (PLAN §7.2).
+        // SIGHUP reloads regardless of mtime.
         if (signals.reload_requested.swap(false, .acq_rel)) {
             active.forceReload(config_path, &config_mtime, &key_stamps);
             next_reload_ms = audit.nowMonotonicMs() +
                 @as(i64, @intCast(active.current.config.server.reload_interval_ms));
         }
 
-        // mtime watcher fires only on a per-config-interval cadence.
-        // `reload_interval_ms == 0` disables it (PLAN §7.3); only
-        // SIGHUP can re-read the file in that mode. The same call also
-        // stats authorized-key files of the running config.
+        // Also stats the running config's authorized-key files.
         const reload_interval = active.current.config.server.reload_interval_ms;
         if (reload_interval > 0 and audit.nowMonotonicMs() >= next_reload_ms) {
             active.reloadIfChanged(config_path, &config_mtime, &key_stamps);
@@ -192,8 +168,6 @@ pub fn run(
         var ip_buf: [64]u8 = undefined;
         const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
 
-        // Built-in abuse floor: temporarily refuse sources that recently
-        // burned through auth failures. No external ban daemon required.
         if (abuse.isSuppressed(io, peer_ip, audit.nowMonotonicMs())) {
             audit.log(io, null, "accept.rejected", null, .denied, "source suppressed", peer_ip);
             c.ssh_disconnect(session);
@@ -209,11 +183,7 @@ pub fn run(
             continue :accept_loop;
         }
 
-        // Independent pre-auth cap (PLAN §8.4). When configured (>0),
-        // bounds handshake-storm pressure so an attacker can't consume
-        // the entire `max-connections` pool with stuck pre-auth sockets.
-        // `0` falls back to the global cap above, preserving the
-        // behavior operators see when they don't tune this knob.
+        // 0 = no separate pre-auth cap.
         const max_unauth_cfg = active.current.config.server.max_unauth_connections;
         if (max_unauth_cfg != 0 and
             unauth_sessions.load(.acquire) >= max_unauth_cfg)
@@ -237,18 +207,16 @@ pub fn run(
             .session = session,
         };
 
-        // Reserve both slots before spawn so subsequent accepts see
-        // them. Pre-auth slot is released at successful auth (or at
-        // session exit if auth never completes); total slot is
-        // released at session exit unconditionally.
+        // Reserve both slots before spawn so the next accept sees them.
+        // The worker releases the pre-auth slot at auth (or exit) and
+        // the total slot at exit.
         _ = active_sessions.fetchAdd(1, .acq_rel);
         _ = unauth_sessions.fetchAdd(1, .acq_rel);
 
         const thread = std.Thread.spawn(.{}, sessionThread, .{args}) catch |err| {
             _ = active_sessions.fetchSub(1, .acq_rel);
             _ = unauth_sessions.fetchSub(1, .acq_rel);
-            // Capture libssh's session error while the session is
-            // still alive. ssh_get_error dereferences this pointer.
+            // Before ssh_free: ssh_get_error reads the session.
             try logLibsshError(io, @errorName(err), session, .note);
             ref.release(allocator);
             c.ssh_free(session);
@@ -258,23 +226,14 @@ pub fn run(
         thread.detach();
     }
 
-    // Graceful drain. The listening socket is closed implicitly on
-    // return via `defer ssh_bind_free`; workers keep their own session
-    // sockets. We wait for the active-sessions counter to drain on its
-    // own up to `shutdown_grace_ms`; if it doesn't, we actively
-    // `shutdown(2)` every still-registered session FD so libssh reads
-    // unblock, workers tear down their state, and we don't have to
-    // rely on kernel reap at process exit (PLAN §7.1).
+    // Graceful drain: wait up to `shutdown_grace_ms`, then shutdown(2)
+    // every remaining session socket so workers unblock and clean up.
     const stderr = std.Io.File.stderr();
     try stderr.writeStreamingAll(io, "zift: shutdown signal received, draining sessions\n");
 
-    // PLAN §7.1: close the listening socket FIRST so no fresh TCP
-    // connections land during the grace window. The `defer
-    // ssh_bind_free` at function entry still tears down libssh's bind
-    // state on return; this just unbinds the port immediately.
-    // `ssh_bind_free` closes `bindfd` again when it is >= 0. Workers
-    // still open files during grace, so that second close can hit a
-    // reused descriptor. Drop libssh's copy after the real close.
+    // Unbind now so no connection lands during the grace window. Then
+    // clear libssh's copy of the fd: ssh_bind_free would close it again,
+    // possibly hitting a descriptor a worker has since reused.
     _ = std.c.close(bind_fd);
     c.ssh_bind_set_fd(bind, @as(@TypeOf(bind_fd), -1));
 
@@ -287,9 +246,6 @@ pub fn run(
     if (active_sessions.load(.acquire) == 0) {
         try stderr.writeStreamingAll(io, "zift: all sessions drained, exiting\n");
     } else {
-        // Force-close path. Snapshot the count, shut down every
-        // registered FD, then give workers a brief window to finish
-        // their cleanup before we return up the stack.
         const closed = signals.forceCloseAll(io);
         var buf: [128]u8 = undefined;
         const line = std.fmt.bufPrint(
@@ -299,9 +255,7 @@ pub fn run(
         ) catch unreachable;
         try stderr.writeStreamingAll(io, line);
 
-        // 500 ms is generous: every libssh read on a shut-down socket
-        // returns immediately; the worker's deferred decrement is one
-        // mutex acquisition + atomic op away.
+        // Reads on a shut-down socket return at once; 500 ms is ample.
         const final_deadline = audit.nowMonotonicMs() + 500;
         while (active_sessions.load(.acquire) != 0 and audit.nowMonotonicMs() < final_deadline) {
             std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
@@ -320,21 +274,14 @@ pub fn run(
         }
     }
 
-    // Only free the session-fd registry when every worker has actually
-    // exited. A straggler on its way out still calls
-    // `unregisterSessionFd`, which iterates the registry — freeing it
-    // here (as the old code did unconditionally, including down the
-    // "still alive after force-close" branch) is a use-after-free. If
-    // stragglers remain, leak the registry: the process is exiting and
-    // the OS reclaims it in microseconds.
+    // A straggler still calls `unregisterSessionFd`, so free the registry
+    // only when none remain; otherwise leak it to process exit.
     if (active_sessions.load(.acquire) == 0) {
         signals.deinitSessionRegistry(io, allocator);
     }
 }
 
-/// Human-comparable label for a `LogTarget` ("stderr" or the file
-/// path), so the restart-only reload check can diff the audit
-/// destination as a plain string.
+/// "stderr" or the file path, for the restart-only comparison.
 fn logTargetLabel(target: config.LogTarget) []const u8 {
     return switch (target) {
         .stderr => "stderr",
@@ -342,12 +289,9 @@ fn logTargetLabel(target: config.LogTarget) []const u8 {
     };
 }
 
-/// Best-effort raise of `RLIMIT_NOFILE` to cover the worst-case fd
-/// demand, warning if the ceiling is still short. See the call site in
-/// `run` for the rationale.
+/// Raise the soft `RLIMIT_NOFILE` toward the worst case; warn if short.
 fn ensureFdBudget(io: std.Io, max_connections: u32) void {
-    // Per session: one socket, a couple of libssh internal fds, plus the
-    // per-session handle cap. Round up with slack.
+    // Socket, libssh's own fds, and the handle cap, with slack.
     const per_session: u64 = sftp.max_handles_per_session + 8;
     const needed: u64 = @as(u64, max_connections) * per_session + 64;
 
@@ -401,23 +345,13 @@ const ActiveConfig = struct {
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
     current: *ConfigRef,
-    /// Tracks the warned-state for repeated stat failures on the
-    /// config file. Set on first failure (warning emitted), cleared
-    /// when the file becomes readable again. PLAN §7.3.
+    /// One warning per run of config stat failures.
     stat_warned: bool = false,
-    /// True while the on-disk config has been rejected and the daemon is
-    /// serving the PREVIOUS (in-memory) config instead — i.e. on-disk and
-    /// in-memory have diverged. Set at every reject site, cleared when a
-    /// good config finally loads (which announces recovery). Makes the
-    /// divergence a tracked state rather than a single log line that
-    /// scrolls past, so `is-active` staying green can't hide it.
+    /// The on-disk config was rejected and the previous one is still
+    /// serving. Cleared, loudly, when a good config loads.
     reload_degraded: bool = false,
-    /// The `listen`, `host-key`, and `log` values actually in force —
-    /// bound once at startup and never re-applied on reload. Owned
-    /// copies (the startup config's arena may be freed once its last
-    /// session drops it). Used to warn the operator when a reload
-    /// changes one of these restart-only settings, instead of silently
-    /// printing "config reloaded" while the change has no effect.
+    /// Restart-only values in force (owned: the startup config may be
+    /// freed when its last session ends).
     bound_listen: []const u8 = "",
     bound_host_key: []const u8 = "",
     bound_log: []const u8 = "",
@@ -439,10 +373,7 @@ const ActiveConfig = struct {
         key_stamps: *KeyStamps,
     ) void {
         const mtime = currentConfigMtime(self.io, path) catch |err| {
-            // PLAN §7.3: a deleted or unreadable config logs a single
-            // warning and keeps the previous config running. Repeated
-            // failures are suppressed until the file becomes readable
-            // again, then we log the recovery.
+            // Warn once and keep the previous config until it is back.
             if (!self.stat_warned) {
                 const stderr = std.Io.File.stderr();
                 stderr.writeStreamingAll(self.io, "zift: cannot stat config file: ") catch {};
@@ -461,13 +392,9 @@ const ActiveConfig = struct {
             self.stat_warned = false;
         }
 
-        // PLAN §7.3: config reload triggers only when mtime moves
-        // forward. Atomic-deploy patterns that preserve or rewind
-        // mtime rely on SIGHUP (which uses `forceReload` and skips
-        // this check). Authorized-key files are outside that mtime, so
-        // a newer stamp — or a stat failure — takes the same path.
-        // Stderr and allocation failures stay in this function: leaving
-        // `run` would drop every live session.
+        // Reload when the config mtime moves forward or a key-file stamp
+        // changes; deploys that keep mtime need SIGHUP. Errors stay in
+        // here: leaving `run` would drop every live session.
         if (mtime.nanoseconds <= known_mtime.nanoseconds and
             !key_stamps.changed(self.io, self.current.config))
         {
@@ -476,9 +403,7 @@ const ActiveConfig = struct {
         self.applyReload(path, mtime, known_mtime, key_stamps);
     }
 
-    /// Reload triggered by SIGHUP. Skips the mtime comparison so atomic
-    /// deploy patterns that preserve or rewind mtime still take effect
-    /// (PLAN §7.3 mtime caveat).
+    /// SIGHUP: reload without the mtime comparison.
     fn forceReload(
         self: *ActiveConfig,
         path: []const u8,
@@ -499,11 +424,8 @@ const ActiveConfig = struct {
         const stderr = std.Io.File.stderr();
 
         const contents = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1 << 20)) catch |err| {
-            // A *read* failure may be transient (EMFILE/EACCES/transient
-            // I/O). Do NOT advance `known_mtime` (or the key-file
-            // snapshot) here: a later `chmod 000`->`644` (which does
-            // not bump mtime) or easing fd pressure must be retried on
-            // the next `reload-interval`.
+            // A read failure may be transient (EMFILE, a chmod that does
+            // not bump mtime), so keep the stamps and retry next poll.
             stderr.writeStreamingAll(self.io, "zift: config reload read failed: ") catch return;
             stderr.writeStreamingAll(self.io, @errorName(err)) catch return;
             stderr.writeStreamingAll(self.io, "\n") catch {};
@@ -511,15 +433,9 @@ const ActiveConfig = struct {
         };
         defer self.allocator.free(contents);
 
-        // The read succeeded, so from here on advance `known_mtime` to the
-        // file's current mtime: a config that keeps failing to *parse* (a
-        // saved typo) must not be re-read, re-parsed, and re-logged every
-        // `reload-interval` forever. The next genuine edit moves mtime
-        // forward again and triggers a fresh attempt. SIGHUP always
-        // retries regardless. The key-file snapshot moves with it,
-        // including failed stats, so a stable bad key file does not
-        // reload every poll either. Paths are those of the config still
-        // in service; a successful swap re-snapshots below.
+        // Read succeeded: advance the stamps now, so a saved typo or a
+        // bad key file is not re-parsed and re-logged every poll. The next
+        // edit (or SIGHUP) retries. A successful swap re-snapshots below.
         known_mtime.* = mtime;
         key_stamps.remember(self.allocator, self.io, self.current.config);
 
@@ -532,24 +448,15 @@ const ActiveConfig = struct {
             return;
         };
 
-        // Cross-cutting semantic checks (PLAN.md §6.2). On failure, the
-        // running config keeps serving; validateSemantic has already
-        // written the specific diagnostic (e.g. "host-key unreadable")
-        // to stderr, so the audit detail here is the generic reason.
+        // validateSemantic already printed the specific diagnostic.
         config.validateSemantic(self.io, self.allocator, &next_config) catch {
             next_config.deinit();
             self.noteReloadRejected(stderr, path, "semantic validation failed (see preceding diagnostic)");
             return;
         };
 
-        // Warn about restart-only settings that changed. `listen`,
-        // `host-key`, and `log` are bound exactly once at startup and
-        // are NOT re-applied here, so silently reporting "config
-        // reloaded" would mislead an operator who just repointed the
-        // audit log or the listen address. The reload still applies to
-        // users/rules/timeouts; these three keep their startup values
-        // until a full restart. A warning that cannot be printed must
-        // not discard a good config or stop the accept loop.
+        // These are not re-applied; say so rather than imply they were.
+        // A warning that fails to print must not discard a good config.
         self.warnRestartOnly(stderr, "listen", self.bound_listen, next_config.server.listen);
         self.warnRestartOnly(stderr, "host-key", self.bound_host_key, next_config.server.host_key);
         self.warnRestartOnly(stderr, "log", self.bound_log, logTargetLabel(next_config.server.log));
@@ -562,10 +469,8 @@ const ActiveConfig = struct {
             return;
         };
 
-        // `next_ref` owns `next_config` from here. Do not deinit it if a
-        // later status write fails, and do not put the previous ref back:
-        // sessions may already observe `self.current`, and a good config
-        // whose announcement could not be printed stays in service.
+        // `next_ref` owns `next_config` now; once published it stays,
+        // even if a later status write fails.
         self.mutex.lockUncancelable(self.io);
         const old_ref = self.current;
         self.current = next_ref;
@@ -574,10 +479,6 @@ const ActiveConfig = struct {
         old_ref.release(self.allocator);
         key_stamps.remember(self.allocator, self.io, self.current.config);
 
-        // If we were serving a stale config because earlier edits were
-        // rejected, this successful load ends the divergence. Announce the
-        // recovery loudly and in the audit stream so the degraded window
-        // has a visible close, then clear the flag.
         if (self.reload_degraded) {
             self.reload_degraded = false;
             stderr.writeStreamingAll(self.io, "zift: config reload recovered — on-disk config valid again; now serving it\n") catch {};
@@ -587,15 +488,9 @@ const ActiveConfig = struct {
         stderr.writeStreamingAll(self.io, "zift: config reloaded (users/rules/timeouts applied to new sessions)\n") catch {};
     }
 
-    /// Emit the loud, monitorable signal for a rejected reload and mark
-    /// the running config degraded (on-disk differs from what's served).
-    /// Called from every reject site. Keeps the `config reload rejected`
-    /// substring existing tooling/tests grep for, while making the
-    /// divergence explicit, and lands a structured `config.reload` event
-    /// in the JSON audit stream operators already pipe to jq. The daemon
-    /// stays degraded (see the applyReload success path) until a good
-    /// config loads, so a rejected reload can't quietly scroll past while
-    /// `systemctl is-active` still reports active.
+    /// Report a rejected reload on stderr and in the audit log, and mark
+    /// the daemon degraded until a good config loads. Tooling and tests
+    /// grep for `config reload rejected`.
     fn noteReloadRejected(
         self: *ActiveConfig,
         stderr: std.Io.File,
@@ -652,10 +547,7 @@ fn sessionThread(args: *SessionArgs) void {
     const ssh_session = args.session;
     allocator.destroy(args);
 
-    // Register this session's TCP FD so the graceful-drain path can
-    // actively shut down the socket if grace expires before the worker
-    // finishes naturally (PLAN §7.1). Failure to register isn't fatal —
-    // we still serve the request, just without forced-close visibility.
+    // Registered so drain can force-close it; failure is not fatal.
     const session_fd = c.ssh_get_fd(ssh_session);
     var registered = false;
     if (session_fd >= 0) {
@@ -667,11 +559,8 @@ fn sessionThread(args: *SessionArgs) void {
         configureSocket(session_fd);
     }
 
-    // PLAN §8.4: the pre-auth slot is owned by `sessionThread` until
-    // either (a) `handleSession` flips this flag at successful auth
-    // and decrements the counter directly, or (b) the session exits
-    // before reaching that point and the defer below releases the
-    // slot on the way out. The flag prevents double-decrement.
+    // Set by `handleSession` when it releases the pre-auth slot at auth;
+    // otherwise the defer below releases it.
     var auth_completed = false;
 
     defer {
@@ -695,17 +584,14 @@ fn statKeyMtime(io: std.Io, path: []const u8) ?std.Io.Timestamp {
     return stat.mtime;
 }
 
-/// Mtimes of authorized-key files referenced by the config currently in
-/// service. Stored beside the config mtime and advanced on every reload
-/// attempt whose config read succeeded — including rejects — so a stable
-/// bad key file does not trigger another reload on the next poll.
+/// Mtimes of the serving config's key files, advanced on every reload
+/// attempt whose read succeeded (even a rejected one).
 const KeyStamps = struct {
     entries: []Entry = &.{},
 
     const Entry = struct {
         path: []u8,
-        /// null when the last stat failed. A later success reloads; a
-        /// repeated failure does not.
+        /// null after a failed stat; a later success triggers a reload.
         mtime: ?std.Io.Timestamp,
     };
 
@@ -750,11 +636,8 @@ const KeyStamps = struct {
         return false;
     }
 
-    /// Restat key files of `cfg`. An unchanged path set is updated in
-    /// place so a rejected reload remembers a bad file even when a
-    /// fresh allocation fails. A changed path set allocates; on
-    /// `OutOfMemory` the previous entries are left as they were (the
-    /// intersection already restatted).
+    /// Restat `cfg`'s key files. Shared paths update in place first, so
+    /// a failed allocation for a changed path set still records them.
     fn remember(self: *KeyStamps, allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) void {
         for (self.entries) |*e| {
             if (configHasKeyFile(cfg, e.path)) e.mtime = statKeyMtime(io, e.path);
@@ -827,19 +710,10 @@ fn handleSession(
 ) !void {
     defer c.ssh_free(session);
 
-    // Capture peer IP at session start so every audit line emitted by
-    // this session — accept-time, handshake, auth, SFTP ops — carries
-    // it. Lifetime of `peer_ip` is the stack frame of handleSession,
-    // and every callee runs synchronously from here, so pointing into
-    // `ip_buf` is safe.
     var ip_buf: [64]u8 = undefined;
     const peer_ip: ?[]const u8 = capturePeerIp(session, &ip_buf);
 
-    // Apply the configured idle-timeout to all blocking libssh reads
-    // BEFORE the handshake. Without this, a TCP-only "client" that
-    // never speaks SSH pins a worker thread + a max-connections slot
-    // forever; PLAN §6.2 says the timeout applies across the session
-    // lifecycle, not just after auth completes.
+    // Before the handshake, or a silent TCP client pins a worker forever.
     setSessionTimeout(session, cfg.server.idle_timeout_ms);
 
     if (c.ssh_handle_key_exchange(session) != c.SSH_OK) {
@@ -849,29 +723,20 @@ fn handleSession(
 
     const user = try ssh.authenticate(io, allocator, cfg, session, peer_ip);
 
-    // Auth succeeded: release the pre-auth slot immediately so the next
-    // handshake-storm packet has a slot. Set the flag BEFORE the
-    // decrement so a defer in sessionThread that unwinds via panic
-    // (Zig's `defer` runs on panic too) does not double-decrement.
+    // Release the pre-auth slot now; the flag tells sessionThread's
+    // defer not to release it again.
     auth_completed.* = true;
     _ = unauth_sessions.fetchSub(1, .acq_rel);
 
     const channel = try sftp.acceptSftpSubsystem(session);
 
     try sftp.runSftp(io, allocator, channel, user, cfg.server, peer_ip);
-    // ssh_disconnect sends SSH2_MSG_DISCONNECT (clients log "disconnect").
-    // Channel lifetime is owned by the session — ssh_free below frees it.
-    // Explicit channel_free here would double-free and abort.
+    // The session owns the channel; freeing it here would double-free.
     c.ssh_disconnect(session);
 }
 
-/// Configure the per-session blocking-read timeout. libssh stores this
-/// in `ssh_session.opts.timeout` and applies it to every blocking
-/// socket read (handshake, key-exchange, USERAUTH messages, channel
-/// open/subsystem). Once we hand off to `runSftp` the per-call
-/// `ssh_channel_read_timeout` takes precedence for the SFTP read loop.
-/// `idle_timeout_ms == 0` means PLAN §6.2's "disabled" mode: do not set
-/// a timeout, leave libssh's default in place.
+/// Timeout for every blocking libssh read before SFTP starts (the SFTP
+/// loop enforces idle itself). 0 leaves libssh's default.
 fn setSessionTimeout(session: c.ssh_session, idle_timeout_ms: u64) void {
     if (idle_timeout_ms == 0) return;
     const seconds: c_long = @intCast(idle_timeout_ms / 1000);
@@ -880,33 +745,12 @@ fn setSessionTimeout(session: c.ssh_session, idle_timeout_ms: u64) void {
     _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT_USEC, &usec);
 }
 
-/// Apply the socket options every accepted connection should have.
-/// All best-effort: a failed setsockopt leaves the option at its
-/// default and we still serve the session.
-///
-///   TCP_NODELAY    Disable Nagle. SFTP is tight request/response —
-///                  Nagle adds ~40ms of delayed-ACK latency per
-///                  round trip otherwise. Same constant on Linux +
-///                  macOS (1).
-///   SO_KEEPALIVE   Enable TCP keepalive probes so a dead peer (NAT
-///                  rebind, partner network drop, hung client) is
-///                  detected and the kernel drops the socket. Constant
-///                  values for `SOL_SOCKET`/`SO_KEEPALIVE` differ
-///                  between Linux and macOS; we use Zig's platform-
-///                  aware `std.posix` so we don't accidentally pass
-///                  a Linux value on a macOS host (which silently
-///                  configures a different option entirely — see
-///                  `TCP_NOPUSH=4` on Darwin which is what an
-///                  innocent-looking `TCP_KEEPIDLE=4` would hit).
-///   TCP_KEEPIDLE   Linux only. Wait 60s of idle before starting
-///                  probes — much faster than the 7200s default.
-///                  macOS uses `TCP_KEEPALIVE` for the same idea
-///                  but Linux is our primary deploy target so we
-///                  only tighten the timing there. macOS keeps
-///                  defaults (still gets the basic SO_KEEPALIVE on).
-///   TCP_KEEPINTVL  Linux only. Probe every 10s.
-///   TCP_KEEPCNT    Linux only. Give up after 6 probes
-///                  (~60s idle + 60s probing = ~120s to declare dead).
+/// Best-effort socket options. TCP_NODELAY: SFTP is request/response,
+/// and Nagle adds delayed-ACK latency. SO_KEEPALIVE drops dead peers; on
+/// Linux the probes start after 60s idle and give up after 6 × 10s.
+/// Option numbers differ by OS (Darwin's 4 is TCP_NOPUSH, not
+/// KEEPIDLE), so they come from `std.posix` and the timing knobs are
+/// Linux-only.
 fn configureSocket(fd: c_int) void {
     if (fd < 0) return;
     const enable: c_int = 1;
@@ -929,9 +773,6 @@ fn configureSocket(fd: c_int) void {
         const idle_seconds: c_int = 60;
         const intvl_seconds: c_int = 10;
         const probe_count: c_int = 6;
-        // These three are Linux-specific TCP keepalive timing knobs;
-        // on macOS they don't exist (or have entirely different values
-        // that mean entirely different things), so we don't touch them.
         _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPIDLE, @ptrCast(&idle_seconds), @sizeOf(c_int));
         _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPINTVL, @ptrCast(&intvl_seconds), @sizeOf(c_int));
         _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT, @ptrCast(&probe_count), @sizeOf(c_int));
@@ -966,29 +807,16 @@ fn setBindOption(bind: c.ssh_bind, option: c.enum_ssh_bind_options_e, value: [*:
 
 /// What to do when libssh has no error text to contribute.
 const NoDetail = enum {
-    /// Log anyway, with a placeholder. For failures that are fatal or
-    /// otherwise have no audit record of their own -- the stderr line
-    /// is the only evidence they happened, so silence would lose them.
+    /// Log a placeholder: the failure has no audit record of its own.
     note,
-    /// Emit nothing at all. For per-session failures, which already
-    /// produce a structured audit record carrying operation, result,
-    /// and peer IP.
-    ///
-    /// This is not tidiness. An internet-facing port is probed
-    /// continuously; each scanner that opens a connection and walks
-    /// away mid-handshake produced `zift: LibsshFailure:` -- a line
-    /// whose entire informational content was "something failed",
-    /// which the audit record already said, with the IP attached.
-    /// libssh legitimately has no message for a peer that simply
-    /// disconnected, so the empty string is the normal case here, not
-    /// an anomaly. Logging it buried real failures in noise.
+    /// Log nothing: per-session failures already have an audit record,
+    /// and a scanner that hangs up mid-handshake leaves libssh with no
+    /// message at all. Logging those buried real failures in noise.
     skip,
 };
 
 fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail: NoDetail) !void {
-    // A non-null pointer to an EMPTY string is the common case, so
-    // checking only for null (as this did) emitted a line that ended at
-    // the colon with nothing after it.
+    // Usually a non-null pointer to an empty string.
     const raw = c.ssh_get_error(handle);
     const detail: []const u8 = if (raw != null) std.mem.span(raw) else "";
     if (detail.len == 0 and no_detail == .skip) return;
