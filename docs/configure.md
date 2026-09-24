@@ -85,8 +85,8 @@ ownership is checked against the user running it.
 
 Generate one with `ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N
 ""`. The file must be a regular file (a symlink is followed and its
-target checked), owned by root or the daemon's user, with no
-group-write, group-exec or other bits: `0600` and `0640` pass, `0644`
+target checked) with one hard link, owned by root or the daemon's user,
+with no group-write, group-exec or other bits: `0600` and `0640` pass, `0644`
 and `0660` do not. `root:zift 0640` lets the daemon read its identity
 but not rewrite it.
 
@@ -154,8 +154,8 @@ are not allowed. Accepted algorithms: `ssh-ed25519`,
 `ssh-rsa` from 2048 to 8192 bits. RSA keys authenticate only with
 `rsa-sha2-256` or `rsa-sha2-512` signatures, never SHA-1; DSA is
 rejected. The file must be a regular file (a symlink is followed and its
-target checked, so Kubernetes Secrets and systemd credentials work),
-owned by root or the daemon's user, not group- or world-writable, and
+target checked, so Kubernetes Secrets and systemd credentials work)
+with one hard link, owned by root or the daemon's user, not group- or world-writable, and
 contain at least one key. Each key must be well formed and load in
 libssh exactly as it would at login.
 

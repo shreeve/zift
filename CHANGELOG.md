@@ -58,8 +58,11 @@ the line and the reason.
 - Opening an existing FIFO, device or socket over SFTP fails at once
   instead of hanging the session. Only regular files open.
 - The host key and `auth` key files must be owned by root or the
-  daemon's user, and the host key may not grant group-write, group-exec
-  or other access (see Breaking changes).
+  daemon's user and have one hard link (a second one inside a partner
+  root escaped the private-file check), and the host key may not grant
+  group-write, group-exec or other access (see Breaking changes). They
+  are opened non-blocking, so a FIFO put in their place cannot hang a
+  reload.
 - `validate` refuses daemon-private files (host key, key files, audit
   log, the config itself) inside any partner root, including through a
   symlink.
@@ -116,8 +119,9 @@ the line and the reason.
   days) is rejected. Migration: use `24d` or less, or `0`.
 - A host key that grants group-write, group-exec or any other access
   (`0644`, `0660`) is rejected, and so is a host key or key file owned by
-  anyone but root or the daemon's user. Migration: `chown root:zift` and
-  `chmod 0640` (or `0600`).
+  anyone but root or the daemon's user or with a second hard link.
+  Migration: `chown root:zift`, `chmod 0640` (or `0600`), and copy
+  instead of hard-linking.
 
 ### Added
 

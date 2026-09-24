@@ -29,6 +29,7 @@ pub const SemanticError = error{
     AuthKeyFileNotRegular,
     AuthKeyFileWritableByOthers,
     AuthKeyFileUntrustedOwner,
+    AuthKeyFileHardLinked,
     OutOfMemory,
 };
 
@@ -222,24 +223,29 @@ const Checker = struct {
     }
 };
 
-const TrustError = error{ Unreadable, NotRegular, BadMode, BadOwner };
+const TrustError = error{ Unreadable, NotRegular, HardLinked, BadMode, BadOwner };
 
 /// Open a file the daemon trusts (host key, key file). Symlinks are
 /// followed (Kubernetes Secrets and systemd credentials are symlinks);
-/// the file itself must be regular, owned by root or the daemon's user
-/// (another local user could rewrite it), with no `forbidden_mode` bits.
-/// The checks run on the open fd, so the inode checked is the inode read.
-fn openTrusted(io: std.Io, path: []const u8, forbidden_mode: u32) TrustError!std.Io.File {
-    // Opening a FIFO would block, so refuse anything else first.
-    const pre = std.Io.Dir.cwd().statFile(io, path, .{}) catch return error.Unreadable;
-    if (pre.kind != .file) return error.NotRegular;
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.Unreadable;
-    errdefer file.close(io);
-    const st = listing.statFd(file.handle) catch return error.Unreadable;
+/// the file itself must be regular, with no second hard link (one inside
+/// a partner root would evade `checkOutsideRoots`), owned by root or the
+/// daemon's user (another local user could rewrite it), with no
+/// `forbidden_mode` bits. The open is O_NONBLOCK, so a FIFO swapped in at
+/// the path cannot hang validate or a reload, and every check runs on the
+/// open fd, so the inode checked is the inode read. (O_NONBLOCK does not
+/// change reads of a regular file.)
+fn openTrusted(path: []const u8, forbidden_mode: u32) TrustError!std.Io.File {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.Unreadable;
+    const path_z = std.posix.toPosixPath(path) catch return error.Unreadable;
+    const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .NOCTTY = true, .CLOEXEC = true });
+    if (fd < 0) return error.Unreadable;
+    errdefer _ = std.c.close(fd);
+    const st = listing.statFd(fd) catch return error.Unreadable;
     if (st.mode & listing.S_IFMT != listing.S_IFREG) return error.NotRegular;
+    if (st.nlink > 1) return error.HardLinked;
     if (st.mode & forbidden_mode != 0) return error.BadMode;
     if (st.uid != 0 and st.uid != std.c.geteuid()) return error.BadOwner;
-    return file;
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
 /// Room for any private key file (an 8192-bit RSA PEM is about 6 KiB).
@@ -249,9 +255,10 @@ const max_host_key_bytes = 64 * 1024;
 /// in a trusted file with no group-write, group-exec, or other bits, so
 /// 0600, 0400, and 0640 root:zift pass. Key bytes never reach a diagnostic.
 fn checkHostKey(ck: Checker, gpa: std.mem.Allocator, path: []const u8) SemanticError!void {
-    var file = openTrusted(ck.io, path, 0o037) catch |err| return switch (err) {
+    var file = openTrusted(path, 0o037) catch |err| return switch (err) {
         error.Unreadable => ck.fail(error.HostKeyUnreadable, "host-key unreadable: {s}", .{path}),
         error.NotRegular => ck.fail(error.HostKeyUnreadable, "host-key not a regular file: {s}", .{path}),
+        error.HardLinked => ck.fail(error.HostKeyUnreadable, "host-key has more than one hard link: {s}", .{path}),
         error.BadMode => ck.fail(error.HostKeyUnreadable, "host-key mode allows group-write, group-exec, or other access: {s}", .{path}),
         error.BadOwner => ck.fail(error.HostKeyUnreadable, "host-key owned by neither root nor the daemon's user: {s}", .{path}),
     };
@@ -358,9 +365,10 @@ fn resolveOneKeyFile(
     user_name: []const u8,
     path: []const u8,
 ) SemanticError!void {
-    var file = openTrusted(ck.io, path, 0o022) catch |err| return switch (err) {
+    var file = openTrusted(path, 0o022) catch |err| return switch (err) {
         error.Unreadable => keyFileFail(ck, error.AuthKeyFileUnreadable, user_name, path, 0, "unreadable"),
         error.NotRegular => keyFileFail(ck, error.AuthKeyFileNotRegular, user_name, path, 0, "not a regular file"),
+        error.HardLinked => keyFileFail(ck, error.AuthKeyFileHardLinked, user_name, path, 0, "has more than one hard link"),
         error.BadMode => keyFileFail(ck, error.AuthKeyFileWritableByOthers, user_name, path, 0, "writable by group/world (mode)"),
         error.BadOwner => keyFileFail(ck, error.AuthKeyFileUntrustedOwner, user_name, path, 0, "owned by neither root nor the daemon's user"),
     };
@@ -2065,6 +2073,30 @@ test "validateSemantic: host key and key file symlinks are followed, and the tar
     try tree.chmod("etc/u.pub", 0o664);
     try std.testing.expectError(error.AuthKeyFileWritableByOthers, tree.check(linked, null));
 }
+
+test "validateSemantic: trusted files may not be hard-linked, and a FIFO never blocks" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const io = std.testing.io;
+    // A second link, say inside a partner root, would evade the check
+    // that keeps private files out of every root.
+    try tree.tmp.dir.hardLink("etc/host", tree.tmp.dir, "r/host", io, .{});
+    try std.testing.expectError(error.HostKeyUnreadable, tree.check(TestTree.config, null));
+    try tree.tmp.dir.deleteFile(io, "r/host");
+    try tree.check(TestTree.config, null);
+    try tree.tmp.dir.hardLink("etc/u.pub", tree.tmp.dir, "r/u.pub", io, .{});
+    try std.testing.expectError(error.AuthKeyFileHardLinked, tree.check(TestTree.config, null));
+    try tree.tmp.dir.deleteFile(io, "r/u.pub");
+
+    // A FIFO with no writer: a blocking open would hang here.
+    const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/etc/fifo", .{tree.path}, 0);
+    defer std.testing.allocator.free(fifo);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo, 0o600));
+    try std.testing.expectError(error.HostKeyUnreadable, tree.checkWith("@/etc/host", "@/etc/fifo"));
+    try std.testing.expectError(error.AuthKeyFileNotRegular, tree.checkWith("@/etc/u.pub", "@/etc/fifo"));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.posix.mode_t) c_int;
 
 test "validateSemantic: key files hold keys, comments, and blank lines" {
     var tree = try TestTree.init();
