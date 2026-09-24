@@ -144,7 +144,8 @@ The runner reads:
 1. rejects any other tag shape;
 2. strips the leading `v` and passes the rest as `-Dversion`;
 3. runs the unit tests, then builds the four release targets;
-4. packs the systemd unit into `zift-deploy-X.Y.Z.tar.gz`;
+4. packs the systemd unit, `LICENSE` and `THIRD_PARTY_LICENSES.md` into
+   `zift-deploy-X.Y.Z.tar.gz`;
 5. writes `SHA256SUMS` over exactly the files it publishes and signs it
    with cosign keyless through GitHub's OIDC identity;
 6. publishes a GitHub release, marked prerelease if the tag has a `-`.

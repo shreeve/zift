@@ -36,6 +36,7 @@ name: Release
 #   zift-X.Y.Z-aarch64-macos      libSystem-only macOS aarch64 binary
 #   zift-deploy-X.Y.Z.tar.gz      optional systemd unit bundle:
 #                                   - zift.service
+#                                   - LICENSE, THIRD_PARTY_LICENSES.md
 #   SHA256SUMS                    sha256 of every artifact above
 #   SHA256SUMS.bundle             cosign keyless signature over SHA256SUMS
 #
@@ -163,10 +164,10 @@ jobs:
           mkdir -p release
           cp dist/release-*/zift-* release/
 
-          # Optional systemd unit only. Security and config live in the
-          # binary + docs — no fail2ban/CrowdSec/logrotate bundle.
+          # The systemd unit and the license notices a binary must ship
+          # with. No fail2ban/CrowdSec/logrotate bundle.
           mkdir -p "staging/zift-deploy-${version}"
-          cp packaging/systemd/zift.service \
+          cp packaging/systemd/zift.service LICENSE THIRD_PARTY_LICENSES.md \
              "staging/zift-deploy-${version}/"
           tar -C staging -czf "release/zift-deploy-${version}.tar.gz" "zift-deploy-${version}"
 
