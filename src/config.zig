@@ -7,6 +7,7 @@
 const std = @import("std");
 const passhash = @import("passhash.zig");
 const netmatch = @import("netmatch.zig");
+const sys = @import("sys.zig");
 const vfs = @import("vfs.zig");
 
 /// Filesystem checks that fail `validateSemantic`. Each also writes a
@@ -147,22 +148,11 @@ pub fn validateSemantic(
     allocator: std.mem.Allocator,
     cfg: *Config,
 ) SemanticError!void {
-    const stderr = std.Io.File.stderr();
-
     // 1. Numeric checks, before touching the filesystem.
     validatePureNumeric(cfg) catch |err| {
-        switch (err) {
-            error.UnauthCapExceedsTotal => {
-                stderr.writeStreamingAll(io, "zift: max-unauth-connections (") catch {};
-                var num_buf: [16]u8 = undefined;
-                const u = std.fmt.bufPrint(&num_buf, "{d}", .{cfg.server.max_unauth_connections}) catch num_buf[0..0];
-                stderr.writeStreamingAll(io, u) catch {};
-                stderr.writeStreamingAll(io, ") exceeds max-connections (") catch {};
-                const t = std.fmt.bufPrint(&num_buf, "{d}", .{cfg.server.max_connections}) catch num_buf[0..0];
-                stderr.writeStreamingAll(io, t) catch {};
-                stderr.writeStreamingAll(io, ")\n") catch {};
-            },
-        }
+        sys.note(io, "zift: max-unauth-connections ({d}) exceeds max-connections ({d})\n", .{
+            cfg.server.max_unauth_connections, cfg.server.max_connections,
+        }) catch {};
         return err;
     };
 
@@ -174,20 +164,20 @@ pub fn validateSemantic(
         .follow_symlinks = false,
     }) catch |err| {
         const reason: []const u8 = if (err == error.SymLinkLoop) "symlink" else "unreadable";
-        writeHostKeyDiag(io, stderr, reason, host_key);
+        writeHostKeyDiag(io, reason, host_key);
         return error.HostKeyUnreadable;
     };
     if (host_stat.kind == .sym_link) {
-        writeHostKeyDiag(io, stderr, "symlink", host_key);
+        writeHostKeyDiag(io, "symlink", host_key);
         return error.HostKeyUnreadable;
     }
     if (host_stat.kind != .file) {
-        writeHostKeyDiag(io, stderr, "not a regular file", host_key);
+        writeHostKeyDiag(io, "not a regular file", host_key);
         return error.HostKeyUnreadable;
     }
     const host_mode: u32 = @intCast(host_stat.permissions.toMode() & 0o7777);
     if ((host_mode & 0o037) != 0) {
-        writeHostKeyDiag(io, stderr, "mode", host_key);
+        writeHostKeyDiag(io, "mode", host_key);
         return error.HostKeyUnreadable;
     }
     var host_file = std.Io.Dir.cwd().openFile(io, host_key, .{
@@ -195,7 +185,7 @@ pub fn validateSemantic(
         .follow_symlinks = false,
     }) catch |err| {
         const reason: []const u8 = if (err == error.SymLinkLoop) "symlink" else "unreadable";
-        writeHostKeyDiag(io, stderr, reason, host_key);
+        writeHostKeyDiag(io, reason, host_key);
         return error.HostKeyUnreadable;
     };
     host_file.close(io);
@@ -212,20 +202,12 @@ pub fn validateSemantic(
 
     for (cfg.users) |*user| {
         const real = std.Io.Dir.realPathFileAbsoluteAlloc(io, user.root, allocator) catch {
-            stderr.writeStreamingAll(io, "zift: user '") catch {};
-            stderr.writeStreamingAll(io, user.name) catch {};
-            stderr.writeStreamingAll(io, "' root does not exist or is unreadable: ") catch {};
-            stderr.writeStreamingAll(io, user.root) catch {};
-            stderr.writeStreamingAll(io, "\n") catch {};
+            sys.note(io, "zift: user '{s}' root does not exist or is unreadable: {s}\n", .{ user.name, user.root }) catch {};
             return error.UserRootMissing;
         };
         const dir = std.Io.Dir.openDirAbsolute(io, real, .{}) catch {
             allocator.free(real);
-            stderr.writeStreamingAll(io, "zift: user '") catch {};
-            stderr.writeStreamingAll(io, user.name) catch {};
-            stderr.writeStreamingAll(io, "' root is not a directory: ") catch {};
-            stderr.writeStreamingAll(io, user.root) catch {};
-            stderr.writeStreamingAll(io, "\n") catch {};
+            sys.note(io, "zift: user '{s}' root is not a directory: {s}\n", .{ user.name, user.root }) catch {};
             return error.UserRootNotDirectory;
         };
         dir.close(io);
@@ -238,15 +220,9 @@ pub fn validateSemantic(
     for (canonical_roots[0..canonical_count], 0..) |a, i| {
         for (canonical_roots[i + 1 .. canonical_count], i + 1..) |b, j| {
             if (vfs.isInsideRoot(a, b) or vfs.isInsideRoot(b, a)) {
-                stderr.writeStreamingAll(io, "zift: overlapping roots for users '") catch {};
-                stderr.writeStreamingAll(io, cfg.users[i].name) catch {};
-                stderr.writeStreamingAll(io, "' and '") catch {};
-                stderr.writeStreamingAll(io, cfg.users[j].name) catch {};
-                stderr.writeStreamingAll(io, "': ") catch {};
-                stderr.writeStreamingAll(io, a) catch {};
-                stderr.writeStreamingAll(io, " vs ") catch {};
-                stderr.writeStreamingAll(io, b) catch {};
-                stderr.writeStreamingAll(io, "\n") catch {};
+                sys.note(io, "zift: overlapping roots for users '{s}' and '{s}': {s} vs {s}\n", .{
+                    cfg.users[i].name, cfg.users[j].name, a, b,
+                }) catch {};
                 return error.OverlappingRoots;
             }
         }
@@ -267,7 +243,6 @@ fn resolveAuthKeyFiles(
     gpa: std.mem.Allocator,
     cfg: *Config,
 ) SemanticError!void {
-    const stderr = std.Io.File.stderr();
     const arena_alloc = cfg.arena.allocator();
 
     for (cfg.users) |*user| {
@@ -276,7 +251,7 @@ fn resolveAuthKeyFiles(
         var combined: std.ArrayList(PublicKey) = .empty;
 
         for (user.key_files) |path| {
-            try resolveOneKeyFile(io, gpa, stderr, arena_alloc, &combined, user.name, path);
+            try resolveOneKeyFile(io, gpa, arena_alloc, &combined, user.name, path);
         }
 
         user.keys = try combined.toOwnedSlice(arena_alloc);
@@ -287,7 +262,6 @@ fn resolveAuthKeyFiles(
 fn resolveOneKeyFile(
     io: std.Io,
     gpa: std.mem.Allocator,
-    stderr: std.Io.File,
     arena_alloc: std.mem.Allocator,
     combined: *std.ArrayList(PublicKey),
     user_name: []const u8,
@@ -300,24 +274,24 @@ fn resolveOneKeyFile(
         .follow_symlinks = false,
     }) catch |err| switch (err) {
         error.SymLinkLoop => {
-            writeKeyFileDiag(io, stderr, user_name, path, 0, "symlinks not allowed (use in-place rename for rotation)");
+            writeKeyFileDiag(io, user_name, path, 0, "symlinks not allowed (use in-place rename for rotation)");
             return error.AuthKeyFileNotRegular;
         },
         else => {
-            writeKeyFileDiag(io, stderr, user_name, path, 0, "unreadable");
+            writeKeyFileDiag(io, user_name, path, 0, "unreadable");
             return error.AuthKeyFileUnreadable;
         },
     };
     defer file.close(io);
 
     const stat = file.stat(io) catch {
-        writeKeyFileDiag(io, stderr, user_name, path, 0, "stat failed");
+        writeKeyFileDiag(io, user_name, path, 0, "stat failed");
         return error.AuthKeyFileUnreadable;
     };
     switch (stat.kind) {
         .file => {},
         else => {
-            writeKeyFileDiag(io, stderr, user_name, path, 0, "not a regular file");
+            writeKeyFileDiag(io, user_name, path, 0, "not a regular file");
             return error.AuthKeyFileNotRegular;
         },
     }
@@ -325,7 +299,7 @@ fn resolveOneKeyFile(
     const file_mode: u32 = @intCast(stat.permissions.toMode() & 0o7777);
     const writable_by_others_mask: u32 = 0o022;
     if ((file_mode & writable_by_others_mask) != 0) {
-        writeKeyFileDiag(io, stderr, user_name, path, 0, "writable by group/world (mode)");
+        writeKeyFileDiag(io, user_name, path, 0, "writable by group/world (mode)");
         return error.AuthKeyFileWritableByOthers;
     }
 
@@ -336,11 +310,11 @@ fn resolveOneKeyFile(
     const contents = file_reader.interface.allocRemaining(gpa, .limited(file_read_cap)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StreamTooLong => {
-            writeKeyFileDiag(io, stderr, user_name, path, 0, "too large");
+            writeKeyFileDiag(io, user_name, path, 0, "too large");
             return error.AuthKeyFileTooLarge;
         },
         error.ReadFailed => {
-            writeKeyFileDiag(io, stderr, user_name, path, 0, "read failed");
+            writeKeyFileDiag(io, user_name, path, 0, "read failed");
             return error.AuthKeyFileUnreadable;
         },
     };
@@ -356,13 +330,13 @@ fn resolveOneKeyFile(
         if (trimmed.len == 0) continue;
         if (trimmed[0] == '#') continue;
         if (trimmed.len > max_keyline_bytes) {
-            writeKeyFileDiag(io, stderr, user_name, path, line_no, "key line too long");
+            writeKeyFileDiag(io, user_name, path, line_no, "key line too long");
             return error.AuthKeyFileMalformed;
         }
         const pubkey = parsePublicKeyLine(arena_alloc, trimmed) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                writeKeyFileDiag(io, stderr, user_name, path, line_no, "malformed public-key line");
+                writeKeyFileDiag(io, user_name, path, line_no, "malformed public-key line");
                 return error.AuthKeyFileMalformed;
             },
         };
@@ -371,43 +345,29 @@ fn resolveOneKeyFile(
     }
 
     if (parsed == 0) {
-        writeKeyFileDiag(io, stderr, user_name, path, 0, "no public-key lines found");
+        writeKeyFileDiag(io, user_name, path, 0, "no public-key lines found");
         return error.AuthKeyFileEmpty;
     }
 }
 
-fn writeHostKeyDiag(io: std.Io, stderr: std.Io.File, reason: []const u8, path: []const u8) void {
-    stderr.writeStreamingAll(io, "zift: host-key ") catch {};
-    stderr.writeStreamingAll(io, reason) catch {};
-    stderr.writeStreamingAll(io, ": ") catch {};
-    stderr.writeStreamingAll(io, path) catch {};
-    stderr.writeStreamingAll(io, "\n") catch {};
+fn writeHostKeyDiag(io: std.Io, reason: []const u8, path: []const u8) void {
+    sys.note(io, "zift: host-key {s}: {s}\n", .{ reason, path }) catch {};
 }
 
 /// `zift: user '<name>': auth key file '<path>'[ line N]: <reason>`;
 /// `line_no` 0 means the whole file.
 fn writeKeyFileDiag(
     io: std.Io,
-    stderr: std.Io.File,
     user_name: []const u8,
     path: []const u8,
     line_no: u32,
     reason: []const u8,
 ) void {
-    stderr.writeStreamingAll(io, "zift: user '") catch {};
-    stderr.writeStreamingAll(io, user_name) catch {};
-    stderr.writeStreamingAll(io, "': auth key file '") catch {};
-    stderr.writeStreamingAll(io, path) catch {};
-    stderr.writeStreamingAll(io, "'") catch {};
     if (line_no != 0) {
-        stderr.writeStreamingAll(io, " line ") catch {};
-        var num_buf: [16]u8 = undefined;
-        const printed = std.fmt.bufPrint(&num_buf, "{d}", .{line_no}) catch num_buf[0..0];
-        stderr.writeStreamingAll(io, printed) catch {};
+        sys.note(io, "zift: user '{s}': auth key file '{s}' line {d}: {s}\n", .{ user_name, path, line_no, reason }) catch {};
+    } else {
+        sys.note(io, "zift: user '{s}': auth key file '{s}': {s}\n", .{ user_name, path, reason }) catch {};
     }
-    stderr.writeStreamingAll(io, ": ") catch {};
-    stderr.writeStreamingAll(io, reason) catch {};
-    stderr.writeStreamingAll(io, "\n") catch {};
 }
 
 const ServerBuilder = struct {

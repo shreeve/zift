@@ -1,4 +1,5 @@
-//! Small process-wide helpers: clocks and UTC calendar math.
+//! Small process-wide helpers: clocks, UTC calendar math, and stderr
+//! diagnostic lines.
 
 const std = @import("std");
 
@@ -15,6 +16,15 @@ pub fn realtime() std.c.timespec {
     var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
     _ = std.c.clock_gettime(.REALTIME, &ts);
     return ts;
+}
+
+/// Format one stderr line and write it in one go (lines longer than the
+/// buffer drain in chunks), so concurrent lines do not interleave.
+pub fn note(io: std.Io, comptime fmt: []const u8, args: anytype) std.Io.File.Writer.Error!void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+    w.interface.print(fmt, args) catch return w.err.?;
+    w.interface.flush() catch return w.err.?;
 }
 
 pub const Civil = struct {

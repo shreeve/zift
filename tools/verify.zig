@@ -10,27 +10,20 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    const stderr = std.Io.File.stderr();
     if (args.len != 2) {
-        try stderr.writeStreamingAll(io, "usage: verify <artifact-path>\n");
+        try printTo(stderr, io, "usage: verify <artifact-path>\n", .{});
         std.process.exit(2);
     }
 
     const path = args[1];
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, init.gpa, .limited(64 * 1024 * 1024)) catch |err| {
-        try stderr.writeStreamingAll(io, "verify: cannot read ");
-        try stderr.writeStreamingAll(io, path);
-        try stderr.writeStreamingAll(io, ": ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
+        try printTo(stderr, io, "verify: cannot read {s}: {s}\n", .{ path, @errorName(err) });
         std.process.exit(2);
     };
     defer init.gpa.free(data);
 
     if (data.len < 4) {
-        try stderr.writeStreamingAll(io, "verify: file too small to identify: ");
-        try stderr.writeStreamingAll(io, path);
-        try stderr.writeStreamingAll(io, "\n");
+        try printTo(stderr, io, "verify: file too small to identify: {s}\n", .{path});
         std.process.exit(2);
     }
 
@@ -56,21 +49,14 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try stderr.writeStreamingAll(io, "verify: unknown binary magic in ");
-    try stderr.writeStreamingAll(io, path);
-    try stderr.writeStreamingAll(io, "\n");
+    try printTo(stderr, io, "verify: unknown binary magic in {s}\n", .{path});
     std.process.exit(2);
 }
 
 fn verifyElf(io: std.Io, path: []const u8, data: []const u8) !u8 {
-    const stdout = std.Io.File.stdout();
-    const stderr = std.Io.File.stderr();
-
     var reader = std.Io.Reader.fixed(data);
     const hdr = std.elf.Header.read(&reader) catch {
-        try stderr.writeStreamingAll(io, "verify: malformed ELF header in ");
-        try stderr.writeStreamingAll(io, path);
-        try stderr.writeStreamingAll(io, "\n");
+        try printTo(stderr, io, "verify: malformed ELF header in {s}\n", .{path});
         return 2;
     };
 
@@ -94,34 +80,24 @@ fn verifyElf(io: std.Io, path: []const u8, data: []const u8) !u8 {
     }
 
     if (needed > 0) {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "verify: FAIL — {s} has {d} DT_NEEDED entries (expected zero, fully static)\n", .{ path, needed }) catch unreachable;
-        try stderr.writeStreamingAll(io, msg);
+        try printTo(stderr, io, "verify: FAIL — {s} has {d} DT_NEEDED entries (expected zero, fully static)\n", .{ path, needed });
         return 1;
     }
 
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "verify: OK — DT_NEEDED (ELF) in {s}:\n  (zero entries — fully static)\n", .{path}) catch unreachable;
-    try stdout.writeStreamingAll(io, msg);
+    try printTo(stdout, io, "verify: OK — DT_NEEDED (ELF) in {s}:\n  (zero entries — fully static)\n", .{path});
     return 0;
 }
 
 fn verifyMachO(io: std.Io, path: []const u8, data: []const u8) !u8 {
-    const stdout = std.Io.File.stdout();
-    const stderr = std.Io.File.stderr();
 
     // Only 64-bit Mach-O ships.
     if (data.len < @sizeOf(std.macho.mach_header_64)) {
-        try stderr.writeStreamingAll(io, "verify: Mach-O too small in ");
-        try stderr.writeStreamingAll(io, path);
-        try stderr.writeStreamingAll(io, "\n");
+        try printTo(stderr, io, "verify: Mach-O too small in {s}\n", .{path});
         return 2;
     }
     const is_64 = data[3] == 0xcf or data[0] == 0xcf;
     if (!is_64) {
-        try stderr.writeStreamingAll(io, "verify: only 64-bit Mach-O supported: ");
-        try stderr.writeStreamingAll(io, path);
-        try stderr.writeStreamingAll(io, "\n");
+        try printTo(stderr, io, "verify: only 64-bit Mach-O supported: {s}\n", .{path});
         return 2;
     }
 
@@ -137,17 +113,13 @@ fn verifyMachO(io: std.Io, path: []const u8, data: []const u8) !u8 {
     var i: u32 = 0;
     while (i < ncmds) : (i += 1) {
         if (off + @sizeOf(std.macho.load_command) > data.len) {
-            try stderr.writeStreamingAll(io, "verify: truncated load command in ");
-            try stderr.writeStreamingAll(io, path);
-            try stderr.writeStreamingAll(io, "\n");
+            try printTo(stderr, io, "verify: truncated load command in {s}\n", .{path});
             return 2;
         }
         const lc: *const std.macho.load_command = @ptrCast(@alignCast(data.ptr + off));
         const cmdsize = lc.cmdsize;
         if (off + cmdsize > data.len) {
-            try stderr.writeStreamingAll(io, "verify: load command overflows file in ");
-            try stderr.writeStreamingAll(io, path);
-            try stderr.writeStreamingAll(io, "\n");
+            try printTo(stderr, io, "verify: load command overflows file in {s}\n", .{path});
             return 2;
         }
 
@@ -156,7 +128,7 @@ fn verifyMachO(io: std.Io, path: []const u8, data: []const u8) !u8 {
                 const dl: *const std.macho.dylib_command = @ptrCast(@alignCast(data.ptr + off));
                 const name_off = dl.dylib.name;
                 if (name_off >= cmdsize) {
-                    try stderr.writeStreamingAll(io, "verify: dylib name offset out of bounds\n");
+                    try printTo(stderr, io, "verify: dylib name offset out of bounds\n", .{});
                     return 2;
                 }
                 const name_start = off + name_off;
@@ -180,22 +152,16 @@ fn verifyMachO(io: std.Io, path: []const u8, data: []const u8) !u8 {
     }
 
     if (unexpected_count > 0) {
-        var head_buf: [256]u8 = undefined;
-        const head = std.fmt.bufPrint(&head_buf, "verify: FAIL — {s} has {d} unexpected LC_LOAD_DYLIB entries\n", .{ path, unexpected_count }) catch unreachable;
-        try stderr.writeStreamingAll(io, head);
-        try stderr.writeStreamingAll(io, report_w.buffered());
-        try stderr.writeStreamingAll(io,
+        try printTo(stderr, io, "verify: FAIL — {s} has {d} unexpected LC_LOAD_DYLIB entries\n{s}" ++
             \\  Either the build picked up a non-system dylib (regression)
             \\  or tools/verify.zig's allowlist needs updating to match a
             \\  deliberate change in our dependency surface.
             \\
-        );
+        , .{ path, unexpected_count, report_w.buffered() });
         return 1;
     }
 
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "verify: OK — LC_LOAD_DYLIB (Mach-O) in {s}: {d} system entr{s}\n", .{ path, ok_count, if (ok_count == 1) @as([]const u8, "y") else "ies" }) catch unreachable;
-    try stdout.writeStreamingAll(io, msg);
+    try printTo(stdout, io, "verify: OK — LC_LOAD_DYLIB (Mach-O) in {s}: {d} system entr{s}\n", .{ path, ok_count, if (ok_count == 1) @as([]const u8, "y") else "ies" });
     return 0;
 }
 
@@ -204,4 +170,14 @@ fn isAllowedDylib(name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "/usr/lib/libc++.") and std.mem.endsWith(u8, name, ".dylib")) return true;
     if (std.mem.startsWith(u8, name, "/System/Library/Frameworks/")) return true;
     return false;
+}
+
+const stdout = std.Io.File.stdout();
+const stderr = std.Io.File.stderr();
+
+fn printTo(file: std.Io.File, io: std.Io, comptime fmt: []const u8, args: anytype) !void {
+    var buf: [1024]u8 = undefined;
+    var w = file.writerStreaming(io, &buf);
+    try w.interface.print(fmt, args);
+    try w.interface.flush();
 }

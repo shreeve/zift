@@ -123,10 +123,7 @@ pub fn run(
         .revents = 0,
     }};
 
-    const status = std.Io.File.stderr();
-    try status.writeStreamingAll(io, "zift: listening on ");
-    try status.writeStreamingAll(io, active.current.config.server.listen);
-    try status.writeStreamingAll(io, "\n");
+    try sys.note(io, "zift: listening on {s}\n", .{active.current.config.server.listen});
 
     // mtime polling every `reload-interval`; 0 leaves only SIGHUP.
     var next_reload_ms: i64 = sys.monotonicMs() +
@@ -224,8 +221,7 @@ pub fn run(
 
     // Graceful drain: wait up to `shutdown_grace_ms`, then shutdown(2)
     // every remaining session socket so workers unblock and clean up.
-    const stderr = std.Io.File.stderr();
-    try stderr.writeStreamingAll(io, "zift: shutdown signal received, draining sessions\n");
+    try sys.note(io, "zift: shutdown signal received, draining sessions\n", .{});
 
     // Unbind now so no connection lands during the grace window. Then
     // clear libssh's copy of the fd: ssh_bind_free would close it again,
@@ -240,16 +236,10 @@ pub fn run(
     }
 
     if (active_sessions.load(.acquire) == 0) {
-        try stderr.writeStreamingAll(io, "zift: all sessions drained, exiting\n");
+        try sys.note(io, "zift: all sessions drained, exiting\n", .{});
     } else {
         const closed = signals.forceCloseAll(io);
-        var buf: [128]u8 = undefined;
-        const line = std.fmt.bufPrint(
-            &buf,
-            "zift: grace period expired, force-closing {d} session(s)\n",
-            .{closed},
-        ) catch unreachable;
-        try stderr.writeStreamingAll(io, line);
+        try sys.note(io, "zift: grace period expired, force-closing {d} session(s)\n", .{closed});
 
         // Reads on a shut-down socket return at once; 500 ms is ample.
         const final_deadline = sys.monotonicMs() + 500;
@@ -259,14 +249,9 @@ pub fn run(
 
         const stragglers = active_sessions.load(.acquire);
         if (stragglers == 0) {
-            try stderr.writeStreamingAll(io, "zift: all sessions drained after force-close, exiting\n");
+            try sys.note(io, "zift: all sessions drained after force-close, exiting\n", .{});
         } else {
-            const line2 = std.fmt.bufPrint(
-                &buf,
-                "zift: {d} session(s) still alive after force-close; exiting anyway\n",
-                .{stragglers},
-            ) catch unreachable;
-            try stderr.writeStreamingAll(io, line2);
+            try sys.note(io, "zift: {d} session(s) still alive after force-close; exiting anyway\n", .{stragglers});
         }
     }
 
@@ -302,15 +287,12 @@ fn ensureFdBudget(io: std.Io, max_connections: u32) void {
     const after = std.posix.getrlimit(.NOFILE) catch return;
     if (@as(u64, after.cur) >= needed) return;
 
-    const stderr = std.Io.File.stderr();
-    var buf: [320]u8 = undefined;
-    const line = std.fmt.bufPrint(
-        &buf,
+    sys.note(
+        io,
         "zift: warning: file-descriptor soft limit {d} is below the worst case {d} " ++
             "(max-connections {d} × {d} handles/session); lower max-connections or raise LimitNOFILE\n",
         .{ after.cur, needed, max_connections, sftp.max_handles_per_session },
-    ) catch return;
-    stderr.writeStreamingAll(io, line) catch {};
+    ) catch {};
 }
 
 const ConfigRef = struct {
@@ -371,20 +353,14 @@ const ActiveConfig = struct {
         const mtime = currentConfigMtime(self.io, path) catch |err| {
             // Warn once and keep the previous config until it is back.
             if (!self.stat_warned) {
-                const stderr = std.Io.File.stderr();
-                stderr.writeStreamingAll(self.io, "zift: cannot stat config file: ") catch {};
-                stderr.writeStreamingAll(self.io, path) catch {};
-                stderr.writeStreamingAll(self.io, ": ") catch {};
-                stderr.writeStreamingAll(self.io, @errorName(err)) catch {};
-                stderr.writeStreamingAll(self.io, " (keeping previous config)\n") catch {};
+                sys.note(self.io, "zift: cannot stat config file: {s}: {s} (keeping previous config)\n", .{ path, @errorName(err) }) catch {};
                 self.stat_warned = true;
             }
             return;
         };
 
         if (self.stat_warned) {
-            const stderr = std.Io.File.stderr();
-            stderr.writeStreamingAll(self.io, "zift: config file readable again\n") catch {};
+            sys.note(self.io, "zift: config file readable again\n", .{}) catch {};
             self.stat_warned = false;
         }
 
@@ -417,14 +393,10 @@ const ActiveConfig = struct {
         known_mtime: *std.Io.Timestamp,
         key_stamps: *KeyStamps,
     ) void {
-        const stderr = std.Io.File.stderr();
-
         const contents = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1 << 20)) catch |err| {
             // A read failure may be transient (EMFILE, a chmod that does
             // not bump mtime), so keep the stamps and retry next poll.
-            stderr.writeStreamingAll(self.io, "zift: config reload read failed: ") catch return;
-            stderr.writeStreamingAll(self.io, @errorName(err)) catch return;
-            stderr.writeStreamingAll(self.io, "\n") catch {};
+            sys.note(self.io, "zift: config reload read failed: {s}\n", .{@errorName(err)}) catch {};
             return;
         };
         defer self.allocator.free(contents);
@@ -440,28 +412,26 @@ const ActiveConfig = struct {
             var msg_buf: [512]u8 = undefined;
             var w = std.Io.Writer.fixed(&msg_buf);
             diag.format(err, &w) catch {};
-            self.noteReloadRejected(stderr, path, w.buffered());
+            self.noteReloadRejected(path, w.buffered());
             return;
         };
 
         // validateSemantic already printed the specific diagnostic.
         config.validateSemantic(self.io, self.allocator, &next_config) catch {
             next_config.deinit();
-            self.noteReloadRejected(stderr, path, "semantic validation failed (see preceding diagnostic)");
+            self.noteReloadRejected(path, "semantic validation failed (see preceding diagnostic)");
             return;
         };
 
         // These are not re-applied; say so rather than imply they were.
         // A warning that fails to print must not discard a good config.
-        self.warnRestartOnly(stderr, "listen", self.bound_listen, next_config.server.listen);
-        self.warnRestartOnly(stderr, "host-key", self.bound_host_key, next_config.server.host_key);
-        self.warnRestartOnly(stderr, "log", self.bound_log, logTargetLabel(next_config.server.log));
+        self.warnRestartOnly("listen", self.bound_listen, next_config.server.listen);
+        self.warnRestartOnly("host-key", self.bound_host_key, next_config.server.host_key);
+        self.warnRestartOnly("log", self.bound_log, logTargetLabel(next_config.server.log));
 
         const next_ref = ConfigRef.create(self.allocator, next_config) catch |err| {
             next_config.deinit();
-            stderr.writeStreamingAll(self.io, "zift: config reload failed: ") catch return;
-            stderr.writeStreamingAll(self.io, @errorName(err)) catch return;
-            stderr.writeStreamingAll(self.io, " (keeping previous config)\n") catch {};
+            sys.note(self.io, "zift: config reload failed: {s} (keeping previous config)\n", .{@errorName(err)}) catch {};
             return;
         };
 
@@ -477,11 +447,11 @@ const ActiveConfig = struct {
 
         if (self.reload_degraded) {
             self.reload_degraded = false;
-            stderr.writeStreamingAll(self.io, "zift: config reload recovered — on-disk config valid again; now serving it\n") catch {};
+            sys.note(self.io, "zift: config reload recovered — on-disk config valid again; now serving it\n", .{}) catch {};
             audit.log(self.io, null, "config.reload", path, .ok, "recovered; on-disk config now serving", "");
         }
 
-        stderr.writeStreamingAll(self.io, "zift: config reloaded (users/rules/timeouts applied to new sessions)\n") catch {};
+        sys.note(self.io, "zift: config reloaded (users/rules/timeouts applied to new sessions)\n", .{}) catch {};
     }
 
     /// Report a rejected reload on stderr and in the audit log, and mark
@@ -489,19 +459,12 @@ const ActiveConfig = struct {
     /// grep for `config reload rejected`.
     fn noteReloadRejected(
         self: *ActiveConfig,
-        stderr: std.Io.File,
         path: []const u8,
         detail: []const u8,
     ) void {
         self.reload_degraded = true;
-        stderr.writeStreamingAll(self.io, "zift: config reload rejected — SERVING PREVIOUS CONFIG; fix ") catch {};
-        stderr.writeStreamingAll(self.io, path) catch {};
-        stderr.writeStreamingAll(self.io, " and it will auto-apply") catch {};
-        if (detail.len != 0) {
-            stderr.writeStreamingAll(self.io, ": ") catch {};
-            stderr.writeStreamingAll(self.io, detail) catch {};
-        }
-        stderr.writeStreamingAll(self.io, "\n") catch {};
+        const sep: []const u8 = if (detail.len != 0) ": " else "";
+        sys.note(self.io, "zift: config reload rejected — SERVING PREVIOUS CONFIG; fix {s} and it will auto-apply{s}{s}\n", .{ path, sep, detail }) catch {};
         audit.log(
             self.io,
             null,
@@ -515,17 +478,12 @@ const ActiveConfig = struct {
 
     fn warnRestartOnly(
         self: *ActiveConfig,
-        stderr: std.Io.File,
         name: []const u8,
         bound: []const u8,
         proposed: []const u8,
     ) void {
         if (std.mem.eql(u8, bound, proposed)) return;
-        stderr.writeStreamingAll(self.io, "zift: warning: '") catch return;
-        stderr.writeStreamingAll(self.io, name) catch return;
-        stderr.writeStreamingAll(self.io, "' changed in config but is applied only at startup; still using '") catch return;
-        stderr.writeStreamingAll(self.io, bound) catch return;
-        stderr.writeStreamingAll(self.io, "' — restart zift to apply\n") catch {};
+        sys.note(self.io, "zift: warning: '{s}' changed in config but is applied only at startup; still using '{s}' — restart zift to apply\n", .{ name, bound }) catch {};
     }
 };
 
@@ -817,10 +775,5 @@ fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail:
     const detail: []const u8 = if (raw != null) std.mem.span(raw) else "";
     if (detail.len == 0 and no_detail == .skip) return;
 
-    const stderr = std.Io.File.stderr();
-    try stderr.writeStreamingAll(io, "zift: ");
-    try stderr.writeStreamingAll(io, where);
-    try stderr.writeStreamingAll(io, ": ");
-    try stderr.writeStreamingAll(io, if (detail.len > 0) detail else "no detail from libssh");
-    try stderr.writeStreamingAll(io, "\n");
+    try sys.note(io, "zift: {s}: {s}\n", .{ where, if (detail.len > 0) detail else "no detail from libssh" });
 }

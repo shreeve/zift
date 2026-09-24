@@ -11,6 +11,7 @@ const config = @import("config.zig");
 const passhash = @import("passhash.zig");
 const server = @import("server.zig");
 const signals = @import("signals.zig");
+const sys = @import("sys.zig");
 const vfs = @import("vfs.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -61,15 +62,8 @@ fn usage(io: std.Io) !void {
 }
 
 fn version(io: std.Io) !void {
-    const stdout = std.Io.File.stdout();
-    try stdout.writeStreamingAll(io, "zift ");
-    try stdout.writeStreamingAll(io, build_options.version);
-    try stdout.writeStreamingAll(io, "\n");
-    try stdout.writeStreamingAll(io, "build: ");
-    try stdout.writeStreamingAll(io, build_options.target);
-    try stdout.writeStreamingAll(io, " ");
-    try stdout.writeStreamingAll(io, build_options.optimize);
-    try stdout.writeStreamingAll(io, "\n");
+    try std.Io.File.stdout().writeStreamingAll(io, "zift " ++ build_options.version ++ "\n" ++
+        "build: " ++ build_options.target ++ " " ++ build_options.optimize ++ "\n");
 }
 
 fn validate(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
@@ -82,11 +76,7 @@ fn validate(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
     const path = args[2];
 
     const contents = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch |err| {
-        try stderr.writeStreamingAll(io, "zift validate: cannot read ");
-        try stderr.writeStreamingAll(io, path);
-        try stderr.writeStreamingAll(io, ": ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
+        try sys.note(io, "zift validate: cannot read {s}: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
     defer gpa.free(contents);
@@ -138,13 +128,8 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     // Announce the running version before reading the config. After an
     // upgrade `zift version` reports the file on disk, not this process;
     // this line is the journal's record, even when startup then fails.
-    try stderr.writeStreamingAll(io, "zift: starting zift ");
-    try stderr.writeStreamingAll(io, build_options.version);
-    try stderr.writeStreamingAll(io, " (");
-    try stderr.writeStreamingAll(io, build_options.target);
-    try stderr.writeStreamingAll(io, " ");
-    try stderr.writeStreamingAll(io, build_options.optimize);
-    try stderr.writeStreamingAll(io, ")\n");
+    try stderr.writeStreamingAll(io, "zift: starting zift " ++ build_options.version ++
+        " (" ++ build_options.target ++ " " ++ build_options.optimize ++ ")\n");
 
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 20));
     defer gpa.free(contents);
@@ -170,10 +155,8 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     // Informational: the legacy staging dir is never used any more.
     for (cfg.users) |*user| {
         if (vfs.legacyStagingDirExists(io, user.root)) {
-            try stderr.writeStreamingAll(io, "zift: warning: legacy staging dir at ");
-            try stderr.writeStreamingAll(io, user.root);
-            try stderr.writeStreamingAll(io, "/.zift-staging is ignored by v0.8.0+; ");
-            try stderr.writeStreamingAll(io, "sweep with `rm -rf` once no in-flight sessions need it\n");
+            try sys.note(io, "zift: warning: legacy staging dir at {s}/.zift-staging is ignored by v0.8.0+; " ++
+                "sweep with `rm -rf` once no in-flight sessions need it\n", .{user.root});
         }
     }
 
@@ -181,13 +164,9 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     try audit.initGlobal(io, gpa, cfg.server.log);
     defer audit.deinitGlobal(gpa);
 
-    try stderr.writeStreamingAll(io, "zift: libssh initialized\n");
-    try stderr.writeStreamingAll(io, "zift: config path: ");
-    try stderr.writeStreamingAll(io, args[2]);
-    try stderr.writeStreamingAll(io, "\n");
-    try stderr.writeStreamingAll(io, "zift: listen: ");
-    try stderr.writeStreamingAll(io, cfg.server.listen);
-    try stderr.writeStreamingAll(io, "\n");
+    try sys.note(io, "zift: libssh initialized\nzift: config path: {s}\nzift: listen: {s}\n", .{
+        args[2], cfg.server.listen,
+    });
     try server.run(io, gpa, args[2], cfg);
 }
 
@@ -210,6 +189,6 @@ fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !void {
     }
     var hash_buffer: [128]u8 = undefined;
     const hash = try passhash.mint(io, gpa, password, &hash_buffer);
-    try stdout.writeStreamingAll(io, hash);
-    try stdout.writeStreamingAll(io, "\n");
+    var line: [passhash.blob_len + 1]u8 = undefined;
+    try stdout.writeStreamingAll(io, std.fmt.bufPrint(&line, "{s}\n", .{hash}) catch unreachable);
 }

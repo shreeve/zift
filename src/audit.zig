@@ -110,9 +110,7 @@ pub const Sink = struct {
             if (warn) self.last_reopen_warn_ms = failed_at;
             self.mutex.unlock(io);
             if (warn) {
-                writeStderrRaw("zift: audit log reopen failed: ");
-                writeStderrRaw(@errorName(err));
-                writeStderrRaw("\n");
+                sys.note(io, "zift: audit log reopen failed: {s}\n", .{@errorName(err)}) catch {};
             }
             return;
         };
@@ -123,7 +121,7 @@ pub const Sink = struct {
 
         // Close after the swap; the caller's line goes to the new fd.
         if (old_fd >= 0) _ = std.c.close(old_fd);
-        writeStderrRaw("zift: audit log reopened\n");
+        sys.note(io, "zift: audit log reopened\n", .{}) catch {};
     }
 
     pub fn log(
@@ -159,7 +157,7 @@ pub const Sink = struct {
 
         const n = std.c.write(fd, line.ptr, line.len);
         if (n < 0 or @as(usize, @intCast(n)) != line.len) {
-            warnWriteFailure(if (n < 0) "WriteFailed" else "ShortWrite");
+            warnWriteFailure(io, if (n < 0) "WriteFailed" else "ShortWrite");
         }
     }
 };
@@ -170,19 +168,13 @@ pub const Sink = struct {
 const warn_min_interval_ms: i64 = 5_000;
 var last_warn_ms: std.atomic.Value(i64) = .init(0);
 
-fn warnWriteFailure(name: []const u8) void {
+fn warnWriteFailure(io: std.Io, name: []const u8) void {
     const now = sys.monotonicMs();
     const last = last_warn_ms.load(.acquire);
     if (now - last < warn_min_interval_ms and last != 0) return;
     last_warn_ms.store(now, .release);
 
-    writeStderrRaw("zift: audit write failed: ");
-    writeStderrRaw(name);
-    writeStderrRaw("\n");
-}
-
-fn writeStderrRaw(text: []const u8) void {
-    _ = std.c.write(2, text.ptr, text.len);
+    sys.note(io, "zift: audit write failed: {s}\n", .{name}) catch {};
 }
 
 fn openLogFile(io: std.Io, path: []const u8) !c_int {
