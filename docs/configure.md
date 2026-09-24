@@ -33,6 +33,8 @@ user ally
   allow /pending full
   allow /archive read
   deny **.exe
+  # **/.ssh/** does not match the .ssh directory itself, so READDIR can list names while OPEN of the key file stays denied.
+  deny **/.ssh
   deny **/.ssh/**
 ```
 
@@ -99,9 +101,12 @@ Generate one with:
 ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N ""
 ```
 
-The file must be readable by the `zift` process. In hardened
-deployments, make it `root:zift` and mode `0640` so the daemon can read
-but not rewrite its own server identity.
+The file must be a regular file, not a symlink, and readable by the
+`zift` process. Its mode must not include any other-permission bit, and
+must not include group-write or group-exec. `0640` and `0600` are
+valid; `0644` and `0660` are rejected by `zift validate` and by
+startup. In hardened deployments, make it `root:zift` and mode `0640`
+so the daemon can read but not rewrite its own server identity.
 
 ### `partner-root`
 
@@ -133,7 +138,8 @@ Trailing slashes are normalized.
 
 Optional. Default: `2s`.
 
-How often Zift checks the config file mtime for changes:
+How often Zift checks the `zift.conf` mtime and each authorized-key
+file's mtime for changes:
 
 ```zift
 reload-interval 2s
@@ -154,7 +160,8 @@ Disconnects idle sessions, including pre-auth sessions:
 idle-timeout 5m
 ```
 
-Set to `0` to disable.
+Set to `0` to disable. Any other value must be at most 2147483647
+milliseconds (about 24.8 days). Larger values are a config error.
 
 ### `max-connections`
 
@@ -215,10 +222,13 @@ log /home/zift/audit.jsonl
 
 Prefer `stderr` in production so the supervisor (journald, Docker,
 Kubernetes) owns retention. Use a file path only when you already have
-a log-shipping preference. File paths must be absolute. File
-destinations are opened append-only by the process and reopened on
-`SIGUSR1`, which supports ordinary external rotation workflows (send
-`SIGUSR1` after renaming the file).
+a log-shipping preference. File paths must be absolute. The file is
+opened append-only and with `NOFOLLOW`: a symlink at the log path is
+refused. A file the daemon creates is mode `0640`. A pre-existing
+regular file is appended to and is not chmod'd. The path is reopened
+on `SIGUSR1`; a failed reopen is retried. That supports ordinary
+external rotation (send `SIGUSR1` after renaming the file).
+
 ### `listing-mode`
 
 Optional. Default: `virtual`.
@@ -300,6 +310,10 @@ printf '%s\n' 'secret' | zift hash-password
 Legacy `$argon2id$…` PHC strings are rejected; remint with
 `zift hash-password`.
 
+`zift hash-password` rejects an empty password and writes nothing to
+stdout. An empty password never authenticates, even against a
+previously minted hash of the empty string.
+
 Public-key file:
 
 ```zift
@@ -359,6 +373,9 @@ Maps the virtual user's `/` to a real filesystem directory:
 root /home/zift/ally
 ```
 
+Like `partner-root`, `root` must be an absolute path. A relative root
+is a config error at parse time and does not abort the daemon.
+
 The root must exist and be a directory when the config is validated,
 loaded, or reloaded.
 
@@ -386,8 +403,12 @@ Denies matching virtual paths:
 
 ```zift
 deny **.exe
+deny **/.ssh
 deny **/.ssh/**
 ```
+
+`**/.ssh/**` does not match the directory `.ssh` itself, so READDIR of
+that directory can list names while OPEN of the key file stays denied.
 
 `deny` overrides `allow`.
 
@@ -513,8 +534,12 @@ Examples:
 ```zift
 deny /*.exe      # .exe files directly under the virtual root
 deny **.exe      # .exe files at any depth
-deny **/.ssh/**  # anything inside .ssh at any depth
+deny **/.ssh
+deny **/.ssh/**
 ```
+
+`**/.ssh/**` does not match the directory `.ssh` itself, so READDIR of
+that directory can list names while OPEN of the key file stays denied.
 
 Prefer explicit patterns over clever ones. The config language is meant
 to stay small.
@@ -549,9 +574,12 @@ Mutable workspace:
 allow /workspace full
 ```
 
-Block common dangerous names everywhere:
+Block common dangerous names everywhere. `**/.ssh/**` does not match
+the directory `.ssh` itself, so READDIR of that directory can list
+names while OPEN of the key file stays denied:
 
 ```zift
+deny **/.ssh
 deny **/.ssh/**
 deny **.exe
 ```
@@ -574,8 +602,9 @@ Full namespace model, hardening, and caveats:
 
 ## SFTP Surface
 
-Zift speaks SFTP v3. It supports the request types needed for ordinary
-file transfer:
+Zift speaks SFTP version 3. A client `INIT` version below 3 drops the
+session. A client version of 3 or higher is answered with version 3.
+It supports the request types needed for ordinary file transfer:
 
 - `REALPATH`
 - `STAT`, `LSTAT`, and `FSTAT`
@@ -589,12 +618,16 @@ session continues. Clients that try to set mtime, chmod, chown, create
 symlinks, or use protocol extensions should treat those as unsupported
 features rather than transfer failures.
 
+Append writes are `O_APPEND` `write(2)` calls, not a stat of the size
+followed by `pwrite`.
+
 ## Reloads
 
-Zift reloads for new sessions when the config mtime moves forward, or
-immediately on `SIGHUP`. Existing sessions keep the snapshot they
-authenticated with. Invalid reloads are rejected; the previous config
-keeps serving.
+Zift reloads for new sessions when the `zift.conf` mtime or an
+authorized-key file's mtime moves forward, or immediately on `SIGHUP`.
+Existing sessions keep the snapshot they authenticated with. Invalid
+reloads are rejected; the previous config keeps serving. A reload
+whose status write or allocation fails does not exit the process.
 
 A rejected reload is **loud**, not silent (0.10.1). The daemon marks
 itself degraded, logs `config reload rejected — SERVING PREVIOUS CONFIG`,

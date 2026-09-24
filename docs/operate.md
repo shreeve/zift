@@ -244,6 +244,8 @@ user ally
   allow /pending full
   allow /archive read
   deny **.exe
+  # **/.ssh/** does not match the .ssh directory itself, so READDIR can list names while OPEN of the key file stays denied.
+  deny **/.ssh
   deny **/.ssh/**
 ```
 
@@ -258,7 +260,9 @@ sudo -u zift zift validate /home/zift/zift.conf
 
 Validation checks syntax plus live filesystem invariants:
 
-- host key is readable
+- host key is a readable regular file, not a symlink, with no
+  other-permission bits and no group-write or group-exec (`0640` and
+  `0600` pass; `0644` and `0660` fail)
 - partner roots exist
 - partner roots are directories
 - partner roots do not overlap after symlink resolution
@@ -340,13 +344,18 @@ config **before** signalling, so an invalid config makes the reload
 command **fail** (non-zero, shown in `systemctl status` and the journal)
 and the daemon is never HUPed. `systemctl kill -s HUP` skips that guard.
 
-Zift also watches the config mtime according to `reload-interval`.
-Reloads affect new sessions only. Existing sessions keep their current
-config snapshot until disconnect.
+Zift watches the `zift.conf` mtime and each authorized-key file's mtime
+on `reload-interval`, and reloads on `SIGHUP`. Replacing an
+authorized-key file does not need a dummy edit of `zift.conf`. Reloads
+affect new sessions only. Existing sessions keep their current config
+snapshot until disconnect.
 
-mtime polling only notices config files whose timestamp moves forward.
+Polling notices a watched file only when its timestamp moves forward.
 If your deploy tool preserves or rewinds mtimes, send `SIGHUP` after the
 file is in place.
+
+Write config changes atomically: write a temporary file and rename it
+into place. An in-place rewrite can be observed as a valid prefix.
 
 ### A rejected reload is loud (0.10.1)
 
@@ -368,6 +377,10 @@ active AND `zift validate` of the on-disk config fails ⇒ the daemon is
 serving stale rules a restart would fail to reload.** The host-zift
 runbook's `verify` checks exactly this ("on-disk config in sync with
 running daemon").
+
+A reload whose status write or allocation fails does not exit the
+process. An invalid config file still keeps the previous config in
+service.
 
 ## Add A Partner
 
@@ -601,7 +614,7 @@ Common failures:
 
 | Symptom | Likely cause |
 | --- | --- |
-| startup fails | bad config, unreadable host key, missing root, port in use |
+| startup fails | bad config, rejected host key (unreadable, symlink, or mode), missing root, port in use |
 | `config reload rejected` / degraded | edited config is invalid; previous config is still serving. Fix the file (reload auto-recovers) or run `systemctl reload` to see the validation error |
 | auth denied | wrong credential, missing key file, unsupported key type |
 | upload fails at close | target collision, policy denial, cross-filesystem publish |
