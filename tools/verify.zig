@@ -107,17 +107,13 @@ fn verifyElf(io: std.Io, gpa: std.mem.Allocator, path: []const u8, data: []const
 
     if (needed > 0) {
         var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf,
-            "verify: FAIL — {s} has {d} DT_NEEDED entries (expected zero, fully static)\n",
-            .{ path, needed }) catch unreachable;
+        const msg = std.fmt.bufPrint(&buf, "verify: FAIL — {s} has {d} DT_NEEDED entries (expected zero, fully static)\n", .{ path, needed }) catch unreachable;
         try stderr.writeStreamingAll(io, msg);
         return 1;
     }
 
     var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf,
-        "verify: OK — DT_NEEDED (ELF) in {s}:\n  (zero entries — fully static)\n",
-        .{path}) catch unreachable;
+    const msg = std.fmt.bufPrint(&buf, "verify: OK — DT_NEEDED (ELF) in {s}:\n  (zero entries — fully static)\n", .{path}) catch unreachable;
     try stdout.writeStreamingAll(io, msg);
     return 0;
 }
@@ -202,9 +198,7 @@ fn verifyMachO(io: std.Io, path: []const u8, data: []const u8) !u8 {
 
     if (unexpected_count > 0) {
         var head_buf: [256]u8 = undefined;
-        const head = std.fmt.bufPrint(&head_buf,
-            "verify: FAIL — {s} has {d} unexpected LC_LOAD_DYLIB entries\n",
-            .{ path, unexpected_count }) catch unreachable;
+        const head = std.fmt.bufPrint(&head_buf, "verify: FAIL — {s} has {d} unexpected LC_LOAD_DYLIB entries\n", .{ path, unexpected_count }) catch unreachable;
         try stderr.writeStreamingAll(io, head);
         try stderr.writeStreamingAll(io, report_w.buffered());
         try stderr.writeStreamingAll(io,
@@ -217,9 +211,7 @@ fn verifyMachO(io: std.Io, path: []const u8, data: []const u8) !u8 {
     }
 
     var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf,
-        "verify: OK — LC_LOAD_DYLIB (Mach-O) in {s}: {d} system entr{s}\n",
-        .{ path, ok_count, if (ok_count == 1) @as([]const u8, "y") else "ies" }) catch unreachable;
+    const msg = std.fmt.bufPrint(&buf, "verify: OK — LC_LOAD_DYLIB (Mach-O) in {s}: {d} system entr{s}\n", .{ path, ok_count, if (ok_count == 1) @as([]const u8, "y") else "ies" }) catch unreachable;
     try stdout.writeStreamingAll(io, msg);
     return 0;
 }

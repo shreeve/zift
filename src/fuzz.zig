@@ -96,13 +96,15 @@ fn fuzzPolicyGlob(_: void, smith: *Smith) !void {
 // config parser (version letter, alphabet, exact length).
 
 test "fuzz passhash credential validation" {
-    return std.testing.fuzz({}, fuzzPasshash, .{ .corpus = &.{
-        "a0000000000000000000000000000000",
-        "zAAAA", // unknown version letter
-        "$argon2id$v=19$m=65536,t=2,p=1$aa$bb",
-        "a!!!!",
-        "b0000000000000000000000000000000", // future version
-    } });
+    return std.testing.fuzz({}, fuzzPasshash, .{
+        .corpus = &.{
+            "a0000000000000000000000000000000",
+            "zAAAA", // unknown version letter
+            "$argon2id$v=19$m=65536,t=2,p=1$aa$bb",
+            "a!!!!",
+            "b0000000000000000000000000000000", // future version
+        },
+    });
 }
 
 fn fuzzPasshash(_: void, smith: *Smith) !void {

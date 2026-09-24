@@ -204,9 +204,7 @@ pub fn writeFullAttrs(w: *PacketWriter, info: listing.EntryInfo) !void {
     // which we don't track separately — we report mtime for both
     // since SFTP clients use atime only as a fallback for dirs that
     // don't track it.
-    const t32: u32 = if (info.mtime_secs < 0) 0
-        else if (info.mtime_secs > std.math.maxInt(u32)) std.math.maxInt(u32)
-        else @intCast(info.mtime_secs);
+    const t32: u32 = if (info.mtime_secs < 0) 0 else if (info.mtime_secs > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(info.mtime_secs);
     try w.putU32(t32);
     try w.putU32(t32);
 }

@@ -405,4 +405,3 @@ fn matchAgainstDummyKey(allocator: std.mem.Allocator, presented: c.ssh_key) bool
     _ = c.ssh_key_cmp(presented, parsed, c.SSH_KEY_CMP_PUBLIC);
     return false;
 }
-
