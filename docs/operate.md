@@ -44,7 +44,7 @@ binary against `SHA256SUMS`, and installs the binary only.
 The examples below use `ZIFT_VERSION`; set it to the release you want.
 
 ```sh
-ZIFT_VERSION=0.11.0
+ZIFT_VERSION=0.12.0
 ARCH=$(uname -m)          # x86_64 or aarch64
 BASE=https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}
 

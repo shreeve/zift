@@ -6,7 +6,7 @@
 #
 # Pin a version by passing a tag (with or without the leading v):
 #
-#   curl -fsSL .../install.sh | bash -s v0.11.0
+#   curl -fsSL .../install.sh | bash -s v0.12.0
 #
 # Downloads the release binary for this platform, verifies it against the
 # release's signed SHA256SUMS, and installs it.
@@ -175,7 +175,7 @@ main() {
   tag=${1:-}
   if [ -n "$tag" ]; then
     case "$tag" in v*) ;; *) tag="v$tag" ;; esac
-    valid_tag "$tag" || fail "not a release tag: ${1} (expected vX.Y.Z or vX.Y.Z-pre, e.g. v0.11.0)"
+    valid_tag "$tag" || fail "not a release tag: ${1} (expected vX.Y.Z or vX.Y.Z-pre, e.g. v0.12.0)"
   else
     tag=$(curl -fsSLI --retry 3 --retry-delay 1 -o /dev/null -w '%{url_effective}' \
       "https://github.com/$REPO/releases/latest") || fail "cannot reach github.com"

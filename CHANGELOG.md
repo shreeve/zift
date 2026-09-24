@@ -3,7 +3,7 @@
 User-visible changes to Zift. Dates are those of the release commit.
 Versions marked "untagged" were released from a commit, not a git tag.
 
-## Unreleased
+## 0.12.0 — 2026-09-24
 
 To upgrade, run `zift validate` on your config with the new binary, as
 the service user (`sudo -u zift zift validate …`), before you restart.
