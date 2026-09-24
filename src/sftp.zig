@@ -10,7 +10,8 @@ const wire = @import("wire.zig");
 
 /// Floor for staging-orphan age before unlink. Concurrent sessions for
 /// the same partner may still be writing; never delete files younger
-/// than this even when idle-timeout is short or disabled.
+/// than this even when idle-timeout is short or disabled. Names still
+/// registered to a live handle are kept regardless of age.
 const staging_orphan_min_age_ms: i64 = 15 * 60 * 1000;
 
 /// Namespace changes are serialized across sessions. Directory-rename
@@ -20,6 +21,20 @@ const staging_orphan_min_age_ms: i64 = 15 * 60 * 1000;
 /// add, remove, or move an entry between that check and the rename.
 /// Operator-side filesystem changes remain outside Zift's threat model.
 var namespace_mutation_mutex: std.Io.Mutex = .init;
+
+const StagingLive = struct {
+    root: []u8,
+    name: [32]u8,
+};
+
+/// Live staging names (partner root + 32-byte name). Lock order is
+/// `namespace_mutation_mutex` then `staging_live_mutex`; never acquire
+/// `namespace_mutation_mutex` while holding `staging_live_mutex`.
+var staging_live_mutex: std.Io.Mutex = .init;
+var staging_live: std.ArrayList(StagingLive) = .empty;
+
+/// Ignored SSH messages tolerated before the sftp subsystem is accepted.
+const max_ignored_pre_subsystem: u32 = 64;
 
 /// Bound the work a single directory rename can force. A larger tree
 /// fails closed instead of monopolizing a session thread indefinitely.
@@ -73,6 +88,7 @@ fn appendVirtualChild(
 
 pub fn acceptSftpSubsystem(session: c.ssh_session) !c.ssh_channel {
     var channel: c.ssh_channel = null;
+    var ignored: u32 = 0;
 
     while (channel == null) {
         const msg = c.ssh_message_get(session) orelse return error.LibsshFailure;
@@ -82,9 +98,12 @@ pub fn acceptSftpSubsystem(session: c.ssh_session) !c.ssh_channel {
             c.ssh_message_subtype(msg) == c.SSH_CHANNEL_SESSION)
         {
             channel = c.ssh_message_channel_request_open_reply_accept(msg);
+            if (channel != null) continue;
+            try noteIgnoredPreSubsystem(&ignored);
             continue;
         }
 
+        try noteIgnoredPreSubsystem(&ignored);
         _ = c.ssh_message_reply_default(msg);
     }
 
@@ -102,8 +121,18 @@ pub fn acceptSftpSubsystem(session: c.ssh_session) !c.ssh_channel {
             }
         }
 
+        try noteIgnoredPreSubsystem(&ignored);
         _ = c.ssh_message_reply_default(msg);
     }
+}
+
+fn noteIgnoredPreSubsystem(count: *u32) error{LibsshFailure}!void {
+    if (preSubsystemIgnoreSaturated(count.*)) return error.LibsshFailure;
+    count.* += 1;
+}
+
+fn preSubsystemIgnoreSaturated(ignored: u32) bool {
+    return ignored >= max_ignored_pre_subsystem;
 }
 
 pub fn runSftp(
@@ -154,7 +183,7 @@ pub fn runSftp(
         },
         else => return err,
     };
-    if (first_payload.len < 5 or first_payload[0] != c.SSH_FXP_INIT) return error.LibsshFailure;
+    try acceptInitPayload(first_payload);
     try writeVersion(channel);
     state.last_activity_ms = audit.nowMonotonicMs();
 
@@ -275,6 +304,9 @@ const Handle = struct {
     dir: ?std.Io.Dir = null,
     dir_iter: ?std.Io.Dir.Iterator = null,
     dir_done: bool = false,
+    /// READDIR iterator failed. Later READDIR calls on this handle
+    /// fail instead of continuing past the unread names.
+    dir_failed: bool = false,
     /// Virtual path the dir was opened with (e.g., "/pending"). Stored
     /// verbatim so the listing renderer can ask the policy "what can
     /// this user do at <dir_vpath>/<entry_name>?" — necessary for
@@ -292,11 +324,11 @@ const Handle = struct {
     /// OPEN time from the SFTP open flags + matching `.open_write` policy.
     /// PLAN §6.3: `write` controls SSH_FXP_WRITE.
     can_write: bool = false,
-    /// Set when OPEN included `SSH_FXF_APPEND`. WRITE on an append
-    /// handle writes at the current end-of-file regardless of the
-    /// offset the client supplies. PLAN §7.6 commits to ordinary
-    /// SFTP v3 semantics; SSH_FXF_APPEND is the standard "all writes
-    /// go to the end" mode (rsync-over-sftp uses this).
+    /// Set when OPEN included `SSH_FXF_APPEND`. The fd has O_APPEND;
+    /// WRITE uses write(2) and ignores the client offset. PLAN §7.6
+    /// commits to ordinary SFTP v3 semantics; SSH_FXF_APPEND is the
+    /// standard "all writes go to the end" mode (rsync-over-sftp
+    /// uses this).
     is_append: bool = false,
     /// v0.5.0 staging-rename: when this handle was opened with
     /// CREAT against a non-existent target, the actual fd points at
@@ -509,13 +541,8 @@ const SftpState = struct {
     fn handleRealpath(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const parsed = parseString(payload) catch
             return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
-
-        const normalized = vfs_mod.Vfs.normalizeVirtual(self.allocator, parsed.value) catch |err| {
-            const status: c_int = if (err == error.PathTraversal) c.SSH_FX_PERMISSION_DENIED else c.SSH_FX_NO_SUCH_PATH;
-            return replyStatus(self.channel, request_id, status, "bad path");
-        };
-        defer self.allocator.free(normalized);
-
+        var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+        const normalized = (try self.normalizedPath(request_id, parsed.value, &vbuf)) orelse return;
         try replyName(self.channel, request_id, normalized);
     }
 
@@ -663,7 +690,10 @@ const SftpState = struct {
             defer self.auditFailed("opendir", path.value, "open dir failed");
             return replyStatus(self.channel, request_id, status, "open dir failed");
         };
-        const id = try self.addDirHandle(dir, path.value);
+        const id = self.addDirHandle(dir, path.value) catch |err| {
+            defer self.auditFailed("opendir", path.value, @errorName(err));
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open dir failed");
+        };
         defer self.auditOk("opendir", path.value, "");
         try replyHandle(self.channel, request_id, id);
     }
@@ -671,6 +701,7 @@ const SftpState = struct {
     fn handleReaddir(self: *SftpState, request_id: u32, payload: []const u8) !void {
         const id = parseHandleId(payload) catch return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
         const handle = self.findHandle(id, .dir) orelse return replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
+        if (handle.dir_failed) return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read dir failed");
         if (handle.dir_done) return replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof");
 
         // Batch up to `batch_size` entries per READDIR reply. Smaller
@@ -706,7 +737,11 @@ const SftpState = struct {
 
         while (count < entries.len) {
             const entry = handle.dir_iter.?.next(self.io) catch {
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read dir failed");
+                // Names already copied must still be sent. The next
+                // READDIR on this handle returns the failure so the
+                // client cannot continue past the hole.
+                handle.dir_failed = true;
+                break;
             } orelse {
                 handle.dir_done = true;
                 break;
@@ -829,7 +864,11 @@ const SftpState = struct {
             count += 1;
         }
 
-        if (count == 0) return replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof");
+        switch (readdirFollowup(count, handle.dir_failed)) {
+            .send_batch => {},
+            .eof => return replyStatus(self.channel, request_id, c.SSH_FX_EOF, "eof"),
+            .fail => return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "read dir failed"),
+        }
         try replyNames(self.channel, request_id, entries[0..count]);
     }
 
@@ -912,7 +951,15 @@ const SftpState = struct {
         }) catch |err| switch (err) {
             error.FileNotFound => {
                 if (!want_creat or !want_write) {
-                    return replyStatus(self.channel, request_id, c.SSH_FX_NO_SUCH_FILE, "not found");
+                    // Write without read/list must not distinguish a
+                    // missing path from a present one.
+                    const may_stat = policy.check(self.user, .stat, path.value) == .allow;
+                    const status = openExistenceStatus(may_stat, .missing);
+                    if (!may_stat) {
+                        defer self.auditDenied(op_label, path.value);
+                        return replyStatus(self.channel, request_id, status, "denied");
+                    }
+                    return replyStatus(self.channel, request_id, status, "not found");
                 }
                 // v0.5.0 atomic-upload: create-on-non-existent goes
                 // through a staging file in `<root>/.zift/staging/`,
@@ -947,6 +994,10 @@ const SftpState = struct {
                     return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
                 const staging_name = staging_name_buf[0..];
+                self.registerStagingName(staging_name) catch {
+                    defer self.auditFailed(op_label, path.value, "staging register failed");
+                    return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                };
 
                 // The staging file is created with the configured
                 // `publish-mode` (default 0o660) so it lands at the
@@ -966,16 +1017,23 @@ const SftpState = struct {
                     .exclusive = true,
                     .permissions = .fromMode(@intCast(publish_mode)),
                 }) catch {
+                    // createFile failed, so the name is not ours to unlink.
+                    self.unregisterStagingName(staging_name);
                     defer self.auditFailed(op_label, path.value, "staging create failed");
                     return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
                 created.setPermissions(self.io, .fromMode(@intCast(publish_mode))) catch {
-                    var f = created;
-                    f.close(self.io);
-                    staging.deleteFile(self.io, staging_name) catch {};
+                    self.rollbackStagingCreate(staging, staging_name, created);
                     defer self.auditFailed(op_label, path.value, "staging chmod failed");
                     return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
+                if (want_append) {
+                    setFdAppend(created.handle) catch {
+                        self.rollbackStagingCreate(staging, staging_name, created);
+                        defer self.auditFailed(op_label, path.value, "append flag failed");
+                        return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+                    };
+                }
 
                 // Truncate request is moot here (we just created an
                 // empty file). EXCL is honored at CLOSE-time via
@@ -989,11 +1047,11 @@ const SftpState = struct {
                     want_append,
                     want_excl,
                 ) catch |alloc_err| {
-                    // addStagedHandle failed (OOM in dupe). The
-                    // errdefer inside it closes `created`, but we
-                    // also need to unlink the file we created in
-                    // staging — otherwise it'd be an orphan.
-                    staging.deleteFile(self.io, staging_name) catch {};
+                    // addStagedHandle failed (OOM in dupe, or no
+                    // handle id). Its errdefer closes `created`.
+                    // Unlink and drop the registry entry so the
+                    // sweep can treat the name as a crash orphan.
+                    self.rollbackStagingCreate(staging, staging_name, null);
                     defer self.auditFailed(op_label, path.value, @errorName(alloc_err));
                     return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
                 };
@@ -1012,9 +1070,16 @@ const SftpState = struct {
         };
 
         // EXCL means "create exclusively". The file existed → fail.
+        // A partner who cannot stat must not learn that from "exists".
         if (want_creat and want_excl) {
             file.close(self.io);
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "exists");
+            const may_stat = policy.check(self.user, .stat, path.value) == .allow;
+            const status = openExistenceStatus(may_stat, .excl_exists);
+            if (!may_stat) {
+                defer self.auditDenied(op_label, path.value);
+                return replyStatus(self.channel, request_id, status, "denied");
+            }
+            return replyStatus(self.channel, request_id, status, "exists");
         }
 
         // Belt-and-suspenders FD verification. If the platform's
@@ -1051,9 +1116,25 @@ const SftpState = struct {
             return replyStatus(
                 self.channel,
                 request_id,
-                c.SSH_FX_PERMISSION_DENIED,
+                openExistenceStatus(policy.check(self.user, .stat, path.value) == .allow, .present_no_update),
                 "permission denied",
             );
+        }
+
+        // Before truncate: an exhausted id must not zero the file and
+        // then kill the session. Ids are not recycled.
+        if (!handleIdAvailable(self.next_handle)) {
+            file.close(self.io);
+            defer self.auditFailed(op_label, path.value, "handle id exhausted");
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+        }
+
+        if (want_append) {
+            setFdAppend(file.handle) catch {
+                file.close(self.io);
+                defer self.auditFailed(op_label, path.value, "append flag failed");
+                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+            };
         }
 
         // Truncation only after the FD is proven inside the jail
@@ -1066,7 +1147,10 @@ const SftpState = struct {
             };
         }
 
-        const id = try self.addFileHandle(file, want_read, want_write, want_append);
+        const id = self.addFileHandle(file, want_read, want_write, want_append) catch |err| {
+            defer self.auditFailed(op_label, path.value, @errorName(err));
+            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
+        };
         defer self.auditOk(op_label, path.value, "");
         try replyHandle(self.channel, request_id, id);
     }
@@ -1120,7 +1204,7 @@ const SftpState = struct {
 
         // Reject an out-of-range write offset up front (same reasoning
         // as READ). Append mode ignores the client offset entirely.
-        if (client_offset > std.math.maxInt(i64)) {
+        if (!handle.is_append and client_offset > std.math.maxInt(i64)) {
             return replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad offset");
         }
 
@@ -1130,21 +1214,17 @@ const SftpState = struct {
             return replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
 
-        // SSH_FXF_APPEND mode (PLAN §7.6): the client's offset is
-        // ignored; every write goes to the current end-of-file. Stat
-        // the open fd to learn the current size, then pwrite there.
-        // SFTP handles are single-threaded per session, so no other
-        // worker can race the size between stat and write on this fd.
-        const offset: u64 = blk: {
-            if (!handle.is_append) break :blk client_offset;
-            const file_stat = handle.file.?.stat(self.io) catch
-                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "stat for append failed");
-            break :blk file_stat.size;
-        };
-
-        handle.file.?.writePositionalAll(self.io, data.value, offset) catch {
-            return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "write failed");
-        };
+        // SSH_FXF_APPEND: write(2) honors the O_APPEND set at OPEN,
+        // including writes from other sessions. pwrite does not.
+        if (handle.is_append) {
+            handle.file.?.writeStreamingAll(self.io, data.value) catch {
+                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "write failed");
+            };
+        } else {
+            handle.file.?.writePositionalAll(self.io, data.value, client_offset) catch {
+                return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "write failed");
+            };
+        }
         try replyStatus(self.channel, request_id, c.SSH_FX_OK, "ok");
     }
 
@@ -1337,8 +1417,10 @@ const SftpState = struct {
             };
         }
 
-        // Rename succeeded — clear staging_basename so closeHandle
-        // doesn't unlink the file we just published.
+        // Rename succeeded — drop the live-name registration and
+        // clear staging_basename so closeHandle doesn't unlink the
+        // file we just published.
+        self.unregisterStagingName(staging_basename);
         self.allocator.free(staging_basename);
         handle.staging_basename = null;
 
@@ -1382,7 +1464,12 @@ const SftpState = struct {
         // returning SSH_FX_OK on a directory whose mode doesn't match
         // the configured `mkdir-mode` would be a silent contract
         // violation.
-        var created_dir = parent.parent.openDir(self.io, parent.base, .{}) catch {
+        // `iterate` keeps Zig off O_PATH. An O_PATH fd cannot fchmod,
+        // and that failure would roll the mkdir back.
+        var created_dir = parent.parent.openDir(self.io, parent.base, .{
+            .follow_symlinks = false,
+            .iterate = true,
+        }) catch {
             parent.parent.deleteDir(self.io, parent.base) catch {};
             defer self.auditFailed("mkdir", path.value, "openDir-after-create failed");
             return replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "mkdir failed");
@@ -1764,9 +1851,9 @@ const SftpState = struct {
     }
 
     /// Unlink crash orphans under this partner's `<root>/.zift/staging/`.
-    /// Safe across partners (each jail is separate). Safe with concurrent
-    /// sessions for the same partner by only deleting files older than
-    /// `max(idle_timeout, 15m)`.
+    /// Safe across partners (each jail is separate). Registered names
+    /// are skipped regardless of age. Unregistered files are deleted
+    /// only when older than `max(idle_timeout, 15m)`.
     fn sweepStagingOrphans(self: *SftpState) void {
         var dir = self.vfs.tryOpenExistingStagingDir(self.io) orelse return;
         defer dir.close(self.io);
@@ -1778,10 +1865,59 @@ const SftpState = struct {
         var it = dir.iterate();
         while (it.next(self.io) catch null) |entry| {
             if (entry.kind != .file) continue;
-            const info = listing.statAt(dir.handle, entry.name) catch continue;
-            if (now_secs - info.mtime_secs < min_age_secs) continue;
+            const live = self.stagingNameIsLive(entry.name);
+            const age_secs: i64 = if (live) 0 else blk: {
+                const info = listing.statAt(dir.handle, entry.name) catch continue;
+                break :blk now_secs - info.mtime_secs;
+            };
+            if (!sweepUnlinksStagingFile(live, age_secs, min_age_secs)) continue;
             dir.deleteFile(self.io, entry.name) catch {};
         }
+    }
+
+    fn registerStagingName(self: *SftpState, name: []const u8) !void {
+        std.debug.assert(name.len == 32);
+        const root_copy = try self.allocator.dupe(u8, self.vfs.root);
+        staging_live_mutex.lockUncancelable(self.io);
+        defer staging_live_mutex.unlock(self.io);
+        var copied: [32]u8 = undefined;
+        @memcpy(&copied, name[0..32]);
+        staging_live.append(self.allocator, .{
+            .root = root_copy,
+            .name = copied,
+        }) catch |err| {
+            self.allocator.free(root_copy);
+            return err;
+        };
+    }
+
+    fn unregisterStagingName(self: *SftpState, name: []const u8) void {
+        staging_live_mutex.lockUncancelable(self.io);
+        defer staging_live_mutex.unlock(self.io);
+        var i: usize = 0;
+        while (i < staging_live.items.len) : (i += 1) {
+            const entry = staging_live.items[i];
+            if (!stagingIdentityMatches(self.vfs.root, name, entry.root, &entry.name)) continue;
+            const root = entry.root;
+            _ = staging_live.swapRemove(i);
+            self.allocator.free(root);
+            return;
+        }
+    }
+
+    fn stagingNameIsLive(self: *SftpState, name: []const u8) bool {
+        staging_live_mutex.lockUncancelable(self.io);
+        defer staging_live_mutex.unlock(self.io);
+        for (staging_live.items) |entry| {
+            if (stagingIdentityMatches(self.vfs.root, name, entry.root, &entry.name)) return true;
+        }
+        return false;
+    }
+
+    fn rollbackStagingCreate(self: *SftpState, staging: std.Io.Dir, name: []const u8, file: ?std.Io.File) void {
+        if (file) |f| f.close(self.io);
+        staging.deleteFile(self.io, name) catch {};
+        self.unregisterStagingName(name);
     }
 
     /// Rename that fails with PathAlreadyExists instead of replacing.
@@ -1978,6 +2114,7 @@ const SftpState = struct {
             if (self.staging_dir) |*dir| {
                 dir.deleteFile(self.io, sb) catch {};
             }
+            self.unregisterStagingName(sb);
             self.allocator.free(sb);
         }
         if (handle.staging_target_vpath) |tv| self.allocator.free(tv);
@@ -2128,6 +2265,67 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
     }
 }
 
+fn acceptInitPayload(payload: []const u8) error{LibsshFailure}!void {
+    if (payload.len < 5 or payload[0] != c.SSH_FXP_INIT) return error.LibsshFailure;
+    if (readU32(payload[1..5]) < 3) return error.LibsshFailure;
+}
+
+fn handleIdAvailable(next_handle: u32) bool {
+    return next_handle != std.math.maxInt(u32);
+}
+
+const OpenExistence = enum { missing, excl_exists, present_no_update };
+
+fn openExistenceStatus(may_stat: bool, kind: OpenExistence) c_int {
+    if (!may_stat) return c.SSH_FX_PERMISSION_DENIED;
+    return switch (kind) {
+        .missing => c.SSH_FX_NO_SUCH_FILE,
+        .excl_exists => c.SSH_FX_FAILURE,
+        .present_no_update => c.SSH_FX_PERMISSION_DENIED,
+    };
+}
+
+const ReaddirFollowup = enum { send_batch, eof, fail };
+
+fn readdirFollowup(copied: usize, failed: bool) ReaddirFollowup {
+    if (copied != 0) return .send_batch;
+    if (failed) return .fail;
+    return .eof;
+}
+
+fn sweepUnlinksStagingFile(live: bool, age_secs: i64, min_age_secs: i64) bool {
+    if (live) return false;
+    return age_secs >= min_age_secs;
+}
+
+fn stagingIdentityMatches(root: []const u8, name: []const u8, entry_root: []const u8, entry_name: []const u8) bool {
+    return name.len == 32 and entry_name.len == 32 and
+        std.mem.eql(u8, root, entry_root) and
+        std.mem.eql(u8, name, entry_name);
+}
+
+/// Zig 0.16 OpenFileOptions has no append bit, and pwrite ignores
+/// O_APPEND. F_SETFL is what makes WRITE atomic across sessions.
+fn setFdAppend(fd: std.posix.fd_t) error{AppendFlagFailed}!void {
+    const append_bit: c_int = @intCast(@as(u32, 1) << @bitOffsetOf(std.c.O, "APPEND"));
+    const current: c_int = getfl: while (true) {
+        const rc = std.c.fcntl(fd, @as(c_int, std.c.F.GETFL), @as(c_int, 0));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break :getfl rc,
+            .INTR => continue,
+            else => return error.AppendFlagFailed,
+        }
+    };
+    while (true) {
+        const rc = std.c.fcntl(fd, @as(c_int, std.c.F.SETFL), current | append_bit);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return error.AppendFlagFailed,
+        }
+    }
+}
+
 test "disconnectReason: the graceful goodbye is recognized" {
     // The exact text libssh's disconnect callback produces. Real clients
     // send an empty message, which is what the trailing colon carries.
@@ -2166,4 +2364,62 @@ test "disconnectReason: unrelated libssh errors stay unrecognized" {
     try std.testing.expectEqual(@as(?u32, null), disconnectReason("Received SSH_MSG_DISCONNECT: "));
     try std.testing.expectEqual(@as(?u32, null), disconnectReason("Received SSH_MSG_DISCONNECT: abc:x"));
     try std.testing.expectEqual(@as(?u32, null), disconnectReason("Received SSH_MSG_DISCONNECT: 11"));
+}
+
+test "init below version 3 drops; version 3 and above are accepted" {
+    const init: u8 = @intCast(c.SSH_FXP_INIT);
+    try std.testing.expectError(error.LibsshFailure, acceptInitPayload(&[_]u8{ init, 0, 0, 0 }));
+    try std.testing.expectError(error.LibsshFailure, acceptInitPayload(&[_]u8{ 2, 0, 0, 0, 3 }));
+    try std.testing.expectError(error.LibsshFailure, acceptInitPayload(&[_]u8{ init, 0, 0, 0, 2 }));
+    try acceptInitPayload(&[_]u8{ init, 0, 0, 0, 3 });
+    // Trailing extension bytes are ignored.
+    try acceptInitPayload(&[_]u8{ init, 0, 0, 0, 6, 0, 1, 2, 3 });
+}
+
+test "handle ids stop before u32 wrap" {
+    try std.testing.expect(handleIdAvailable(1));
+    try std.testing.expect(handleIdAvailable(std.math.maxInt(u32) - 1));
+    try std.testing.expect(!handleIdAvailable(std.math.maxInt(u32)));
+}
+
+test "write-only open conceals existence unless stat is allowed" {
+    const denied: c_int = c.SSH_FX_PERMISSION_DENIED;
+    const missing: c_int = c.SSH_FX_NO_SUCH_FILE;
+    const failure: c_int = c.SSH_FX_FAILURE;
+    try std.testing.expectEqual(denied, openExistenceStatus(false, .missing));
+    try std.testing.expectEqual(denied, openExistenceStatus(false, .excl_exists));
+    try std.testing.expectEqual(denied, openExistenceStatus(false, .present_no_update));
+    try std.testing.expectEqual(missing, openExistenceStatus(true, .missing));
+    try std.testing.expectEqual(failure, openExistenceStatus(true, .excl_exists));
+    try std.testing.expectEqual(denied, openExistenceStatus(true, .present_no_update));
+}
+
+test "readdir keeps a partial batch and fails the empty one" {
+    try std.testing.expectEqual(ReaddirFollowup.send_batch, readdirFollowup(3, true));
+    try std.testing.expectEqual(ReaddirFollowup.fail, readdirFollowup(0, true));
+    try std.testing.expectEqual(ReaddirFollowup.eof, readdirFollowup(0, false));
+    try std.testing.expectEqual(ReaddirFollowup.send_batch, readdirFollowup(16, false));
+}
+
+test "staging sweep skips live names and young orphans" {
+    try std.testing.expect(!sweepUnlinksStagingFile(true, 10_000, 60));
+    try std.testing.expect(!sweepUnlinksStagingFile(true, 0, 60));
+    try std.testing.expect(!sweepUnlinksStagingFile(false, 59, 60));
+    try std.testing.expect(sweepUnlinksStagingFile(false, 60, 60));
+    try std.testing.expect(!sweepUnlinksStagingFile(false, -1, 60));
+}
+
+test "staging registry key is root plus the 32-byte name" {
+    const name = "0123456789abcdef0123456789abcdef";
+    const other = "ffffffffffffffffffffffffffffffff";
+    try std.testing.expect(stagingIdentityMatches("/jails/a", name, "/jails/a", name));
+    try std.testing.expect(!stagingIdentityMatches("/jails/a", name, "/jails/b", name));
+    try std.testing.expect(!stagingIdentityMatches("/jails/a", name, "/jails/a", other));
+    try std.testing.expect(!stagingIdentityMatches("/jails/a", "short", "/jails/a", name));
+}
+
+test "pre-subsystem ignore cap is 64" {
+    try std.testing.expect(!preSubsystemIgnoreSaturated(0));
+    try std.testing.expect(!preSubsystemIgnoreSaturated(63));
+    try std.testing.expect(preSubsystemIgnoreSaturated(64));
 }
