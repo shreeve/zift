@@ -62,30 +62,32 @@ pub const LogTarget = union(enum) {
     file: []const u8,
 };
 
+/// The `server` section. Defaults are those of an omitted directive;
+/// `listen` and `host-key` are required.
 pub const ServerConfig = struct {
-    listen: []const u8,
-    host_key: []const u8,
-    reload_interval_ms: u64,
+    listen: []const u8 = "",
+    host_key: []const u8 = "",
+    reload_interval_ms: u64 = 2000,
     /// 0 disables the timeout.
-    idle_timeout_ms: u64,
-    max_connections: u32,
+    idle_timeout_ms: u64 = 300_000,
+    max_connections: u32 = 128,
     /// Separate cap on pre-auth sessions so a handshake storm cannot
     /// fill `max_connections`. 0 = no separate cap; else ≤ max_connections.
     /// Unset, it is max(1, max_connections / 4).
-    max_unauth_connections: u32,
+    max_unauth_connections: u32 = 0,
     /// How long SIGTERM waits for sessions before force-closing them.
-    shutdown_grace_ms: u64,
-    log: LogTarget,
+    shutdown_grace_ms: u64 = 30_000,
+    log: LogTarget = .stderr,
     /// `virtual` shows the partner's own name, group `sftp`, and
     /// policy-derived rwx; `reality` passes the inode's owner and mode.
-    listing_mode: ListingMode,
+    listing_mode: ListingMode = .virtual,
     /// Mode of a published upload: owner rw, never world-writable, no
     /// special bits. In-flight uploads are protected by the 0700 staging
     /// dir, not by this mode.
-    publish_mode: u32,
+    publish_mode: u32 = 0o660,
     /// Mode of an SFTP MKDIR: owner rwx, never world-writable. Setgid
     /// (on by default) keeps the partner tree's group on new subdirectories.
-    mkdir_mode: u32,
+    mkdir_mode: u32 = 0o2770,
 };
 
 pub const ListingMode = enum {
@@ -413,18 +415,7 @@ fn keyFileFail(
 }
 
 const ServerBuilder = struct {
-    listen: ?[]const u8 = null,
-    host_key: ?[]const u8 = null,
-    reload_interval_ms: u64 = 2000,
-    idle_timeout_ms: u64 = 300_000,
-    max_connections: u32 = 128,
-    /// Used only when set; see `ServerConfig.max_unauth_connections`.
-    max_unauth_connections: u32 = 0,
-    shutdown_grace_ms: u64 = 30_000,
-    log: ?LogTarget = null,
-    listing_mode: ListingMode = .virtual,
-    publish_mode: u32 = 0o660,
-    mkdir_mode: u32 = 0o2770,
+    cfg: ServerConfig = .{},
     /// Default root for users without `root`: `<partner-root>/<name>`.
     partner_root: ?[]const u8 = null,
     /// Line each directive was set on (0 = not set). Every server
@@ -465,46 +456,47 @@ const Section = enum {
     user,
 };
 
+/// Parse failures; `ParseDiag` says where, and usually what to write.
 pub const Error = error{
-    DuplicateServerSection,
     DuplicateDirective,
     DuplicateKeyFile,
     DuplicatePassword,
+    DuplicateServerSection,
     DuplicateUser,
     EmptyUserName,
     InvalidAuth,
     InvalidDuration,
+    InvalidFrom,
     InvalidKeyLine,
-    InvalidRsaKeySize,
-    KeyAlgorithmMismatch,
     InvalidListen,
     InvalidListingMode,
     InvalidMode,
     InvalidNumber,
+    InvalidPasshash,
+    InvalidPattern,
     InvalidPermission,
+    InvalidRsaKeySize,
     InvalidUserName,
+    KeyAlgorithmMismatch,
     KeyDirectiveRemoved,
     KeyLineTooLong,
-    UsernameTooLong,
     MissingCredentials,
     MissingHostKey,
     MissingListen,
     MissingRoot,
-    InvalidPattern,
     MissingRulePermissions,
     MissingServerSection,
     MissingValue,
-    UnauthCapExceedsTotal,
     OutOfMemory,
     PasswordDirectiveRemoved,
     PasswordPhcRemoved,
-    InvalidPasshash,
     PropertyOutsideSection,
     RelativePath,
+    UnauthCapExceedsTotal,
     UnknownKey,
     UnknownSection,
     UnsupportedKeyAlgorithm,
-    InvalidFrom,
+    UsernameTooLong,
 };
 
 /// Fixed limits, enforced at parse time.
@@ -743,20 +735,20 @@ pub fn parseWithDiag(
         section = .none;
         return error.MissingServerSection;
     }
-    const listen = server.listen orelse return error.MissingListen;
-    const host_key = server.host_key orelse return error.MissingHostKey;
+    if (server.lines.get(.listen) == 0) return error.MissingListen;
+    if (server.lines.get(.@"host-key") == 0) return error.MissingHostKey;
 
     // Unset, handshakes may hold at most a quarter of the slots, so a
     // pile of silent pre-auth sockets cannot starve every partner. An
     // explicit value, 0 (no separate cap) included, is kept as written.
     const unauth_line = server.lines.get(.@"max-unauth-connections");
-    const max_unauth = if (unauth_line != 0) server.max_unauth_connections else @max(1, server.max_connections / 4);
-    if (max_unauth > server.max_connections) {
+    const max_unauth = if (unauth_line != 0) server.cfg.max_unauth_connections else @max(1, server.cfg.max_connections / 4);
+    if (max_unauth > server.cfg.max_connections) {
         // Such a cap could never fire, so it is a typo.
         line_no = unauth_line;
         key_for_diag = "max-unauth-connections";
         return d.fail(error.UnauthCapExceedsTotal, "max-unauth-connections ({d}) exceeds max-connections ({d})", .{
-            max_unauth, server.max_connections,
+            max_unauth, server.cfg.max_connections,
         });
     }
 
@@ -792,23 +784,8 @@ pub fn parseWithDiag(
         };
     }
 
-    return .{
-        .arena = arena,
-        .server = .{
-            .listen = listen,
-            .host_key = host_key,
-            .reload_interval_ms = server.reload_interval_ms,
-            .idle_timeout_ms = server.idle_timeout_ms,
-            .max_connections = server.max_connections,
-            .max_unauth_connections = max_unauth,
-            .shutdown_grace_ms = server.shutdown_grace_ms,
-            .log = server.log orelse .stderr,
-            .listing_mode = server.listing_mode,
-            .publish_mode = server.publish_mode,
-            .mkdir_mode = server.mkdir_mode,
-        },
-        .users = final_users,
-    };
+    server.cfg.max_unauth_connections = max_unauth;
+    return .{ .arena = arena, .server = server.cfg, .users = final_users };
 }
 
 fn parseServerProperty(
@@ -825,33 +802,33 @@ fn parseServerProperty(
         .listen => {
             _ = parseListen(value) catch
                 return d.fail(error.InvalidListen, "use host:port, :port, or [ipv6]:port with a port from 1 to 65535", .{});
-            server.listen = try allocator.dupe(u8, value);
+            server.cfg.listen = try allocator.dupe(u8, value);
         },
-        .@"host-key" => server.host_key = try allocator.dupe(u8, value),
+        .@"host-key" => server.cfg.host_key = try allocator.dupe(u8, value),
         // Floors: a shorter poll re-stats every key file on each accept-loop
         // wake-up, and a shorter idle timeout fails every handshake.
-        .@"reload-interval" => server.reload_interval_ms = try parseDurationAtLeast(d, value, 100, "100ms"),
+        .@"reload-interval" => server.cfg.reload_interval_ms = try parseDurationAtLeast(d, value, 100, "100ms"),
         .@"idle-timeout" => {
             const ms = try parseDurationAtLeast(d, value, std.time.ms_per_s, "1s");
             // Above libssh's signed 32-bit ms limit it waits forever.
             if (ms > max_libssh_idle_timeout_ms) return d.fail(error.InvalidDuration, "at most 24d (libssh's limit)", .{});
-            server.idle_timeout_ms = ms;
+            server.cfg.idle_timeout_ms = ms;
         },
         .@"max-connections" => {
             // 0 would refuse every connection; elsewhere 0 means "off".
-            server.max_connections = try parseCount(d, value);
-            if (server.max_connections == 0) return d.fail(error.InvalidNumber, "must be at least 1", .{});
+            server.cfg.max_connections = try parseCount(d, value);
+            if (server.cfg.max_connections == 0) return d.fail(error.InvalidNumber, "must be at least 1", .{});
         },
-        .@"max-unauth-connections" => server.max_unauth_connections = try parseCount(d, value),
-        .@"shutdown-grace" => server.shutdown_grace_ms = try parseDurationMs(d, value),
-        .log => server.log = if (std.mem.eql(u8, value, "stderr"))
+        .@"max-unauth-connections" => server.cfg.max_unauth_connections = try parseCount(d, value),
+        .@"shutdown-grace" => server.cfg.shutdown_grace_ms = try parseDurationMs(d, value),
+        .log => server.cfg.log = if (std.mem.eql(u8, value, "stderr"))
             .stderr
         else
             .{ .file = try dupeAbsolute(allocator, d, value) },
-        .@"listing-mode" => server.listing_mode = std.meta.stringToEnum(ListingMode, value) orelse
+        .@"listing-mode" => server.cfg.listing_mode = std.meta.stringToEnum(ListingMode, value) orelse
             return d.fail(error.InvalidListingMode, "use 'virtual' or 'reality'", .{}),
-        .@"publish-mode" => server.publish_mode = try parsePublishMode(d, value),
-        .@"mkdir-mode" => server.mkdir_mode = try parseMkdirMode(d, value),
+        .@"publish-mode" => server.cfg.publish_mode = try parsePublishMode(d, value),
+        .@"mkdir-mode" => server.cfg.mkdir_mode = try parseMkdirMode(d, value),
         .@"partner-root" => {
             // Trailing `/` is trimmed, except for `/` itself.
             var pr = try dupeAbsolute(allocator, d, value);
@@ -1247,37 +1224,6 @@ test "parse valid config" {
     try std.testing.expect(ally.rules[0].permissions.contains(.write));
 }
 
-test "parse: 'write' is create-only — no mkdir, update, delete, or rename" {
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user alice
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/alice
-        \\  allow /pending read write
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-
-    const alice = cfg.findUser("alice").?;
-    try std.testing.expectEqual(@as(usize, 1), alice.rules.len);
-    const rule = alice.rules[0];
-    try std.testing.expectEqualStrings("/pending", rule.pattern);
-    // `write` is create-only: a drop box without mkdir, overwrite,
-    // delete, or rename.
-    try std.testing.expect(rule.permissions.contains(.read));
-    try std.testing.expect(rule.permissions.contains(.list));
-    try std.testing.expect(rule.permissions.contains(.write));
-    try std.testing.expect(!rule.permissions.contains(.mkdir));
-    try std.testing.expect(!rule.permissions.contains(.update));
-    try std.testing.expect(!rule.permissions.contains(.delete));
-    try std.testing.expect(!rule.permissions.contains(.rename));
-}
-
 test "parse: listen is validated at parse time" {
     const bad = [_][]const u8{
         "NOT-AN-ADDRESS", // no colon at all
@@ -1348,196 +1294,51 @@ test "parseListen: host and port to bind" {
     try std.testing.expectError(error.InvalidListen, parseListen("a" ** 256 ++ ":22"));
 }
 
-test "parse: 'update' grants clobber without granting deletion" {
-    // A partner who re-sends the same filename may replace it but never delete.
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user feeder
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/feeder
-        \\  allow /feed read write update
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-
-    const rule = cfg.findUser("feeder").?.rules[0];
-    try std.testing.expect(rule.permissions.contains(.read));
-    try std.testing.expect(rule.permissions.contains(.write));
-    try std.testing.expect(rule.permissions.contains(.update));
-    // The whole point: create + overwrite, but no deletion, no rename
-    // (which destroys a name), and no directory creation.
-    try std.testing.expect(!rule.permissions.contains(.delete));
-    try std.testing.expect(!rule.permissions.contains(.rename));
-    try std.testing.expect(!rule.permissions.contains(.mkdir));
-}
-
-test "parse: 'delete' grants deletion without granting clobber" {
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user picker
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/picker
-        \\  allow /outgoing read delete
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-
-    const rule = cfg.findUser("picker").?.rules[0];
-    try std.testing.expect(rule.permissions.contains(.delete));
-    try std.testing.expect(!rule.permissions.contains(.update));
-    try std.testing.expect(!rule.permissions.contains(.write));
-}
-
-test "parse: retired verbs add/create/remove are rejected" {
-    // A retired verb is a hard error, never silently reinterpreted.
-    for ([_][]const u8{ "add", "create", "remove" }) |verb| {
-        var buf: [256]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf,
-            \\server
-            \\  listen 127.0.0.1:2222
-            \\  host-key /tmp/zift_host_ed25519
-            \\  log stderr
-            \\
-            \\user u
-            \\  auth a0000000000000000000000000000000
-            \\  root /tmp/zift/u
-            \\  allow /pending read {s}
-            \\
-        , .{verb});
-        try std.testing.expectError(error.InvalidPermission, parse(std.testing.allocator, text));
-    }
-}
-
-test "parse: 'full' includes update" {
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user w
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/w
-        \\  allow /workspace full
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-
-    const rule = cfg.findUser("w").?.rules[0];
-    inline for (.{ .read, .list, .write, .mkdir, .rename, .delete, .update }) |p| {
-        try std.testing.expect(rule.permissions.contains(p));
-    }
-}
-
-test "parse: 'read' is a superset of 'list'" {
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user alice
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/alice
-        \\  allow /pending read
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    const alice = cfg.findUser("alice").?;
-    const rule = alice.rules[0];
-    try std.testing.expect(rule.permissions.contains(.read));
-    try std.testing.expect(rule.permissions.contains(.list));
-    // ...and no mutation.
-    try std.testing.expect(!rule.permissions.contains(.write));
-    try std.testing.expect(!rule.permissions.contains(.mkdir));
-    try std.testing.expect(!rule.permissions.contains(.rename));
-    try std.testing.expect(!rule.permissions.contains(.delete));
-}
-
-test "parse: bare 'list' grants no download" {
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user alice
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/alice
-        \\  allow /pending list
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    const alice = cfg.findUser("alice").?;
-    const rule = alice.rules[0];
-    try std.testing.expect(rule.permissions.contains(.list));
-    try std.testing.expect(!rule.permissions.contains(.read));
-}
-
-test "parse: 'full' grants every permission" {
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user alice
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/alice
-        \\  allow /workspace full
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    const alice = cfg.findUser("alice").?;
-    const rule = alice.rules[0];
-    try std.testing.expect(rule.permissions.contains(.read));
-    try std.testing.expect(rule.permissions.contains(.list));
-    try std.testing.expect(rule.permissions.contains(.write));
-    try std.testing.expect(rule.permissions.contains(.mkdir));
-    try std.testing.expect(rule.permissions.contains(.rename));
-    try std.testing.expect(rule.permissions.contains(.delete));
-}
-
-test "parse: a composite alongside its own granular verbs is idempotent" {
-    // `full` + granular verbs already inside `full`'s expansion should
-    // just OR cleanly — no error, no surprise, no double-counting.
-    const text =
-        \\server
-        \\  listen 127.0.0.1:2222
-        \\  host-key /tmp/zift_host_ed25519
-        \\  log stderr
-        \\
-        \\user alice
-        \\  auth a0000000000000000000000000000000
-        \\  root /tmp/zift/alice
-        \\  allow /pending full write rename mkdir
-        \\
-    ;
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    const alice = cfg.findUser("alice").?;
-    const rule = alice.rules[0];
-    try std.testing.expect(rule.permissions.contains(.write));
-    try std.testing.expect(rule.permissions.contains(.mkdir));
-    try std.testing.expect(rule.permissions.contains(.rename));
-}
-
 // Structurally valid passhash (23 zero bytes). Parser checks shape only.
 const valid_test_passhash = "a" ++ ("0" ** 31);
+
+test "verbs: each allow line grants exactly its permissions" {
+    const all = &[_]Permission{ .read, .list, .write, .update, .delete, .mkdir, .rename };
+    const cases = [_]struct { []const u8, []const Permission }{
+        // `read` implies `list`: download-without-listing is only obscurity.
+        .{ "read", &.{ .read, .list } },
+        // `list` alone browses without downloading.
+        .{ "list", &.{.list} },
+        // `write` is create-only: a drop box without mkdir, overwrite,
+        // delete, or rename.
+        .{ "read write", &.{ .read, .list, .write } },
+        // Re-sending `daily.csv` may replace it (the clobber rule) without
+        // deletion, rename (which destroys a name), or mkdir.
+        .{ "read write update", &.{ .read, .list, .write, .update } },
+        // Deletion without clobber.
+        .{ "read delete", &.{ .read, .list, .delete } },
+        .{ "mkdir", &.{.mkdir} },
+        .{ "rename", &.{.rename} },
+        .{ "full", all },
+        // A composite plus verbs it already includes ORs cleanly.
+        .{ "full write rename mkdir", all },
+        .{ "read write list mkdir delete rename update", all },
+    };
+    for (cases) |case| {
+        const verbs, const want = case;
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n  allow /pending {s}\n", .{verbs});
+        var cfg = try parse(std.testing.allocator, text);
+        defer cfg.deinit();
+        var expected = PermissionSet.initEmpty();
+        for (want) |p| expected.insert(p);
+        try std.testing.expect(expected.eql(cfg.users[0].rules[0].permissions));
+        try std.testing.expectEqualStrings("/pending", cfg.users[0].rules[0].pattern);
+    }
+
+    // A retired verb is a hard error, never silently reinterpreted.
+    for ([_][]const u8{ "add", "create", "remove", "Read" }) |verb| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n  allow /pending read {s}\n", .{verb});
+        try std.testing.expectError(error.InvalidPermission, parse(std.testing.allocator, text));
+    }
+    try std.testing.expectError(error.MissingRulePermissions, parse(std.testing.allocator, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n  allow /pending\n"));
+}
 
 test "duplicate user is rejected" {
     const text =
@@ -1801,15 +1602,6 @@ test "duplicate-password check fires before PasswordPhcRemoved" {
     try std.testing.expectError(error.DuplicatePassword, parse(std.testing.allocator, text));
 }
 
-test "partner-root '/' derives single-slash user root (POSIX-safe)" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /\n\n" ++
-        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    try std.testing.expectEqualStrings("/ally", cfg.findUser("ally").?.root);
-}
-
 test "auth value that is neither valid passhash nor /path rejected" {
     // Letter-leading junk is attempted as a passhash.
     const cases = [_]struct { []const u8, Error }{
@@ -1830,52 +1622,6 @@ test "auth value that is neither valid passhash nor /path rejected" {
     }
 }
 
-test "username '..' rejected (partner-root path-traversal defense)" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
-        "user ..\n  auth " ++ valid_test_passhash ++ "\n";
-    try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
-}
-
-test "username '.' rejected (partner-root path-traversal defense)" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
-        "user .\n  auth " ++ valid_test_passhash ++ "\n";
-    try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
-}
-
-test "username with leading dot rejected" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user .hidden\n  auth " ++ valid_test_passhash ++ "\n  root /tmp/a\n";
-    try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
-}
-
-test "password directive removed: clear migration error" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  password " ++ valid_test_passhash ++ "\n  root /tmp/a\n";
-    try std.testing.expectError(error.PasswordDirectiveRemoved, parse(std.testing.allocator, text));
-}
-
-test "key directive removed: clear migration error" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth " ++ valid_test_passhash ++ "\n  key ssh-ed25519 " ++ valid_ed25519_blob ++ "\n  root /tmp/a\n";
-    try std.testing.expectError(error.KeyDirectiveRemoved, parse(std.testing.allocator, text));
-}
-
-test "partner-root: trailing slash trimmed before deriving user root" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift/\n\n" ++
-        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    // Trimmed `partner-root` stored as `/home/zift`; user root joined
-    // as `/home/zift/ally` — no double-slash.
-    try std.testing.expectEqualStrings("/home/zift/ally", cfg.findUser("ally").?.root);
-}
-
 test "auth /path records path; key file resolved later" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
@@ -1891,43 +1637,53 @@ test "auth /path records path; key file resolved later" {
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.users[0].password_hash);
 }
 
-test "partner-root: explicit user root overrides default" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
-        "user override\n  auth " ++ valid_test_passhash ++ "\n  root /custom/path\n";
-    var cfg = try parse(std.testing.allocator, text);
+test "user names: the name becomes a path component, so no dots up front" {
+    // `.` and `..` would alias or escape `partner-root`; a leading dot hides.
+    for ([_][]const u8{ "..", ".", ".hidden", "a/b", "a b", "ally@example.com" }) |name| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\n  partner-root /home/zift\nuser {s}\n  auth /u.pub\n", .{name});
+        try std.testing.expectError(error.InvalidUserName, parse(std.testing.allocator, text));
+    }
+    var cfg = try parse(std.testing.allocator, "server\n  listen :2222\n  host-key /k\n  partner-root /p\nuser a.b-c_9\n  auth /u.pub\n");
     defer cfg.deinit();
-    try std.testing.expectEqualStrings("/custom/path", cfg.findUser("override").?.root);
+    try std.testing.expectEqualStrings("/p/a.b-c_9", cfg.users[0].root);
 }
 
-test "partner-root: missing user root defaults to <partner-root>/<user>" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root /home/zift\n\n" ++
-        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    try std.testing.expectEqualStrings("/home/zift/ally", cfg.findUser("ally").?.root);
+test "removed directives get a migration error, not UnknownKey" {
+    const base = "server\n  listen :2222\n  host-key /k\nuser ally\n  root /a\n  auth " ++ valid_test_passhash ++ "\n";
+    try std.testing.expectError(error.PasswordDirectiveRemoved, parse(std.testing.allocator, base ++ "  password " ++ valid_test_passhash ++ "\n"));
+    try std.testing.expectError(error.KeyDirectiveRemoved, parse(std.testing.allocator, base ++ "  key ssh-ed25519 " ++ valid_ed25519_blob ++ "\n"));
 }
 
-test "partner-root: unset, missing user root still rejected" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
-    try std.testing.expectError(error.MissingRoot, parse(std.testing.allocator, text));
-}
-
-test "partner-root: relative path rejected at parse time" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n  partner-root home/zift\n\n" ++
-        "user ally\n  auth " ++ valid_test_passhash ++ "\n";
-    try std.testing.expectError(error.RelativePath, parse(std.testing.allocator, text));
-}
-
-test "root: relative path rejected at parse time" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
-        "user ally\n  auth " ++ valid_test_passhash ++ "\n  root home/ally\n";
-    try std.testing.expectError(error.RelativePath, parse(std.testing.allocator, text));
+test "root and partner-root: absolute, and the default root is <partner-root>/<user>" {
+    const Want = union(enum) { root: []const u8, err: Error };
+    const cases = [_]struct { []const u8, []const u8, Want }{
+        // { server lines, user lines, outcome }
+        .{ "  partner-root /home/zift\n", "", .{ .root = "/home/zift/ally" } },
+        // Trailing `/` trimmed: no `//` in the joined root.
+        .{ "  partner-root /home/zift/\n", "", .{ .root = "/home/zift/ally" } },
+        // POSIX leaves a leading `//` implementation-defined.
+        .{ "  partner-root /\n", "", .{ .root = "/ally" } },
+        .{ "  partner-root /home/zift\n", "  root /custom/path\n", .{ .root = "/custom/path" } },
+        .{ "", "  root /custom/path\n", .{ .root = "/custom/path" } },
+        .{ "", "", .{ .err = error.MissingRoot } },
+        .{ "  partner-root home/zift\n", "", .{ .err = error.RelativePath } },
+        .{ "", "  root home/ally\n", .{ .err = error.RelativePath } },
+        .{ "  log var/log/zift.log\n", "  root /r\n", .{ .err = error.RelativePath } },
+    };
+    for (cases) |case| {
+        const server_lines, const user_lines, const want = case;
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\n{s}user ally\n  auth /a.pub\n{s}", .{ server_lines, user_lines });
+        switch (want) {
+            .root => |root| {
+                var cfg = try parse(std.testing.allocator, text);
+                defer cfg.deinit();
+                try std.testing.expectEqualStrings(root, cfg.findUser("ally").?.root);
+            },
+            .err => |err| try std.testing.expectError(err, parse(std.testing.allocator, text)),
+        }
+    }
 }
 
 test "server defaults applied when properties omitted" {
@@ -1967,25 +1723,6 @@ test "idle-timeout above libssh signed-32ms cap (25d) is InvalidDuration" {
     var disabled = try parse(std.testing.allocator, off);
     defer disabled.deinit();
     try std.testing.expectEqual(@as(u64, 0), disabled.server.idle_timeout_ms);
-}
-
-test "max-unauth-connections parses as a non-negative integer" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n" ++
-        "  max-connections 64\n  max-unauth-connections 16\n";
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    try std.testing.expectEqual(@as(u32, 64), cfg.server.max_connections);
-    try std.testing.expectEqual(@as(u32, 16), cfg.server.max_unauth_connections);
-}
-
-test "max-unauth-connections explicit 0 parses (operator-documented opt-out)" {
-    const text =
-        "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n" ++
-        "  max-connections 64\n  max-unauth-connections 0\n";
-    var cfg = try parse(std.testing.allocator, text);
-    defer cfg.deinit();
-    try std.testing.expectEqual(@as(u32, 0), cfg.server.max_unauth_connections);
 }
 
 test "max-unauth-connections: explicit values kept, default a quarter, never above the total" {
@@ -2183,6 +1920,40 @@ test "validateSemantic: host key and key file symlinks are followed, and the tar
     try tree.chmod("etc/host", 0o600);
     try tree.chmod("etc/u.pub", 0o664);
     try std.testing.expectError(error.AuthKeyFileWritableByOthers, tree.check(linked, null));
+}
+
+test "validateSemantic: key files hold keys, comments, and blank lines" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const io = std.testing.io;
+    const write = struct {
+        fn f(t: *TestTree, data: []const u8) !void {
+            try t.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "etc/u.pub", .data = data });
+            try t.chmod("etc/u.pub", 0o644);
+        }
+    }.f;
+
+    // Every key line counts; CRLF, comments, and blanks are fine.
+    try write(&tree, "# ally's keys\r\n\r\nssh-ed25519 " ++ valid_ed25519_blob ++ " laptop\r\n  ecdsa-sha2-nistp256 " ++ p256_blob ++ "\n");
+    {
+        const expanded = try std.mem.replaceOwned(u8, std.testing.allocator, TestTree.config, "@", tree.path);
+        defer std.testing.allocator.free(expanded);
+        var cfg = try parse(std.testing.allocator, expanded);
+        defer cfg.deinit();
+        var diag: LoadDiag = .{};
+        try validateSemantic(io, std.testing.allocator, &cfg, null, &diag);
+        try std.testing.expectEqual(@as(usize, 2), cfg.users[0].keys.len);
+        try std.testing.expectEqualStrings("ecdsa-sha2-nistp256", cfg.users[0].keys[1].algorithm);
+    }
+
+    try write(&tree, "# nothing but a comment\n\n");
+    try std.testing.expectError(error.AuthKeyFileEmpty, tree.check(TestTree.config, null));
+    try write(&tree, "ssh-ed25519 " ++ valid_ed25519_blob ++ "\nssh-ed25519 AAAA\n");
+    try std.testing.expectError(error.AuthKeyFileMalformed, tree.check(TestTree.config, null));
+    try write(&tree, "#" ** (max_keyline_bytes * 4 + 1));
+    try std.testing.expectError(error.AuthKeyFileTooLarge, tree.check(TestTree.config, null));
+    try std.testing.expectError(error.AuthKeyFileNotRegular, tree.checkWith("@/etc/u.pub", "@/etc"));
+    try std.testing.expectError(error.AuthKeyFileUnreadable, tree.checkWith("@/etc/u.pub", "@/etc/none.pub"));
 }
 
 test "validateSemantic: the log directory must exist and a log must be a regular file" {
