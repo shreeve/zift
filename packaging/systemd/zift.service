@@ -11,82 +11,37 @@ Group=zift
 
 ExecStart=/usr/local/bin/zift serve /home/zift/zift.conf
 
-# Reload validates BEFORE it signals. `systemctl reload zift` first runs
-# `zift validate` on the on-disk config; if that fails, the reload job
-# fails (non-zero — shown in `systemctl status` and the journal) and the
-# daemon is never HUPed. This is what makes a bad edit LOUD at the moment
-# you reload, instead of the daemon quietly rejecting the new config on
-# the next SIGHUP/mtime poll and continuing to serve the previous one.
-# Only on a clean validate does the second line deliver SIGHUP, which
-# tells the already-running daemon to re-read and swap in the new config.
-# (systemd runs multiple ExecReload lines in order and aborts on the
-# first non-zero exit.) The daemon still re-validates on its own reload,
-# so this is belt-and-suspenders, not the sole check.
+# Reload validates first: a bad config fails `systemctl reload` loudly
+# and the daemon is never signalled (docs/operate.md, "Reload").
 ExecReload=/usr/local/bin/zift validate /home/zift/zift.conf
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=on-failure
 RestartSec=5
 
-# Bound the drain: keep systemd's stop timeout above the daemon's own
-# `shutdown-grace` (default 30s) so graceful drain + force-close can run
-# to completion before systemd SIGKILLs. Raise this if you raise
-# shutdown-grace.
+# Keep above `shutdown-grace` (default 30s) so the drain can finish.
 TimeoutStopSec=60
 
-# Thread-per-connection: cap total tasks so a connection storm can't
-# spawn unbounded threads. Keep comfortably above max-connections.
+# One thread per connection: keep above max-connections.
 TasksMax=512
 
-# Hardening: restrict the process to the minimum it needs. The set
-# below is the union of well-tested directives that work for a long-
-# running TCP daemon doing libssh + filesystem I/O. Each directive
-# restricts a specific kernel surface; together they cover privilege,
-# namespace, kernel-config, IPC, address-family, syscall, capability,
-# and /dev visibility.
-
-# Privilege & namespace fences.
+# Hardening: the minimum a TCP daemon doing libssh and file I/O needs.
 NoNewPrivileges=true
 LockPersonality=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RemoveIPC=true
 
-# RestrictSUIDSGID is deliberately NOT set, and must not be re-added.
-#
-# It blocks the setgid bit, which the default `mkdir-mode` (0o2770) and
-# any mode an operator gives setgid carry. With it enabled, such a MKDIR
-# fails for every partner under every policy -- the audit log shows
-# `"operation":"mkdir","result":"failed","detail":"createDir failed"`,
-# i.e. the policy check passed and the syscall was refused. Verified by
-# running the same mkdir as `zift` with and without the restriction.
-#
-# The setgid bit is load-bearing, not incidental: it is what keeps new
-# directories in group `zift` so host-side operators retain access
-# without re-chowning (see docs/operate.md, "Operator Access").
-#
-# What RestrictSUIDSGID would defend against -- this process creating a
-# setuid/setgid binary for later escalation -- is already covered:
-# NoNewPrivileges=true stops this process gaining privileges, and
-# NoExecPaths=/home/zift means this service cannot execute anything in
-# its only writable tree.
+# Do NOT add RestrictSUIDSGID: it fails every setgid MKDIR (the default
+# mkdir-mode 0o2770). NoNewPrivileges and NoExecPaths already cover it.
 
-# Filesystem visibility.
-# `PrivateDevices=true` exposes only /dev/null, /dev/zero, /dev/full,
-# /dev/random, /dev/urandom, /dev/tty — enough for libssh's RNG init
-# without exposing the rest of /dev.
-# `ProtectProc=invisible` makes /proc show only this service's PIDs.
-# `ProcSubset=pid` hides /proc/<pid>/{net,sys,...}, leaving only PID
-# metadata. Both directives require Linux 5.8+ / systemd 247+.
+# Filesystem visibility. ProtectProc and ProcSubset need Linux 5.8+ and
+# systemd 247+.
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-# /home/zift/ is the entire deploy tree (config + host key + partner
-# data + audit log). `ProtectHome=tmpfs` replaces /home/ with an empty
-# tmpfs in the unit's mount namespace, hiding every other user's home
-# directory from zift. `BindPaths=/home/zift` bind-mounts just zift's
-# own home back over that tmpfs at the same path. Net effect: zift
-# can see /home/zift/ and nothing else under /home/.
+# Of /home, only /home/zift is visible. Another layout: see
+# docs/operate.md, "Alternative Layouts".
 ProtectHome=tmpfs
 BindPaths=/home/zift
 ProtectProc=invisible
@@ -103,64 +58,32 @@ ProtectHostname=true
 # Memory & exec.
 MemoryDenyWriteExecute=true
 
-# Capabilities. Zift runs as `zift:zift` and never needs root caps.
-# An empty bounding set is the strongest possible filter.
+# No capabilities. A port below 1024 needs CAP_NET_BIND_SERVICE: see
+# the drop-in in docs/operate.md, "Set Up The Host".
 CapabilityBoundingSet=
 AmbientCapabilities=
 
-# Address families. Zift speaks SFTP over TCP only — IPv4 and IPv6.
-# AF_UNIX is not used (no local-socket protocol). AF_NETLINK is not
-# used (no kernel-event subscription). Refusing them removes the
-# corresponding kernel parsers from the attack surface.
+# TCP over IPv4 and IPv6 only.
 RestrictAddressFamilies=AF_INET AF_INET6
 
-# System-call surface. `@system-service` is systemd's curated baseline
-# for ordinary daemons; the additional `~@privileged ~@resources`
-# subtractions block setuid/setgid/sched_setaffinity/etc. One of them
-# Zift can reach: at startup it calls setrlimit (prlimit64 on musl) to
-# raise RLIMIT_NOFILE when the soft limit is below what max-connections
-# needs. LimitNOFILE below covers the defaults, so that call is skipped;
-# with a larger max-connections, SystemCallErrorNumber=EPERM makes the
-# blocked call fail (and Zift print its fd-budget warning) instead of
-# the default SIGSYS killing the daemon at startup.
-# `SystemCallArchitectures=native` blocks the 32-bit syscall ABI on
-# x86_64 hosts (a frequent confused-deputy vector).
+# Syscalls. EPERM, not SIGSYS: raising RLIMIT_NOFILE for a large
+# max-connections is blocked, and Zift then warns instead of dying.
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 SystemCallFilter=~@resources
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
-# Kernel keyring. Zift does not use the keyring; isolate it.
 KeyringMode=private
 
-# The single deploy tree under /home/zift contains the config, host
-# key, partner roots (each user's `root` lives at /home/zift/<user>/),
-# and the audit log. ProtectSystem=strict makes the rest of the
-# filesystem read-only. A different layout (say /etc/zift, /srv/sftp,
-# /var/log/zift) needs matching edits here: every partner root and the
-# audit log's directory in ReadWritePaths= and NoExecPaths=, and the
-# config path in ExecStart= and ExecReload=. Otherwise uploads and the
-# audit log fail with EROFS.
+# The only writable tree, and nothing in it may be executed by this
+# service. Another layout needs these edited (docs/operate.md).
 ReadWritePaths=/home/zift
-# Partners upload arbitrary bytes into /home/zift. MemoryDenyWriteExecute
-# blocks W^X inside this process only. NoExecPaths= keeps this service
-# from execve()ing anything under the writable tree. It applies only in
-# this unit's mount namespace: other processes on the host can still
-# execute uploaded files unless the filesystem is mounted noexec.
 NoExecPaths=/home/zift
 
-# File descriptors: each session may hold up to 256 SFTP handles plus
-# its socket and libssh's own fds, so the default max-connections 128
-# needs 128 x (256 + 8) + 64 = 33,856. 65536 covers that with room;
-# raise it with max-connections (Zift warns at startup when short).
+# The defaults (max-connections 128) need 33,856 fds and peak near
+# 550 MiB. Raise LimitNOFILE with max-connections (docs/operate.md).
 LimitNOFILE=65536
-# Memory: every password verification is Argon2id at 64 MiB, and Zift
-# runs at most 8 at once, so KDF work peaks at 8 x 64 MiB = 512 MiB.
-# Without that cap, 128 unauthenticated connections verifying together
-# would need 8 GiB. Sessions add roughly 256 KiB of packet buffer each
-# (32 MiB at 128). 4G leaves ample headroom; the cgroup OOM-kills the
-# whole daemon, and every live session with it, if it is ever reached.
 MemoryMax=4G
 
 UMask=0027

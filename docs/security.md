@@ -124,6 +124,8 @@ enable. Their numbers are in the [Limits](configure.md#limits) table.
 
 Prefer `from` for partners with stable addresses. A host firewall is
 optional defense in depth; keep administrative SSH on a different port.
+Serving on port 22 needs `CAP_NET_BIND_SERVICE`, which the shipped unit
+withholds; [`operate.md`](operate.md#set-up-the-host) has the drop-in.
 
 ## Uploads And The Per-Partner Namespace
 
