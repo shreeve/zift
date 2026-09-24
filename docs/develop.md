@@ -176,3 +176,35 @@ remote attack surface? Does it make failures harder to explain with
 outside.
 
 Update the docs and `CHANGELOG.md` in the same change as the code.
+
+## Backlog
+
+Considered and deferred, in rough priority order. The user-facing side
+of the first three is in [`security.md`](security.md#known-caveats).
+
+- **Reload revokes sessions.** A reload applies to new sessions only.
+  Ending live sessions whose user was removed, or whose credentials or
+  `from` changed, would need the session registry in `signals.zig`
+  (fds only today) to know each session's user.
+- **Atomic overwrite.** OPEN with `TRUNC` on an existing file (needs
+  `update`) rewrites it in place (`handleOpen` in `sftp.zig`). Staging
+  it like a new upload and renaming over the target on CLOSE would
+  close the half-written window; opens without `TRUNC` stay in place.
+- **Bad key signatures.** libssh drops a public-key request with an
+  invalid signature before Zift's callback, so it gets no reply and
+  does not count toward the auth ceiling. Needs an upstream libssh
+  change.
+- **Password rotation.** A user holds one password hash; allowing two
+  would let a partner's new password go live before the old one is
+  removed.
+- **More SFTP requests.** READLINK and the `fsync@openssh.com`,
+  `statvfs@openssh.com` and `limits@openssh.com` extensions are safe
+  to add. SYMLINK and hard links stay refused: they would breach the
+  jail.
+- **One missing root.** A missing partner root rejects the whole config,
+  on reload as well. Disabling only that user at reload, with an audit
+  line, would keep one typo from freezing everyone's changes; `validate`
+  should still fail.
+- **Abuse table.** Each accept and auth message scans 4096 entries in
+  `abuse.zig` under one mutex. That costs microseconds today; hash by
+  source if the table grows.
