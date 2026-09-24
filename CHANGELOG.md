@@ -3,6 +3,17 @@
 User-visible changes to Zift. Dates are those of the release commit.
 Versions marked "untagged" were released from a commit, not a git tag.
 
+## 0.12.1 — 2026-09-24
+
+- Upgrading on a service host checks the config first: before it
+  replaces the binary the `zift` service runs, the installer runs the
+  new version's `validate` on the service's config, as the service's
+  user, and installs nothing if the config is rejected. An upgrade is
+  now `curl … | bash`, then `sudo systemctl restart zift`.
+- `zift version` prints one line, `zift X.Y.Z`, as janus and harbor do.
+  The journal's `zift: starting` line still names the target and build
+  mode.
+
 ## 0.12.0 — 2026-09-24
 
 To upgrade, run `zift validate` on your config with the new binary, as
