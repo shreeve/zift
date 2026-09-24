@@ -1,72 +1,30 @@
-//! SFTP directory-listing formatter.
+//! Directory-listing support: lstat under a jailed dir fd, uid/gid name
+//! lookup, and the `ls -l` style longname that SFTP clients display
+//! verbatim (instead of their `?`-filled fallback), e.g.
 //!
-//! `ls -la` over SFTP is two questions stitched together:
-//!
-//!   1. What does each entry actually look like on disk? (mode, nlink,
-//!      uid, gid, size, mtime). The SFTP client uses this to render its
-//!      own listing if the server hasn't provided a "longname".
-//!
-//!   2. How does the server choose to *render* that information? The
-//!      protocol lets us send a precomputed longname per entry; if we
-//!      do, the OpenSSH client uses ours verbatim instead of falling
-//!      back to its own renderer (which prints `?` for fields it
-//!      doesn't have).
-//!
-//! Zift answers both: it `fstatat`s each entry under the open dir-fd
-//! (path-jail safe — no string-layer resolution past the verified
-//! directory), then formats a GNU-`ls`-style line, then sends it to
-//! the client along with full SFTP attrs. So `sftp> ls -la` looks like
-//!
-//!     drwxr-x---  5 shreeve trust    -    Apr 27 07:46 alice
-//!     drwxr-s---  4 shreeve trust    -    Apr 24 16:34 ally
-//!     -rw-r--r--  1 root    trust  41 K   Apr 27 06:55 hey.txt
-//!
-//! rather than the client's "?"-laden fallback. The size column is
-//! `-` for directories and special files (which match Unix `ls -lh`'s
-//! "we don't really care how big the inode is") and shows a real
-//! human-readable size for regular files. Numeric uid/gid only appears
-//! when `/etc/passwd` lookup fails — the typical local-user setup
-//! always resolves to names.
-//!
-//! All POSIX shape calls (`statx` on Linux, `fstatat` on macOS,
-//! `getpwuid_r`/`getgrgid_r` for name resolution) are kept in this
-//! module so sftp.zig stays focused on request handling.
+//!     drwxr-s---   4 ally     sftp             - Apr 24 16:34 inbox
+//!     -rw-r-----   1 ally     sftp           41K Apr 27 06:55 hey.txt
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// What we extract from every directory entry. Stays platform-agnostic
-/// even though the syscall to populate it differs (statx vs fstatat).
+/// The stat fields SFTP needs. std's Stat lacks uid/gid, hence our own.
 pub const EntryInfo = struct {
-    /// Full POSIX `st_mode`, including file-type bits in the high
-    /// nibble. Callers extract type via `S_IFMT` mask and permission
-    /// bits via `0o777`.
+    /// Full `st_mode`, file-type bits included.
     mode: u32,
-    /// Hard-link count. Always ≥1 on any sensible filesystem; clients
-    /// surface this in the `ls -l` 2nd column.
     nlink: u32,
     uid: u32,
     gid: u32,
-    /// Apparent size in bytes. For directories and most special files
-    /// the longname formatter substitutes `-`; this field is still
-    /// reported in the SFTP attrs for clients that want it.
     size: u64,
-    /// Whole seconds since the Unix epoch. SFTP v3 attrs only carry
-    /// 32-bit second-resolution timestamps (`uatime`/`umtime`), so
-    /// we don't bother carrying nanos.
+    /// Whole seconds: SFTP v3 carries no finer times.
     mtime_secs: i64,
 };
 
 pub const StatError = error{ NotFound, AccessDenied, Unexpected };
 
-/// `fstatat(dir_fd, name, AT_SYMLINK_NOFOLLOW)` — never follows the
-/// final component, so a symlink in the partner's tree returns its own
-/// metadata rather than reaching whatever it points at. The dir_fd
-/// MUST come from a `Dir` already verified by the path-jail; this
-/// function does NOT enforce containment, it just observes.
+/// lstat of `name` under `dir_fd`: a symlink reports itself, never its
+/// target. `dir_fd` must already be inside the jail; this does not check.
 pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
-    // `fstatat`/`statx` need a NUL-terminated path. NAME_MAX (255 on
-    // Linux/macOS) plus the terminator fits in a stack array.
     if (name.len >= 256) return error.Unexpected;
     var name_buf: [256]u8 = undefined;
     @memcpy(name_buf[0..name.len], name);
@@ -76,36 +34,9 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
     const at_flags: u32 = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
 
     if (builtin.os.tag == .linux) {
-        // Linux: statx syscall. Available since kernel 4.11 (2017).
-        //
-        // CRITICAL — `std.posix.errno` is the WRONG conversion for a
-        // raw syscall return value when libc is linked (which zift
-        // does for libssh's threading symbols). With `use_libc`
-        // active, `std.posix.system = std.c` and `std.posix.errno =
-        // std.c.errno`, whose body is `if (rc == -1) errno else
-        // .SUCCESS`. That's the LIBC convention: libc functions
-        // return -1 on error and stash the actual errno in the
-        // thread-local `errno` variable. Linux RAW SYSCALLS use a
-        // different convention: the syscall return value IS the
-        // negative errno, encoded as a `usize` (e.g. -ENOENT comes
-        // back as 0xFFFFFFFFFFFFFFFE). 0xFFFFFFFFFFFFFFFE != -1, so
-        // the libc-style errno check returns `.SUCCESS` for every
-        // raw-syscall error, silently swallowing failures.
-        //
-        // This is what caused tests 27/28/30/34/35 to fail in CI
-        // since v0.4.0. statx-on-missing-file returned -ENOENT;
-        // `std.posix.errno` treated that as SUCCESS; statAt
-        // returned a zero-filled EntryInfo instead of NotFound;
-        // publishStagedHandle saw `dest_exists = true` and denied
-        // the publish. The misdiagnosis we shipped briefly in
-        // v0.5.2 ("optimizer UB") was wrong — the buffer was
-        // genuinely zeroed by `std.mem.zeroes`, the syscall
-        // genuinely returned the right -ENOENT, but the errno
-        // conversion threw away the result.
-        //
-        // FIX: use `std.os.linux.errno` (the raw-syscall-shape
-        // converter) directly. Same pattern at every other raw-
-        // syscall call site in zift.
+        // Raw statx: decode with `std.os.linux.errno`. With libc linked,
+        // `std.posix.errno` expects libc's -1/errno convention and reads
+        // every raw -errno return as SUCCESS.
         var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
         const mask: std.os.linux.STATX = .{
             .TYPE = true,
@@ -132,11 +63,6 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
             .mtime_secs = sx.mtime.sec,
         };
     } else {
-        // macOS / *BSD / Solaris: libc `fstatat` against `std.c.Stat`.
-        // Function-call boundary forces the compiler to honor memory
-        // effects — no UB optimizer license to elide the kernel's
-        // writes through the buffer pointer. Zero-init for symmetry
-        // with the Linux path.
         var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
         const rc = std.c.fstatat(dir_fd, cname, &st, at_flags);
         if (rc != 0) {
@@ -157,16 +83,10 @@ pub fn statAt(dir_fd: std.posix.fd_t, name: []const u8) StatError!EntryInfo {
     }
 }
 
-/// `fstat`-equivalent for an already-open file descriptor — used by
-/// SFTP `FSTAT` (operating on a handle whose underlying fd is in our
-/// hand). Same portable shape as `statAt`.
+/// `statAt` for an open fd.
 pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
     if (builtin.os.tag == .linux) {
-        // Linux: statx with AT_EMPTY_PATH against the fd. Use
-        // `std.os.linux.errno` (raw-syscall errno shape), NOT
-        // `std.posix.errno` — see `statAt` for the long-form
-        // explanation of why those two are not interchangeable
-        // when libc is linked.
+        // Raw statx: `std.os.linux.errno`, as in `statAt`.
         var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
         const mask: std.os.linux.STATX = .{
             .TYPE = true,
@@ -215,18 +135,8 @@ pub fn statFd(fd: std.posix.fd_t) StatError!EntryInfo {
     }
 }
 
-/// Per-session cache for `uid -> name` and `gid -> name` translation.
-///
-/// Sized for the typical SFTP deployment: a handful of distinct
-/// owners across the partner roots (the OS user running zift, root,
-/// maybe one or two service accounts). When the cache fills, we fall
-/// back to numeric — never evict, because evicting a popular entry
-/// to make room for a single one-off file would worsen the next
-/// listing's perf and the userbase here is tiny anyway.
-///
-/// All buffers live inline in the struct, so the resolver itself
-/// allocates nothing — useful inside the SFTP read loop where we
-/// want predictable behavior under load.
+/// Per-session uid/gid name cache, inline and allocation-free. Hosts have
+/// few owners, so a full cache just stops caching; nothing is evicted.
 pub const NameResolver = struct {
     pub const max_entries: usize = 64;
     pub const max_name_len: usize = 32;
@@ -243,15 +153,10 @@ pub const NameResolver = struct {
     group_count: u8 = 0,
     group_entries: [max_entries]Entry = std.mem.zeroes([max_entries]Entry),
 
-    /// Look up `uid` -> name. Returns either a cached/`getpwuid_r`-resolved
-    /// name (sliced from the cache slot — not a temporary loop copy)
-    /// or a numeric fallback rendered into `numeric_buf` and returned.
+    /// The user name, or the number rendered into `numeric_buf`.
     pub fn user(self: *NameResolver, uid: u32, numeric_buf: []u8) []const u8 {
-        // CRITICAL: index by `i`, NOT `for (self.user_entries) |entry|`.
-        // The latter iterates by VALUE; `entry.name[0..entry.len]` would
-        // return a slice into the loop's stack-local copy, going stale
-        // the moment we return. Indexing keeps the slice live in the
-        // resolver's own backing storage.
+        // Index, don't iterate by value: the returned slice must point
+        // into the cache, not a loop-local copy.
         var i: usize = 0;
         while (i < self.user_count) : (i += 1) {
             if (self.user_entries[i].id == uid) {
@@ -275,9 +180,6 @@ pub const NameResolver = struct {
                 return self.user_entries[slot_index].name[0..self.user_entries[slot_index].len];
             }
         } else if (name) |n| {
-            // Cache full but we still resolved successfully; return the
-            // resolved name in the caller's scratch buffer rather than
-            // trying to evict.
             return copyToBuf(numeric_buf, n);
         }
         return std.fmt.bufPrint(numeric_buf, "{d}", .{uid}) catch numeric_buf[0..0];
@@ -319,11 +221,7 @@ fn copyToBuf(buf: []u8, src: []const u8) []const u8 {
     return buf[0..n];
 }
 
-/// `getpwuid_r` wrapper. Returns the user's `pw_name` if the lookup
-/// succeeds, `null` otherwise (uid not present in passwd db, name
-/// longer than our buffer, or any libc error). Each call uses a
-/// fresh thread-local scratch buffer so concurrent sessions don't
-/// share state.
+/// `getpwuid_r` into thread-local buffers; null on any failure.
 fn lookupUid(uid: u32) ?[]const u8 {
     const S = struct {
         threadlocal var pwd: std.c.passwd = undefined;
@@ -354,22 +252,8 @@ fn lookupGid(gid: u32) ?[]const u8 {
     return S.name[0..gr_name.len];
 }
 
-/// Format a GNU-`ls`-style listing line into `out`. Returns the slice
-/// of `out` that was written. Caller-supplied buffer should be ≥ 256
-/// bytes — long enough for the header plus a NAME_MAX filename.
-///
-/// Layout:
-///
-///     drwxr-xr-x  3 alice    trust         -    Apr 27 07:46 dirname
-///     -rw-r--r--  1 root     trust    41 K     Apr 27 06:55 file.txt
-///     lrwxrwxrwx  1 alice    trust         -    Apr 27 07:46 link -> target
-///
-/// The size column is `-` for directories, FIFOs, sockets, and devices
-/// (where the inode size doesn't carry useful information for the
-/// SFTP client) and a human-readable byte count for regular files /
-/// symlinks. Time format follows `ls -l`'s "recent vs. old" rule: a
-/// `Mon DD HH:MM` form for entries within the last ~6 months, and
-/// `Mon DD  YYYY` for older ones.
+/// A GNU `ls -l` style line (see the module doc) into `out`, which
+/// should hold at least 256 bytes. Long fields push columns right.
 pub fn formatLongname(
     out: []u8,
     info: EntryInfo,
@@ -389,11 +273,6 @@ pub fn formatLongname(
     var time_buf: [20]u8 = undefined;
     const time_str = formatMtime(&time_buf, info.mtime_secs, now_secs);
 
-    // Field widths chosen to stay readable for a typical SFTP partner
-    // setup (one or two service users, group names ≤ 8 chars, sizes
-    // up to a few GB rendered with the K/M/G suffix). Long names
-    // overflow gracefully — they push subsequent columns rightward
-    // rather than truncating.
     w.print(
         "{s} {d:>3} {s:<8} {s:<8} {s:>9} {s} {s}",
         .{ mode_buf[0..], info.nlink, user_name, group_name, size_str, time_str, entry_name },
@@ -402,8 +281,7 @@ pub fn formatLongname(
     return w.buffered();
 }
 
-/// Render the 10-character mode string (`drwxr-xr-x`, `-rw-r--r--`, etc.)
-/// into `out`. `out` must be exactly 10 bytes long.
+/// `drwxr-xr-x` style, including setuid/setgid/sticky letters.
 pub fn formatModeString(out: *[10]u8, mode: u32) void {
     out[0] = switch (mode & S_IFMT) {
         S_IFDIR => 'd',
@@ -450,10 +328,7 @@ pub fn formatModeString(out: *[10]u8, mode: u32) void {
     };
 }
 
-/// Render a human-readable size column. Returns the slice of `out`
-/// that was written. Directories, FIFOs, sockets, and devices show
-/// `-`; regular files and symlinks show a byte count or K/M/G/T
-/// suffix once the value reaches 1024.
+/// `-` for directories and special files, else bytes or `1.5K`, `41K`, ...
 fn formatSize(out: []u8, mode: u32, size: u64) []const u8 {
     switch (mode & S_IFMT) {
         S_IFDIR, S_IFIFO, S_IFSOCK, S_IFCHR, S_IFBLK => return std.fmt.bufPrint(out, "-", .{}) catch out[0..0],
@@ -481,17 +356,12 @@ fn formatSize(out: []u8, mode: u32, size: u64) []const u8 {
     return std.fmt.bufPrint(out, "{d:.0}{c}", .{ value, unit }) catch out[0..0];
 }
 
-/// Format a Unix timestamp the way GNU `ls` does: `Mon DD HH:MM` if
-/// the entry's mtime is within the last ~6 months, otherwise
-/// `Mon DD  YYYY` (note the double space, deliberate — it keeps
-/// the column width the same as the HH:MM form so dates align).
+/// `Mon DD HH:MM` within ~6 months of now, else `Mon DD  YYYY` (the
+/// double space keeps the column width), all in UTC.
 fn formatMtime(out: []u8, mtime_secs: i64, now_secs: i64) []const u8 {
     const broken = breakTime(mtime_secs);
     const six_months_secs: i64 = 6 * 30 * 24 * 60 * 60;
-    // Compare in i128 so an mtime read from a corrupted inode (e.g.
-    // i64.min) doesn't overflow the subtraction. The "recent" window
-    // only cares about coarse months — the i128 widening is purely
-    // defensive and free at this scale.
+    // i128: a junk mtime (e.g. i64 min) must not overflow.
     const diff: i128 = @as(i128, now_secs) - @as(i128, mtime_secs);
     const recent = diff < @as(i128, six_months_secs) and
         diff > -@as(i128, six_months_secs / 2);
@@ -518,11 +388,7 @@ const month_abbrev = [_][]const u8{
 };
 
 const BrokenTime = struct {
-    /// Calendar year. `i32` (not `u16`) so pre-1970 timestamps work
-    /// without underflow and so any unrealistic mtime from a corrupted
-    /// inode never panics ReleaseSafe — `ls -l` over a partner-managed
-    /// tree must never crash the session because of a synthetic
-    /// timestamp.
+    /// Clamped to i32: a junk mtime must never panic the session.
     year: i32,
     month: u4, // 0-11
     day: u8, // 1-31
@@ -530,34 +396,16 @@ const BrokenTime = struct {
     minute: u8, // 0-59
 };
 
-/// A tiny, dependency-free `gmtime`. Avoids pulling in libc localtime
-/// (which links against tz data, allocates, and behaves differently
-/// per host); the SFTP audit log already standardizes on UTC for
-/// timestamps and the `ls -l` time column is informational, not
-/// security-critical, so UTC is fine here too.
-///
-/// Implementation: Howard Hinnant's `civil_from_days` algorithm
-/// (https://howardhinnant.github.io/date_algorithms.html). O(1) — no
-/// loops over years/months — so it cannot spin or panic on extreme
-/// inputs the way the prior iterative implementation did. Any `i64`
-/// second offset within the proleptic Gregorian range converges; a
-/// pre-1970 mtime is just as valid as any other.
+/// UTC `gmtime` via Howard Hinnant's `civil_from_days`
+/// (https://howardhinnant.github.io/date_algorithms.html): O(1) and
+/// panic-free for any i64.
 fn breakTime(secs: i64) BrokenTime {
     const seconds_per_day: i64 = 86400;
     const day = @divFloor(secs, seconds_per_day);
-    // `@mod` gives mathematical modulo (always non-negative when the
-    // divisor is positive), so the result is in [0, 86399] regardless
-    // of `secs`'s sign. The earlier `secs - day * seconds_per_day`
-    // form was equivalent in math but overflowed `day * 86400` at
-    // extreme negative timestamps (e.g. `i64.min + 1` near the
-    // proleptic Gregorian boundary). `audit.zig`'s `formatRfc3339Utc`
-    // already used the @mod form; this brings `listing.zig` back
-    // into agreement.
+    // `@mod`, not `secs - day * 86400`, which overflows near i64 min.
     const seconds_in_day: i64 = @mod(secs, seconds_per_day); // [0, 86399]
 
-    // Shift epoch from 1970-01-01 to 0000-03-01 (the "March 1, year 0"
-    // origin Hinnant's algorithm uses). 719468 = days from 0000-03-01
-    // to 1970-01-01 in the proleptic Gregorian calendar.
+    // Days since 0000-03-01, the algorithm's origin.
     const z: i64 = day + 719468;
     const era: i64 = if (z >= 0) @divFloor(z, 146097) else @divFloor(z - 146096, 146097);
     const doe: u32 = @intCast(z - era * 146097); // [0, 146096]
@@ -566,16 +414,11 @@ fn breakTime(secs: i64) BrokenTime {
     const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     const mp: u32 = (5 * doy + 2) / 153; // [0, 11], March-based
     const day_of_month: u8 = @intCast(doy - (153 * mp + 2) / 5 + 1); // [1, 31]
-    // mp 0-9 = March-December (calendar months 3-12); mp 10-11 = January-February
-    // of the FOLLOWING calendar year, so the Jan/Feb adjustment below.
+    // mp counts from March, so Jan and Feb belong to the next year.
     const month_jan_based: u8 = if (mp < 10) @intCast(mp + 3) else @intCast(mp - 9);
     const calendar_year: i64 = if (month_jan_based <= 2) civil_year + 1 else civil_year;
 
     return .{
-        // Saturate at the i32 range. Any timestamp that produces a
-        // year outside ±2 billion is a synthetic value and we don't
-        // care about pixel-perfect rendering — we only care about
-        // not panicking.
         .year = @intCast(std.math.clamp(calendar_year, std.math.minInt(i32), std.math.maxInt(i32))),
         .month = @intCast(month_jan_based - 1),
         .day = day_of_month,
@@ -584,10 +427,7 @@ fn breakTime(secs: i64) BrokenTime {
     };
 }
 
-// POSIX file-type constants. We define our own copies rather than
-// pulling them from std.c.S because std.c.S is target-specific (the
-// numeric values differ between glibc, musl, and macOS) and we only
-// need the canonical POSIX values, which match across all three.
+// POSIX file-type bits, as u32 to match `EntryInfo.mode`.
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFDIR: u32 = 0o040000;
@@ -660,15 +500,6 @@ test "breakTime: known epoch -> 1970-01-01 00:00" {
 
 test "breakTime: 2026-04-27 14:35 UTC" {
     // 2026-04-27T14:35:00Z = 1777300500.
-    //
-    // (The prior fixture value of 1777905300 was actually 2026-05-04
-    // 14:35 UTC — off by exactly 7 days. The implementation has
-    // always been correct; the test fixture was wrong. Re-derive
-    // independently: 1970→2026 = 56 years × 365 = 20440 days, plus
-    // 14 leap years between 1972 and 2024 inclusive = 20454 days
-    // from epoch to 2026-01-01; Jan 31 + Feb 28 + Mar 31 + 26 = 116
-    // days from 2026-01-01 to 2026-04-27; 20570 × 86400 + 14×3600
-    // + 35×60 = 1777300500.)
     const b = breakTime(1777300500);
     try std.testing.expectEqual(@as(i32, 2026), b.year);
     try std.testing.expectEqual(@as(u4, 3), b.month); // April (0-indexed)
@@ -696,9 +527,6 @@ test "breakTime: 1900-01-01 (pre-Unix-epoch by 70 years)" {
 }
 
 test "breakTime: extreme negative timestamp does not panic" {
-    // Used to underflow `u16 year` and panic in ReleaseSafe. The
-    // exact rendered year doesn't matter; what matters is that the
-    // function returns a `BrokenTime` instead of crashing.
     const b = breakTime(std.math.minInt(i64) + 1);
     _ = b;
 }
@@ -709,9 +537,6 @@ test "breakTime: extreme positive timestamp does not panic" {
 }
 
 test "breakTime: i32 year saturation" {
-    // `breakTime(maxInt(i64))` would overflow `civil_year` past `i32`'s
-    // range. The clamp protects rendering — the `{d}` formatter just
-    // prints the saturated value without ever choking on overflow.
     const b = breakTime(std.math.maxInt(i64));
     try std.testing.expect(b.year == std.math.maxInt(i32) or b.year > 0);
 }
@@ -764,10 +589,6 @@ test "formatMtime: old uses YYYY" {
 }
 
 test "formatMtime: extreme mtime from corrupted inode does not overflow" {
-    // A partner-managed tree should never crash the SFTP session
-    // because `stat` returned a junk timestamp. Used to overflow
-    // `now_secs - mtime_secs`. The output need not be meaningful;
-    // what matters is that the function returns without panicking.
     var buf: [20]u8 = undefined;
     const now: i64 = 1777300500;
     _ = formatMtime(&buf, std.math.minInt(i64), now);

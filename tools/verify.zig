@@ -1,17 +1,8 @@
-//! verify.zig — assert a release artifact's runtime dependency surface
-//! matches what we promised.
+//! `verify <artifact>`: fail `zig build release` if a release binary
+//! gained a runtime dependency.
 //!
-//! Run as: verify <artifact-path>
-//!
-//! Wired into `zig build release` so a regression in the release
-//! dependency surface fails the build, not the deploy.
-//!
-//! Linux ELF: asserts zero DT_NEEDED entries (fully static via the
-//!     vendored libssh + mbedTLS + zlib build graph).
-//! macOS Mach-O: asserts every LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB /
-//!     LC_REEXPORT_DYLIB entry is libSystem, libc++, or a system
-//!     framework. A Homebrew or third-party dylib path would mean the
-//!     static-link broke and the binary went back to dynamic.
+//! Linux ELF must have no DT_NEEDED entries (fully static). Every Mach-O
+//! dylib load must be libSystem, libc++, or a system framework.
 
 const std = @import("std");
 
@@ -71,8 +62,6 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(2);
 }
 
-/// Linux release contract: zero DT_NEEDED entries. We don't need to
-/// resolve string names because the count alone tells us pass or fail.
 fn verifyElf(io: std.Io, gpa: std.mem.Allocator, path: []const u8, data: []const u8) !u8 {
     _ = gpa;
     const stdout = std.Io.File.stdout();
@@ -118,16 +107,11 @@ fn verifyElf(io: std.Io, gpa: std.mem.Allocator, path: []const u8, data: []const
     return 0;
 }
 
-/// macOS release contract: every LC_LOAD_DYLIB entry is libSystem,
-/// libc++, or a system framework. Anything else (Homebrew, system
-/// libssh, etc.) means the static-link broke.
 fn verifyMachO(io: std.Io, path: []const u8, data: []const u8) !u8 {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
 
-    // Read mach_header_64 (we only ship 64-bit Mach-O). Layout:
-    //   u32 magic, u32 cputype, u32 cpusubtype, u32 filetype,
-    //   u32 ncmds, u32 sizeofcmds, u32 flags, u32 reserved
+    // Only 64-bit Mach-O ships.
     if (data.len < @sizeOf(std.macho.mach_header_64)) {
         try stderr.writeStreamingAll(io, "verify: Mach-O too small in ");
         try stderr.writeStreamingAll(io, path);
@@ -216,11 +200,6 @@ fn verifyMachO(io: std.Io, path: []const u8, data: []const u8) !u8 {
     return 0;
 }
 
-/// The macOS allowlist: libSystem, any versioned libc++, and any
-/// system framework path. Mirrors the regex
-///   ^(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\..*\.dylib|
-///     /System/Library/Frameworks/.*\.framework/.*)$
-/// from the previous shell implementation.
 fn isAllowedDylib(name: []const u8) bool {
     if (std.mem.eql(u8, name, "/usr/lib/libSystem.B.dylib")) return true;
     if (std.mem.startsWith(u8, name, "/usr/lib/libc++.") and std.mem.endsWith(u8, name, ".dylib")) return true;

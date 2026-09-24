@@ -1,8 +1,10 @@
+//! SFTP v3 wire encoding: reply packets, attribute blocks, and the
+//! length-prefixed string parser (client-controlled, so bounds-checked).
+
 const std = @import("std");
 const c = @import("libssh");
 const listing = @import("listing.zig");
 
-/// PLAN §7.6: maximum SFTP packet size is 256 KiB.
 pub const sftp_max_packet_bytes: usize = 256 * 1024;
 
 pub const DirEntry = struct {
@@ -55,14 +57,7 @@ pub fn writeVersion(channel: c.ssh_channel) !void {
 }
 
 pub fn replyName(channel: c.ssh_channel, request_id: u32, name: []const u8) !void {
-    // The name is a normalized virtual path, up to
-    // `vfs.max_virtual_path_bytes` (4096). The SFTP_NAME frame carries
-    // it TWICE (filename + longname) plus a small fixed envelope, so
-    // the worst case is 33 + 2*4096 ≈ 8225 bytes. A 512-byte buffer
-    // here silently turned any REALPATH of a 240+ byte path into a
-    // session-dropping error — and REALPATH is the first thing most
-    // clients send. Size for the real maximum (on the 8 MiB worker
-    // stack this is cheap).
+    // Carries a path of up to 4097 bytes twice (name and longname).
     var buf: [9 * 1024]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_NAME));
@@ -75,10 +70,7 @@ pub fn replyName(channel: c.ssh_channel, request_id: u32, name: []const u8) !voi
 }
 
 pub fn replyNames(channel: c.ssh_channel, request_id: u32, entries: []const DirEntry) !void {
-    // 32 KiB per packet: 16 entries × ~(255 name + 320 longname + 28
-    // attrs + 12 length-prefix overhead) ≈ 9.8 KiB worst case, with
-    // room to spare for any future attr additions. Stack-allocated;
-    // the worker thread's stack is 8 MiB.
+    // Room for a READDIR batch of 16 at ~620 bytes each.
     var buf: [32 * 1024]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_NAME));
@@ -114,11 +106,6 @@ pub fn replyDirAttrs(channel: c.ssh_channel, request_id: u32) !void {
 }
 
 pub fn replyFullAttrs(channel: c.ssh_channel, request_id: u32, info: listing.EntryInfo) !void {
-    // SFTP_FXP_ATTRS reply with the full attribute set (mode + uid +
-    // gid + size + atime/mtime). Used by STAT, LSTAT, and FSTAT — so
-    // a partner running `sftp> stat foo` and `sftp> ls -la` see the
-    // same fields, populated from the same `listing.statAt`-derived
-    // EntryInfo.
     var buf: [128]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
     try w.putU8(@intCast(c.SSH_FXP_ATTRS));
@@ -152,17 +139,10 @@ pub fn replyStatus(channel: c.ssh_channel, request_id: u32, status: c_int, messa
 }
 
 pub fn writeDirAttrs(w: *PacketWriter) !void {
-    // Synthetic attrs for SFTP_NAME replies that only carry a path
-    // without an underlying inode (REALPATH against a virtual root).
-    // We claim "directory, mode 0755, size 0" — minimal but well-
-    // formed; the next STAT/READDIR fetches the real shape.
+    // REALPATH has no inode at hand: claim a 0755 directory of size 0.
     try writeBasicAttrs(w, .directory, 0);
 }
 
-/// Synthetic attrs for callers who don't have an actual stat result —
-/// REALPATH replies and similar virtual paths. Only fills SIZE +
-/// PERMISSIONS with a plausible default. NEW code paths should prefer
-/// `writeFullAttrs` with a real `EntryInfo`.
 pub fn writeBasicAttrs(w: *PacketWriter, kind: std.Io.File.Kind, size: u64) !void {
     const mode: u32 = switch (kind) {
         .directory => @intCast(c.SSH_S_IFDIR | 0o755),
@@ -173,18 +153,7 @@ pub fn writeBasicAttrs(w: *PacketWriter, kind: std.Io.File.Kind, size: u64) !voi
     try w.putU32(mode);
 }
 
-/// Emit an SFTP v3 file-attributes block populated from a real
-/// `listing.EntryInfo`. Includes:
-///
-///   - SIZE         : real byte size (0 for directories/specials)
-///   - UIDGID       : real uid + gid for `ls -l` rendering
-///   - PERMISSIONS  : real `st_mode` (file-type bits + permission
-///                    bits), so the client can render `drwxr-xr-x`
-///                    correctly for directories, symlinks, etc.
-///   - ACMODTIME    : atime + mtime as seconds since epoch
-///
-/// The flag word is the OR of the four `SSH_FILEXFER_ATTR_*` bits;
-/// each populated field follows in the spec-defined order.
+/// SIZE, UIDGID, PERMISSIONS (with file-type bits), and ACMODTIME.
 pub fn writeFullAttrs(w: *PacketWriter, info: listing.EntryInfo) !void {
     const flags: u32 = @intCast(
         c.SSH_FILEXFER_ATTR_SIZE |
@@ -197,13 +166,8 @@ pub fn writeFullAttrs(w: *PacketWriter, info: listing.EntryInfo) !void {
     try w.putU32(info.uid);
     try w.putU32(info.gid);
     try w.putU32(info.mode);
-    // SFTP v3 stores acmodtime as 32-bit seconds. mtime_secs comes
-    // from statx/fstat as i64 to handle pre-1970 files correctly,
-    // but SFTP can only carry u32; clamp to the representable range
-    // (1970..2106) rather than truncate silently. Same for atime,
-    // which we don't track separately — we report mtime for both
-    // since SFTP clients use atime only as a fallback for dirs that
-    // don't track it.
+    // v3 times are u32 seconds: clamp rather than wrap. mtime stands in
+    // for atime too.
     const t32: u32 = if (info.mtime_secs < 0) 0 else if (info.mtime_secs > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(info.mtime_secs);
     try w.putU32(t32);
     try w.putU32(t32);
@@ -291,10 +255,7 @@ pub const ParsedString = struct {
 
 pub fn parseString(payload: []const u8) !ParsedString {
     if (payload.len < 4) return error.LibsshFailure;
-    // `len` is a client-controlled u32 up to 0xFFFF_FFFF. Widen to
-    // usize and compare against the remaining bytes; computing
-    // `4 + len` in u32 would overflow (panic in safe builds, wrap in
-    // ReleaseFast) BEFORE the bounds check for len >= 0xFFFF_FFFC.
+    // Widen before adding: `4 + len` in u32 overflows for a hostile len.
     const len: usize = readU32(payload[0..4]);
     const end = 4 + len;
     if (payload.len < end) return error.LibsshFailure;
@@ -337,9 +298,7 @@ test "parseString: declared length exceeds buffer" {
 }
 
 test "parseString: max-u32 length does not overflow (regression)" {
-    // Before the fix, `4 + len` was computed in u32 and overflowed for
-    // len >= 0xFFFF_FFFC, panicking in safe builds (a remote whole-
-    // daemon abort). It must now return an error instead.
+    // In u32, `4 + len` overflows here and a safe build panics.
     inline for ([_]u32{ 0xFFFF_FFFF, 0xFFFF_FFFE, 0xFFFF_FFFD, 0xFFFF_FFFC, 0x8000_0000 }) |big| {
         var payload: [8]u8 = undefined;
         writeU32(payload[0..4], big);

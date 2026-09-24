@@ -1,3 +1,9 @@
+//! Path policy: default deny, any matching `deny` wins, and an `allow`
+//! must grant a permission that satisfies the operation.
+//!
+//! Callers pass the normalized virtual path. Pattern syntax is described
+//! at `globMatch` and in docs/configure.md.
+
 const std = @import("std");
 const config = @import("config.zig");
 
@@ -11,8 +17,7 @@ pub const Operation = enum {
     remove,
     rmdir,
     rename,
-    // The clobber rule: replacing or truncating an entry that already
-    // exists. Distinct from `remove`, which is deletion proper.
+    // The clobber rule: replacing or truncating an existing entry.
     update,
 };
 
@@ -21,49 +26,12 @@ pub const Decision = enum {
     deny,
 };
 
-/// Compose a fictional `mode_t`-shaped value for `vpath` from this
-/// user's policy and the entry's real file kind. Used by the virtual
-/// listing renderer (`listing-mode virtual`, default in v0.3.0+) so
-/// `sftp> ls -la` shows a partner what they can actually DO with each
-/// entry rather than what's on disk.
+/// A mode for `listing-mode virtual` showing what the partner may do at
+/// `vpath`, not what is on disk. The file type is kept; setuid, setgid,
+/// sticky, and other bits are always off; group mirrors owner.
 ///
-/// The mapping has DIFFERENT semantics for files vs directories,
-/// because `w` means different things in those two worlds:
-///
-///   File-type bits        : preserved from the inode (`d` / `-` / `l` / ...)
-///   setuid/setgid/sticky  : ALWAYS off — operational, not partner-facing
-///
-///   For a FILE:
-///     r  = `read`   permission grants `SSH_FXP_OPEN(read)` — the
-///          bytes themselves. `list` alone does NOT set it: the name
-///          is visible in the listing, the content is not.
-///     w  = `write`  permission grants `SSH_FXP_OPEN(write)` —
-///          ability to overwrite the byte content. Note: removal is
-///          NOT counted toward the file's `w` bit; deletion is a
-///          property of the parent directory (you `unlink`-from-the-
-///          dir, not `unlink`-the-file).
-///     x  = always 0. SFTP doesn't execute files; the bit has no
-///          useful meaning to a partner.
-///
-///   For a DIRECTORY:
-///     r  = `read` OR `list` — either grants STAT/LSTAT, so a
-///          browsable directory renders `r-x`, the Unix spelling of
-///          "you can ls this".
-///     w  = ANY mutation perm (`write` OR `mkdir` OR `rename` OR
-///          `remove`) — this directory's *contents* can change. A
-///          partner with rename-only or mkdir-only sees `w` even
-///          though they can't open files for write at this path.
-///     x  = `list`   permission grants `OPENDIR`/`READDIR` and
-///          traversal. (Following Unix convention: a dir with
-///          traverse-but-not-list is an obscurity, not a security
-///          property; we just couple them.)
-///
-///   Group triplet  : MIRRORS owner — the partner is the only
-///                    inhabitant of their jail, "group" doesn't model
-///                    anyone else.
-///   Other triplet  : ALWAYS `---` — there is no third class of
-///                    viewer in the jail, so showing world bits would
-///                    imply a reader who doesn't exist.
+///   file:  r = download, w = write; never x
+///   dir:   r = stat, w = any change inside, x = list
 pub fn policyDerivedMode(
     user: *const config.UserConfig,
     vpath: []const u8,
@@ -75,20 +43,9 @@ pub fn policyDerivedMode(
     var owner: u32 = 0;
 
     if (is_dir) {
-        // Dir `r` = "may learn this directory's metadata" = STAT,
-        // which either `read` or `list` satisfies. Deriving it from
-        // `read` alone would render `d--x` for a directory the partner
-        // can both stat and browse — a listing that contradicts what
-        // the very next request is allowed to do. It also lands on the
-        // Unix reading of the pair: `r-x` on a directory is exactly
-        // "you can ls this".
+        // Browsable renders `r-x`, as on Unix.
         if (check(user, .stat, vpath) == .allow) owner |= 0o4;
 
-        // Dir: any of the four mutation ops contributes to `w`. Each
-        // op corresponds to a DIFFERENT verb in the config DSL
-        // (`write`, `mkdir`, `rename`, `remove`), so we must check
-        // them all — a partner with `mkdir` but not `write` still
-        // gets `w` because they CAN mutate this directory's contents.
         const can_mutate = (check(user, .open_write, vpath) == .allow) or
             (check(user, .mkdir, vpath) == .allow) or
             (check(user, .rename, vpath) == .allow) or
@@ -97,18 +54,10 @@ pub fn policyDerivedMode(
         if (can_mutate) owner |= 0o2;
         if (check(user, .readdir, vpath) == .allow) owner |= 0o1;
     } else {
-        // File `r` strictly means "can download the bytes" — `read`,
-        // and not `list`. A file a partner may see in a listing but
-        // may not fetch renders with no `r`, which is the honest
-        // answer: the name is visible, the content is not.
+        // `list` shows the name, not the bytes, so it gives no `r`.
         if (check(user, .open_read, vpath) == .allow) owner |= 0o4;
 
-        // File: `w` strictly means "can rewrite byte content"
-        // (= `write` permission, which gates `SSH_FXP_OPEN(write)`).
-        // Removal of the file is a property of the parent dir's
-        // policy, not this file's mode bits — exactly like Unix,
-        // where `rm somefile` consults the dir's `w` bit, not the
-        // file's.
+        // As on Unix, removal belongs to the parent directory's `w`.
         if (check(user, .open_write, vpath) == .allow) owner |= 0o2;
     }
 
@@ -120,12 +69,7 @@ pub fn check(user: *const config.UserConfig, operation: Operation, virtual_path:
     var allowed = false;
 
     for (user.rules) |rule| {
-        // Fail-closed on an indeterminate match: if pattern evaluation
-        // exhausts its step budget (a pathological glob against a long
-        // client-supplied path), we cannot prove the rule does NOT
-        // match, so we deny the whole operation. Denying is always the
-        // safe direction — a partner cannot turn a runaway pattern into
-        // an *allow*.
+        // An exhausted glob budget cannot prove a non-match: deny.
         const matched = globMatchChecked(rule.pattern, virtual_path) orelse return .deny;
         if (!matched) continue;
 
@@ -146,19 +90,9 @@ pub fn checkRename(user: *const config.UserConfig, from_path: []const u8, to_pat
     return .allow;
 }
 
-/// The permissions that satisfy `operation`. Holding ANY one of them is
-/// enough; the set is a disjunction, not a requirement list.
-///
-/// Every operation but STAT/LSTAT names exactly one capability. Metadata
-/// is the exception because it is the *listing's own content*: READDIR
-/// hands a partner every name, size, mode, and timestamp in a directory,
-/// so refusing the STAT of a path they may already list withholds
-/// nothing.
-///
-/// It is also what makes `list` usable. Mainstream clients (FileZilla,
-/// WinSCP) stat a remote directory before opening it, so a `list` that
-/// did not satisfy STAT could never render a listing — "browse without
-/// download" has to cover both requests or it covers neither.
+/// Permissions any one of which allows `operation`. Only STAT takes two:
+/// `list` already reveals everything STAT returns, and clients such as
+/// FileZilla and WinSCP stat a directory before listing it.
 fn permissionsFor(operation: Operation) config.PermissionSet {
     var set = config.PermissionSet.initEmpty();
     switch (operation) {
@@ -177,30 +111,8 @@ fn permissionsFor(operation: Operation) config.PermissionSet {
     return set;
 }
 
-/// Match a virtual path against a config pattern per PLAN.md §6.3.
-///
-/// - Patterns with no `*` or `?` are **literal path-component prefix**
-///   matches: pattern matches path P iff P equals the pattern, or P
-///   starts with the pattern followed by `/`. So `/pending` matches
-///   `/pending`, `/pending/inbox`, `/pending/inbox/file.csv`, but
-///   never `/pendingfoo`. The root pattern `/` matches every path
-///   that begins with `/`.
-/// - Patterns containing `*` or `?` are globs. Three wildcards:
-///     `*`   — any sequence not including `/` (single component).
-///     `?`   — exactly one character that is not `/`.
-///     `**`  — any sequence INCLUDING `/` (cross-component). Runs of
-///             three or more `*` collapse to one `**`. So
-///             `deny **.exe` correctly denies `foo.exe`, `dir/foo.exe`,
-///             and `dir/sub/foo.exe` alike. `/inbox/**` matches all
-///             contents of `/inbox` at any depth, but NOT `/inbox`
-///             itself (matching gitignore convention).
-/// Step budget for a single glob evaluation. `**` backtracking is
-/// worst-case superlinear in the (client-controlled) subject length, so
-/// an unbounded matcher lets a partner burn CPU with a crafted path
-/// against a multi-`**` operator pattern — amplified ~80× per READDIR
-/// packet. Legitimate patterns finish in well under a thousand steps;
-/// this ceiling is ~3 orders of magnitude above that, so it only ever
-/// trips on genuinely pathological input, where we fail closed (deny).
+/// Step budget for one glob match. `**` backtracking is superlinear in
+/// the client-controlled path; real patterns need under a thousand steps.
 const glob_budget: usize = 1_000_000;
 
 const MatchCtx = struct {
@@ -208,12 +120,19 @@ const MatchCtx = struct {
     exhausted: bool = false,
 };
 
+/// Match a normalized virtual path against a config pattern.
+///
+/// - No `*` or `?`: a literal component prefix. `/pending` matches
+///   `/pending` and `/pending/x`, never `/pendingfoo`; `/` matches all.
+/// - `*` matches within one component and `?` one non-`/` byte.
+/// - `**` (or more stars) matches across `/`, so `**.exe` matches at any
+///   depth. `/inbox/**` does not match `/inbox` itself. `**/` also
+///   matches zero segments: `/foo/**/bar` matches `/foo/bar`.
 pub fn globMatch(pattern: []const u8, value: []const u8) bool {
     return globMatchChecked(pattern, value) orelse false;
 }
 
-/// Like `globMatch`, but returns null when the step budget is exhausted
-/// (indeterminate) so callers can fail closed.
+/// `globMatch`, or null when the step budget ran out.
 pub fn globMatchChecked(pattern: []const u8, value: []const u8) ?bool {
     if (std.mem.indexOfAny(u8, pattern, "*?") == null) {
         return literalPrefixMatch(pattern, value);
@@ -235,9 +154,6 @@ fn literalPrefixMatch(pattern: []const u8, value: []const u8) bool {
 }
 
 fn globMatchInner(ctx: *MatchCtx, pattern: []const u8, value: []const u8) bool {
-    // Charge one unit per call. On exhaustion, unwind reporting "no
-    // match" and set the flag so the top-level caller can distinguish
-    // this from a genuine non-match and fail closed.
     if (ctx.budget == 0) {
         ctx.exhausted = true;
         return false;
@@ -246,20 +162,7 @@ fn globMatchInner(ctx: *MatchCtx, pattern: []const u8, value: []const u8) bool {
 
     if (pattern.len == 0) return value.len == 0;
 
-    // `**/` — gitignore-style "zero or more path segments". Allows
-    // `/foo/**/bar` to match `/foo/bar` (zero intermediates),
-    // `/foo/x/bar` (one), `/foo/x/y/bar` (two), etc. Without this
-    // special case the literal `/` in the pattern after `**` would
-    // require at least one segment between the two slashes — the
-    // surprise behavior the live demo surfaced.
-    //
-    // Detection: pattern starts with two or more `*` followed by `/`.
-    // We collapse the run of `*` and then split on the trailing slash.
-    // The wildcard then matches either:
-    //   (a) zero segments — `pattern[after_slash..]` runs against `value`
-    //       directly, as if `**/` weren't there.
-    //   (b) one or more segments — try every `/` position in `value`
-    //       as the boundary.
+    // `**/`: zero segments (a), or resume after any `/` in `value` (b).
     if (pattern.len >= 3 and pattern[0] == '*' and pattern[1] == '*') {
         var star_end: usize = 2;
         while (star_end < pattern.len and pattern[star_end] == '*') star_end += 1;
@@ -275,11 +178,7 @@ fn globMatchInner(ctx: *MatchCtx, pattern: []const u8, value: []const u8) bool {
         // Fall through to the general `**` case (e.g. `**.exe`).
     }
 
-    // General `**` — two or more consecutive `*` not followed by `/`.
-    // Matches any sequence of characters INCLUDING `/`. We collapse
-    // runs of three or more `*` to a single cross-slash wildcard so
-    // `***...*` doesn't blow up the recursion in the pathological
-    // pattern case.
+    // `**` not followed by `/`: anything, including `/`.
     if (pattern.len >= 2 and pattern[0] == '*' and pattern[1] == '*') {
         var rest_idx: usize = 2;
         while (rest_idx < pattern.len and pattern[rest_idx] == '*') rest_idx += 1;
@@ -293,7 +192,6 @@ fn globMatchInner(ctx: *MatchCtx, pattern: []const u8, value: []const u8) bool {
     }
 
     if (pattern[0] == '*') {
-        // `*` does not cross path boundaries (PLAN §6.3).
         var i: usize = 0;
         while (i <= value.len) : (i += 1) {
             if (globMatchInner(ctx, pattern[1..], value[i..])) return true;
@@ -305,7 +203,6 @@ fn globMatchInner(ctx: *MatchCtx, pattern: []const u8, value: []const u8) bool {
     if (value.len == 0) return false;
 
     if (pattern[0] == '?') {
-        // `?` does not cross path boundaries (PLAN §6.3).
         if (value[0] == '/') return false;
         return globMatchInner(ctx, pattern[1..], value[1..]);
     }
@@ -373,10 +270,7 @@ test "deny overrides allow" {
 }
 
 test "glob budget: pathological pattern fails closed (indeterminate = deny)" {
-    // A pattern crafted to blow up `**` backtracking. `check` must not
-    // hang and must resolve to deny when the budget is exhausted, for
-    // BOTH an allow rule (can't prove match → not allowed) and a deny
-    // rule (can't prove non-match → deny).
+    // Both an allow and a deny rule must resolve to deny, without hanging.
     const evil_pattern = "**a**a**a**a**a**a**a**b";
     const evil_value = "a" ** 200; // no 'b', so a naive matcher explores exponentially
 
@@ -479,10 +373,7 @@ test "double-star crosses path boundary" {
     try std.testing.expect(globMatch("/inbox/**", "/inbox/sub/file.csv"));
     try std.testing.expect(globMatch("/inbox/**", "/inbox/a/b/c/file.csv"));
 
-    // gitignore convention: `/inbox/**` does NOT match `/inbox` itself
-    // (no character available for `**` to consume after the trailing
-    // `/`). Operators that want to deny the dir too write
-    // `deny /inbox` separately.
+    // Not `/inbox` itself; deny that separately.
     try std.testing.expect(!globMatch("/inbox/**", "/inbox"));
     try std.testing.expect(!globMatch("/inbox/**", "/outbox/file.csv"));
 
@@ -492,8 +383,7 @@ test "double-star crosses path boundary" {
     try std.testing.expect(globMatch("/foo/**/bar", "/foo/x/y/z/bar"));
     try std.testing.expect(!globMatch("/foo/**/bar", "/foo/baz"));
 
-    // Three or more `*` collapse to `**` (no recursive blowup, no
-    // semantic surprise).
+    // Three or more `*` act as `**`.
     try std.testing.expect(globMatch("***.exe", "/dir/tool.exe"));
     try std.testing.expect(globMatch("****", "/anything/at/all"));
 
@@ -504,9 +394,7 @@ test "double-star crosses path boundary" {
 }
 
 test "deny **.exe denies recursively" {
-    // The `*.exe` footgun the live demo surfaced: with single-star
-    // semantics, `deny *.exe` only matches `.exe` files in the
-    // current directory level. `deny **.exe` does the right thing.
+    // `*.exe` would match only one level; `**.exe` matches every depth.
     var rules = [_]config.Rule{
         .{
             .effect = .allow,
@@ -537,8 +425,7 @@ test "deny **.exe denies recursively" {
 }
 
 test "list satisfies STAT but never download" {
-    // The exact shape of a partner root: browsable everywhere, with
-    // download granted only per-subtree.
+    // Browsable everywhere, downloadable in one subtree.
     var rules = [_]config.Rule{
         .{
             .effect = .allow,
@@ -570,14 +457,11 @@ test "list satisfies STAT but never download" {
         .rules = &rules,
     };
 
-    // A client that stats the remote directory before opening it must
-    // get through on `list` alone, or it can never render a listing.
     try std.testing.expectEqual(Decision.allow, check(&user, .stat, "/"));
     try std.testing.expectEqual(Decision.allow, check(&user, .lstat, "/"));
     try std.testing.expectEqual(Decision.allow, check(&user, .readdir, "/"));
 
-    // `list` stops exactly at the bytes. This is the whole point of
-    // the verb: names are visible, content is not.
+    // Names are visible, content is not.
     try std.testing.expectEqual(Decision.deny, check(&user, .open_read, "/"));
     try std.testing.expectEqual(Decision.deny, check(&user, .open_read, "/secret.pdf"));
 

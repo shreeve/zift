@@ -1,3 +1,5 @@
+//! Root of `zig build test`: pulls in every module's tests.
+
 comptime {
     _ = @import("abuse.zig");
     _ = @import("audit.zig");

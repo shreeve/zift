@@ -1,15 +1,6 @@
-//! Fuzz harnesses for Zift's parser/normalizer/matcher code paths
-//! (PLAN §12). Each test draws bytes from a `*std.testing.Smith` and
-//! feeds them to the real production function. The corpus list seeds
-//! the fuzzer with known-tricky inputs so the search starts somewhere
-//! useful instead of from the empty string.
-//!
-//! Run interactively with:
-//!     zig build test --fuzz
-//!
-//! With no `--fuzz` flag, each test runs once with empty input and
-//! returns immediately, so they're cheap to include in the regular
-//! `zig build test` suite.
+//! Fuzz harnesses over the production parsers, normalizer, and matcher.
+//! `zig build test --fuzz` runs them; a plain `zig build test` runs each
+//! once on empty input. The corpora seed known-tricky inputs.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -18,9 +9,6 @@ const vfs_mod = @import("vfs.zig");
 const wire = @import("wire.zig");
 
 const Smith = std.testing.Smith;
-
-// ---------------------------------------------------------------------------
-// Config parser fuzz — exercises every parse path with arbitrary bytes.
 
 test "fuzz config parser" {
     return std.testing.fuzz({}, fuzzConfig, .{ .corpus = &.{
@@ -41,10 +29,6 @@ fn fuzzConfig(_: void, smith: *Smith) !void {
     var cfg = config.parse(std.testing.allocator, buf[0..len]) catch return;
     cfg.deinit();
 }
-
-// ---------------------------------------------------------------------------
-// Virtual path normalization fuzz — exercises the §8.3 byte-set rules
-// and `..`-traversal handling.
 
 test "fuzz virtual path normalization" {
     return std.testing.fuzz({}, fuzzVirtualPath, .{ .corpus = &.{
@@ -67,10 +51,7 @@ fn fuzzVirtualPath(_: void, smith: *Smith) !void {
     std.testing.allocator.free(normalized);
 }
 
-// ---------------------------------------------------------------------------
-// Policy glob matching fuzz — splits Smith's bytes into pattern and
-// value and exercises the §6.3 matcher.
-
+// Input is `pattern\x00value`.
 test "fuzz policy glob matching" {
     return std.testing.fuzz({}, fuzzPolicyGlob, .{ .corpus = &.{
         "/pending\x00/pending/file.txt",
@@ -91,10 +72,7 @@ fn fuzzPolicyGlob(_: void, smith: *Smith) !void {
     _ = policy.globMatch(input[0..sep], input[sep + 1 ..]);
 }
 
-// ---------------------------------------------------------------------------
-// passhash credential validation fuzz — drives parsing through the
-// config parser (version letter, alphabet, exact length).
-
+// Drives passhash validation through the config parser.
 test "fuzz passhash credential validation" {
     return std.testing.fuzz({}, fuzzPasshash, .{
         .corpus = &.{
@@ -122,13 +100,6 @@ fn fuzzPasshash(_: void, smith: *Smith) !void {
     cfg.deinit();
 }
 
-// ---------------------------------------------------------------------------
-// Public-key line validation fuzz — drives `parsePublicKeyLine`
-// directly. v0.7.0 moved key parsing out of the config-line path
-// (the inline `key ...` directive is gone; keys come from
-// operator-managed files referenced by `auth /path/...`), so the
-// fuzz target moved with it.
-
 test "fuzz public key line validation" {
     return std.testing.fuzz({}, fuzzPubkeyLine, .{ .corpus = &.{
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBLAH comment",
@@ -140,7 +111,7 @@ test "fuzz public key line validation" {
 }
 
 fn fuzzPubkeyLine(_: void, smith: *Smith) !void {
-    var buf: [9216]u8 = undefined; // a bit larger than max_keyline_bytes
+    var buf: [9216]u8 = undefined; // just over max_keyline_bytes
     const len = smith.sliceWithHash(&buf, 0xFEEDFACE);
     const line = buf[0..len];
 
@@ -149,13 +120,7 @@ fn fuzzPubkeyLine(_: void, smith: *Smith) !void {
     std.testing.allocator.free(pk.blob);
 }
 
-// ---------------------------------------------------------------------------
-// SFTP wire codec fuzz — the one parser a remote, authenticated partner
-// drives byte-by-byte. Feeds arbitrary bytes through the length-prefixed
-// string/handle decoders; every path must return an error rather than
-// panic (an integer overflow or OOB slice here is a remote DoS). This is
-// exactly the surface that hid the `4 + len` u32-overflow abort.
-
+// The parser a remote partner drives directly: any panic is a remote DoS.
 test "fuzz sftp wire string parser" {
     return std.testing.fuzz({}, fuzzWireParser, .{ .corpus = &.{
         &.{ 0, 0, 0, 3, 'a', 'b', 'c' },
@@ -171,21 +136,15 @@ fn fuzzWireParser(_: void, smith: *Smith) !void {
     const len = smith.sliceWithHash(&buf, 0x5F7B0FF5);
     const input = buf[0..len];
 
-    // Must never panic regardless of the declared inner length.
     if (wire.parseString(input)) |parsed| {
-        // The returned slices must stay within the input buffer.
         std.debug.assert(parsed.value.len <= input.len);
         std.debug.assert(parsed.rest.len <= input.len);
     } else |_| {}
     _ = wire.parseHandleId(input) catch {};
 }
 
-// ---------------------------------------------------------------------------
-// Allocation-free path normalizer fuzz — the security-critical code that
-// authorization now runs against. Must never panic, and must never
-// return a path that escapes the virtual root (a leading-`/`, no `..`
-// component surviving, no reserved `.zift` component).
-
+// Authorization runs on this output: it must be rooted, with no `.`,
+// `..`, or reserved component left.
 test "fuzz normalize into buffer" {
     return std.testing.fuzz({}, fuzzNormalizeInto, .{ .corpus = &.{
         "/pending/../secret",
@@ -204,7 +163,6 @@ fn fuzzNormalizeInto(_: void, smith: *Smith) !void {
 
     var out: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
     const normalized = vfs_mod.normalizeVirtualInto(input, &out) catch return;
-    // Invariants the authorization layer depends on:
     std.debug.assert(normalized.len >= 1 and normalized[0] == '/');
     var it = std.mem.tokenizeScalar(u8, normalized, '/');
     while (it.next()) |part| {
