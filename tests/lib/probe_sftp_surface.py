@@ -123,12 +123,15 @@ def main() -> int:
 
     failures = 0
 
-    # Scenario 1: SETSTAT (opcode 9) — path + ATTRS struct.
+    # Scenario 1: SETSTAT (opcode 9) sets times, but a size change is
+    # unsupported.
+    size_attrs = SFTPAttributes()
+    size_attrs.st_size = 0
     failures += expect_op_unsupported(
-        "setstat", sftp,
+        "setstat-size", sftp,
         sftp_proto.CMD_SETSTAT,
         args.testfile,
-        SFTPAttributes(),
+        size_attrs,
     )
 
     # Scenario 2: READLINK (opcode 19) — just a path.

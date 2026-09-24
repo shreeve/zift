@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Test: SFTP protocol surface matches PLAN §7.6 — explicit OP_UNSUPPORTED
-#       for SETSTAT/FSETSTAT/READLINK/SYMLINK/EXTENDED/unknown, FSTAT works
+#       for SETSTAT of a size/READLINK/SYMLINK/EXTENDED/unknown, FSTAT works
 # Covers: PLAN §7.6 SFTP request surface table
 # TODOS: P1 SFTP wire surface cluster (OP_UNSUPPORTED + FSTAT)
 

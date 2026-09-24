@@ -231,6 +231,39 @@ pub fn parseString(payload: []const u8) !ParsedString {
     };
 }
 
+/// What SETSTAT and FSETSTAT act on in a v3 ATTRS block. Fields after
+/// the times, the extensions, are not needed.
+pub const SetAttrs = struct {
+    size: bool,
+    /// atime, mtime.
+    times: ?[2]u32,
+};
+
+pub fn parseSetAttrs(payload: []const u8) !SetAttrs {
+    if (payload.len < 4) return error.LibsshFailure;
+    const flags = std.mem.readInt(u32, payload[0..4], .big);
+    const has = struct {
+        fn bit(f: u32, b: c_int) bool {
+            return f & @as(u32, @intCast(b)) != 0;
+        }
+    }.bit;
+    var offset: usize = 4;
+    if (has(flags, c.SSH_FILEXFER_ATTR_SIZE)) offset += 8;
+    if (has(flags, c.SSH_FILEXFER_ATTR_UIDGID)) offset += 8;
+    if (has(flags, c.SSH_FILEXFER_ATTR_PERMISSIONS)) offset += 4;
+    var result: SetAttrs = .{ .size = has(flags, c.SSH_FILEXFER_ATTR_SIZE), .times = null };
+    if (has(flags, c.SSH_FILEXFER_ATTR_ACMODTIME)) {
+        if (payload.len < offset + 8) return error.LibsshFailure;
+        result.times = .{
+            std.mem.readInt(u32, payload[offset..][0..4], .big),
+            std.mem.readInt(u32, payload[offset + 4 ..][0..4], .big),
+        };
+        offset += 8;
+    }
+    if (payload.len < offset) return error.LibsshFailure;
+    return result;
+}
+
 pub fn parseHandleId(payload: []const u8) !u32 {
     const parsed = try parseString(payload);
     if (parsed.value.len != 4) return error.LibsshFailure;
@@ -279,4 +312,23 @@ test "parseHandleId: requires exactly 4 payload bytes" {
     var overflow: [8]u8 = undefined;
     std.mem.writeInt(u32, overflow[0..4], 0xFFFF_FFFF, .big);
     try testing.expectError(error.LibsshFailure, parseHandleId(&overflow));
+}
+
+test "parseSetAttrs: skips size, owner and mode to reach the times" {
+    var buf: [36]u8 = undefined;
+    const flags: u32 = @intCast(c.SSH_FILEXFER_ATTR_UIDGID | c.SSH_FILEXFER_ATTR_PERMISSIONS | c.SSH_FILEXFER_ATTR_ACMODTIME);
+    std.mem.writeInt(u32, buf[0..4], flags, .big);
+    @memset(buf[4..16], 0xAA);
+    std.mem.writeInt(u32, buf[16..20], 1000, .big);
+    std.mem.writeInt(u32, buf[20..24], 2000, .big);
+    const got = try parseSetAttrs(buf[0..24]);
+    try testing.expect(!got.size);
+    try testing.expectEqual([2]u32{ 1000, 2000 }, got.times.?);
+    try testing.expectError(error.LibsshFailure, parseSetAttrs(buf[0..23]));
+
+    std.mem.writeInt(u32, buf[0..4], @intCast(c.SSH_FILEXFER_ATTR_SIZE), .big);
+    try testing.expectError(error.LibsshFailure, parseSetAttrs(buf[0..11]));
+    const size_only = try parseSetAttrs(buf[0..12]);
+    try testing.expect(size_only.size);
+    try testing.expectEqual(null, size_only.times);
 }
