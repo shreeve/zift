@@ -385,6 +385,24 @@ const ServerBuilder = struct {
     mkdir_mode: u32 = 0o2770,
     /// Default root for users without `root`: `<partner-root>/<name>`.
     partner_root: ?[]const u8 = null,
+    /// Line each directive was set on (0 = not set). Every server
+    /// directive is a single value, so a second one is an error.
+    lines: std.EnumArray(ServerKey, u32) = .initFill(0),
+};
+
+const ServerKey = enum {
+    listen,
+    @"host-key",
+    @"reload-interval",
+    @"idle-timeout",
+    @"max-connections",
+    @"max-unauth-connections",
+    @"shutdown-grace",
+    log,
+    @"listing-mode",
+    @"publish-mode",
+    @"mkdir-mode",
+    @"partner-root",
 };
 
 const UserBuilder = struct {
@@ -395,6 +413,7 @@ const UserBuilder = struct {
     key_files: std.ArrayList([]const u8) = .empty,
     from: std.ArrayList(netmatch.Cidr) = .empty,
     root: ?[]const u8 = null,
+    root_line: u32 = 0,
     rules: std.ArrayList(Rule) = .empty,
 };
 
@@ -406,6 +425,8 @@ const Section = enum {
 
 pub const Error = error{
     DuplicateServerSection,
+    DuplicateDirective,
+    DuplicateKeyFile,
     DuplicatePassword,
     DuplicateUser,
     EmptyUserName,
@@ -648,8 +669,8 @@ pub fn parseWithDiag(
         if (value.len == 0) return error.MissingValue;
         switch (section) {
             .none => return error.PropertyOutsideSection,
-            .server => try parseServerProperty(allocator, d, &server, key, value),
-            .user => try parseUserProperty(allocator, d, current_user.?, key, value),
+            .server => try parseServerProperty(allocator, d, &server, key, value, line_no),
+            .user => try parseUserProperty(allocator, d, current_user.?, key, value, line_no),
         }
     }
 
@@ -721,45 +742,48 @@ fn parseServerProperty(
     server: *ServerBuilder,
     key: []const u8,
     value: []const u8,
+    line: u32,
 ) Error!void {
-    if (std.mem.eql(u8, key, "listen")) {
-        try validateListen(value);
-        server.listen = try allocator.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "host-key")) {
-        server.host_key = try allocator.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "reload-interval")) {
-        server.reload_interval_ms = try parseDurationMs(d, value);
-    } else if (std.mem.eql(u8, key, "idle-timeout")) {
-        const ms = try parseDurationMs(d, value);
-        // Above libssh's signed 32-bit ms limit it waits forever.
-        if (ms > max_libssh_idle_timeout_ms) return d.fail(error.InvalidDuration, "at most 24d (libssh's limit)", .{});
-        server.idle_timeout_ms = ms;
-    } else if (std.mem.eql(u8, key, "max-connections")) {
-        server.max_connections = try parseCount(d, value);
-    } else if (std.mem.eql(u8, key, "max-unauth-connections")) {
-        server.max_unauth_connections = try parseCount(d, value);
-    } else if (std.mem.eql(u8, key, "shutdown-grace")) {
-        server.shutdown_grace_ms = try parseDurationMs(d, value);
-    } else if (std.mem.eql(u8, key, "log")) {
-        server.log = if (std.mem.eql(u8, value, "stderr"))
+    const which = std.meta.stringToEnum(ServerKey, key) orelse return error.UnknownKey;
+    try firstSetting(d, server.lines.getPtr(which), line);
+    switch (which) {
+        .listen => {
+            try validateListen(value);
+            server.listen = try allocator.dupe(u8, value);
+        },
+        .@"host-key" => server.host_key = try allocator.dupe(u8, value),
+        .@"reload-interval" => server.reload_interval_ms = try parseDurationMs(d, value),
+        .@"idle-timeout" => {
+            const ms = try parseDurationMs(d, value);
+            // Above libssh's signed 32-bit ms limit it waits forever.
+            if (ms > max_libssh_idle_timeout_ms) return d.fail(error.InvalidDuration, "at most 24d (libssh's limit)", .{});
+            server.idle_timeout_ms = ms;
+        },
+        .@"max-connections" => server.max_connections = try parseCount(d, value),
+        .@"max-unauth-connections" => server.max_unauth_connections = try parseCount(d, value),
+        .@"shutdown-grace" => server.shutdown_grace_ms = try parseDurationMs(d, value),
+        .log => server.log = if (std.mem.eql(u8, value, "stderr"))
             .stderr
         else
-            .{ .file = try dupeAbsolute(allocator, d, value) };
-    } else if (std.mem.eql(u8, key, "listing-mode")) {
-        server.listing_mode = std.meta.stringToEnum(ListingMode, value) orelse
-            return d.fail(error.InvalidListingMode, "use 'virtual' or 'reality'", .{});
-    } else if (std.mem.eql(u8, key, "publish-mode")) {
-        server.publish_mode = try parsePublishMode(d, value);
-    } else if (std.mem.eql(u8, key, "mkdir-mode")) {
-        server.mkdir_mode = try parseMkdirMode(d, value);
-    } else if (std.mem.eql(u8, key, "partner-root")) {
-        // Trailing `/` is trimmed, except for `/` itself.
-        var pr = try dupeAbsolute(allocator, d, value);
-        while (pr.len > 1 and pr[pr.len - 1] == '/') pr = pr[0 .. pr.len - 1];
-        server.partner_root = pr;
-    } else {
-        return error.UnknownKey;
+            .{ .file = try dupeAbsolute(allocator, d, value) },
+        .@"listing-mode" => server.listing_mode = std.meta.stringToEnum(ListingMode, value) orelse
+            return d.fail(error.InvalidListingMode, "use 'virtual' or 'reality'", .{}),
+        .@"publish-mode" => server.publish_mode = try parsePublishMode(d, value),
+        .@"mkdir-mode" => server.mkdir_mode = try parseMkdirMode(d, value),
+        .@"partner-root" => {
+            // Trailing `/` is trimmed, except for `/` itself.
+            var pr = try dupeAbsolute(allocator, d, value);
+            while (pr.len > 1 and pr[pr.len - 1] == '/') pr = pr[0 .. pr.len - 1];
+            server.partner_root = pr;
+        },
     }
+}
+
+/// A single-valued directive given twice is ambiguous (a stale copy-paste
+/// could silently move a partner's jail), so the second one is an error.
+fn firstSetting(d: *ParseDiag, seen_line: *u32, line: u32) Error!void {
+    if (seen_line.* != 0) return d.fail(error.DuplicateDirective, "already set on line {d}; keep one", .{seen_line.*});
+    seen_line.* = line;
 }
 
 /// Paths must be absolute: a relative one would depend on the daemon's
@@ -809,10 +833,12 @@ fn parseUserProperty(
     user: *UserBuilder,
     key: []const u8,
     value: []const u8,
+    line: u32,
 ) Error!void {
     if (std.mem.eql(u8, key, "auth")) {
-        try parseAuth(allocator, user, value);
+        try parseAuth(allocator, d, user, value);
     } else if (std.mem.eql(u8, key, "root")) {
+        try firstSetting(d, &user.root_line, line);
         user.root = try dupeAbsolute(allocator, d, value);
     } else if (std.mem.eql(u8, key, "from")) {
         try parseFrom(allocator, user, value);
@@ -832,7 +858,7 @@ fn parseUserProperty(
 
 /// `auth a…` is a passhash (at most one); `auth /…` names a key file
 /// (any number); a legacy `$…` PHC string must be reminted.
-fn parseAuth(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
+fn parseAuth(allocator: std.mem.Allocator, d: *ParseDiag, user: *UserBuilder, value: []const u8) Error!void {
     // A leading letter is a passhash version tag. `value` is never empty.
     if (value[0] >= 'a' and value[0] <= 'z') {
         if (user.password_hash != null) return error.DuplicatePassword;
@@ -845,7 +871,10 @@ fn parseAuth(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8
         return error.PasswordPhcRemoved;
     }
     if (value[0] == '/') {
-        if (value.len > max_keyline_bytes) return error.KeyLineTooLong;
+        if (value.len > std.Io.Dir.max_path_bytes) return d.fail(error.InvalidAuth, "key file path too long", .{});
+        for (user.key_files.items) |path| {
+            if (std.mem.eql(u8, path, value)) return d.fail(error.DuplicateKeyFile, "'{s}' is already listed for this user", .{value});
+        }
         try user.key_files.append(allocator, try allocator.dupe(u8, value));
         return;
     }
@@ -1915,6 +1944,35 @@ test "parse: durations take each unit and reject overflow" {
             try std.testing.expectError(error.InvalidDuration, parse(std.testing.allocator, text));
         }
     }
+}
+
+test "a repeated single-valued directive is rejected, naming the first line" {
+    try expectDiag("server\n  listen :2222\n  host-key /k\n  listen :2223\n", "line 4: [server] 'listen': DuplicateDirective: already set on line 2; keep one");
+    try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /a\n  root /b\n", "line 7: [user u] 'root': DuplicateDirective: already set on line 6; keep one");
+    // Every server directive is single-valued.
+    const samples = [_][]const u8{
+        "listen :2222",       "host-key /k",       "reload-interval 1s",
+        "idle-timeout 1s",    "max-connections 4", "max-unauth-connections 1",
+        "shutdown-grace 1s",  "log stderr",        "listing-mode virtual",
+        "publish-mode 0o600", "mkdir-mode 0o2700", "partner-root /p",
+    };
+    comptime std.debug.assert(samples.len == @typeInfo(ServerKey).@"enum".fields.len);
+    for (samples) |sample| {
+        var buf: [128]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "server\n  {s}\n  {s}\n", .{ sample, sample });
+        try std.testing.expectError(error.DuplicateDirective, parse(std.testing.allocator, text));
+    }
+    // Accumulating directives still accumulate.
+    var cfg = try parse(std.testing.allocator, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /a.pub\n  auth /b.pub\n" ++
+        "  from 10.0.0.1\n  from 10.0.0.2\n  allow /a read\n  allow /b read\n  deny /a/x\n  deny /b/x\n  root /r\n");
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg.users[0].key_files.len);
+    try std.testing.expectEqual(@as(usize, 2), cfg.users[0].from.len);
+    try std.testing.expectEqual(@as(usize, 4), cfg.users[0].rules.len);
+}
+
+test "the same key file twice for one user is rejected" {
+    try std.testing.expectError(error.DuplicateKeyFile, parse(std.testing.allocator, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /a.pub\n  auth /a.pub\n  root /r\n"));
 }
 
 test "rule patterns that can never match are rejected" {
