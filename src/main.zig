@@ -67,36 +67,25 @@ fn version(io: std.Io) !void {
 }
 
 fn validate(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
-    const stderr = std.Io.File.stderr();
     if (args.len != 3) {
-        try stderr.writeStreamingAll(io, "usage: zift validate <config>\n");
+        try sys.note(io, "usage: zift validate <config>\n", .{});
         return 1;
     }
 
     const path = args[2];
 
-    const contents = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch |err| {
+    const contents = config.readFile(io, gpa, path) catch |err| {
         try sys.note(io, "zift validate: cannot read {s}: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
     defer gpa.free(contents);
 
-    var diag: config.ParseDiag = .{};
-    var cfg = config.parseWithDiag(gpa, contents, &diag) catch |err| {
-        var msg_buf: [512]u8 = undefined;
-        var w = std.Io.Writer.fixed(&msg_buf);
-        w.writeAll("zift validate: ") catch {};
-        w.writeAll(path) catch {};
-        w.writeAll(": ") catch {};
-        diag.format(err, &w) catch {};
-        w.writeAll("\n") catch {};
-        try stderr.writeStreamingAll(io, w.buffered());
+    var diag: config.LoadDiag = .{};
+    var cfg = config.load(io, gpa, contents, &diag) catch {
+        if (diag.parse_err != null) try sys.note(io, "zift validate: {s}: {f}\n", .{ path, diag });
         return 1;
     };
     defer cfg.deinit();
-
-    // validateSemantic has already printed the diagnostic.
-    config.validateSemantic(io, gpa, &cfg) catch return 1;
 
     const stdout = std.Io.File.stdout();
     var buf: [4096]u8 = undefined;
@@ -131,24 +120,12 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     try stderr.writeStreamingAll(io, "zift: starting zift " ++ build_options.version ++
         " (" ++ build_options.target ++ " " ++ build_options.optimize ++ ")\n");
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(io, args[2], gpa, .limited(1 << 20));
+    const contents = try config.readFile(io, gpa, args[2]);
     defer gpa.free(contents);
 
-    var diag: config.ParseDiag = .{};
-    var cfg = config.parseWithDiag(gpa, contents, &diag) catch |err| {
-        var msg_buf: [512]u8 = undefined;
-        var w = std.Io.Writer.fixed(&msg_buf);
-        w.writeAll("zift: ") catch {};
-        w.writeAll(args[2]) catch {};
-        w.writeAll(": ") catch {};
-        diag.format(err, &w) catch {};
-        w.writeAll("\n") catch {};
-        try stderr.writeStreamingAll(io, w.buffered());
-        return err;
-    };
-
-    config.validateSemantic(io, gpa, &cfg) catch |err| {
-        cfg.deinit();
+    var diag: config.LoadDiag = .{};
+    const cfg = config.load(io, gpa, contents, &diag) catch |err| {
+        if (diag.parse_err != null) try sys.note(io, "zift: {s}: {f}\n", .{ args[2], diag });
         return err;
     };
 

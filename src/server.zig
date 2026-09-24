@@ -393,7 +393,7 @@ const ActiveConfig = struct {
         known_mtime: *std.Io.Timestamp,
         key_stamps: *KeyStamps,
     ) void {
-        const contents = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1 << 20)) catch |err| {
+        const contents = config.readFile(self.io, self.allocator, path) catch |err| {
             // A read failure may be transient (EMFILE, a chmod that does
             // not bump mtime), so keep the stamps and retry next poll.
             sys.note(self.io, "zift: config reload read failed: {s}\n", .{@errorName(err)}) catch {};
@@ -407,19 +407,17 @@ const ActiveConfig = struct {
         known_mtime.* = mtime;
         key_stamps.remember(self.allocator, self.io, self.current.config);
 
-        var diag: config.ParseDiag = .{};
-        var next_config = config.parseWithDiag(self.allocator, contents, &diag) catch |err| {
+        var diag: config.LoadDiag = .{};
+        var next_config = config.load(self.io, self.allocator, contents, &diag) catch {
+            if (diag.parse_err == null) {
+                // validateSemantic already printed the specific diagnostic.
+                self.noteReloadRejected(path, "semantic validation failed (see preceding diagnostic)");
+                return;
+            }
             var msg_buf: [512]u8 = undefined;
             var w = std.Io.Writer.fixed(&msg_buf);
-            diag.format(err, &w) catch {};
+            w.print("{f}", .{diag}) catch {};
             self.noteReloadRejected(path, w.buffered());
-            return;
-        };
-
-        // validateSemantic already printed the specific diagnostic.
-        config.validateSemantic(self.io, self.allocator, &next_config) catch {
-            next_config.deinit();
-            self.noteReloadRejected(path, "semantic validation failed (see preceding diagnostic)");
             return;
         };
 

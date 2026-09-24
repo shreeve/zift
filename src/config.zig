@@ -473,7 +473,7 @@ pub const ParseDiag = struct {
     }
 
     /// `line N: [section] 'key': ErrorName` (caller prints the file).
-    pub fn format(self: *const ParseDiag, err: anyerror, writer: *std.Io.Writer) !void {
+    pub fn format(self: *const ParseDiag, err: anyerror, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.line != 0) {
             try writer.print("line {d}: ", .{self.line});
         }
@@ -506,6 +506,36 @@ fn isAcceptedKeyAlgorithm(algo: []const u8) bool {
         if (std.mem.eql(u8, algo, accepted)) return true;
     }
     return false;
+}
+
+/// Read a config file (at most 1 MiB).
+pub fn readFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+}
+
+/// Why `load` rejected a config. Only a parse failure carries a message:
+/// `validateSemantic` prints its own.
+pub const LoadDiag = struct {
+    parse: ParseDiag = .{},
+    parse_err: ?Error = null,
+
+    /// `line N: [section] 'key': Error`; valid when `parse_err` is set.
+    pub fn format(self: LoadDiag, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self.parse.format(self.parse_err.?, w);
+    }
+};
+
+/// Parse and validate config text: the one path from a file's contents to
+/// a config that may serve (validate, startup, and reload). Reading is
+/// separate because reload records the file's stamps between the two.
+pub fn load(io: std.Io, gpa: std.mem.Allocator, contents: []const u8, diag: *LoadDiag) (Error || SemanticError)!Config {
+    var cfg = parseWithDiag(gpa, contents, &diag.parse) catch |err| {
+        diag.parse_err = err;
+        return err;
+    };
+    errdefer cfg.deinit();
+    try validateSemantic(io, gpa, &cfg);
+    return cfg;
 }
 
 pub fn parse(gpa: std.mem.Allocator, text: []const u8) Error!Config {
