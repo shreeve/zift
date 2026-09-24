@@ -1047,6 +1047,8 @@ const SftpState = struct {
         staging_live_mutex.lockUncancelable(self.io);
         defer staging_live_mutex.unlock(self.io);
         if (stagingLiveIndex(name)) |i| _ = staging_live.swapRemove(i);
+        // Process-global, so free it once idle or it outlives every session.
+        if (staging_live.items.len == 0) staging_live.clearAndFree(self.allocator);
     }
 
     fn stagingNameIsLive(self: *SftpState, name: []const u8) bool {

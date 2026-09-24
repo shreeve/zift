@@ -14,7 +14,7 @@ const signals = @import("signals.zig");
 const sys = @import("sys.zig");
 const vfs = @import("vfs.zig");
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
@@ -29,7 +29,8 @@ pub fn main(init: std.process.Init) !void {
         try version(io)
     else
         try usage(io);
-    std.process.exit(code);
+    // Return rather than exit, so a Debug build's allocator reports leaks.
+    return code;
 }
 
 fn usage(io: std.Io) !u8 {
