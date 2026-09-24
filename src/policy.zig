@@ -91,8 +91,9 @@ pub fn policyDerivedMode(
 /// and other bits are always off; group mirrors owner.
 ///
 ///   dir:  r = stat, w = any change inside, x = list
-///   file: r = download, w = write; never x. Removal is the parent's
-///         `w`, as on Unix.
+///   file: r = download, w = overwrite (`write` and `update`, since the
+///         file exists); never x. Removal is the parent's `w`, as on Unix.
+///   anything else (symlink, FIFO, ...): no bits, since OPEN refuses it.
 pub fn derivedMode(granted: config.PermissionSet, kind_bits: u32) u32 {
     const file_type = kind_bits & listing.S_IFMT;
     var owner: u32 = 0;
@@ -104,11 +105,12 @@ pub fn derivedMode(granted: config.PermissionSet, kind_bits: u32) u32 {
             if (granted.intersectWith(changes).count() > 0) owner |= 0o2;
             if (granted.contains(.list)) owner |= 0o1;
         },
-        else => {
+        listing.S_IFREG => {
             // `list` shows the name, not the bytes, so it gives no `r`.
             if (granted.contains(.read)) owner |= 0o4;
-            if (granted.contains(.write)) owner |= 0o2;
+            if (granted.contains(.write) and granted.contains(.update)) owner |= 0o2;
         },
+        else => {},
     }
     return file_type | (owner << 6) | (owner << 3);
 }
@@ -444,4 +446,22 @@ test "policy-derived mode: read grants r on both dirs and files" {
     const user = testUser(&.{allow("/", &.{ .read, .list })});
     try std.testing.expectEqual(@as(u32, 0o040550), policyDerivedMode(&user, "/", 0o040755));
     try std.testing.expectEqual(@as(u32, 0o100440), policyDerivedMode(&user, "/a.pdf", 0o100644));
+}
+
+test "policy-derived mode: a file's w needs update, since it already exists" {
+    const file = listing.S_IFREG | 0o644;
+    // A drop box can create files but not overwrite them.
+    try std.testing.expectEqual(@as(u32, 0o100000), derivedMode(.initOne(.write), file));
+    try std.testing.expectEqual(@as(u32, 0o100000), derivedMode(.initOne(.update), file));
+    try std.testing.expectEqual(@as(u32, 0o100660), derivedMode(.initMany(&.{ .read, .write, .update }), file));
+    // The directory still shows `w`: creating inside it is allowed.
+    for ([_]config.Permission{ .write, .mkdir, .rename, .update, .delete }) |perm| {
+        try std.testing.expectEqual(@as(u32, 0o040220), derivedMode(.initOne(perm), listing.S_IFDIR | 0o755));
+    }
+}
+
+test "policy-derived mode: symlinks and special files get no bits" {
+    for ([_]u32{ listing.S_IFLNK, listing.S_IFIFO, listing.S_IFSOCK, listing.S_IFCHR }) |kind| {
+        try std.testing.expectEqual(kind, derivedMode(.initFull(), kind | 0o777));
+    }
 }
