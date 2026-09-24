@@ -37,7 +37,7 @@ while (($#)); do
             done
             exit 0 ;;
         --keep) KEEP=1 ;;
-        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,18p' "$(basename "$0")" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) SELECT+=("$1") ;;
     esac
     shift
