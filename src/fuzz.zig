@@ -236,8 +236,9 @@ fn fuzzWireParser(_: void, smith: *Smith) !void {
     _ = wire.parseHandleId(input) catch {};
 }
 
-// Authorization runs on this output: it must be rooted, with no `.`,
-// `..`, or reserved component left.
+// Authorization runs on this output: it must be rooted, within the
+// length limit, with no empty, `.`, `..`, or reserved component left,
+// and normalizing it again must change nothing.
 test "fuzz normalize into buffer" {
     return std.testing.fuzz({}, fuzzNormalizeInto, .{ .corpus = &.{
         "/pending/../secret",
@@ -254,17 +255,37 @@ test "fuzz normalize into buffer" {
 }
 
 fn fuzzNormalizeInto(_: void, smith: *Smith) !void {
-    var buf: [4096]u8 = undefined;
+    var buf: [4097]u8 = undefined;
     const len = smith.sliceWithHash(&buf, 0x2A2A2F2F);
-    const input = buf[0..len];
+    try checkNormalized(buf[0..len]);
+}
 
+test "normalize invariants hold on random paths" {
+    const atoms = [_][]const u8{ "a", "b", "/", "//", ".", "..", "/..", "/.", ".zift", ".ZIFT", "\xc3\xa9", "\x01", "a" ** 300 };
+    var prng = std.Random.DefaultPrng.init(0x2A2A);
+    const random = prng.random();
+    var buf: [8192]u8 = undefined;
+    for (0..20_000) |_| {
+        var input: []u8 = buf[0..0];
+        for (0..random.uintLessThan(usize, 30)) |_| append(&input, atoms[random.uintLessThan(usize, atoms.len)]);
+        try checkNormalized(input);
+    }
+}
+
+fn checkNormalized(input: []const u8) !void {
     var out: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
     const normalized = vfs_mod.normalizeVirtualInto(input, &out) catch return;
-    std.debug.assert(normalized.len >= 1 and normalized[0] == '/');
-    var it = std.mem.tokenizeScalar(u8, normalized, '/');
-    while (it.next()) |part| {
-        std.debug.assert(!std.mem.eql(u8, part, "."));
-        std.debug.assert(!std.mem.eql(u8, part, ".."));
-        std.debug.assert(!vfs_mod.isReservedComponent(part));
+    try std.testing.expect(normalized.len <= vfs_mod.max_virtual_path_bytes);
+    try std.testing.expect(normalized[0] == '/');
+    if (normalized.len > 1) {
+        var it = std.mem.splitScalar(u8, normalized[1..], '/');
+        while (it.next()) |part| {
+            try std.testing.expect(part.len > 0);
+            try std.testing.expect(!std.mem.eql(u8, part, "."));
+            try std.testing.expect(!std.mem.eql(u8, part, ".."));
+            try std.testing.expect(!vfs_mod.isReservedComponent(part));
+        }
     }
+    var again: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
+    try std.testing.expectEqualStrings(normalized, try vfs_mod.normalizeVirtualInto(normalized, &again));
 }

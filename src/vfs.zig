@@ -272,8 +272,9 @@ pub fn isReservedComponent(part: []const u8) bool {
 
 /// Normalize into `out` (≥ `max_virtual_path_bytes + 1` bytes): validate
 /// bytes, drop `.` and empty components, resolve `..` (never above the
-/// root), and refuse a reserved component anywhere. The result can be one
-/// byte longer than the input (a leading `/` is added).
+/// root), and refuse a reserved component anywhere. The result, which
+/// gains a leading `/` if the input lacked one, is itself held to
+/// `max_virtual_path_bytes`, so it is always a valid input again.
 pub fn normalizeVirtualInto(
     virtual_path: []const u8,
     out: []u8,
@@ -308,6 +309,7 @@ pub fn normalizeVirtualInto(
         out[0] = '/';
         return out[0..1];
     }
+    if (len > max_virtual_path_bytes) return error.PathTooLong;
     return out[0..len];
 }
 
@@ -409,6 +411,15 @@ test "normalizeVirtualInto resolves .. before authorization" {
         try std.testing.expectEqualStrings(case.want, got);
     }
     try std.testing.expectError(error.PathTraversal, normalizeVirtualInto("/a/../../b", &out));
+}
+
+test "normalized output never exceeds the input limit" {
+    var out: [max_virtual_path_bytes + 2]u8 = undefined;
+    const name = "a" ** (max_virtual_path_bytes - 1);
+    try std.testing.expectEqual(max_virtual_path_bytes, (try normalizeVirtualInto(name, &out)).len);
+    try std.testing.expectEqual(max_virtual_path_bytes, (try normalizeVirtualInto("/" ++ name, &out)).len);
+    // The added `/` would make it one byte too long.
+    try std.testing.expectError(error.PathTooLong, normalizeVirtualInto(name ++ "a", &out));
 }
 
 test "isInsideRoot splits at component boundaries, and `/` holds everything" {
