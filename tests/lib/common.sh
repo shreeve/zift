@@ -42,14 +42,22 @@ need_paramiko() {
 need_slow() { [[ "${ZIFT_TEST_SLOW:-0}" == 1 ]] || skip "slow: set ZIFT_TEST_SLOW=1 to run"; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || skip "$1 not installed"; }
 
+# On exit, stop everything gracefully: a Debug server reports leaks as it
+# exits, and a leak fails the case.
 cleanup() {
-    local pid
+    local rc=$? pid
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill -TERM "$pid" 2>/dev/null || true; done
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         wait_exit "$pid" 5 || kill -KILL "$pid" 2>/dev/null || true
     done
+    if leaked && ((rc == 0)); then
+        echo "  fail: zift leaked memory: $(grep -m1 'leaked' "$ZIFT_LOG")" >&2
+        rc=1
+    fi
+    exit "$rc"
 }
 trap cleanup EXIT
+leaked() { grep -q 'memory address 0x[0-9a-f]* leaked' "$ZIFT_LOG" 2>/dev/null; }
 
 # `wait_until <seconds> <command...>`: poll until the command succeeds.
 wait_until() {
@@ -148,7 +156,8 @@ zift_up() {
 }
 
 # `stop_zift [signal]`: signal the server and `wait_zift`.
-# `wait_zift [seconds]`: wait for the server to exit; sets $ZIFT_RC.
+# `wait_zift [seconds]`: wait for the server to exit; sets $ZIFT_RC and
+# fails on a leak report.
 stop_zift() {
     kill -"${1:-TERM}" "$ZIFT_PID" 2>/dev/null || true
     wait_zift
@@ -157,6 +166,8 @@ wait_zift() {
     wait_exit "$ZIFT_PID" "${1:-15}" || fail "zift did not exit"
     ZIFT_RC=0
     wait "$ZIFT_PID" 2>/dev/null || ZIFT_RC=$?
+    leaked && fail "zift leaked memory: $(grep -m1 'leaked' "$ZIFT_LOG")"
+    return 0
 }
 
 # `sftp_password <user> <password> [command...]`: an OpenSSH sftp
