@@ -1037,10 +1037,16 @@ fn parseFrom(allocator: std.mem.Allocator, d: *ParseDiag, user: *UserBuilder, va
 }
 
 /// Reject a pattern that can never match. Policy matches the normalized
-/// virtual path, which starts with `/` and has no empty, `.`, `..`, or
-/// trailing components; a dead `deny` would silently fail open.
+/// virtual path, which starts with `/` and has no empty, `.`, `..`,
+/// trailing or reserved components; a dead `deny` would silently fail
+/// open.
 fn checkPattern(d: *ParseDiag, pattern: []const u8) Error!void {
     if (pattern[0] != '/' and !std.mem.startsWith(u8, pattern, "**")) {
+        // `*/a` does match, but only `/a`: `*` never crosses `/`, and
+        // every path starts with one. The author likely meant `**/a`.
+        if (std.mem.trimStart(u8, pattern, "*").len != 0 and std.mem.trimStart(u8, pattern, "*")[0] == '/') {
+            return d.fail(error.InvalidPattern, "'{s}' matches only at the top level, as if it began with '/': start it with '/' (top level) or '**/' (any depth)", .{pattern});
+        }
         return d.fail(error.InvalidPattern, "'{s}' never matches: start it with '/' (top level) or '**/' (any depth)", .{pattern});
     }
     if (pattern.len > 1 and pattern[pattern.len - 1] == '/') {
@@ -1054,6 +1060,9 @@ fn checkPattern(d: *ParseDiag, pattern: []const u8) Error!void {
         }
         if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) {
             return d.fail(error.InvalidPattern, "'{s}' never matches: paths are matched without '.' or '..' components", .{pattern});
+        }
+        if (vfs.isReservedComponent(part)) {
+            return d.fail(error.InvalidPattern, "'{s}' never matches: '{s}' is reserved, and every request naming it is refused", .{ pattern, part });
         }
     }
 }
@@ -2154,13 +2163,16 @@ test "the same key file twice for one user is rejected" {
 }
 
 test "rule patterns that can never match are rejected" {
-    // Each of these is a silent no-op in policy.check: as a `deny` it
-    // would fail open. `*` never crosses `/`, and every path starts with it.
+    // Each of these is a silent no-op in policy.check (as a `deny` it
+    // would fail open), or matches far less than it reads. `*` never
+    // crosses `/`, and every path starts with it.
     const dead = [_][]const u8{
         "*", "*.exe", "secret", "?x", "pending/*", // no leading `/` or `**`
         "/secret/", "/in/*/", "**/", // trailing `/`
         "//x", "/a//b", // empty component
         "/a/./b", "/a/..", "/../etc", "**/..", "/.", // `.` / `..` component
+        "/.zift", "/pending/.zift/**", "**/.Zift", "/.ZIFT-staging", "/a/.zift-staging/b", // reserved
+        "*/a", "*/**", // match only as `/a` and `/**`: ambiguous, so rejected
     };
     for (dead) |pattern| {
         var buf: [256]u8 = undefined;
@@ -2171,7 +2183,7 @@ test "rule patterns that can never match are rejected" {
         try std.testing.expectError(error.InvalidPattern, parse(std.testing.allocator, allow));
     }
 
-    const live = [_][]const u8{ "/", "/secret", "/*.exe", "**", "**.exe", "***.exe", "**/secret", "/in/**", "/a/**/b", "/a.b/..c", "/#x", "/a#" };
+    const live = [_][]const u8{ "/", "/secret", "/*.exe", "**", "**.exe", "***.exe", "**/secret", "/in/**", "/a/**/b", "/a.b/..c", "/#x", "/a#", "**.zift", "/a.zift", "/.zift2", "/.zift*" };
     for (live) |pattern| {
         var buf: [256]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n  deny {s}\n", .{pattern});
@@ -2181,4 +2193,6 @@ test "rule patterns that can never match are rejected" {
     }
 
     try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  deny *.exe\n", "line 5: [user u] 'deny': InvalidPattern: '*.exe' never matches: start it with '/' (top level) or '**/' (any depth)");
+    try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  deny */a\n", "line 5: [user u] 'deny': InvalidPattern: '*/a' matches only at the top level, as if it began with '/': start it with '/' (top level) or '**/' (any depth)");
+    try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  deny /in/.Zift/**\n", "line 5: [user u] 'deny': InvalidPattern: '/in/.Zift/**' never matches: '.Zift' is reserved, and every request naming it is refused");
 }

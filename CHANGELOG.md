@@ -76,8 +76,9 @@ the line and the reason.
 ### Breaking changes
 
 - Patterns must be anchored. A pattern that does not start with `/` or
-  `**`, ends in `/` (other than `/` itself), or contains `//`, `.` or
-  `..` is `InvalidPattern`. Migration: `deny *.exe` becomes `deny
+  `**`, ends in `/` (other than `/` itself), or contains `//`, `.`,
+  `..` or a reserved `.zift`/`.zift-staging` component is
+  `InvalidPattern`. Migration: `deny *.exe` becomes `deny
   /*.exe` (top level) or `deny **.exe` (any depth); `/dir/` becomes
   `/dir`.
 - A single-valued directive given twice (`listen`, `host-key`, `root`,

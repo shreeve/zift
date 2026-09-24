@@ -122,7 +122,8 @@ for rule in "deny *.exe|'deny': InvalidPattern: '*.exe' never matches" \
             "deny secret|'secret' never matches" \
             "allow /pending/ read|drop the trailing '/'" \
             "deny /a//b|empty component" \
-            "deny /inbox/../etc|'.' or '..'"; do
+            "deny /inbox/../etc|'.' or '..'" \
+            "deny /pending/.zift/**|'.zift' is reserved"; do
     conf rule "$(user runner "root $T/root_a" "allow / full" "${rule%%|*}")"
     validate_err "$T/rule.conf" "${rule#*|}"
 done

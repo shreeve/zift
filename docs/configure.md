@@ -264,15 +264,17 @@ Matching is case-sensitive and byte-exact apart from `?`, which takes
 one whole UTF-8 character.
 
 Paths are normalized before matching: they start with `/` and have no
-`.`, `..`, empty or trailing components. A pattern that could never
-match such a path is rejected with `InvalidPattern`:
+`.`, `..`, empty or trailing components, and never name the reserved
+`.zift` or `.zift-staging` in any letter case. A pattern that could
+never match such a path is rejected with `InvalidPattern`:
 
 | Rejected | Write instead |
 | --- | --- |
-| `*.exe`, `secret` | `/*.exe` (top level) or `**.exe`, `**/secret` (any depth) |
+| `*.exe`, `secret`, `*/a` | `/*.exe` (top level) or `**.exe`, `**/secret` (any depth) |
 | `/dir/` | `/dir` |
 | `/a//b`, `/a/./b` | `/a/b` |
 | `/a/../b` | `/b` |
+| `/.zift`, `/in/.zift/**` | nothing: partners can never reach it |
 
 `/dir/**` matches everything below `/dir` but not `/dir` itself. So
 `deny **/.ssh/**` refuses every file under any `.ssh` directory, and
