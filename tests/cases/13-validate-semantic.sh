@@ -237,6 +237,7 @@ set +e
 "$ZIFT" serve "$TEST_TMP/missing_root.conf" \
     > "$TEST_TMP/serve_reject.stdout" 2> "$TEST_TMP/serve_reject.stderr" &
 serve_pid=$!
+PIDS+=("$serve_pid")
 # Wait briefly; if startup refuses, the process should exit on its own.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     kill -0 "$serve_pid" 2>/dev/null || break

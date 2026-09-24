@@ -8,17 +8,8 @@
 
 source "$(dirname "$0")/../lib/common.sh"
 
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
-if [[ "${ZIFT_TEST_SLOW:-0}" != "1" ]]; then
-    echo "skip: set ZIFT_TEST_SLOW=1 to run"
-    exit 0
-fi
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV"
-    exit 0
-fi
+need_slow
+need_paramiko
 
 make_host_key
 hash=$(make_password_hash secret)

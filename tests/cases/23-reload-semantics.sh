@@ -95,6 +95,7 @@ EOF
 # Start a second instance with reload polling disabled.
 "$ZIFT_BIN" serve "$TEST_TMP/zift_disabled.conf" >"$TEST_TMP/disabled.log" 2>&1 &
 DISABLED_PID=$!
+PIDS+=("$DISABLED_PID")
 disown
 for _ in 1 2 3 4 5; do
     grep -q 'listening on' "$TEST_TMP/disabled.log" 2>/dev/null && break

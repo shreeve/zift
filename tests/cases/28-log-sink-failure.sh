@@ -11,13 +11,7 @@
 
 source "$(dirname "$0")/../lib/common.sh"
 
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV"
-    exit 0
-fi
+need_paramiko
 
 make_host_key
 hash=$(make_password_hash secret)
@@ -36,6 +30,7 @@ mkfifo "$FIFO"
 # server's open(O_WRONLY) on the fifo blocks indefinitely.
 cat "$FIFO" > "$TEST_TMP/audit.captured" &
 READER_PID=$!
+PIDS+=("$READER_PID")
 
 write_config <<EOF
 server

@@ -6,14 +6,8 @@
 
 source "$(dirname "$0")/../lib/common.sh"
 
-PROBE="$(dirname "$0")/../lib/probe_path_limits.py"
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV"
-    exit 0
-fi
+need_paramiko
+PROBE="$LIB_DIR/probe_path_limits.py"
 
 make_host_key
 mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it

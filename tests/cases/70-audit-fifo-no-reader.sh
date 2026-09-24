@@ -43,6 +43,7 @@ mkfifo "$AUDIT"
 config_with_log "$AUDIT"
 "$ZIFT_BIN" serve "$TEST_TMP/zift.conf" >"$TEST_TMP/startup.log" 2>&1 &
 pid=$!
+PIDS+=("$pid")
 if ! exits_within "$pid" 50; then
     kill -KILL "$pid" 2>/dev/null || true
     fail "serve blocked opening a FIFO with no reader"
@@ -76,6 +77,7 @@ ok "failed reopen keeps serving and keeps writing the old log"
 # --- c) the retry picks up a reader --------------------------------------
 cat "$AUDIT" >"$TEST_TMP/shipped.log" &
 READER=$!
+PIDS+=("$READER")
 # The retry deadline is 5 s after the failure; a session after that
 # carries the reopen.
 sleep 5.5

@@ -5,14 +5,8 @@
 
 source "$(dirname "$0")/../lib/common.sh"
 
-PROBE="$(dirname "$0")/../lib/probe_handle_access.py"
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV (run 'python3 -m venv tests/.venv && tests/.venv/bin/pip install paramiko')"
-    exit 0
-fi
+need_paramiko
+PROBE="$LIB_DIR/probe_handle_access.py"
 
 make_host_key
 hash=$(make_password_hash secret)

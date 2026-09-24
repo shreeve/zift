@@ -8,9 +8,6 @@
 
 source "$(dirname "$0")/../lib/common.sh"
 
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
 make_host_key
 mkdir -p "$TEST_TMP/root/inbox"
 hash=$(make_password_hash secret)
@@ -81,10 +78,7 @@ sed -i.bak "s|listen 127.0.0.1:$TEST_PORT|listen [::1]:$TEST_PORT|" "$TEST_TMP/v
 ok "listen [::1]:$TEST_PORT validates"
 
 # ---------- the commented deny still denies at runtime ----------
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV"
-    exit 0
-fi
+need_paramiko
 write_config <<EOF
 server
   listen 127.0.0.1:$TEST_PORT

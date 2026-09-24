@@ -6,12 +6,8 @@
 
 source "$(dirname "$0")/../lib/common.sh"
 
-PROBE="$(dirname "$0")/../lib/probe_channel_flood.py"
-PY="$(dirname "$0")/../.venv/bin/python3"
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing"
-    exit 0
-fi
+need_paramiko
+PROBE="$LIB_DIR/probe_channel_flood.py"
 
 make_host_key
 hash=$(make_password_hash secret)

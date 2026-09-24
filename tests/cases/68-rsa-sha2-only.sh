@@ -7,13 +7,7 @@
 
 source "$(dirname "$0")/../lib/common.sh"
 
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV"
-    exit 0
-fi
+need_paramiko
 
 make_host_key
 ssh-keygen -t rsa -b 3072 -f "$TEST_TMP/rsa_user" -N "" -q
@@ -34,8 +28,7 @@ user rsa
 EOF
 
 if ! "$ZIFT_BIN" validate "$TEST_TMP/zift.conf" >/dev/null 2>&1; then
-    echo "skip: this build does not accept ssh-rsa key lines"
-    exit 0
+    skip "this build does not accept ssh-rsa key lines"
 fi
 
 start_zift

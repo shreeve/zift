@@ -20,7 +20,9 @@
 #   log_contains <pattern>             -> checks server stderr log
 #   sftp_password <user> <pass> <cmds>  -> runs sftp via expect with password
 #   ok <message>                       -> prints "ok: ...", returns 0
-#   fail <message>                     -> prints "fail: ...", returns 1
+#   fail <message>                     -> prints "fail: ...", exits 1
+#   skip <reason>                      -> the case cannot run here: exit 77
+#   need_paramiko / need_slow / need_cmd <tool>  -> skip unless available
 
 set -euo pipefail
 
@@ -29,25 +31,36 @@ set -euo pipefail
 : "${TEST_PORT:?must be set by runner}"
 : "${TEST_NAME:?must be set by runner}"
 
+LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PY="$LIB_DIR/../.venv/bin/python3"
 ZIFT_PID=""
 ZIFT_LOG="$TEST_TMP/zift.log"
+PIDS=()  # every server and background job this case started
 
+# `skip <reason>`: the case cannot run here. A reason starting with
+# "slow" marks a slow-gated case, which ZIFT_REQUIRE_ALL=1 tolerates.
+skip() {
+    echo "skip: $*"
+    printf '%s\n' "$*" > "$TEST_TMP/.skip"
+    exit 77
+}
+need_paramiko() {
+    [[ -x "$PY" ]] || skip "paramiko venv missing: python3 -m venv tests/.venv && tests/.venv/bin/pip install paramiko"
+}
+need_slow() { [[ "${ZIFT_TEST_SLOW:-0}" == 1 ]] || skip "slow: set ZIFT_TEST_SLOW=1 to run"; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || skip "$1 not installed"; }
+
+# Stop what this case started, and nothing else on the host.
 cleanup() {
-    if [[ -n "$ZIFT_PID" ]] && kill -0 "$ZIFT_PID" 2>/dev/null; then
-        kill -TERM "$ZIFT_PID" 2>/dev/null || true
-        for _ in 1 2 3 4 5; do
-            kill -0 "$ZIFT_PID" 2>/dev/null || break
+    local pid
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill -TERM "$pid" 2>/dev/null || true; done
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$pid" 2>/dev/null || break
             sleep 0.5
         done
-        kill -KILL "$ZIFT_PID" 2>/dev/null || true
-    fi
-    # Belt-and-suspenders: kill anything still bound to TEST_PORT.
-    # `xargs -r` is GNU-only; emulate with an explicit empty-input check.
-    local pids
-    pids=$(lsof -ti tcp:"$TEST_PORT" 2>/dev/null || true)
-    if [[ -n "$pids" ]]; then
-        echo "$pids" | xargs kill -KILL 2>/dev/null || true
-    fi
+        kill -KILL "$pid" 2>/dev/null || true
+    done
 }
 trap cleanup EXIT
 
@@ -60,6 +73,7 @@ BG_PIDS=()
 bg() {
     ( trap - EXIT; "$@" ) &
     BG_PIDS+=("$!")
+    PIDS+=("$!")
 }
 
 # Wait for every job started via `bg`. Each child's exit code is ignored
@@ -76,9 +90,12 @@ make_host_key() {
     ssh-keygen -t ed25519 -f "$TEST_TMP/host_ed25519" -N "" -q
 }
 
+# One Argon2id hash (0.7 s in Debug) per password per run, cached in the
+# directory run.sh shares between cases.
 make_password_hash() {
-    local plain="$1"
-    printf '%s\n' "$plain" | "$ZIFT_BIN" hash-password 2>/dev/null | sed 's/password: //'
+    local cache="${ZIFT_TEST_CACHE:-$TEST_TMP}/hash-$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')"
+    [[ -s "$cache" ]] || printf '%s\n' "$1" | "$ZIFT_BIN" hash-password > "$cache"
+    cat "$cache"
 }
 
 write_config() {
@@ -88,6 +105,7 @@ write_config() {
 start_zift() {
     "$ZIFT_BIN" serve "$TEST_TMP/zift.conf" >"$ZIFT_LOG" 2>&1 &
     ZIFT_PID=$!
+    PIDS+=("$ZIFT_PID")
     wait_listening
 }
 

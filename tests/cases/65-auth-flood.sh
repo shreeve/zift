@@ -9,13 +9,7 @@
 
 source "$(dirname "$0")/../lib/common.sh"
 
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV"
-    exit 0
-fi
+need_paramiko
 
 make_host_key
 hash=$(make_password_hash secret)
@@ -44,6 +38,7 @@ start_zift
       sleep 0.05
   done ) &
 SAMPLER=$!
+PIDS+=("$SAMPLER")
 
 "$PY" - <<EOF >"$TEST_TMP/flood.out" 2>&1 || true
 import paramiko, socket, threading

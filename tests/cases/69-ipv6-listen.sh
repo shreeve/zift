@@ -8,17 +8,9 @@
 
 source "$(dirname "$0")/../lib/common.sh"
 
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV"
-    exit 0
-fi
-if ! "$PY" -c "import socket; s = socket.socket(socket.AF_INET6); s.bind(('::1', 0))" 2>/dev/null; then
-    echo "skip: no IPv6 loopback"
-    exit 0
-fi
+need_paramiko
+"$PY" -c "import socket; socket.socket(socket.AF_INET6).bind(('::1', 0))" 2>/dev/null \
+    || skip "no IPv6 loopback"
 
 make_host_key
 hash=$(make_password_hash secret)

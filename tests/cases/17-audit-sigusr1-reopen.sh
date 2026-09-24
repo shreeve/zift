@@ -45,7 +45,6 @@ sleep 1
 mv "$AUDIT_PATH" "$AUDIT_PATH.1"
 : > "$AUDIT_PATH"
 
-# $ZIFT_PID is this case's server; pgrep could pick another run's.
 kill -USR1 "$ZIFT_PID"
 sleep 1
 
