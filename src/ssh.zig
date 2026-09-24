@@ -20,7 +20,12 @@ pub fn authenticate(
     cfg: config.Config,
     session: c.ssh_session,
     ip_str: []const u8,
+    deadline_ms: i64,
 ) !*const config.UserConfig {
+    errdefer |err| if (err == error.LoginGraceExpired) {
+        audit.log(io, null, "auth.rejected", null, .denied, "login grace expired", ip_str);
+    };
+
     // Two ceilings.
     //
     // HARD failures are real credential rejections: a wrong or unknown-
@@ -31,11 +36,10 @@ pub fn authenticate(
     // SOFT operations are `none`, non-auth messages, and public-key
     // probes (offers, unconfigured keys, a public-key `from` miss). A
     // stock client sends one per agent key before trying a password, so
-    // they get no backoff and no abuse credit, only a loop bound: each
-    // message restarts libssh's idle deadline. A public-key `from` miss
-    // is soft so that it cannot be told apart from an unknown user.
+    // they get no backoff and no abuse credit, only a count bound; the
+    // login grace bounds the time. A public-key `from` miss is soft so
+    // that it cannot be told apart from an unknown user.
     const max_hard_failures: u32 = 6;
-    const max_soft_ops: u32 = 64;
     var hard_failures: u32 = 0;
     var soft_ops: u32 = 0;
     while (true) {
@@ -45,15 +49,13 @@ pub fn authenticate(
             return error.LibsshFailure;
         }
 
-        const msg = c.ssh_message_get(session) orelse return error.LibsshFailure;
+        try boundRead(session, cfg.server.idle_timeout_ms, deadline_ms);
+        const msg = c.ssh_message_get(session) orelse
+            return if (sys.monotonicMs() >= deadline_ms) error.LoginGraceExpired else error.LibsshFailure;
         defer c.ssh_message_free(msg);
 
         if (c.ssh_message_type(msg) != c.SSH_REQUEST_AUTH) {
-            soft_ops += 1;
-            if (soft_ops >= max_soft_ops) {
-                audit.log(io, null, "auth.too_many_attempts", null, .denied, "probes", ip_str);
-                return error.LibsshFailure;
-            }
+            try countSoft(io, &soft_ops, ip_str);
             _ = c.ssh_message_reply_default(msg);
             continue;
         }
@@ -76,41 +78,26 @@ pub fn authenticate(
             if (username_ptr != null and password_ptr != null) {
                 const username = std.mem.span(username_ptr);
                 const password = std.mem.span(password_ptr);
-                if (cfg.findUser(username)) |user| {
-                    if (!netmatch.allowed(user.from, ip_str)) {
-                        // Pay the KDF anyway so timing hides the username.
-                        runDummyVerify(io, allocator, password);
-                        audit.log(io, username, "auth.password", null, .denied, "source not allowed", ip_str);
-                        is_hard = true;
-                    } else if (verifyPassword(io, allocator, user, password)) {
-                        _ = c.ssh_message_auth_reply_success(msg, 0);
-                        audit.log(io, username, "auth.password", null, .ok, "", ip_str);
-                        abuse.recordSuccess(io, ip_str);
-                        return user;
-                    } else {
-                        audit.log(io, username, "auth.password", null, .denied, "bad password", ip_str);
-                        is_hard = true;
-                    }
-                } else {
-                    runDummyVerify(io, allocator, password);
-                    audit.log(io, username, "auth.password", null, .denied, "unknown user", ip_str);
-                    is_hard = true;
+                const user = cfg.findUser(username);
+                const allowed = if (user) |u| netmatch.allowed(u.from, ip_str) else false;
+                // An unknown user or a `from` miss still pays the KDF, so
+                // timing hides the username.
+                if (try verifyPassword(io, allocator, if (allowed) user.?.password_hash else null, password, deadline_ms)) {
+                    _ = c.ssh_message_auth_reply_success(msg, 0);
+                    audit.log(io, username, "auth.password", null, .ok, "", ip_str);
+                    return user.?;
                 }
+                const detail = if (user == null) "unknown user" else if (!allowed) "source not allowed" else "bad password";
+                audit.log(io, username, "auth.password", null, .denied, detail, ip_str);
+                is_hard = true;
             }
         } else if (subtype == c.SSH_AUTH_METHOD_PUBLICKEY) {
             const decision = handlePublicKeyMessage(io, allocator, cfg, msg, ip_str);
             switch (decision) {
-                .accepted => |user| {
-                    abuse.recordSuccess(io, ip_str);
-                    return user;
-                },
+                .accepted => |user| return user,
                 .offered => {
                     // `pk_ok` was sent; wait for the signed follow-up.
-                    soft_ops += 1;
-                    if (soft_ops >= max_soft_ops) {
-                        audit.log(io, null, "auth.too_many_attempts", null, .denied, "pubkey probes", ip_str);
-                        return error.LibsshFailure;
-                    }
+                    try countSoft(io, &soft_ops, ip_str);
                     continue;
                 },
                 .hard_denied => is_hard = true,
@@ -127,18 +114,14 @@ pub fn authenticate(
                 audit.log(io, null, "auth.rejected", null, .denied, "source suppressed", ip_str);
                 return error.LibsshFailure;
             }
-            const delay_ms = @min(hard_failures * 250, 2000);
-            std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
             if (hard_failures >= max_hard_failures) {
                 audit.log(io, null, "auth.too_many_attempts", null, .denied, "", ip_str);
                 return error.LibsshFailure;
             }
+            // Backoff: 250 ms per failure so far, at most 1.25 s.
+            std.Io.sleep(io, .fromMilliseconds(hard_failures * 250), .awake) catch {};
         } else {
-            soft_ops += 1;
-            if (soft_ops >= max_soft_ops) {
-                audit.log(io, null, "auth.too_many_attempts", null, .denied, "probes", ip_str);
-                return error.LibsshFailure;
-            }
+            try countSoft(io, &soft_ops, ip_str);
         }
 
         _ = c.ssh_message_auth_set_methods(msg, methodsForUser(cfg, username_for_methods));
@@ -146,45 +129,93 @@ pub fn authenticate(
     }
 }
 
+/// Count one soft operation (see `authenticate`); fails at the bound.
+fn countSoft(io: std.Io, soft_ops: *u32, ip_str: []const u8) error{LibsshFailure}!void {
+    const max_soft_ops: u32 = 64;
+    soft_ops.* += 1;
+    if (soft_ops.* < max_soft_ops) return;
+    audit.log(io, null, "auth.too_many_attempts", null, .denied, "probes", ip_str);
+    return error.LibsshFailure;
+}
+
+/// From accept to successful authentication, key exchange included.
+/// Fixed, like OpenSSH's LoginGraceTime: libssh restarts the idle timer
+/// on every message, so idle alone lets a client hold a pre-auth slot
+/// for hours.
+pub const login_grace_ms: i64 = 120 * 1000;
+
+/// Bound libssh's next blocking read by the idle timeout (0 = none) and
+/// the login deadline.
+pub fn boundRead(session: c.ssh_session, idle_ms: u64, deadline_ms: i64) error{LoginGraceExpired}!void {
+    setReadTimeout(session, try readTimeoutMs(idle_ms, deadline_ms, sys.monotonicMs()));
+}
+
+fn readTimeoutMs(idle_ms: u64, deadline_ms: i64, now_ms: i64) error{LoginGraceExpired}!u64 {
+    if (now_ms >= deadline_ms) return error.LoginGraceExpired;
+    const left: u64 = @intCast(deadline_ms - now_ms);
+    return if (idle_ms == 0) left else @min(idle_ms, left);
+}
+
+/// libssh's timeout for each blocking read; 0 waits forever. libssh
+/// rounds a total under 1 ms to 0, so callers pass whole milliseconds.
+pub fn setReadTimeout(session: c.ssh_session, ms: u64) void {
+    const seconds: c_long = @intCast(ms / 1000);
+    const usec: c_long = @intCast((ms % 1000) * 1000);
+    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT, &seconds);
+    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT_USEC, &usec);
+}
+
+/// One Argon2id under a KDF slot, against `hash` or, when null, a dummy,
+/// so every password denial costs the same as a real verify.
 fn verifyPassword(
     io: std.Io,
     allocator: std.mem.Allocator,
-    user: *const config.UserConfig,
+    hash: ?[]const u8,
     password: []const u8,
-) bool {
-    const hash = user.password_hash orelse {
-        // Key-only user: pay the KDF so timing matches the other denials.
-        runDummyVerify(io, allocator, password);
-        return false;
-    };
-    return passhash.verify(io, allocator, password, hash);
+    deadline_ms: i64,
+) error{LoginGraceExpired}!bool {
+    try acquireKdfSlot(io, deadline_ms);
+    defer releaseKdfSlot();
+    const ok = passhash.verify(io, allocator, password, hash orelse dummy_hash);
+    return ok and hash != null;
 }
 
-/// One Argon2id against a cached dummy credential, so every password
-/// denial costs the same as a real verify.
-fn runDummyVerify(io: std.Io, allocator: std.mem.Allocator, password: []const u8) void {
-    ensureDummy(io, allocator);
-    _ = passhash.verify(io, allocator, password, dummy_blob[0..passhash.blob_len]);
+/// Minted from a random password that was then discarded.
+const dummy_hash = "aUCxJ9zfsJYoIY84XNe5oVcKvG2pwBeh";
+
+/// Argon2id runs in flight, process-wide. Each takes 64 MiB, so unbounded
+/// a flood of bad logins exhausts memory before the abuse table has
+/// counted a single failure.
+var kdf_in_use: std.atomic.Value(u32) = .init(0);
+/// CPU count clamped to 2..8; 0 until first use.
+var kdf_slots: std.atomic.Value(u32) = .init(0);
+
+fn kdfSlots() u32 {
+    var n = kdf_slots.load(.monotonic);
+    if (n == 0) {
+        n = @intCast(std.math.clamp(std.Thread.getCpuCount() catch 2, 2, 8));
+        kdf_slots.store(n, .monotonic);
+    }
+    return n;
 }
 
-var dummy_blob: [passhash.blob_len]u8 = undefined;
-var dummy_ready: std.atomic.Value(bool) = .init(false);
-var dummy_mutex: std.Io.Mutex = .init;
+/// Wait for a KDF slot until `deadline_ms`. Polls: a wait is about one
+/// KDF long, and `std.Io.Condition` has no timed wait.
+fn acquireKdfSlot(io: std.Io, deadline_ms: i64) error{LoginGraceExpired}!void {
+    const slots = kdfSlots();
+    while (true) {
+        const n = kdf_in_use.load(.monotonic);
+        if (n < slots) {
+            if (kdf_in_use.cmpxchgWeak(n, n + 1, .acquire, .monotonic) == null) return;
+            continue;
+        }
+        if (sys.monotonicMs() >= deadline_ms) return error.LoginGraceExpired;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+}
 
-fn ensureDummy(io: std.Io, allocator: std.mem.Allocator) void {
-    if (dummy_ready.load(.acquire)) return;
-
-    dummy_mutex.lockUncancelable(io);
-    defer dummy_mutex.unlock(io);
-    if (dummy_ready.load(.acquire)) return;
-
-    _ = passhash.mint(io, allocator, "zift-dummy-password", &dummy_blob) catch {
-        // Fall back to a structurally valid but unverifiable blob so
-        // the verify path still runs KDF work against a real salt.
-        @memcpy(dummy_blob[0..passhash.prefix.len], passhash.prefix);
-        @memset(dummy_blob[passhash.prefix.len..], '0');
-    };
-    dummy_ready.store(true, .release);
+fn releaseKdfSlot() void {
+    _ = kdf_in_use.fetchSub(1, .release);
 }
 
 /// Methods list for a `userauth_failure` reply. A password-only user
@@ -333,27 +364,59 @@ fn matchAgainstDummyKey(allocator: std.mem.Allocator, presented: c.ssh_key) bool
     return false;
 }
 
-fn testUser(password_hash: ?[]const u8) config.UserConfig {
-    return .{
-        .name = "ally",
-        .password_hash = password_hash,
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &.{},
-    };
-}
+const no_deadline = std.math.maxInt(i64);
 
 test "verifyPassword accepts only the right password" {
     var out: [passhash.blob_len]u8 = undefined;
     const hash = try passhash.mint(std.testing.io, std.testing.allocator, "correct horse", &out);
-    const user = testUser(hash);
-    try std.testing.expect(verifyPassword(std.testing.io, std.testing.allocator, &user, "correct horse"));
-    try std.testing.expect(!verifyPassword(std.testing.io, std.testing.allocator, &user, "wrong horse"));
+    try std.testing.expect(try verifyPassword(std.testing.io, std.testing.allocator, hash, "correct horse", no_deadline));
+    try std.testing.expect(!try verifyPassword(std.testing.io, std.testing.allocator, hash, "wrong horse", no_deadline));
 }
 
 test "verifyPassword returns false when user has no password" {
-    const user = testUser(null);
-    try std.testing.expect(!verifyPassword(std.testing.io, std.testing.allocator, &user, "anything"));
+    try std.testing.expect(!try verifyPassword(std.testing.io, std.testing.allocator, null, "anything", no_deadline));
+}
+
+test "countSoft ends the loop at the 64th soft operation" {
+    var soft_ops: u32 = 0;
+    for (0..63) |_| try countSoft(std.testing.io, &soft_ops, "192.0.2.1");
+    try std.testing.expectError(error.LibsshFailure, countSoft(std.testing.io, &soft_ops, "192.0.2.1"));
+}
+
+test "readTimeoutMs: the login deadline caps the idle timeout" {
+    try std.testing.expectEqual(@as(u64, 300_000), try readTimeoutMs(300_000, 1_000_000, 0));
+    try std.testing.expectEqual(@as(u64, 5_000), try readTimeoutMs(300_000, 10_000, 5_000));
+    // Idle 0 means no idle limit, not no limit at all.
+    try std.testing.expectEqual(@as(u64, 1), try readTimeoutMs(0, 10_000, 9_999));
+    try std.testing.expectError(error.LoginGraceExpired, readTimeoutMs(0, 10_000, 10_000));
+    try std.testing.expectError(error.LoginGraceExpired, readTimeoutMs(300_000, 10_000, 20_000));
+}
+
+test "KDF slots bound concurrency, and a wait ends at the deadline" {
+    const io = std.testing.io;
+    const slots = kdfSlots();
+    try std.testing.expect(slots >= 2 and slots <= 8);
+
+    const Probe = struct {
+        var running: std.atomic.Value(u32) = .init(0);
+        var peak: std.atomic.Value(u32) = .init(0);
+        fn run() void {
+            acquireKdfSlot(std.testing.io, no_deadline) catch unreachable;
+            defer releaseKdfSlot();
+            const now = running.fetchAdd(1, .acq_rel) + 1;
+            _ = peak.fetchMax(now, .acq_rel);
+            std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+            _ = running.fetchSub(1, .acq_rel);
+        }
+    };
+    var threads: [24]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Probe.run, .{});
+    for (threads) |t| t.join();
+    try std.testing.expect(Probe.peak.load(.acquire) <= slots);
+    try std.testing.expectEqual(@as(u32, 0), kdf_in_use.load(.acquire));
+
+    // All slots busy: a waiter gives up at its deadline.
+    kdf_in_use.store(slots, .release);
+    defer kdf_in_use.store(0, .release);
+    try std.testing.expectError(error.LoginGraceExpired, acquireKdfSlot(io, sys.monotonicMs() + 30));
 }

@@ -17,35 +17,35 @@ const ssh = @import("ssh.zig");
 const sys = @import("sys.zig");
 
 /// In-flight session threads; enforces `max-connections` and drain.
-pub var active_sessions: std.atomic.Value(u32) = .init(0);
+var active_sessions: std.atomic.Value(u32) = .init(0);
 
 /// Sessions not yet authenticated; enforces `max-unauth-connections`.
-pub var unauth_sessions: std.atomic.Value(u32) = .init(0);
+var unauth_sessions: std.atomic.Value(u32) = .init(0);
 
 /// The peer address (no port, no brackets) formatted into `buf`, or null.
-fn capturePeerIp(session: c.ssh_session, buf: []u8) ?[]const u8 {
-    const fd = c.ssh_get_fd(session);
-    if (fd < 0) return null;
-
-    var ss: std.posix.sockaddr.storage align(8) = undefined;
-    var ss_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    std.posix.getpeername(fd, @ptrCast(@alignCast(&ss)), &ss_len) catch return null;
-
-    const family = @as(*const std.posix.sockaddr, @ptrCast(@alignCast(&ss))).family;
+/// An IPv4-mapped IPv6 address prints as IPv4: a dual-stack listener
+/// then logs and rate-limits IPv4 clients per address, not all as one
+/// IPv6 /64.
+fn formatPeer(ss: *const std.posix.sockaddr.storage, buf: []u8) ?[]const u8 {
+    const family = @as(*const std.posix.sockaddr, @ptrCast(ss)).family;
     switch (family) {
         std.posix.AF.INET => {
-            const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&ss));
+            const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(ss));
             const bytes: [4]u8 = @bitCast(sa.addr);
-            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            }) catch null;
+            return formatIPv4(bytes, buf);
         },
         std.posix.AF.INET6 => {
-            const sa: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&ss));
+            const sa: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(ss));
+            const v4_mapped_prefix = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff };
+            if (std.mem.eql(u8, sa.addr[0..12], &v4_mapped_prefix)) return formatIPv4(sa.addr[12..16].*, buf);
             return formatIPv6(&sa.addr, buf);
         },
         else => return null,
     }
+}
+
+fn formatIPv4(bytes: [4]u8, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch null;
 }
 
 /// Colon-hex IPv6 without `::` compression (netmatch accepts this form).
@@ -60,6 +60,94 @@ fn formatIPv6(addr: *const [16]u8, buf: []u8) ?[]const u8 {
         std.mem.readInt(u16, addr[12..14], .big),
         std.mem.readInt(u16, addr[14..16], .big),
     }) catch null;
+}
+
+/// Why a new connection from `peer_ip` is refused, or null to admit it.
+/// Admission takes one of the source's pre-auth slots.
+fn refusal(io: std.Io, cfg: config.ServerConfig, peer_ip: []const u8, now_ms: i64) ?[]const u8 {
+    if (active_sessions.load(.acquire) >= cfg.max_connections) return "max-connections reached";
+    // 0 = no separate pre-auth cap.
+    if (cfg.max_unauth_connections != 0 and
+        unauth_sessions.load(.acquire) >= cfg.max_unauth_connections)
+    {
+        return "max-unauth-connections reached";
+    }
+    return switch (abuse.admit(io, peer_ip, now_ms)) {
+        .admitted => null,
+        .suppressed => "source suppressed",
+        .busy => "too many pre-auth connections from source",
+    };
+}
+
+/// Give back a session's pre-auth slots: the global one and its source's.
+fn releasePreauth(io: std.Io, peer_ip: []const u8) void {
+    _ = unauth_sessions.fetchSub(1, .acq_rel);
+    abuse.releasePreauth(io, peer_ip);
+}
+
+/// Hand an accepted connection to a detached worker. On error `fd` is
+/// closed and every reservation released.
+fn startSession(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    active: *ActiveConfig,
+    bind: c.ssh_bind,
+    fd: c_int,
+    ip_buf: [64]u8,
+    ip_len: u8,
+) !void {
+    errdefer abuse.releasePreauth(io, ip_buf[0..ip_len]);
+    const session = c.ssh_new() orelse {
+        _ = std.c.close(fd);
+        return error.OutOfMemory;
+    };
+    if (c.ssh_bind_accept_fd(bind, session, fd) != c.SSH_OK) {
+        // Out of memory only. By now libssh may or may not own `fd`, and
+        // may have left the session's socket half-built, so close the fd
+        // and leak the session rather than risk a double close or free.
+        logLibsshError(io, "ssh_bind_accept_fd", bind, .note);
+        _ = std.c.close(fd);
+        return error.LibsshFailure;
+    }
+    errdefer c.ssh_free(session); // closes fd
+
+    // Registered here, not in the worker, so a drain that starts before
+    // the worker runs still force-closes it.
+    try signals.registerSessionFd(io, allocator, fd);
+    errdefer signals.unregisterSessionFd(io, fd);
+
+    const args = try allocator.create(SessionArgs);
+    errdefer allocator.destroy(args);
+    const ref = active.acquire();
+    errdefer ref.release(allocator);
+    args.* = .{
+        .io = io,
+        .allocator = allocator,
+        .config_ref = ref,
+        .session = session,
+        .session_fd = fd,
+        .login_deadline_ms = sys.monotonicMs() + ssh.login_grace_ms,
+        .ip_buf = ip_buf,
+        .ip_len = ip_len,
+    };
+
+    // Reserve both slots before spawn so the next accept sees them. The
+    // worker releases the pre-auth slot at auth (or exit) and the total
+    // slot at exit.
+    _ = active_sessions.fetchAdd(1, .acq_rel);
+    errdefer _ = active_sessions.fetchSub(1, .acq_rel);
+    _ = unauth_sessions.fetchAdd(1, .acq_rel);
+    errdefer _ = unauth_sessions.fetchSub(1, .acq_rel);
+
+    const thread = try std.Thread.spawn(.{}, sessionThread, .{args});
+    thread.detach();
+}
+
+fn setNonblocking(fd: c_int, on: bool) void {
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL);
+    if (flags < 0) return;
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.c.fcntl(fd, std.posix.F.SETFL, if (on) flags | nonblock else flags & ~nonblock);
 }
 
 pub fn run(
@@ -92,11 +180,7 @@ pub fn run(
     const bind = c.ssh_bind_new() orelse return error.LibsshFailure;
     defer c.ssh_bind_free(bind);
 
-    var config_mtime = try currentConfigMtime(io, config_path);
-    // Advanced together with `config_mtime` on every reload attempt,
-    // even a rejected one, so the poll does not spin.
-    var key_stamps = try KeyStamps.collect(allocator, io, active.current.config);
-    defer key_stamps.deinit(allocator);
+    active.stamp = try configStamp(io, config_path, active.current.config);
 
     const listen = try parseListen(allocator, active.current.config.server.listen);
     defer listen.deinit(allocator);
@@ -107,16 +191,29 @@ pub fn run(
     try setBindOption(bind, c.SSH_BIND_OPTIONS_BINDADDR, listen.host.ptr);
     try setBindOption(bind, c.SSH_BIND_OPTIONS_BINDPORT_STR, listen.port.ptr);
     try setBindOption(bind, c.SSH_BIND_OPTIONS_HOSTKEY, host_key.ptr);
+    // The config file is the only config: without this, ssh_bind_listen
+    // also reads /etc/ssh/libssh_server_config, which can add host keys
+    // and change the algorithms.
+    const process_config = false;
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_PROCESS_CONFIG, &process_config);
+    // libssh verifies SHA-1 `ssh-rsa` user signatures unless the accepted
+    // list excludes it; RSA is allowed with SHA-2 only, and at 2048 bits.
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_PUBKEY_ACCEPTED_KEY_TYPES, signature_algorithms);
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_HOSTKEY_ALGORITHMS, signature_algorithms);
+    const rsa_min_bits: c_int = 2048;
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_RSA_MIN_SIZE, &rsa_min_bits);
 
     if (c.ssh_bind_listen(bind) != c.SSH_OK) {
-        try logLibsshError(io, "ssh_bind_listen", bind, .note);
+        logLibsshError(io, "ssh_bind_listen", bind, .note);
         return error.LibsshFailure;
     }
 
-    // Poll libssh's listening fd so signals are seen within a second
-    // instead of waiting behind a blocking ssh_bind_accept.
-    c.ssh_bind_set_blocking(bind, 0);
+    // Zift polls and accepts on libssh's listening fd itself: signals
+    // are seen within a second, the peer address comes with the accept,
+    // and a refused connection is just closed. Non-blocking, so a
+    // connection reset between poll and accept cannot stall the loop.
     const bind_fd = c.ssh_bind_get_fd(bind);
+    setNonblocking(bind_fd, true);
     var pfd = [1]std.posix.pollfd{.{
         .fd = bind_fd,
         .events = std.posix.POLL.IN,
@@ -125,24 +222,25 @@ pub fn run(
 
     try sys.note(io, "zift: listening on {s}\n", .{active.current.config.server.listen});
 
-    // mtime polling every `reload-interval`; 0 leaves only SIGHUP.
+    // Change polling every `reload-interval`; 0 leaves only SIGHUP.
     var next_reload_ms: i64 = sys.monotonicMs() +
         @as(i64, @intCast(active.current.config.server.reload_interval_ms));
+    var accept_backoff_ms: i64 = 0;
 
     accept_loop: while (true) {
         if (signals.shutdown_requested.load(.acquire)) break :accept_loop;
 
-        // SIGHUP reloads regardless of mtime.
+        // SIGHUP reloads whether or not anything changed.
         if (signals.reload_requested.swap(false, .acq_rel)) {
-            active.forceReload(config_path, &config_mtime, &key_stamps);
+            active.forceReload(config_path);
             next_reload_ms = sys.monotonicMs() +
                 @as(i64, @intCast(active.current.config.server.reload_interval_ms));
         }
 
-        // Also stats the running config's authorized-key files.
+        // Stats the config and its authorized-key files.
         const reload_interval = active.current.config.server.reload_interval_ms;
         if (reload_interval > 0 and sys.monotonicMs() >= next_reload_ms) {
-            active.reloadIfChanged(config_path, &config_mtime, &key_stamps);
+            active.reloadIfChanged(config_path);
             next_reload_ms = sys.monotonicMs() +
                 @as(i64, @intCast(active.current.config.server.reload_interval_ms));
         }
@@ -150,118 +248,82 @@ pub fn run(
         const ready = std.posix.poll(&pfd, 1000) catch continue :accept_loop;
         if (ready == 0) continue :accept_loop;
 
-        const session = c.ssh_new() orelse return error.LibsshFailure;
-        const accept_rc = c.ssh_bind_accept(bind, session);
-        if (accept_rc != c.SSH_OK) {
-            try logLibsshError(io, "ssh_bind_accept", bind, .note);
-            c.ssh_free(session);
+        var ss: std.posix.sockaddr.storage align(8) = undefined;
+        var ss_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        const fd = std.c.accept(bind_fd, @ptrCast(&ss), &ss_len);
+        if (fd < 0) {
+            switch (std.posix.errno(fd)) {
+                .AGAIN, .INTR, .CONNABORTED => {},
+                else => |e| {
+                    // EMFILE and the like leave the connection queued, so
+                    // poll fires again at once: back off instead of spinning.
+                    accept_backoff_ms = std.math.clamp(accept_backoff_ms * 2, 10, 1000);
+                    sys.note(io, "zift: accept failed: E{s}\n", .{@tagName(e)}) catch {};
+                    std.Io.sleep(io, .fromMilliseconds(accept_backoff_ms), .awake) catch {};
+                },
+            }
             continue :accept_loop;
         }
+        accept_backoff_ms = 0;
+        // BSD sockets inherit O_NONBLOCK from the listener; libssh wants blocking.
+        setNonblocking(fd, false);
 
         var ip_buf: [64]u8 = undefined;
-        const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
-
-        if (abuse.isSuppressed(io, peer_ip, sys.monotonicMs())) {
-            audit.log(io, null, "accept.rejected", null, .denied, "source suppressed", peer_ip);
-            c.ssh_disconnect(session);
-            c.ssh_free(session);
+        const peer_ip = formatPeer(&ss, &ip_buf) orelse "";
+        const now_ms = sys.monotonicMs();
+        if (refusal(io, active.current.config.server, peer_ip, now_ms)) |reason| {
+            if (abuse.rejectionLogDue(io, peer_ip, now_ms)) {
+                audit.log(io, null, "accept.rejected", null, .denied, reason, peer_ip);
+            }
+            _ = std.c.close(fd);
             continue :accept_loop;
         }
-
-        const max = active.current.config.server.max_connections;
-        if (active_sessions.load(.acquire) >= max) {
-            audit.log(io, null, "accept.rejected", null, .denied, "max-connections reached", peer_ip);
-            c.ssh_disconnect(session);
-            c.ssh_free(session);
-            continue :accept_loop;
-        }
-
-        // 0 = no separate pre-auth cap.
-        const max_unauth_cfg = active.current.config.server.max_unauth_connections;
-        if (max_unauth_cfg != 0 and
-            unauth_sessions.load(.acquire) >= max_unauth_cfg)
-        {
-            audit.log(io, null, "accept.rejected", null, .denied, "max-unauth-connections reached", peer_ip);
-            c.ssh_disconnect(session);
-            c.ssh_free(session);
-            continue :accept_loop;
-        }
-
-        const ref = active.acquire();
-        const args = allocator.create(SessionArgs) catch |err| {
-            ref.release(allocator);
-            c.ssh_free(session);
-            return err;
+        startSession(io, allocator, &active, bind, fd, ip_buf, @intCast(peer_ip.len)) catch |err| {
+            sys.note(io, "zift: cannot start session: {s}\n", .{@errorName(err)}) catch {};
         };
-        args.* = .{
-            .io = io,
-            .allocator = allocator,
-            .config_ref = ref,
-            .session = session,
-            .ip_buf = ip_buf,
-            .ip_len = @intCast(peer_ip.len),
-        };
-
-        // Reserve both slots before spawn so the next accept sees them.
-        // The worker releases the pre-auth slot at auth (or exit) and
-        // the total slot at exit.
-        _ = active_sessions.fetchAdd(1, .acq_rel);
-        _ = unauth_sessions.fetchAdd(1, .acq_rel);
-
-        const thread = std.Thread.spawn(.{}, sessionThread, .{args}) catch |err| {
-            _ = active_sessions.fetchSub(1, .acq_rel);
-            _ = unauth_sessions.fetchSub(1, .acq_rel);
-            // Before ssh_free: ssh_get_error reads the session.
-            try logLibsshError(io, @errorName(err), session, .note);
-            ref.release(allocator);
-            c.ssh_free(session);
-            allocator.destroy(args);
-            continue :accept_loop;
-        };
-        thread.detach();
     }
-
-    // Graceful drain: wait up to `shutdown_grace_ms`, then shutdown(2)
-    // every remaining session socket so workers unblock and clean up.
-    try sys.note(io, "zift: shutdown signal received, draining sessions\n", .{});
 
     // Unbind now so no connection lands during the grace window. Then
     // clear libssh's copy of the fd: ssh_bind_free would close it again,
     // possibly hitting a descriptor a worker has since reused.
     _ = std.c.close(bind_fd);
     c.ssh_bind_set_fd(bind, @as(@TypeOf(bind_fd), -1));
+    drain(io, active.current.config.server.shutdown_grace_ms);
+    signals.deinitSessionRegistry(io, allocator);
+}
 
-    const grace_ms: i64 = @intCast(active.current.config.server.shutdown_grace_ms);
-    const drain_deadline = sys.monotonicMs() + grace_ms;
-    while (active_sessions.load(.acquire) != 0 and sys.monotonicMs() < drain_deadline) {
-        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+/// Wait up to `grace_ms` for sessions to end, then shutdown(2) every
+/// remaining session socket so workers unblock and clean up. Status
+/// lines are best effort: a failed stderr write must not skip the drain.
+fn drain(io: std.Io, grace_ms: u64) void {
+    sys.note(io, "zift: shutdown signal received, draining sessions\n", .{}) catch {};
+    if (waitForSessions(io, @intCast(grace_ms), 100)) {
+        sys.note(io, "zift: all sessions drained, exiting\n", .{}) catch {};
+        return;
     }
 
-    if (active_sessions.load(.acquire) == 0) {
-        try sys.note(io, "zift: all sessions drained, exiting\n", .{});
-    } else {
-        const closed = signals.forceCloseAll(io);
-        try sys.note(io, "zift: grace period expired, force-closing {d} session(s)\n", .{closed});
-
-        // Reads on a shut-down socket return at once; 500 ms is ample.
-        const final_deadline = sys.monotonicMs() + 500;
-        while (active_sessions.load(.acquire) != 0 and sys.monotonicMs() < final_deadline) {
-            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
-        }
-
-        const stragglers = active_sessions.load(.acquire);
-        if (stragglers == 0) {
-            try sys.note(io, "zift: all sessions drained after force-close, exiting\n", .{});
-        } else {
-            try sys.note(io, "zift: {d} session(s) still alive after force-close; exiting anyway\n", .{stragglers});
-        }
+    const closed = signals.forceCloseAll(io);
+    sys.note(io, "zift: grace period expired, force-closing {d} session(s)\n", .{closed}) catch {};
+    // Reads on a shut-down socket return at once; 500 ms is ample.
+    if (waitForSessions(io, 500, 20)) {
+        sys.note(io, "zift: all sessions drained after force-close, exiting\n", .{}) catch {};
+        return;
     }
 
-    // A straggler still calls `unregisterSessionFd`, so free the registry
-    // only when none remain; otherwise leak it to process exit.
-    if (active_sessions.load(.acquire) == 0) {
-        signals.deinitSessionRegistry(io, allocator);
+    // Returning would let main free the audit sink and finalize libssh
+    // under the stragglers' feet; end the process here instead.
+    sys.note(io, "zift: {d} session(s) still alive after force-close; exiting anyway\n", .{active_sessions.load(.acquire)}) catch {};
+    std.process.exit(0);
+}
+
+/// True once no session is active; false if `timeout_ms` passes first.
+fn waitForSessions(io: std.Io, timeout_ms: i64, step_ms: i64) bool {
+    const deadline = sys.monotonicMs() + timeout_ms;
+    while (active_sessions.load(.acquire) != 0) {
+        if (sys.monotonicMs() >= deadline) return false;
+        std.Io.sleep(io, .fromMilliseconds(step_ms), .awake) catch {};
     }
+    return true;
 }
 
 /// "stderr" or the file path, for the restart-only comparison.
@@ -320,11 +382,16 @@ const ConfigRef = struct {
     }
 };
 
+/// The serving config. Only the accept thread reads or swaps `current`;
+/// workers touch only their own `ConfigRef`'s atomic count.
 const ActiveConfig = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
-    mutex: std.Io.Mutex = .init,
     current: *ConfigRef,
+    /// `configStamp` taken before the last reload attempt whose read
+    /// succeeded (even a rejected one, so a saved typo is not re-parsed
+    /// every poll).
+    stamp: u64 = 0,
     /// One warning per run of config stat failures.
     stat_warned: bool = false,
     /// The on-disk config was rejected and the previous one is still
@@ -337,8 +404,6 @@ const ActiveConfig = struct {
     bound_log: []const u8 = "",
 
     fn acquire(self: *ActiveConfig) *ConfigRef {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         return self.current.acquire();
     }
 
@@ -346,13 +411,11 @@ const ActiveConfig = struct {
         self.current.release(self.allocator);
     }
 
-    fn reloadIfChanged(
-        self: *ActiveConfig,
-        path: []const u8,
-        known_mtime: *std.Io.Timestamp,
-        key_stamps: *KeyStamps,
-    ) void {
-        const mtime = currentConfigMtime(self.io, path) catch |err| {
+    /// Reload when the stamp differs in any way, so a deploy that keeps
+    /// or rewinds mtimes is seen too. Errors stay in here: leaving `run`
+    /// would drop every live session.
+    fn reloadIfChanged(self: *ActiveConfig, path: []const u8) void {
+        const stamp = configStamp(self.io, path, self.current.config) catch |err| {
             // Warn once and keep the previous config until it is back.
             if (!self.stat_warned) {
                 sys.note(self.io, "zift: cannot stat config file: {s}: {s} (keeping previous config)\n", .{ path, @errorName(err) }) catch {};
@@ -365,49 +428,27 @@ const ActiveConfig = struct {
             sys.note(self.io, "zift: config file readable again\n", .{}) catch {};
             self.stat_warned = false;
         }
-
-        // Reload when the config mtime moves forward or a key-file stamp
-        // changes; deploys that keep mtime need SIGHUP. Errors stay in
-        // here: leaving `run` would drop every live session.
-        if (mtime.nanoseconds <= known_mtime.nanoseconds and
-            !key_stamps.changed(self.io, self.current.config))
-        {
-            return;
-        }
-        self.applyReload(path, mtime, known_mtime, key_stamps);
+        if (stamp != self.stamp) self.applyReload(path, stamp);
     }
 
-    /// SIGHUP: reload without the mtime comparison.
-    fn forceReload(
-        self: *ActiveConfig,
-        path: []const u8,
-        known_mtime: *std.Io.Timestamp,
-        key_stamps: *KeyStamps,
-    ) void {
-        const mtime = currentConfigMtime(self.io, path) catch std.Io.Timestamp.zero;
-        self.applyReload(path, mtime, known_mtime, key_stamps);
+    /// SIGHUP: reload even when nothing looks changed.
+    fn forceReload(self: *ActiveConfig, path: []const u8) void {
+        self.applyReload(path, configStamp(self.io, path, self.current.config) catch 0);
     }
 
-    fn applyReload(
-        self: *ActiveConfig,
-        path: []const u8,
-        mtime: std.Io.Timestamp,
-        known_mtime: *std.Io.Timestamp,
-        key_stamps: *KeyStamps,
-    ) void {
+    /// `stamp` is taken before the read, so an edit that lands during
+    /// the load differs from it and reloads again on the next poll. When
+    /// a reload changes which key files are named, the next poll reloads
+    /// once more, now stamping the new set.
+    fn applyReload(self: *ActiveConfig, path: []const u8, stamp: u64) void {
         const contents = config.readFile(self.io, self.allocator, path) catch |err| {
-            // A read failure may be transient (EMFILE, a chmod that does
-            // not bump mtime), so keep the stamps and retry next poll.
+            // A read failure may be transient (EMFILE, a chmod), so keep
+            // the old stamp and retry next poll.
             sys.note(self.io, "zift: config reload read failed: {s}\n", .{@errorName(err)}) catch {};
             return;
         };
         defer self.allocator.free(contents);
-
-        // Read succeeded: advance the stamps now, so a saved typo or a
-        // bad key file is not re-parsed and re-logged every poll. The next
-        // edit (or SIGHUP) retries. A successful swap re-snapshots below.
-        known_mtime.* = mtime;
-        key_stamps.remember(self.allocator, self.io, self.current.config);
+        self.stamp = stamp;
 
         var diag: config.LoadDiag = .{};
         var next_config = config.load(self.io, self.allocator, contents, &diag) catch {
@@ -437,13 +478,10 @@ const ActiveConfig = struct {
 
         // `next_ref` owns `next_config` now; once published it stays,
         // even if a later status write fails.
-        self.mutex.lockUncancelable(self.io);
         const old_ref = self.current;
         self.current = next_ref;
-        self.mutex.unlock(self.io);
-
         old_ref.release(self.allocator);
-        key_stamps.remember(self.allocator, self.io, self.current.config);
+        ensureFdBudget(self.io, self.current.config.server.max_connections);
 
         if (self.reload_degraded) {
             self.reload_degraded = false;
@@ -492,6 +530,10 @@ const SessionArgs = struct {
     allocator: std.mem.Allocator,
     config_ref: *ConfigRef,
     session: c.ssh_session,
+    /// Already registered with `signals`.
+    session_fd: c_int,
+    /// Monotonic ms by which authentication must succeed.
+    login_deadline_ms: i64,
     /// Peer address captured at accept; "" when unknown.
     ip_buf: [64]u8,
     ip_len: u8,
@@ -501,163 +543,54 @@ fn sessionThread(args: *SessionArgs) void {
     const io = args.io;
     const allocator = args.allocator;
     const ref = args.config_ref;
-    const ssh_session = args.session;
+    const session = args.session;
+    const session_fd = args.session_fd;
+    const deadline_ms = args.login_deadline_ms;
     const ip_buf = args.ip_buf;
     const peer_ip = ip_buf[0..args.ip_len];
     allocator.destroy(args);
 
-    // Registered so drain can force-close it; failure is not fatal.
-    const session_fd = c.ssh_get_fd(ssh_session);
-    var registered = false;
-    if (session_fd >= 0) {
-        signals.registerSessionFd(io, allocator, session_fd) catch |err| {
-            logLibsshError(io, @errorName(err), ssh_session, .note) catch {};
-        };
-        registered = true;
+    configureSocket(session_fd);
 
-        configureSocket(session_fd);
-    }
-
-    // Set by `handleSession` when it releases the pre-auth slot at auth;
-    // otherwise the defer below releases it.
+    // Set by `handleSession` when it releases the pre-auth slot at auth.
     var auth_completed = false;
-
-    defer {
-        if (!auth_completed) _ = unauth_sessions.fetchSub(1, .acq_rel);
-        if (registered) signals.unregisterSessionFd(io, session_fd);
-        ref.release(allocator);
-        _ = active_sessions.fetchSub(1, .acq_rel);
-    }
-    handleSession(io, allocator, ref.config, ssh_session, peer_ip, &auth_completed) catch |err| {
-        logLibsshError(io, @errorName(err), ssh_session, .skip) catch {};
-    };
-}
-
-fn currentConfigMtime(io: std.Io, path: []const u8) !std.Io.Timestamp {
-    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
-    return stat.mtime;
-}
-
-fn statKeyMtime(io: std.Io, path: []const u8) ?std.Io.Timestamp {
-    return currentConfigMtime(io, path) catch null;
-}
-
-/// Mtimes of the serving config's key files, advanced on every reload
-/// attempt whose read succeeded (even a rejected one).
-const KeyStamps = struct {
-    entries: []Entry = &.{},
-
-    const Entry = struct {
-        path: []u8,
-        /// null after a failed stat; a later success triggers a reload.
-        mtime: ?std.Io.Timestamp,
+    const ok = if (handleSession(io, allocator, ref.config, session, peer_ip, deadline_ms, &auth_completed)) true else |err| blk: {
+        // The error text lives in the session, so read it before ssh_free.
+        logLibsshError(io, @errorName(err), session, .skip);
+        break :blk false;
     };
 
-    const Lookup = union(enum) {
-        absent,
-        failed,
-        mtime: std.Io.Timestamp,
-    };
+    // Unregister while the fd is still open: once libssh closes it, the
+    // number can be reused and a force-close would hit another socket.
+    signals.unregisterSessionFd(io, session_fd);
+    if (ok) c.ssh_disconnect(session);
+    c.ssh_free(session);
 
-    fn deinit(self: *KeyStamps, allocator: std.mem.Allocator) void {
-        for (self.entries) |e| allocator.free(e.path);
-        allocator.free(self.entries);
-        self.* = .{};
-    }
+    if (!auth_completed) releasePreauth(io, peer_ip);
+    ref.release(allocator);
+    _ = active_sessions.fetchSub(1, .acq_rel);
+}
 
-    fn lookup(self: *const KeyStamps, path: []const u8) Lookup {
-        for (self.entries) |e| {
-            if (!std.mem.eql(u8, e.path, path)) continue;
-            if (e.mtime) |ts| return .{ .mtime = ts };
-            return .failed;
+/// Hash of the size, mtime, ctime, and inode of the config file and each
+/// key file it names; ctime catches an edit that puts the mtime back. A
+/// key file that cannot be stat'ed hashes as missing; only the config
+/// file itself failing is an error.
+fn configStamp(io: std.Io, path: []const u8, cfg: config.Config) !u64 {
+    var h: std.hash.Wyhash = .init(0);
+    hashStat(&h, try std.Io.Dir.cwd().statFile(io, path, .{}));
+    for (cfg.users) |user| {
+        for (user.key_files) |key_path| {
+            h.update(key_path);
+            hashStat(&h, std.Io.Dir.cwd().statFile(io, key_path, .{}) catch null);
         }
-        return .absent;
     }
+    return h.final();
+}
 
-    /// Newer than the last recorded stamp, missing after a successful
-    /// stamp, present after a failed stamp, or not recorded yet.
-    fn changed(self: *const KeyStamps, io: std.Io, cfg: config.Config) bool {
-        for (cfg.users) |user| {
-            for (user.key_files) |kpath| {
-                switch (self.lookup(kpath)) {
-                    .absent => return true,
-                    .failed => {
-                        if (statKeyMtime(io, kpath) != null) return true;
-                    },
-                    .mtime => |prev| {
-                        const now = statKeyMtime(io, kpath) orelse return true;
-                        if (now.nanoseconds > prev.nanoseconds) return true;
-                    },
-                }
-            }
-        }
-        return false;
-    }
-
-    /// Restat `cfg`'s key files. Shared paths update in place first, so
-    /// a failed allocation for a changed path set still records them.
-    fn remember(self: *KeyStamps, allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) void {
-        for (self.entries) |*e| {
-            if (configHasKeyFile(cfg, e.path)) e.mtime = statKeyMtime(io, e.path);
-        }
-        if (self.samePaths(cfg)) return;
-        const fresh = collect(allocator, io, cfg) catch return;
-        self.deinit(allocator);
-        self.* = fresh;
-    }
-
-    fn samePaths(self: *const KeyStamps, cfg: config.Config) bool {
-        for (cfg.users) |user| {
-            for (user.key_files) |p| {
-                switch (self.lookup(p)) {
-                    .absent => return false,
-                    else => {},
-                }
-            }
-        }
-        for (self.entries) |e| {
-            if (!configHasKeyFile(cfg, e.path)) return false;
-        }
-        return true;
-    }
-
-    fn collect(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !KeyStamps {
-        var list: std.ArrayList(Entry) = .empty;
-        errdefer {
-            for (list.items) |e| allocator.free(e.path);
-            list.deinit(allocator);
-        }
-        for (cfg.users) |user| {
-            for (user.key_files) |p| {
-                if (listHas(list.items, p)) continue;
-                const owned = try allocator.dupe(u8, p);
-                const mtime = statKeyMtime(io, p);
-                list.append(allocator, .{ .path = owned, .mtime = mtime }) catch |err| {
-                    allocator.free(owned);
-                    return err;
-                };
-            }
-        }
-        if (list.items.len == 0) return .{};
-        return .{ .entries = try list.toOwnedSlice(allocator) };
-    }
-
-    fn listHas(entries: []const Entry, path: []const u8) bool {
-        for (entries) |e| {
-            if (std.mem.eql(u8, e.path, path)) return true;
-        }
-        return false;
-    }
-
-    fn configHasKeyFile(cfg: config.Config, path: []const u8) bool {
-        for (cfg.users) |user| {
-            for (user.key_files) |p| {
-                if (std.mem.eql(u8, p, path)) return true;
-            }
-        }
-        return false;
-    }
-};
+fn hashStat(h: *std.hash.Wyhash, stat: ?std.Io.File.Stat) void {
+    const s = stat orelse return h.update("missing");
+    std.hash.autoHash(h, .{ s.size, s.mtime.nanoseconds, s.ctime.nanoseconds, s.inode });
+}
 
 fn handleSession(
     io: std.Io,
@@ -665,74 +598,52 @@ fn handleSession(
     cfg: config.Config,
     session: c.ssh_session,
     peer_ip: []const u8,
+    login_deadline_ms: i64,
     auth_completed: *bool,
 ) !void {
-    defer c.ssh_free(session);
-
-    // Before the handshake, or a silent TCP client pins a worker forever.
-    setSessionTimeout(session, cfg.server.idle_timeout_ms);
+    // Before the handshake, or a silent TCP client pins a worker.
+    try ssh.boundRead(session, cfg.server.idle_timeout_ms, login_deadline_ms);
 
     if (c.ssh_handle_key_exchange(session) != c.SSH_OK) {
         audit.log(io, null, "handshake.failed", null, .failed, "", peer_ip);
         return error.LibsshFailure;
     }
 
-    const user = try ssh.authenticate(io, allocator, cfg, session, peer_ip);
+    const user = try ssh.authenticate(io, allocator, cfg, session, peer_ip, login_deadline_ms);
 
-    // Release the pre-auth slot now; the flag tells sessionThread's
-    // defer not to release it again.
+    // Release the pre-auth slots now; the flag tells sessionThread not
+    // to release it again.
     auth_completed.* = true;
-    _ = unauth_sessions.fetchSub(1, .acq_rel);
+    releasePreauth(io, peer_ip);
 
+    // Plain idle from here (the SFTP loop enforces idle itself).
+    ssh.setReadTimeout(session, cfg.server.idle_timeout_ms);
     const channel = try sftp.acceptSftpSubsystem(session);
 
-    try sftp.runSftp(io, allocator, channel, user, cfg.server, peer_ip);
     // The session owns the channel; freeing it here would double-free.
-    c.ssh_disconnect(session);
-}
-
-/// Timeout for every blocking libssh read before SFTP starts (the SFTP
-/// loop enforces idle itself). 0 leaves libssh's default.
-fn setSessionTimeout(session: c.ssh_session, idle_timeout_ms: u64) void {
-    if (idle_timeout_ms == 0) return;
-    const seconds: c_long = @intCast(idle_timeout_ms / 1000);
-    const usec: c_long = @intCast((idle_timeout_ms % 1000) * 1000);
-    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT, &seconds);
-    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT_USEC, &usec);
+    try sftp.runSftp(io, allocator, channel, user, cfg.server, peer_ip);
 }
 
 /// Best-effort socket options. TCP_NODELAY: SFTP is request/response,
-/// and Nagle adds delayed-ACK latency. SO_KEEPALIVE drops dead peers; on
-/// Linux the probes start after 60s idle and give up after 6 × 10s.
-/// Option numbers differ by OS (Darwin's 4 is TCP_NOPUSH, not
-/// KEEPIDLE), so they come from `std.posix` and the timing knobs are
-/// Linux-only.
+/// and Nagle adds delayed-ACK latency. Keepalive drops dead peers (which
+/// matters with `idle-timeout 0`): probes start after 60 s idle and give
+/// up after 6 × 10 s. Darwin names the idle knob TCP_KEEPALIVE.
 fn configureSocket(fd: c_int) void {
-    if (fd < 0) return;
-    const enable: c_int = 1;
-    _ = std.c.setsockopt(
-        fd,
-        std.posix.IPPROTO.TCP,
-        std.posix.TCP.NODELAY,
-        @ptrCast(&enable),
-        @sizeOf(c_int),
-    );
-    _ = std.c.setsockopt(
-        fd,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.KEEPALIVE,
-        @ptrCast(&enable),
-        @sizeOf(c_int),
-    );
+    const tcp = std.posix.IPPROTO.TCP;
+    setIntOption(fd, tcp, std.posix.TCP.NODELAY, 1);
+    setIntOption(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, 1);
+    const keep_idle = switch (builtin.os.tag) {
+        .linux => std.posix.TCP.KEEPIDLE,
+        .macos => std.posix.TCP.KEEPALIVE,
+        else => return,
+    };
+    setIntOption(fd, tcp, keep_idle, 60);
+    setIntOption(fd, tcp, std.posix.TCP.KEEPINTVL, 10);
+    setIntOption(fd, tcp, std.posix.TCP.KEEPCNT, 6);
+}
 
-    if (builtin.os.tag == .linux) {
-        const idle_seconds: c_int = 60;
-        const intvl_seconds: c_int = 10;
-        const probe_count: c_int = 6;
-        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPIDLE, @ptrCast(&idle_seconds), @sizeOf(c_int));
-        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPINTVL, @ptrCast(&intvl_seconds), @sizeOf(c_int));
-        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT, @ptrCast(&probe_count), @sizeOf(c_int));
-    }
+fn setIntOption(fd: c_int, level: i32, option: u32, value: c_int) void {
+    _ = std.c.setsockopt(fd, level, option, @ptrCast(&value), @sizeOf(c_int));
 }
 
 const Listen = struct {
@@ -745,11 +656,16 @@ const Listen = struct {
     }
 };
 
+/// `host:port`, `[v6]:port`, bare-v6 `::1:port`, or `:port` (all IPv4).
 fn parseListen(allocator: std.mem.Allocator, listen: []const u8) !Listen {
     const colon = std.mem.lastIndexOfScalar(u8, listen, ':') orelse return error.InvalidListenAddress;
-    const raw_host = listen[0..colon];
+    var raw_host = listen[0..colon];
     const raw_port = listen[colon + 1 ..];
     if (raw_port.len == 0) return error.InvalidListenAddress;
+    // libssh resolves the host as given, and "[::1]" does not resolve.
+    if (raw_host.len >= 2 and raw_host[0] == '[' and raw_host[raw_host.len - 1] == ']') {
+        raw_host = raw_host[1 .. raw_host.len - 1];
+    }
     const host = if (raw_host.len == 0) "0.0.0.0" else raw_host;
     return .{
         .host = try allocator.dupeZ(u8, host),
@@ -757,7 +673,12 @@ fn parseListen(allocator: std.mem.Allocator, listen: []const u8) !Listen {
     };
 }
 
-fn setBindOption(bind: c.ssh_bind, option: c.enum_ssh_bind_options_e, value: [*:0]const u8) !void {
+/// User-key and host-key signature algorithms: the key types the config
+/// accepts, with RSA limited to its SHA-2 signatures.
+const signature_algorithms = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521," ++
+    "rsa-sha2-512,rsa-sha2-256";
+
+fn setBindOption(bind: c.ssh_bind, option: c.enum_ssh_bind_options_e, value: *const anyopaque) !void {
     if (c.ssh_bind_options_set(bind, option, value) != c.SSH_OK) return error.LibsshFailure;
 }
 
@@ -771,11 +692,88 @@ const NoDetail = enum {
     skip,
 };
 
-fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail: NoDetail) !void {
+/// Best effort: a failed stderr write is not worth failing a caller over.
+fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail: NoDetail) void {
     // Usually a non-null pointer to an empty string.
     const raw = c.ssh_get_error(handle);
     const detail: []const u8 = if (raw != null) std.mem.span(raw) else "";
     if (detail.len == 0 and no_detail == .skip) return;
 
-    try sys.note(io, "zift: {s}: {s}\n", .{ where, if (detail.len > 0) detail else "no detail from libssh" });
+    sys.note(io, "zift: {s}: {s}\n", .{ where, if (detail.len > 0) detail else "no detail from libssh" }) catch {};
+}
+
+test "parseListen: IPv4, bracketed and bare IPv6, empty host" {
+    const alloc = std.testing.allocator;
+    const cases = [_][3][]const u8{
+        .{ "127.0.0.1:2222", "127.0.0.1", "2222" },
+        .{ "[::1]:2222", "::1", "2222" },
+        .{ "[::]:22", "::", "22" },
+        .{ "::1:2222", "::1", "2222" },
+        .{ ":2222", "0.0.0.0", "2222" },
+    };
+    for (cases) |case| {
+        const l = try parseListen(alloc, case[0]);
+        defer l.deinit(alloc);
+        try std.testing.expectEqualStrings(case[1], l.host);
+        try std.testing.expectEqualStrings(case[2], l.port);
+    }
+    try std.testing.expectError(error.InvalidListenAddress, parseListen(alloc, "127.0.0.1"));
+    try std.testing.expectError(error.InvalidListenAddress, parseListen(alloc, "[::1]:"));
+}
+
+test "configStamp changes on any change to the config or a key file" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    const conf_path = try std.fmt.allocPrint(alloc, "{s}/zift.conf", .{dir});
+    defer alloc.free(conf_path);
+    const text = try std.fmt.allocPrint(alloc, "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
+        "user ally\n  auth {s}/keys.pub\n  root /tmp/ally\n  allow / read\n", .{dir});
+    defer alloc.free(text);
+    try tmp.dir.writeFile(io, .{ .sub_path = "zift.conf", .data = text });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keys.pub", .data = "key one" });
+    var cfg = try config.parse(alloc, text);
+    defer cfg.deinit();
+
+    const s0 = try configStamp(io, conf_path, cfg);
+    try std.testing.expectEqual(s0, try configStamp(io, conf_path, cfg));
+
+    // A key file's mtime moving backwards counts (it used to need SIGHUP).
+    const y2000: std.Io.File.SetTimestamp = .{ .new = .fromNanoseconds(946684800 * std.time.ns_per_s) };
+    try tmp.dir.setTimestamps(io, "keys.pub", .{ .modify_timestamp = y2000 });
+    const s1 = try configStamp(io, conf_path, cfg);
+    try std.testing.expect(s1 != s0);
+
+    // Same size with the mtime put back: ctime still moves. The sleep
+    // clears coarse filesystem clocks.
+    try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+    try tmp.dir.writeFile(io, .{ .sub_path = "keys.pub", .data = "key two" });
+    try tmp.dir.setTimestamps(io, "keys.pub", .{ .modify_timestamp = y2000 });
+    const s2 = try configStamp(io, conf_path, cfg);
+    try std.testing.expect(s2 != s1);
+
+    try tmp.dir.deleteFile(io, "keys.pub");
+    try std.testing.expect(try configStamp(io, conf_path, cfg) != s2);
+
+    try tmp.dir.deleteFile(io, "zift.conf");
+    try std.testing.expectError(error.FileNotFound, configStamp(io, conf_path, cfg));
+}
+
+fn expectPeer(expected: []const u8, sa: anytype) !void {
+    var ss: std.posix.sockaddr.storage align(8) = undefined;
+    @as(*@TypeOf(sa), @ptrCast(@alignCast(&ss))).* = sa;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, formatPeer(&ss, &buf).?);
+}
+
+test "formatPeer: IPv4, IPv6 uncompressed, IPv4-mapped as IPv4" {
+    try expectPeer("192.0.2.7", std.posix.sockaddr.in{ .port = 0, .addr = @bitCast([4]u8{ 192, 0, 2, 7 }) });
+    const v6 = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try expectPeer("2001:db8:0:0:0:0:0:1", std.posix.sockaddr.in6{ .port = 0, .flowinfo = 0, .addr = v6, .scope_id = 0 });
+    const mapped = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 198, 51, 100, 9 };
+    try expectPeer("198.51.100.9", std.posix.sockaddr.in6{ .port = 0, .flowinfo = 0, .addr = mapped, .scope_id = 0 });
 }
