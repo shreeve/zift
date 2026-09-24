@@ -23,19 +23,25 @@ const wire = @import("wire.zig");
 /// registered to a live handle are kept regardless of age.
 const staging_orphan_min_age_ms: i64 = 15 * 60 * 1000;
 
-/// Serializes namespace changes across sessions, so a directory rename's
-/// subtree authorization sees the same tree the rename then moves.
+/// Serialize namespace changes within a partner root, so a directory
+/// rename's subtree authorization sees the same tree the rename then
+/// moves. Roots never overlap, so striping by root keeps that guarantee
+/// without making one partner's slow rename stall everyone else.
 /// Operator-side changes are outside the threat model.
-var namespace_mutation_mutex: std.Io.Mutex = .init;
+var namespace_locks: [64]std.Io.Mutex = @splat(.init);
+
+fn namespaceLockFor(root: []const u8) *std.Io.Mutex {
+    return &namespace_locks[std.hash.Wyhash.hash(0, root) % namespace_locks.len];
+}
 
 const StagingLive = struct {
     root: []u8,
     name: [32]u8,
 };
 
-/// Live staging names (partner root + 32-byte name). Lock order is
-/// `namespace_mutation_mutex` then `staging_live_mutex`; never acquire
-/// `namespace_mutation_mutex` while holding `staging_live_mutex`.
+/// Live staging names (partner root + 32-byte name). Lock order is a
+/// namespace lock then `staging_live_mutex`; never take a namespace lock
+/// while holding `staging_live_mutex`, and never hold two namespace locks.
 var staging_live_mutex: std.Io.Mutex = .init;
 var staging_live: std.ArrayList(StagingLive) = .empty;
 
@@ -149,6 +155,7 @@ pub fn runSftp(
         .user = user,
         .peer_ip = peer_ip,
         .vfs = jail,
+        .namespace_lock = namespaceLockFor(jail.root),
         .idle_timeout_ms = server_cfg.idle_timeout_ms,
         .listing_mode = server_cfg.listing_mode,
         .publish_mode = server_cfg.publish_mode,
@@ -286,6 +293,7 @@ const SftpState = struct {
     /// Borrowed from the session thread, which outlives this state.
     peer_ip: []const u8 = "",
     vfs: vfs_mod.Vfs,
+    namespace_lock: *std.Io.Mutex,
     /// 0 disables the idle check.
     idle_timeout_ms: u64 = 0,
     last_activity_ms: i64 = 0,
@@ -949,8 +957,8 @@ const SftpState = struct {
             handle.file = null;
         }
 
-        namespace_mutation_mutex.lockUncancelable(self.io);
-        defer namespace_mutation_mutex.unlock(self.io);
+        self.namespace_lock.lockUncancelable(self.io);
+        defer self.namespace_lock.unlock(self.io);
 
         // The parent may have changed during the upload; walk it again.
         var to_parent = self.vfs.openVerifiedParent(self.io, self.allocator, target_vpath) catch |err| {
@@ -1018,8 +1026,8 @@ const SftpState = struct {
             defer self.auditDenied("mkdir", path.value);
             return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
-        namespace_mutation_mutex.lockUncancelable(self.io);
-        defer namespace_mutation_mutex.unlock(self.io);
+        self.namespace_lock.lockUncancelable(self.io);
+        defer self.namespace_lock.unlock(self.io);
         var parent = (try self.openParentOrReply(request_id, "mkdir", path.value)) orelse return;
         defer parent.deinit(self.io, self.allocator);
 
@@ -1059,8 +1067,8 @@ const SftpState = struct {
             defer self.auditDenied("remove", path.value);
             return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
-        namespace_mutation_mutex.lockUncancelable(self.io);
-        defer namespace_mutation_mutex.unlock(self.io);
+        self.namespace_lock.lockUncancelable(self.io);
+        defer self.namespace_lock.unlock(self.io);
         var parent = (try self.openParentOrReply(request_id, "remove", path.value)) orelse return;
         defer parent.deinit(self.io, self.allocator);
 
@@ -1080,8 +1088,8 @@ const SftpState = struct {
             defer self.auditDenied("rmdir", path.value);
             return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
-        namespace_mutation_mutex.lockUncancelable(self.io);
-        defer namespace_mutation_mutex.unlock(self.io);
+        self.namespace_lock.lockUncancelable(self.io);
+        defer self.namespace_lock.unlock(self.io);
         var parent = (try self.openParentOrReply(request_id, "rmdir", path.value)) orelse return;
         defer parent.deinit(self.io, self.allocator);
 
@@ -1104,8 +1112,8 @@ const SftpState = struct {
             defer self.auditDenied("rename", from.value);
             return wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
         }
-        namespace_mutation_mutex.lockUncancelable(self.io);
-        defer namespace_mutation_mutex.unlock(self.io);
+        self.namespace_lock.lockUncancelable(self.io);
+        defer self.namespace_lock.unlock(self.io);
         var from_parent = (try self.openParentOrReply(request_id, "rename", from.value)) orelse return;
         defer from_parent.deinit(self.io, self.allocator);
         var to_parent = (try self.openParentOrReply(request_id, "rename", to.value)) orelse return;
