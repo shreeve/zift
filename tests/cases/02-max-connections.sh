@@ -1,63 +1,24 @@
 #!/usr/bin/env bash
 # Test: max-connections refuses excess concurrent sessions with audit
-# Covers: PLAN §6.2 max-connections, accept denial audit line
-# TODOS: DONE (max-connections in operational signal cluster)
+# The global cap bounds what logged-in partners can hold at once.
 
 source "$(dirname "$0")/../lib/common.sh"
 
 make_host_key
-mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it
-hash=$(make_password_hash secret)
-
-write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  max-connections 2
-  # Off: this case is about max-connections (the default pre-auth cap is 1 here).
-  max-unauth-connections 0
-  log stderr
-
-user runner
-  auth $hash
-  root $TEST_TMP/root
-  allow / read list
-EOF
-
+# Pre-auth cap off: this case is about max-connections alone.
+basic_config "max-connections 2" "max-unauth-connections 0"
 start_zift
 
-hold_session() {
-    local label="$1"
-    expect <<EOF >"$TEST_TMP/client-$label.log" 2>&1
-set timeout 30
-spawn sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-    -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 \\
-    -P $TEST_PORT runner@127.0.0.1
-expect "password:"
-send "secret\r"
-expect "sftp>"
-sleep 5
-send "bye\r"
-expect eof
-EOF
-}
+bg sftp_password ally secret "@until $TEST_TMP/release" >"$TEST_TMP/a.log" 2>&1
+bg sftp_password ally secret "@until $TEST_TMP/release" >"$TEST_TMP/b.log" 2>&1
+wait_for_count '"operation":"auth.password","result":"ok"' 2 || fail "two sessions never logged in"
 
-bg hold_session a
-bg hold_session b
-sleep 1
-bg hold_session c
-# Client c is expected to fail (denied at SSH level). wait_bg ignores
-# child exit codes; the audit log is the actual oracle.
-wait_bg
-
-# Two should have authed successfully; one should have been refused.
-auth_count=$(grep -c '"operation":"auth.password","result":"ok"' "$ZIFT_LOG" || true)
-deny_count=$(grep -c '"operation":"accept.rejected","result":"denied"' "$ZIFT_LOG" || true)
-
-[[ "$auth_count" == "2" ]] || fail "expected 2 successful auths, got $auth_count"
-ok "two sessions admitted"
-
-[[ "$deny_count" -ge "1" ]] || fail "expected at least 1 accept denial, got $deny_count"
+sftp_password ally secret >"$TEST_TMP/c.log" 2>&1 && fail "a third session was admitted"
+wait_for_log '"operation":"accept.rejected","result":"denied"' || fail "no accept denial audited"
 ok "excess connection denied with audit"
 
-stop_zift TERM
+touch "$TEST_TMP/release"
+wait_bg || fail "a held session did not finish cleanly"
+[[ $(count_log '"operation":"auth.password","result":"ok"') == 2 ]] \
+    || fail "expected exactly 2 successful auths"
+ok "exactly two sessions admitted, and both finished"

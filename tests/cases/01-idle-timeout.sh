@@ -1,47 +1,18 @@
 #!/usr/bin/env bash
 # Test: idle-timeout disconnects an authenticated client past the deadline
-# Covers: PLAN §6.2 idle-timeout, §8.5 idle.timeout audit line
-# TODOS: DONE (idle-timeout in operational signal cluster)
+# A logged-in partner who goes quiet must not hold a session forever.
 
 source "$(dirname "$0")/../lib/common.sh"
 
 make_host_key
-mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it
-hash=$(make_password_hash secret)
-
-write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  idle-timeout 3s
-  log stderr
-
-user runner
-  auth $hash
-  root $TEST_TMP/root
-  allow / read list
-EOF
-
+basic_config "idle-timeout 1s"
 start_zift
 
-# Connect, sit idle past the 3s timeout, observe the disconnect.
-expect <<EOF >"$TEST_TMP/client.log" 2>&1
-set timeout 15
-spawn sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-    -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 \\
-    -P $TEST_PORT runner@127.0.0.1
-expect "password:"
-send "secret\r"
-expect "sftp>"
-sleep 5
-send "ls\r"
-expect eof
-EOF
-
-grep -q 'idle.timeout' "$ZIFT_LOG" || fail "no idle.timeout audit line"
-ok "idle.timeout audit line emitted"
-
-grep -q 'disconnect' "$TEST_TMP/client.log" || fail "client did not see disconnect"
+sftp_password ally secret "@eof" >"$TEST_TMP/client.log" 2>&1 \
+    || fail "client was not disconnected: $(cat "$TEST_TMP/client.log")"
+grep -q 'Received disconnect' "$TEST_TMP/client.log" || fail "client saw no SSH disconnect"
 ok "client received disconnect"
 
-stop_zift TERM
+wait_for_log '"operation":"session.ended","result":"ok","detail":"idle timeout' \
+    || fail "no idle timeout audit line"
+ok "idle timeout audited"

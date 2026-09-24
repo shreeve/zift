@@ -1,0 +1,41 @@
+# Drive an OpenSSH sftp session for common.sh's sftp_password.
+# argv: port user command...; password in $ZIFT_TEST_PASSWORD, extra ssh
+# options in $SFTP_OPTS. A timeout or an unexpected close fails.
+
+set timeout 10
+set cmds [lassign $argv port user]
+set opts {}
+if {[info exists env(SFTP_OPTS)]} { set opts $env(SFTP_OPTS) }
+# ssh takes the first value of an option, so $SFTP_OPTS wins.
+lappend opts -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1
+
+proc status {} {
+    lassign [wait] pid spawn_id os_error value
+    return [expr {$os_error == 0 ? $value : 1}]
+}
+
+spawn sftp {*}$opts -P $port $user@127.0.0.1
+expect_after {
+    timeout { puts "\nexpect: timed out"; exit 124 }
+    eof { puts "\nexpect: session closed"; set rc [status]; exit [expr {$rc ? $rc : 125}] }
+}
+expect {
+    "password:" { send -- "$env(ZIFT_TEST_PASSWORD)\r"; exp_continue }
+    "sftp>" {}
+}
+foreach cmd $cmds {
+    switch -glob -- $cmd {
+        "@eof" { expect "Connection closed" { exit 0 } eof { exit 0 } }
+        "@until *" {
+            set path [lindex $cmd 1]
+            for {set i 0} {![file exists $path]} {incr i} {
+                if {$i > 1200} { puts "\nexpect: $path never appeared"; exit 124 }
+                after 50
+            }
+        }
+        default { send -- "$cmd\r"; expect "sftp>" }
+    }
+}
+send "bye\r"
+expect eof { exit [status] }

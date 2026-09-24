@@ -1,126 +1,80 @@
 #!/usr/bin/env bash
-# Test: SIGHUP-driven reloads under concurrent traffic do not disrupt
-#       in-flight sessions AND the new config snapshot is observable
-#       to subsequently-connecting clients (PLAN §7.3).
-# Covers: PLAN §7.3 ConfigRef refcounting + SIGHUP forceReload + active
-#         session continues to use its captured snapshot.
-# Oracle: a) the long-running session holds its old snapshot for life
-#            and completes pre- and post-reload writes; b) a brand-new
-#            session opened AFTER the reload sees the new config (an
-#            additional virtual user that didn't exist at startup).
+# Test: a session open across five SIGHUP reloads keeps its config
+#       snapshot, while new sessions see the new config
+# A reload that narrows a partner's rights applies to their next login,
+# not mid-session; and rapid reloads must not corrupt the snapshot.
 
 source "$(dirname "$0")/../lib/common.sh"
-
-VENV="$(dirname "$0")/../.venv"
-PY="$VENV/bin/python3"
-
-if [[ ! -x "$PY" ]]; then
-    echo "skip: paramiko venv missing at $VENV"
-    exit 0
-fi
+need_paramiko
 
 make_host_key
-runner_hash=$(make_password_hash secret)
+runner_key=$(user_key)
 later_hash=$(make_password_hash later-secret)
+mkdir -p "$TEST_TMP/data/uploads" "$TEST_TMP/data2"
 
-mkdir -p "$TEST_TMP/data/uploads"
-mkdir -p "$TEST_TMP/data2"
-
-# Initial config: only `runner` exists. `late` is added by the rewrite
-# between SIGHUPs.
-write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  reload-interval 0
-  idle-timeout 30s
-  shutdown-grace 5s
-  log stderr
-
-user runner
-  auth $runner_hash
+v1="user runner
+  auth $runner_key
   root $TEST_TMP/data
-  allow / read write list mkdir delete update rename
-EOF
+  allow / read list
+  allow /uploads read write list"
+write_config <<EOF
+$(config_head "reload-interval 0")
 
+$v1
+EOF
 start_zift
 
-# Phase 1: open a long-running session under the OLD config and write
-# a file. This session captures the v1 ConfigRef and must keep using
-# it across all subsequent reloads.
-"$PY" - <<EOF || fail "phase 1 sftp open failed"
-import paramiko, socket
-sock = socket.create_connection(("127.0.0.1", $TEST_PORT), timeout=15)
-t = paramiko.Transport(sock)
-t.connect(username="runner", password="secret")
-sftp = paramiko.SFTPClient.from_transport(t)
-with sftp.open("/uploads/before.txt", "w") as f:
-    f.write(b"BEFORE_RELOAD")
-sftp.close(); t.close()
-EOF
-ok "phase 1: pre-reload session wrote /uploads/before.txt"
-
-# Phase 2: rewrite the config to include a SECOND user, then hammer
-# the server with five SIGHUPs in rapid succession. Each SIGHUP forces
-# a reparse + validateSemantic + ConfigRef swap. The active session
-# above has already gone away, but if forceReload thrashing leaks
-# memory or corrupts the snapshot pointer this is where it would show.
-cat > "$TEST_TMP/zift.conf" <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  reload-interval 0
-  idle-timeout 30s
-  shutdown-grace 5s
-  log stderr
+# v2 drops runner's write on /uploads and adds a user `late`.
+write_config "$TEST_TMP/v2.conf" <<EOF
+$(config_head "reload-interval 0")
 
 user runner
-  auth $runner_hash
+  auth $runner_key
   root $TEST_TMP/data
-  allow / read write list mkdir delete update rename
+  allow / read list
 
 user late
   auth $later_hash
   root $TEST_TMP/data2
-  allow / read write list mkdir
+  allow / read write list
 EOF
 
-sleep 0.2  # ensure the new config is fully on disk + visible
-for _ in 1 2 3 4 5; do
-    kill -HUP "$ZIFT_PID"
-    sleep 0.2
-done
-sleep 1  # let the last reload land
+"$PY" - "$ZIFT_PID" "$ZIFT_LOG" <<'EOF'
+import io, os, shutil, signal, sys
+from client import *
+pid, log = int(sys.argv[1]), sys.argv[2]
+put = lambda sftp, path, data: sftp.putfo(io.BytesIO(data), path)
+reloads = lambda: open(log).read().count("config reloaded")
 
-# Sanity: the last "config reloaded" line in stderr must reflect the
-# rewrite. If we only see the *first* successful reload before the
-# rewrite, that's a missed signal we want to surface explicitly.
-echo "  stderr after SIGHUP storm:"
-sed 's/^/    /' "$TEST_TMP/zift.log" | tail -10
+old = connect("runner")
+put(old, "/uploads/before.txt", b"BEFORE_RELOAD")
+ok("session opened under v1 wrote /uploads/before.txt")
 
-# Phase 3: open a NEW session as `late` — a user that did not exist
-# in the v1 snapshot. This proves the post-SIGHUP config is observable
-# to new connections, not just that SIGHUP didn't crash the server.
-"$PY" - <<EOF || fail "phase 3 sftp as 'late' failed (new config not observable)"
-import paramiko, socket
-sock = socket.create_connection(("127.0.0.1", $TEST_PORT), timeout=15)
-t = paramiko.Transport(sock)
-t.connect(username="late", password="later-secret")
-sftp = paramiko.SFTPClient.from_transport(t)
-with sftp.open("/added.txt", "w") as f:
-    f.write(b"AFTER_RELOAD")
-sftp.close(); t.close()
+shutil.copy(os.path.join(TMP, "v2.conf"), os.path.join(TMP, "zift.conf"))
+for i in range(1, 6):
+    os.kill(pid, signal.SIGHUP)
+    if not wait_for(lambda: reloads() >= i):
+        fail(f"reload {i} never happened")
+    put(old, f"/uploads/during-{i}.txt", b"DURING")
+ok("five reloads; the v1 session wrote after each one")
+
+put(old, "/uploads/after.txt", b"AFTER_RELOAD")
+if read("data/uploads/after.txt") != b"AFTER_RELOAD":
+    fail("the v1 session's post-reload write is wrong on disk")
+ok("the v1 session keeps its snapshot: its removed write rule still applies")
+
+new = connect("runner")
+expect("a new runner session under v2 writing to /uploads", "denied",
+       put, new, "/uploads/new.txt", b"x")
+
+late = connect("late", "later-secret")
+put(late, "/added.txt", b"AFTER_RELOAD")
+ok("user `late`, added by the reload, logged in and wrote")
+for sftp in (old, new, late):
+    close(sftp)
 EOF
-ok "phase 3: new session under new user 'late' authenticated and wrote"
 
-# Phase 4: confirm both payloads landed in the right partner roots.
-# `before.txt` lives under the v1 root, `added.txt` lives under the
-# v2 root added by the reload.
-[[ "$(cat "$TEST_TMP/data/uploads/before.txt")" == "BEFORE_RELOAD" ]] \
-    || fail "phase 4: before payload corrupted"
-[[ "$(cat "$TEST_TMP/data2/added.txt")" == "AFTER_RELOAD" ]] \
-    || fail "phase 4: after payload corrupted"
-ok "phase 4: both payloads landed in their respective partner roots"
-
-stop_zift TERM
-wait "$ZIFT_PID" 2>/dev/null || true
+[[ "$(cat "$TEST_TMP/data/uploads/before.txt")" == BEFORE_RELOAD ]] || fail "before payload corrupted"
+[[ "$(cat "$TEST_TMP/data2/added.txt")" == AFTER_RELOAD ]] || fail "late's payload corrupted"
+[[ ! -e "$TEST_TMP/data/uploads/new.txt" ]] || fail "the v2 session's denied upload landed"
+ok "every payload is in its own partner root"

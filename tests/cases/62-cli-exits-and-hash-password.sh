@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # Test: CLI exit codes and messages, and hash-password reading one line
-# Covers: serve with the wrong argument count exits 1; an unreadable
-#         config names the path; a parse error is printed once; validate
-#         survives a long listen host and config path; hash-password
-#         hashes only the first stdin line (as Janus does), so a trailing
-#         second line cannot lock the partner out.
+# Wrong usage exits 1; an unreadable config names the path; a parse
+# error prints once; validate survives long names; hash-password hashes
+# only the first stdin line, so a stray second line cannot lock anyone out.
 
 source "$(dirname "$0")/../lib/common.sh"
 
@@ -12,11 +10,8 @@ make_host_key
 mkdir -p "$TEST_TMP/root"
 
 expect_rc() {
-    local want="$1" label="$2"; shift 2
-    set +e
-    "$@" >"$TEST_TMP/out" 2>"$TEST_TMP/err"
-    local rc=$?
-    set -e
+    local want="$1" label="$2" rc=0; shift 2
+    "$@" >"$TEST_TMP/out" 2>"$TEST_TMP/err" || rc=$?
     [[ "$rc" == "$want" ]] || fail "$label: expected exit $want, got $rc; stderr: $(cat "$TEST_TMP/err")"
 }
 
@@ -65,10 +60,7 @@ ok "validate prints a long ok line instead of panicking"
 
 # ---------- hash-password: first line only ----------
 write_config <<EOF
-server
-  listen 127.0.0.1:$TEST_PORT
-  host-key $TEST_TMP/host_ed25519
-  log stderr
+$(config_head)
 
 user runner
   auth $hash
@@ -76,10 +68,9 @@ user runner
   allow / read list
 EOF
 start_zift
-out=$(sftp_password runner secret "ls" 2>&1) || true
-echo "$out" | grep -q "sftp>" || fail "password 'secret' (first stdin line) did not log in: $out"
+sftp_password runner secret "ls" >"$TEST_TMP/login.log" 2>&1 \
+    || fail "password 'secret' (first stdin line) did not log in: $(cat "$TEST_TMP/login.log")"
 ok "hash-password hashed only the first line ('secret')"
-stop_zift TERM
 
 expect_rc 1 "empty password" sh -c "printf '\r\n' | '$ZIFT_BIN' hash-password"
 grep -q 'password must not be empty' "$TEST_TMP/err" || fail "empty password: $(cat "$TEST_TMP/err")"
