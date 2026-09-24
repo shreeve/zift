@@ -90,7 +90,7 @@ pub const ListingMode = enum {
 /// An authorized key as text from a key file; libssh re-imports it when
 /// matching a presented key.
 pub const PublicKey = struct {
-    /// One of `accepted_key_algorithms`.
+    /// One of `key_algorithms`.
     algorithm: []const u8,
     /// Base64 wire blob (second field of an OpenSSH key line).
     blob: []const u8,
@@ -316,12 +316,16 @@ fn resolveOneKeyFile(
             writeKeyFileDiag(io, user_name, path, line_no, "key line too long");
             return error.AuthKeyFileMalformed;
         }
-        const pubkey = parsePublicKeyLine(arena_alloc, trimmed) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                writeKeyFileDiag(io, user_name, path, line_no, "malformed public-key line");
-                return error.AuthKeyFileMalformed;
-            },
+        const pubkey = parsePublicKeyLine(arena_alloc, trimmed) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            writeKeyFileDiag(io, user_name, path, line_no, switch (err) {
+                error.UnsupportedKeyAlgorithm => "malformed public-key line: unsupported algorithm " ++
+                    "(use ssh-ed25519, ecdsa-sha2-nistp256/384/521, or ssh-rsa; no option prefixes)",
+                error.KeyAlgorithmMismatch => "malformed public-key line: the key does not match its algorithm name",
+                error.InvalidRsaKeySize => "malformed public-key line: RSA keys must be 2048 to 8192 bits",
+                else => "malformed public-key line",
+            });
+            return error.AuthKeyFileMalformed;
         };
         try combined.append(arena_alloc, pubkey);
         parsed += 1;
@@ -416,6 +420,8 @@ pub const Error = error{
     InvalidAuth,
     InvalidDuration,
     InvalidKeyLine,
+    InvalidRsaKeySize,
+    KeyAlgorithmMismatch,
     InvalidListen,
     InvalidListingMode,
     InvalidMode,
@@ -521,19 +527,23 @@ pub const ParseDiag = struct {
     }
 };
 
-/// RSA and DSA are deliberately absent.
-const accepted_key_algorithms = [_][]const u8{
-    "ssh-ed25519",
-    "ecdsa-sha2-nistp256",
-    "ecdsa-sha2-nistp384",
-    "ecdsa-sha2-nistp521",
+/// Accepted key algorithms and the length of the key each blob carries
+/// (an ECDSA point is uncompressed: 1 + 2 × field bytes). RSA (0) is
+/// checked by modulus size instead; the server accepts only rsa-sha2
+/// signatures for it. DSA is deliberately absent.
+const key_algorithms = [_]struct { []const u8, usize }{
+    .{ "ssh-ed25519", 32 },
+    .{ "ecdsa-sha2-nistp256", 65 },
+    .{ "ecdsa-sha2-nistp384", 97 },
+    .{ "ecdsa-sha2-nistp521", 133 },
+    .{ "ssh-rsa", 0 },
 };
 
-fn isAcceptedKeyAlgorithm(algo: []const u8) bool {
-    for (accepted_key_algorithms) |accepted| {
-        if (std.mem.eql(u8, algo, accepted)) return true;
+fn keyMaterialLen(algorithm: []const u8) ?usize {
+    for (key_algorithms) |entry| {
+        if (std.mem.eql(u8, algorithm, entry[0])) return entry[1];
     }
-    return false;
+    return null;
 }
 
 /// Read a config file (at most 1 MiB).
@@ -885,17 +895,24 @@ fn parseAuth(allocator: std.mem.Allocator, d: *ParseDiag, user: *UserBuilder, va
 }
 
 /// Parse `<algorithm> <blob> [comment]`; the result is allocator-owned.
+/// The blob must decode to a well-formed key of the named algorithm: a
+/// mislabelled or truncated key would otherwise pass validation and then
+/// silently never match at login.
 pub fn parsePublicKeyLine(allocator: std.mem.Allocator, line: []const u8) Error!PublicKey {
     if (line.len > max_keyline_bytes) return error.KeyLineTooLong;
 
     var parts = std.mem.tokenizeAny(u8, line, " \t");
     const algorithm = parts.next() orelse return error.InvalidKeyLine;
     const blob = parts.next() orelse return error.InvalidKeyLine;
+    const key_len = keyMaterialLen(algorithm) orelse return error.UnsupportedKeyAlgorithm;
 
-    if (!isAcceptedKeyAlgorithm(algorithm)) return error.UnsupportedKeyAlgorithm;
-    if (blob.len == 0) return error.InvalidKeyLine;
-
-    if (!isValidStandardBase64(blob)) return error.InvalidKeyLine;
+    // Strict padded RFC 4648 base64, the form libssh accepts.
+    const decoder = std.base64.standard.Decoder;
+    var raw_buf: [max_keyline_bytes / 4 * 3]u8 = undefined;
+    const raw_len = decoder.calcSizeForSlice(blob) catch return error.InvalidKeyLine;
+    if (blob.len % 4 != 0 or raw_len > raw_buf.len) return error.InvalidKeyLine;
+    decoder.decode(raw_buf[0..raw_len], blob) catch return error.InvalidKeyLine;
+    try checkKeyBlob(algorithm, key_len, raw_buf[0..raw_len]);
 
     return .{
         .algorithm = try allocator.dupe(u8, algorithm),
@@ -903,15 +920,41 @@ pub fn parsePublicKeyLine(allocator: std.mem.Allocator, line: []const u8) Error!
     };
 }
 
-/// Strict padded RFC 4648 base64, the form libssh accepts for key blobs.
-fn isValidStandardBase64(data: []const u8) bool {
-    if (data.len == 0 or data.len % 4 != 0) return false;
-    const decoder = std.base64.standard.Decoder;
-    const decoded_len = decoder.calcSizeForSlice(data) catch return false;
-    var buf: [8192]u8 = undefined;
-    if (decoded_len > buf.len) return false;
-    decoder.decode(buf[0..decoded_len], data) catch return false;
-    return true;
+/// RSA below 2048 bits is breakable; mbedTLS cannot load above 8192.
+const min_rsa_bits = 2048;
+const max_rsa_bits = 8192;
+
+/// Check the SSH wire form (RFC 4253 §6.6, RFC 5656 §3.1): the embedded
+/// algorithm name, the ECDSA curve, the key length or RSA modulus size,
+/// and nothing trailing.
+fn checkKeyBlob(algorithm: []const u8, key_len: usize, raw: []const u8) Error!void {
+    var rest = raw;
+    const name = sshString(&rest) orelse return error.InvalidKeyLine;
+    if (!std.mem.eql(u8, name, algorithm)) return error.KeyAlgorithmMismatch;
+    if (key_len == 0) {
+        _ = sshString(&rest) orelse return error.InvalidKeyLine; // e
+        const n = std.mem.trimStart(u8, sshString(&rest) orelse return error.InvalidKeyLine, "\x00");
+        const bits = if (n.len == 0) 0 else n.len * 8 - @clz(n[0]);
+        if (bits < min_rsa_bits or bits > max_rsa_bits) return error.InvalidRsaKeySize;
+    } else {
+        if (std.mem.startsWith(u8, algorithm, "ecdsa-sha2-")) {
+            const curve = sshString(&rest) orelse return error.InvalidKeyLine;
+            if (!std.mem.eql(u8, curve, algorithm["ecdsa-sha2-".len..])) return error.KeyAlgorithmMismatch;
+        }
+        const key = sshString(&rest) orelse return error.InvalidKeyLine;
+        if (key.len != key_len) return error.InvalidKeyLine;
+    }
+    if (rest.len != 0) return error.InvalidKeyLine;
+}
+
+/// Take one u32-length-prefixed string off the front of `rest`.
+fn sshString(rest: *[]const u8) ?[]const u8 {
+    if (rest.len < 4) return null;
+    const len = std.mem.readInt(u32, rest.*[0..4], .big);
+    if (len > rest.len - 4) return null;
+    const s = rest.*[4..][0..len];
+    rest.* = rest.*[4 + len ..];
+    return s;
 }
 
 /// One IP or CIDR per `from` line; lines accumulate.
@@ -1561,11 +1604,6 @@ test "auth passhash rejected when truncated" {
 // 68 base64 chars = 51 bytes decoded.
 const valid_ed25519_blob = "AAAAC3NzaC1lZDI1NTE5AAAAIPHj7SuD0g1xj0ZqLELSQ7Ux8RSjGlYBhVMxbfBhPXMd";
 
-// 96 base64 chars = 72 bytes decoded; long enough to look like an
-// ECDSA P-256 wire blob.
-const valid_ecdsa_blob =
-    "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPHj7SuD0g1xj0ZqLELSQ7Ux8RSjGlYBhVMxbfBhPXMd";
-
 test "parsePublicKeyLine: valid ed25519 line" {
     const line = "ssh-ed25519 " ++ valid_ed25519_blob ++ " comment";
     const pk = try parsePublicKeyLine(std.testing.allocator, line);
@@ -1586,33 +1624,52 @@ test "parsePublicKeyLine: bad base64 length rejected" {
     try std.testing.expectError(error.InvalidKeyLine, parsePublicKeyLine(std.testing.allocator, line));
 }
 
-test "parsePublicKeyLine: rsa key rejected" {
-    try std.testing.expectError(
-        error.UnsupportedKeyAlgorithm,
-        parsePublicKeyLine(std.testing.allocator, "ssh-rsa AAAAB3NzaC1yc2EAAAA notallowed"),
-    );
+// Real public keys from `ssh-keygen` (the private halves were discarded).
+const p256_blob = "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNKeFpUsh1jUHDG+05bmJFHkl2uxDCjdzZHpWB5+qoysGjTdSVeYyLMvCPSfif9sYokbeyXsXjDJYZJ7ki3ncFI=";
+const p384_blob = "AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBKumS9+/JaZVJ/Cy6DX3wzfwD8UofDcCVAavhN0eOMlz8xd1Qli5lSNOXhQ9CQ14+1QIckZol5yTVMbHkyAYgPI2kkdiaHvkU+r6TR7yZsQ9+p2E/RR7061Gv2eAGId08Q==";
+const p521_blob = "AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBABtVeJs+6gDDLIYuTlpiRXMpL6rHaxhFsr958i8Q+2232CptIdRPW3Mw9qy15b5TWZiIib5/gCowKElSUcLqmboagD0O+ODB8+hYSEHlmoiF0ZVzY0gvJWNBOSzJuih1jH7L2mcm7dRXYCuRMNizCM7eqLKLml02JQfjkp2tDiQYSpt8w==";
+const rsa2048_blob = "AAAAB3NzaC1yc2EAAAADAQABAAABAQDNf82HsFOlWYPeBHDp6nhLVUzGgJT4+D99TPH/fJ2VOmoUq3DHwsbawX0A5NIg9gzMhKauVlbHPy2H7H9vBZ9q6nJIhynI3Fp8QfMQVFg8GxOK42sGGmW0bgu+kbtSFuW26zj4wrBHYPGdDWLiVIqv4gw6a+uAZyuWQBkVAoonto4vJzSyOPRyKxYbMWMV5gI0aYBpCYCERzskqidZNb8AZ7Ky05APp7MYTbLRvJ4lfzXsEaEI+98QF6ukTn11rGgVT6rfhLQFM2WgnxkDCup22bGu7EPTmlbZIRk0JB2chhhTqWPxKKcLdcWyWIbtnPcE+zNgArR3CgMxgdGlPKQh";
+const rsa1024_blob = "AAAAB3NzaC1yc2EAAAADAQABAAAAgQDhVYKGNZBL5evydJndB/lNoUz5v6AQMtfSBv4SS3GgXSKDzPvjZkQVDL9mBbamJ9Va/OLKEygtlxowa8yyflT9iers1ISexP/R0bUdEKlGNUuhyahABR4XQbw2Y3snodGgDPq4RU2UpJLp4MpwEPB9kivODfWt3xzML4v63PKLYQ==";
+
+test "parsePublicKeyLine: each algorithm accepted with a matching blob" {
+    const good = [_][]const u8{
+        "ssh-ed25519 " ++ valid_ed25519_blob ++ " comment",
+        "ecdsa-sha2-nistp256 " ++ p256_blob ++ " backup",
+        "ecdsa-sha2-nistp384 " ++ p384_blob,
+        "ecdsa-sha2-nistp521 " ++ p521_blob,
+        "ssh-rsa " ++ rsa2048_blob ++ " old-mft-client",
+    };
+    for (good) |line| {
+        const pk = try parsePublicKeyLine(std.testing.allocator, line);
+        std.testing.allocator.free(pk.algorithm);
+        std.testing.allocator.free(pk.blob);
+    }
 }
 
-test "parsePublicKeyLine: dsa key rejected" {
-    try std.testing.expectError(
-        error.UnsupportedKeyAlgorithm,
-        parsePublicKeyLine(std.testing.allocator, "ssh-dss AAAAB3NzaC1kc3MAAAA legacy"),
-    );
-}
-
-test "parsePublicKeyLine: missing blob rejected" {
-    try std.testing.expectError(
-        error.InvalidKeyLine,
-        parsePublicKeyLine(std.testing.allocator, "ssh-ed25519"),
-    );
-}
-
-test "parsePublicKeyLine: ecdsa key accepted" {
-    const line = "ecdsa-sha2-nistp256 " ++ valid_ecdsa_blob ++ " backup";
-    const pk = try parsePublicKeyLine(std.testing.allocator, line);
-    defer std.testing.allocator.free(pk.algorithm);
-    defer std.testing.allocator.free(pk.blob);
-    try std.testing.expectEqualStrings("ecdsa-sha2-nistp256", pk.algorithm);
+test "parsePublicKeyLine: blob must match its algorithm and be well formed" {
+    const cases = [_]struct { []const u8, Error }{
+        // The label names one algorithm, the blob another.
+        .{ "ssh-ed25519 " ++ p256_blob, error.KeyAlgorithmMismatch },
+        .{ "ecdsa-sha2-nistp384 " ++ p256_blob, error.KeyAlgorithmMismatch },
+        .{ "ssh-rsa " ++ valid_ed25519_blob, error.KeyAlgorithmMismatch },
+        // Too short to hold a key, or truncated mid-string.
+        .{ "ssh-ed25519 AAAA", error.InvalidKeyLine },
+        .{ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5", error.InvalidKeyLine },
+        .{ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPHj7SuD0g1xj0ZqLELSQ7Ux8RSjGlYBhVMxbfBhPX==", error.InvalidKeyLine },
+        // Trailing bytes after the key (a 51-byte blob plus one zero byte).
+        .{ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPHj7SuD0g1xj0ZqLELSQ7Ux8RSjGlYBhVMxbfBhPXMdAA==", error.InvalidKeyLine },
+        // RSA below 2048 bits.
+        .{ "ssh-rsa " ++ rsa1024_blob, error.InvalidRsaKeySize },
+        // DSA, FIDO, and authorized_keys option prefixes are not supported.
+        .{ "ssh-dss AAAAB3NzaC1kc3MAAAA legacy", error.UnsupportedKeyAlgorithm },
+        .{ "sk-ssh-ed25519@openssh.com AAAA", error.UnsupportedKeyAlgorithm },
+        .{ "from=\"10.0.0.1\" ssh-ed25519 " ++ valid_ed25519_blob, error.UnsupportedKeyAlgorithm },
+        .{ "ssh-ed25519", error.InvalidKeyLine },
+    };
+    for (cases) |case| {
+        const line, const want = case;
+        try std.testing.expectError(want, parsePublicKeyLine(std.testing.allocator, line));
+    }
 }
 
 test "user with no auth lines rejected" {
