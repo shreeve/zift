@@ -98,24 +98,25 @@ both a password and a key.
 ## Abuse Controls
 
 These are built in and always on; there is nothing to install or
-enable. The numbers are in the [Limits](configure.md#limits) table.
+enable. Their numbers are in the [Limits](configure.md#limits) table.
 
-- **Login grace.** A connection has 120 s from accept to a successful
-  login, key exchange included, whatever its activity.
+- **Login grace.** A connection must log in within a fixed time from
+  accept, key exchange included, however busy it keeps the server.
 - **Per-connection ceilings.** Hard failures (a bad password, a
-  password from outside `from`) back off 250 ms more each time and end
-  the connection at 6. Soft operations (key offers, `none`, other SSH
-  messages) end it at 64.
-- **Source suppression.** Ten hard failures from one source within ten
-  minutes refuse that source for 15 minutes, including its connections
-  still logging in. A successful login does not clear the count. A source is an IPv4
-  address or an IPv6 /64.
+  password from outside `from`) back off a little longer each time and
+  end the connection after a few. Soft operations (key offers, `none`,
+  other SSH messages) are only counted, with a higher ceiling.
+- **Source suppression.** A burst of hard failures from one source
+  refuses that source for a while, including its connections still
+  logging in. A successful login does not clear the count. A source is
+  an IPv4 address or an IPv6 /64.
 - **Connection caps.** `max-connections` bounds all sessions,
-  `max-unauth-connections` those not yet logged in, and each source may
-  hold 8 pre-auth connections. Refusals are audited at most once a
-  minute per source.
-- **Bounded password work.** At most clamp(CPU count, 2, 8) Argon2id
-  checks run at once, so a flood of bad logins cannot exhaust memory.
+  `max-unauth-connections` those not yet logged in, and each source
+  gets a small share of pre-auth connections. Refusals are audited at
+  most once a minute per source.
+- **Bounded password work.** Only a few Argon2id checks run at once, so
+  a flood of bad logins cannot exhaust memory; the rest wait within
+  their login grace.
 - **No shell or forwarding.** After the SFTP subsystem starts, extra
   channels and channel or global requests (`exec`, `pty-req`,
   `tcpip-forward`, ...) are refused.
@@ -222,7 +223,8 @@ provenance.
   are left out of listings.
 - **Shared addresses share a counter.** Partners behind one NAT, or in
   one IPv6 /64, share suppression and the per-source pre-auth cap. One
-  of them guessing badly can lock the others out for 15 minutes.
+  of them guessing badly can lock the others out until the suppression
+  expires.
 - **One daemon per partner root.** Two Zift processes serving the same
   root can sweep each other's in-flight uploads.
 - **Public-key timing is close, not identical.** Password denials cost

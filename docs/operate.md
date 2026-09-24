@@ -23,7 +23,7 @@ and can write only inside partner roots. For another layout, see
 ## Install
 
 Install `cosign` first (`apt install cosign`, `dnf install cosign` or
-`brew install cosign`); the installer refuses to run without it. Then:
+`brew install cosign`); the installer will not install without it. Then:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
@@ -244,8 +244,9 @@ says so loudly:
 - audit: `config.reload` with result `failed` and the reason as detail.
 
 It stays in that degraded state until a valid config loads, then logs
-`config reload recovered` and audits `config.reload` `ok`. Partners
-only ever see a generic "Permission denied", so watch the journal:
+`config reload recovered` and audits `config.reload` `ok`. A partner
+added by the rejected edit just sees "Permission denied", so watch the
+journal:
 
 ```sh
 journalctl -u zift -o cat | grep '"operation":"config.reload"'
@@ -319,7 +320,7 @@ when empty; `ip` is always present.
 | `session.ended` | session over; detail is the reason and `duration_ms`; `failed` when it ended on an error |
 | `opendir`, `open_read`, `open_write` | directory or file opened; a new upload's `open_write` has detail `staged` |
 | `publish` | upload renamed into place at close |
-| `close` | a publish refused at close (the target appeared, or the clobber rule) |
+| `close` | an upload that could not be published at close: refused (the target appeared, or the clobber rule) or failed |
 | `read`, `write` | refused on a handle opened without that access (once per handle) |
 | `stat` | STAT refused (successes are not logged) |
 | `mkdir`, `remove`, `rmdir`, `rename`, `setstat`, `fsetstat` | as named; `rename`'s detail is the new path |
@@ -388,7 +389,7 @@ ss -ltnp | grep 2222
 | startup fails | invalid config, host key rejected, missing root, audit log cannot be opened, port in use |
 | `config reload rejected` | the edited config is invalid and the previous one is serving; fix the file (it applies itself) or run `systemctl reload` to see the error |
 | login denied | wrong credential, `from` mismatch, source suppressed, or the partner's key is not in their key file |
-| every new upload fails with `staging dir unavailable` | the partner root or its `.zift` is not writable or owned as required (see [`security.md`](security.md#per-partner-namespace)) |
+| every new upload fails with `staging dir unavailable` | the partner root or its `.zift` is not writable or owned as required (see [`security.md`](security.md#uploads-and-the-per-partner-namespace)) |
 | upload fails at close | the target appeared meanwhile, policy denial, or the target is on another filesystem |
 | rename or upload fails on NFS or SMB | the filesystem lacks no-replace rename (see [`security.md`](security.md#known-caveats)) |
 | startup warns about `.zift-staging` | leftover from 0.7.x or earlier; remove it once no session needs it |

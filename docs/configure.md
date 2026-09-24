@@ -71,8 +71,8 @@ ownership is checked against the user running it.
 | `listen` | required | `host:port`, `:port` (every IPv4 address), or `[ipv6]:port` such as `[::]:2222` |
 | `host-key` | required | SSH host private key |
 | `partner-root` | none | base for users without `root`: user `ally` gets `<partner-root>/ally` |
-| `reload-interval` | `2s` | how often to check the config and key files for changes; `0` or at least `100ms` |
-| `idle-timeout` | `5m` | close a session idle this long; `0` or `1s` to `24d` |
+| `reload-interval` | `2s` | how often to check the config and key files for changes; `0` (SIGHUP only) or at least `100ms` |
+| `idle-timeout` | `5m` | close a session idle this long; `0` (never) or `1s` up to about 24.8 days |
 | `max-connections` | `128` | concurrent sessions, at least 1 |
 | `max-unauth-connections` | a quarter of `max-connections` (at least 1) | concurrent sessions not yet logged in; `0` = no separate cap; at most `max-connections` |
 | `shutdown-grace` | `30s` | how long SIGTERM waits for sessions before closing them |
@@ -265,7 +265,8 @@ match such a path is rejected with `InvalidPattern`:
 | --- | --- |
 | `*.exe`, `secret` | `/*.exe` (top level) or `**.exe`, `**/secret` (any depth) |
 | `/dir/` | `/dir` |
-| `/a//b`, `/a/./b`, `/a/../b` | `/a/b` |
+| `/a//b`, `/a/./b` | `/a/b` |
+| `/a/../b` | `/b` |
 
 `/dir/**` matches everything below `/dir` but not `/dir` itself. So
 `deny **/.ssh/**` refuses every file under any `.ssh` directory, and
@@ -377,7 +378,7 @@ Fixed in the binary; none is configurable.
 | User name | 64 bytes |
 | Audit line | 4096 bytes (longer lines are clipped and marked `truncated`) |
 | Login grace, from accept to successful login | 120 s |
-| Hard auth failures per connection (bad password, `from` miss) | 6 |
+| Hard auth failures per connection (bad password, password from outside `from`) | 6 |
 | Soft auth operations per connection (key offers, `none`, other messages) | 64 |
 | Backoff after the nth hard failure | 250 ms × n |
 | Source suppression | 10 hard failures within 10 min block the source for 15 min |
