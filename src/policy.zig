@@ -7,6 +7,8 @@
 const std = @import("std");
 const config = @import("config.zig");
 const listing = @import("listing.zig");
+const vfs = @import("vfs.zig");
+const sys = @import("sys.zig");
 
 pub const Operation = enum {
     open_read,
@@ -68,11 +70,11 @@ pub fn policyDerivedMode(
 pub fn check(user: *const config.UserConfig, operation: Operation, virtual_path: []const u8) Decision {
     const sufficient = permissionsFor(operation);
     var allowed = false;
+    // No client can name a longer path, and `globMatch` is sized for it.
+    if (virtual_path.len > vfs.max_virtual_path_bytes) return .deny;
 
     for (user.rules) |rule| {
-        // An exhausted glob budget cannot prove a non-match: deny.
-        const matched = globMatchChecked(rule.pattern, virtual_path) orelse return .deny;
-        if (!matched) continue;
+        if (!globMatch(rule.pattern, virtual_path)) continue;
 
         switch (rule.effect) {
             .deny => return .deny,
@@ -112,36 +114,114 @@ fn permissionsFor(operation: Operation) config.PermissionSet {
     return set;
 }
 
-/// Step budget for one glob match. `**` backtracking is superlinear in
-/// the client-controlled path; real patterns need under a thousand steps.
-const glob_budget: usize = 1_000_000;
-
-const MatchCtx = struct {
-    budget: usize,
-    exhausted: bool = false,
-};
-
-/// Match a normalized virtual path against a config pattern.
+/// Match a normalized virtual path against a rule pattern.
 ///
-/// - No `*` or `?`: a literal component prefix. `/pending` matches
-///   `/pending` and `/pending/x`, never `/pendingfoo`; `/` matches all.
-/// - `*` matches within one component and `?` one non-`/` byte.
-/// - `**` (or more stars) matches across `/`, so `**.exe` matches at any
-///   depth. `/inbox/**` does not match `/inbox` itself. `**/` also
-///   matches zero segments: `/foo/**/bar` matches `/foo/bar`.
+/// A pattern without `*` or `?` is a literal component prefix: `/pending`
+/// matches `/pending` and everything below it, never `/pendingfoo`; `/`
+/// matches every path that starts with `/`. Any other pattern must match
+/// the whole value, where
+///
+/// - `?` matches one UTF-8 character other than `/` (an invalid byte
+///   counts as one character);
+/// - `*` matches any run, possibly empty, that contains no `/`;
+/// - `**` (two or more stars) matches any run, `/` included;
+/// - `**/` also matches nothing at all, so `/a/**/b` matches `/a/b`;
+/// - every other byte matches itself, case-sensitively.
+///
+/// So `/inbox/**` does not match `/inbox`, and since a normalized path
+/// starts with `/`, only a pattern starting with `/`, `**`, or `*/` can
+/// match one (`*.exe` never does). A value longer than
+/// `vfs.max_virtual_path_bytes` matches no wildcard pattern.
+///
+/// Time is O(len(pattern) * len(value)); space is one fixed buffer.
 pub fn globMatch(pattern: []const u8, value: []const u8) bool {
-    return globMatchChecked(pattern, value) orelse false;
+    const head = std.mem.indexOfAny(u8, pattern, "*?") orelse
+        return literalPrefixMatch(pattern, value);
+    if (value.len > vfs.max_virtual_path_bytes) return false;
+    // Cheap rejects: the literal text before the first wildcard and after
+    // the last one (and its `/`, which `**/` may skip) must frame the value.
+    var tail = std.mem.lastIndexOfAny(u8, pattern, "*?").? + 1;
+    if (std.mem.endsWith(u8, pattern[0..tail], "**") and std.mem.startsWith(u8, pattern[tail..], "/")) tail += 1;
+    if (!std.mem.startsWith(u8, value, pattern[0..head])) return false;
+    if (!std.mem.endsWith(u8, value, pattern[tail..])) return false;
+
+    // reach[i]: the pattern read so far can match exactly value[0..i].
+    // Tokens only move offsets forward, so one array updated in place
+    // suffices. Every live offset lies in [lo, hi].
+    var buf: [vfs.max_virtual_path_bytes + 1]bool = undefined;
+    const reach = buf[0 .. value.len + 1];
+    @memset(reach, false);
+    reach[head] = true;
+    var lo = head;
+    var hi = head;
+
+    var p = head;
+    while (p < pattern.len) {
+        const token = pattern[p];
+        p += 1;
+        if (token != '*') {
+            // One character. Descending, so each offset is read before
+            // anything lands on it.
+            var next_lo: usize = reach.len;
+            var next_hi: usize = 0;
+            var i = hi + 1;
+            while (i > lo) {
+                i -= 1;
+                if (!reach[i]) continue;
+                reach[i] = false;
+                if (i == value.len) continue;
+                const n: usize = if (token != '?')
+                    @intFromBool(value[i] == token)
+                else if (value[i] != '/')
+                    charLen(value[i..])
+                else
+                    0;
+                if (n == 0) continue;
+                reach[i + n] = true;
+                next_lo = @min(next_lo, i + n);
+                next_hi = @max(next_hi, i + n);
+            }
+            if (next_lo == reach.len) return false;
+            lo = next_lo;
+            hi = next_hi;
+            continue;
+        }
+        var stars: usize = 1;
+        while (p < pattern.len and pattern[p] == '*') : (p += 1) stars += 1;
+        if (stars == 1) {
+            // `*`: extend each live offset up to the next `/`.
+            var i = lo;
+            while (i <= hi and i < value.len) : (i += 1) {
+                if (reach[i] and value[i] != '/') {
+                    reach[i + 1] = true;
+                    hi = @max(hi, i + 1);
+                }
+            }
+        } else if (p < pattern.len and pattern[p] == '/') {
+            // `**/`: zero segments (offsets stay live), or resume just
+            // past any later `/`.
+            p += 1;
+            for (value[lo..], lo..) |b, i| {
+                if (b == '/') {
+                    reach[i + 1] = true;
+                    hi = @max(hi, i + 1);
+                }
+            }
+        } else {
+            // `**`: anything from the lowest live offset on.
+            @memset(reach[lo..], true);
+            hi = value.len;
+        }
+    }
+    return reach[value.len];
 }
 
-/// `globMatch`, or null when the step budget ran out.
-pub fn globMatchChecked(pattern: []const u8, value: []const u8) ?bool {
-    if (std.mem.indexOfAny(u8, pattern, "*?") == null) {
-        return literalPrefixMatch(pattern, value);
-    }
-    var ctx = MatchCtx{ .budget = glob_budget };
-    const result = globMatchInner(&ctx, pattern, value);
-    if (ctx.exhausted) return null;
-    return result;
+/// Bytes in the character at the start of `s`: a whole valid UTF-8
+/// sequence, else one byte. Never covers a `/` after the first byte.
+fn charLen(s: []const u8) usize {
+    const n = std.unicode.utf8ByteSequenceLength(s[0]) catch return 1;
+    if (n > s.len or !std.unicode.utf8ValidateSlice(s[0..n])) return 1;
+    return n;
 }
 
 fn literalPrefixMatch(pattern: []const u8, value: []const u8) bool {
@@ -154,185 +234,67 @@ fn literalPrefixMatch(pattern: []const u8, value: []const u8) bool {
     return value[pattern.len] == '/';
 }
 
-fn globMatchInner(ctx: *MatchCtx, pattern: []const u8, value: []const u8) bool {
-    if (ctx.budget == 0) {
-        ctx.exhausted = true;
-        return false;
-    }
-    ctx.budget -= 1;
-
-    if (pattern.len == 0) return value.len == 0;
-
-    // `**/`: zero segments (a), or resume after any `/` in `value` (b).
-    if (pattern.len >= 3 and pattern[0] == '*' and pattern[1] == '*') {
-        var star_end: usize = 2;
-        while (star_end < pattern.len and pattern[star_end] == '*') star_end += 1;
-        if (star_end < pattern.len and pattern[star_end] == '/') {
-            const rest = pattern[star_end + 1 ..];
-            if (globMatchInner(ctx, rest, value)) return true; // (a)
-            var i: usize = 0;
-            while (i < value.len) : (i += 1) {
-                if (value[i] == '/' and globMatchInner(ctx, rest, value[i + 1 ..])) return true; // (b)
-            }
-            return false;
-        }
-        // Fall through to the general `**` case (e.g. `**.exe`).
-    }
-
-    // `**` not followed by `/`: anything, including `/`.
-    if (pattern.len >= 2 and pattern[0] == '*' and pattern[1] == '*') {
-        var rest_idx: usize = 2;
-        while (rest_idx < pattern.len and pattern[rest_idx] == '*') rest_idx += 1;
-        const rest = pattern[rest_idx..];
-
-        var i: usize = 0;
-        while (i <= value.len) : (i += 1) {
-            if (globMatchInner(ctx, rest, value[i..])) return true;
-        }
-        return false;
-    }
-
-    if (pattern[0] == '*') {
-        var i: usize = 0;
-        while (i <= value.len) : (i += 1) {
-            if (globMatchInner(ctx, pattern[1..], value[i..])) return true;
-            if (i < value.len and value[i] == '/') return false;
-        }
-        return false;
-    }
-
-    if (value.len == 0) return false;
-
-    if (pattern[0] == '?') {
-        if (value[0] == '/') return false;
-        return globMatchInner(ctx, pattern[1..], value[1..]);
-    }
-
-    if (pattern[0] == value[0]) {
-        return globMatchInner(ctx, pattern[1..], value[1..]);
-    }
-
-    return false;
-}
-
-test "default deny and explicit allow" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/pending",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.read);
-                set.insert(.write);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
+fn testUser(rules: []const config.Rule) config.UserConfig {
+    return .{
         .name = "ally",
         .password_hash = "hash",
         .keys = &.{},
         .key_files = &.{},
         .from = &.{},
         .root = "/tmp",
-        .rules = &rules,
+        .rules = rules,
     };
+}
 
+fn allow(pattern: []const u8, permissions: []const config.Permission) config.Rule {
+    return .{ .effect = .allow, .pattern = pattern, .permissions = .initMany(permissions) };
+}
+
+fn deny(pattern: []const u8) config.Rule {
+    return .{ .effect = .deny, .pattern = pattern, .permissions = .initFull() };
+}
+
+const full = std.enums.values(config.Permission);
+
+test "default deny and explicit allow" {
+    const user = testUser(&.{allow("/pending", &.{ .read, .write })});
     try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/pending/file.txt"));
     try std.testing.expectEqual(Decision.deny, check(&user, .readdir, "/pending"));
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/archive/file.txt"));
 }
 
 test "deny overrides allow" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = config.PermissionSet.initFull(),
-        },
-        .{
-            .effect = .deny,
-            .pattern = "/*.exe",
-            .permissions = config.PermissionSet.initFull(),
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ally",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{ allow("/", full), deny("/*.exe") });
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/tool.exe"));
     try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/tool.txt"));
 }
 
-test "glob budget: pathological pattern fails closed (indeterminate = deny)" {
-    // Both an allow and a deny rule must resolve to deny, without hanging.
-    const evil_pattern = "**a**a**a**a**a**a**a**b";
-    const evil_value = "a" ** 200; // no 'b', so a naive matcher explores exponentially
+test "pathological patterns match correctly and in linear time" {
+    // Each once exhausted the old backtracking matcher's step budget or
+    // took tens of milliseconds, and so was denied whatever the rules.
+    var path_buf: [vfs.max_virtual_path_bytes]u8 = undefined;
+    for (&path_buf, 0..) |*b, i| b.* = if (i % 64 == 0) '/' else 'a';
+    const path: []const u8 = &path_buf;
+    const user = testUser(&.{
+        allow("/", full),
+        deny("**/**/**/**/**/b"),
+        deny("**a**a**a**a**a**a**a**b"),
+        deny("/inbox/**/archive/**/*.csv"),
+    });
 
-    {
-        var rules = [_]config.Rule{.{
-            .effect = .allow,
-            .pattern = evil_pattern,
-            .permissions = config.PermissionSet.initFull(),
-        }};
-        const user: config.UserConfig = .{
-            .name = "ally",
-            .password_hash = "hash",
-            .keys = &.{},
-            .key_files = &.{},
-            .from = &.{},
-            .root = "/tmp",
-            .rules = &rules,
-        };
-        try std.testing.expectEqual(Decision.deny, check(&user, .open_read, evil_value));
-    }
-    {
-        var rules = [_]config.Rule{
-            .{ .effect = .allow, .pattern = "/", .permissions = config.PermissionSet.initFull() },
-            .{ .effect = .deny, .pattern = evil_pattern, .permissions = config.PermissionSet.initFull() },
-        };
-        const user: config.UserConfig = .{
-            .name = "ally",
-            .password_hash = "hash",
-            .keys = &.{},
-            .key_files = &.{},
-            .from = &.{},
-            .root = "/tmp",
-            .rules = &rules,
-        };
-        // The deny pattern is indeterminate → whole op denied.
-        try std.testing.expectEqual(Decision.deny, check(&user, .open_read, evil_value));
-    }
+    const start = sys.monotonicMs();
+    try std.testing.expectEqual(Decision.allow, check(&user, .open_read, path));
+    path_buf[path_buf.len - 1] = 'b';
+    try std.testing.expectEqual(Decision.deny, check(&user, .open_read, path));
+    try std.testing.expect(sys.monotonicMs() - start < 250);
+
+    const archive = "/inbox" ++ "/archive" ** 510;
+    try std.testing.expect(!globMatch("/inbox/**/archive/**/*.csv", archive));
+    try std.testing.expect(globMatch("/inbox/**/archive/**/*.csv", archive ++ "/x.csv"));
 }
 
 test "rename checks source and destination" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/pending",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.rename);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ally",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{allow("/pending", &.{.rename})});
     try std.testing.expectEqual(Decision.allow, checkRename(&user, "/pending/a", "/pending/b"));
     try std.testing.expectEqual(Decision.deny, checkRename(&user, "/pending/a", "/archive/b"));
 }
@@ -358,6 +320,21 @@ test "star does not cross path boundary" {
     try std.testing.expect(!globMatch("*.exe", "/tool.exe"));
     try std.testing.expect(globMatch("/pending/*.tmp", "/pending/foo.tmp"));
     try std.testing.expect(!globMatch("/pending/*.tmp", "/pending/sub/foo.tmp"));
+    try std.testing.expect(globMatch("/pending/*", "/pending/"));
+    try std.testing.expect(!globMatch("/pending/*", "/pending/a/"));
+}
+
+test "question mark matches one character, not one byte, never `/`" {
+    try std.testing.expect(globMatch("/?.txt", "/a.txt"));
+    try std.testing.expect(globMatch("/?.txt", "/é.txt"));
+    try std.testing.expect(globMatch("/?.txt", "/€.txt"));
+    try std.testing.expect(globMatch("/?.txt", "/😀.txt"));
+    try std.testing.expect(!globMatch("/??.txt", "/é.txt"));
+    try std.testing.expect(!globMatch("/a?b", "/a/b"));
+    try std.testing.expect(!globMatch("/?", "/"));
+    // A byte that starts no valid character is one character.
+    try std.testing.expect(globMatch("/?x", "/\xc3x"));
+    try std.testing.expect(globMatch("/??", "/\xa9\xa9"));
 }
 
 test "double-star crosses path boundary" {
@@ -383,10 +360,12 @@ test "double-star crosses path boundary" {
     try std.testing.expect(globMatch("/foo/**/bar", "/foo/x/bar"));
     try std.testing.expect(globMatch("/foo/**/bar", "/foo/x/y/z/bar"));
     try std.testing.expect(!globMatch("/foo/**/bar", "/foo/baz"));
+    try std.testing.expect(!globMatch("/foo/**/bar", "/foo/xbar"));
 
     // Three or more `*` act as `**`.
     try std.testing.expect(globMatch("***.exe", "/dir/tool.exe"));
     try std.testing.expect(globMatch("****", "/anything/at/all"));
+    try std.testing.expect(globMatch("/a/***/b", "/a/b"));
 
     // `**` alone matches anything (including the empty string).
     try std.testing.expect(globMatch("**", ""));
@@ -396,28 +375,7 @@ test "double-star crosses path boundary" {
 
 test "deny **.exe denies recursively" {
     // `*.exe` would match only one level; `**.exe` matches every depth.
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = config.PermissionSet.initFull(),
-        },
-        .{
-            .effect = .deny,
-            .pattern = "**.exe",
-            .permissions = config.PermissionSet.initFull(),
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ally",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{ allow("/", full), deny("**.exe") });
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/tool.exe"));
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/sub/tool.exe"));
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/a/b/c/tool.exe"));
@@ -427,36 +385,7 @@ test "deny **.exe denies recursively" {
 
 test "list satisfies STAT but never download" {
     // Browsable everywhere, downloadable in one subtree.
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.list);
-                break :blk set;
-            },
-        },
-        .{
-            .effect = .allow,
-            .pattern = "/results",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.read);
-                set.insert(.list);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ola",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
+    const user = testUser(&.{ allow("/", &.{.list}), allow("/results", &.{ .read, .list }) });
 
     try std.testing.expectEqual(Decision.allow, check(&user, .stat, "/"));
     try std.testing.expectEqual(Decision.allow, check(&user, .readdir, "/"));
@@ -477,80 +406,23 @@ test "list satisfies STAT but never download" {
 }
 
 test "deny still overrides list-granted stat" {
-    var rules = [_]config.Rule{
-        .{ .effect = .allow, .pattern = "/", .permissions = config.PermissionSet.initFull() },
-        .{ .effect = .deny, .pattern = "**/.ssh/**", .permissions = config.PermissionSet.initFull() },
-    };
-    const user: config.UserConfig = .{
-        .name = "ola",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{ allow("/", full), deny("**/.ssh/**") });
     try std.testing.expectEqual(Decision.deny, check(&user, .stat, "/home/.ssh/id_ed25519"));
     try std.testing.expectEqual(Decision.allow, check(&user, .stat, "/home/notes.txt"));
 }
 
 test "policy-derived mode: browsable dir renders r-x, its files render ---" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.list);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ola",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{allow("/", &.{.list})});
     // Directory: stat + readdir allowed, no mutation → `r-x`, mirrored
     // into group, world always empty.
-    const dir_mode = policyDerivedMode(&user, "/", 0o040755);
-    try std.testing.expectEqual(@as(u32, 0o040550), dir_mode);
-
+    try std.testing.expectEqual(@as(u32, 0o040550), policyDerivedMode(&user, "/", 0o040755));
     // File under a list-only rule: visible in the listing, no download
     // → every permission bit off, file type preserved.
-    const file_mode = policyDerivedMode(&user, "/a.pdf", 0o100644);
-    try std.testing.expectEqual(@as(u32, 0o100000), file_mode);
+    try std.testing.expectEqual(@as(u32, 0o100000), policyDerivedMode(&user, "/a.pdf", 0o100644));
 }
 
 test "policy-derived mode: read grants r on both dirs and files" {
-    var rules = [_]config.Rule{
-        .{
-            .effect = .allow,
-            .pattern = "/",
-            .permissions = blk: {
-                var set = config.PermissionSet.initEmpty();
-                set.insert(.read);
-                set.insert(.list);
-                break :blk set;
-            },
-        },
-    };
-    const user: config.UserConfig = .{
-        .name = "ola",
-        .password_hash = "hash",
-        .keys = &.{},
-        .key_files = &.{},
-        .from = &.{},
-        .root = "/tmp",
-        .rules = &rules,
-    };
-
+    const user = testUser(&.{allow("/", &.{ .read, .list })});
     try std.testing.expectEqual(@as(u32, 0o040550), policyDerivedMode(&user, "/", 0o040755));
     try std.testing.expectEqual(@as(u32, 0o100440), policyDerivedMode(&user, "/a.pdf", 0o100644));
 }
