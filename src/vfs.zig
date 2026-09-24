@@ -132,7 +132,13 @@ pub const Vfs = struct {
                 .iterate = iterate,
                 .follow_symlinks = false,
             }) catch |err| switch (err) {
-                error.SymLinkLoop, error.NotDir => return error.PathTraversal,
+                error.SymLinkLoop => return error.PathTraversal,
+                // Linux also reports a symlink as ENOTDIR here; only a
+                // real non-directory is the honest "no such path".
+                error.NotDir => {
+                    const info = listing.statAt(current.handle, part) catch return error.PathTraversal;
+                    return if (info.mode & listing.S_IFMT == listing.S_IFLNK) error.PathTraversal else error.NotDir;
+                },
                 else => |e| return e,
             };
             current.close(io);
@@ -463,6 +469,27 @@ test "legacyStagingDirExists detects each entry type the operator might find" {
     try tmp.dir.deleteFile(std.testing.io, ".zift-staging");
 
     try std.testing.expect(!legacyStagingDirExists(std.testing.io, root_path));
+}
+
+test "a file used as a directory is not found, not a traversal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(std.testing.io, "root", .default_dir);
+    (try tmp.dir.createFile(std.testing.io, "root/file.txt", .{})).close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "file.txt", "root/link", .{});
+
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPathFile(std.testing.io, "root", &root_buf);
+    var vfs = try Vfs.init(std.testing.io, std.testing.allocator, root_buf[0..root_len]);
+    defer vfs.deinit(std.testing.allocator);
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.NotDir, vfs.openVerifiedParent(io, gpa, "/file.txt/x"));
+    try std.testing.expectError(error.NotDir, vfs.openVirtualDir(io, gpa, "/file.txt", false));
+    // A symlink stays a traversal whatever it points at.
+    try std.testing.expectError(error.PathTraversal, vfs.openVerifiedParent(io, gpa, "/link/x"));
 }
 
 test "openVerifiedParent rejects every parent symlink" {
