@@ -101,6 +101,12 @@ pub fn acceptSftpSubsystem(session: c.ssh_session) !c.ssh_channel {
             const subsystem_ptr = c.ssh_message_channel_request_subsystem(msg);
             if (subsystem_ptr != null and std.mem.eql(u8, std.mem.span(subsystem_ptr), "sftp")) {
                 if (c.ssh_message_channel_request_reply_success(msg) != c.SSH_OK) return error.LibsshFailure;
+                // Nothing reads messages from here on, and libssh would
+                // queue every later channel open or request for the life
+                // of the session. Refuse them as they arrive instead, and
+                // refuse any already queued.
+                c.ssh_set_message_callback(session, refuseMessage, null);
+                if (c.ssh_execute_message_callbacks(session) != c.SSH_OK) return error.LibsshFailure;
                 return channel;
             }
         }
@@ -108,6 +114,11 @@ pub fn acceptSftpSubsystem(session: c.ssh_session) !c.ssh_channel {
         try noteIgnoredPreSubsystem(&ignored);
         _ = c.ssh_message_reply_default(msg);
     }
+}
+
+/// 1 tells libssh to send its default (refusing) reply and free the message.
+fn refuseMessage(_: c.ssh_session, _: c.ssh_message, _: ?*anyopaque) callconv(.c) c_int {
+    return 1;
 }
 
 fn noteIgnoredPreSubsystem(count: *u32) error{LibsshFailure}!void {
