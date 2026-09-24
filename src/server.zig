@@ -17,10 +17,10 @@ const ssh = @import("ssh.zig");
 const sys = @import("sys.zig");
 
 /// In-flight session threads; enforces `max-connections` and drain.
-pub var active_sessions: std.atomic.Value(u32) = .init(0);
+var active_sessions: std.atomic.Value(u32) = .init(0);
 
 /// Sessions not yet authenticated; enforces `max-unauth-connections`.
-pub var unauth_sessions: std.atomic.Value(u32) = .init(0);
+var unauth_sessions: std.atomic.Value(u32) = .init(0);
 
 /// The peer address (no port, no brackets) formatted into `buf`, or null.
 /// An IPv4-mapped IPv6 address prints as IPv4: a dual-stack listener

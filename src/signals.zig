@@ -1,6 +1,6 @@
 //! Signal flags and the registry of live session sockets.
 //!
-//!     SIGHUP             force a config reload regardless of mtime
+//!     SIGHUP             force a config reload, changed or not
 //!     SIGTERM / SIGINT   graceful shutdown with grace period
 //!     SIGUSR1            reopen the audit log file (no-op on stderr)
 //!     SIGPIPE            ignored
@@ -14,7 +14,7 @@ const std = @import("std");
 pub var shutdown_requested: std.atomic.Value(bool) = .init(false);
 
 /// Set by SIGHUP. Accept loop forces a config reload on next iteration,
-/// regardless of the config file's mtime.
+/// even if nothing on disk changed.
 pub var reload_requested: std.atomic.Value(bool) = .init(false);
 
 /// Set by SIGUSR1. The audit log writer reopens its file destination on
@@ -24,7 +24,9 @@ pub var log_reopen_requested: std.atomic.Value(bool) = .init(false);
 /// TCP socket fds of in-flight sessions. When the shutdown grace period
 /// expires, the accept thread `shutdown(2)`s each one so blocked libssh
 /// reads return and workers exit cleanly. `shutdown` from another thread
-/// is safe; only the worker ever `close`s its fd.
+/// is safe. The accept thread registers an fd before its worker starts;
+/// the worker unregisters it before libssh closes it, so a force-close
+/// never reaches a reused descriptor.
 var sessions_mutex: std.Io.Mutex = .init;
 var session_fds: std.ArrayList(c_int) = .empty;
 
@@ -61,6 +63,37 @@ pub fn deinitSessionRegistry(io: std.Io, allocator: std.mem.Allocator) void {
     sessions_mutex.lockUncancelable(io);
     defer sessions_mutex.unlock(io);
     session_fds.deinit(allocator);
+    session_fds = .empty;
+}
+
+test "session registry: force-close shuts down registered sockets only" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const posix = std.posix;
+    const socketpair = @extern(*const fn (c_uint, c_uint, c_uint, *[2]c_int) callconv(.c) c_int, .{ .name = "socketpair" });
+
+    var a: [2]c_int = undefined;
+    var b: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &a));
+    try std.testing.expectEqual(@as(c_int, 0), socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &b));
+    defer for (a ++ b) |fd| {
+        _ = std.c.close(fd);
+    };
+
+    try registerSessionFd(io, alloc, a[0]);
+    try registerSessionFd(io, alloc, b[0]);
+    unregisterSessionFd(io, b[0]);
+    try std.testing.expectEqual(@as(usize, 1), forceCloseAll(io));
+
+    // The registered socket's peer sees EOF; the unregistered one is live.
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), std.c.read(a[1], &byte, 1));
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(b[1], "x", 1));
+    try std.testing.expectEqual(@as(isize, 1), std.c.read(b[0], &byte, 1));
+
+    unregisterSessionFd(io, a[0]);
+    try std.testing.expectEqual(@as(usize, 0), forceCloseAll(io));
+    deinitSessionRegistry(io, alloc);
 }
 
 fn handleShutdown(_: std.posix.SIG) callconv(.c) void {
