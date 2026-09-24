@@ -73,11 +73,12 @@ pub const ServerConfig = struct {
     /// `virtual` shows the partner's own name, group `sftp`, and
     /// policy-derived rwx; `reality` passes the inode's owner and mode.
     listing_mode: ListingMode,
-    /// Mode of a published upload (0o600, 0o640, or 0o660). In-flight
-    /// uploads are protected by the 0700 staging dir, not by this mode.
+    /// Mode of a published upload: owner rw, never world-writable, no
+    /// special bits. In-flight uploads are protected by the 0700 staging
+    /// dir, not by this mode.
     publish_mode: u32,
-    /// Mode of an SFTP MKDIR (0o2700, 0o2750, or 0o2770). Setgid keeps
-    /// the partner tree's group on every new subdirectory.
+    /// Mode of an SFTP MKDIR: owner rwx, never world-writable. Setgid
+    /// (on by default) keeps the partner tree's group on new subdirectories.
     mkdir_mode: u32,
 };
 
@@ -806,31 +807,26 @@ fn parseDigits(comptime T: type, text: []const u8, base: u8) ?T {
     return std.fmt.parseUnsigned(T, text, base) catch null;
 }
 
-/// Only 0o600, 0o640, or 0o660: partner data never gets world bits.
+/// The daemon must be able to write what it publishes, and partner data
+/// is never world-writable. No setuid, setgid, or sticky bit on files.
 fn parsePublishMode(d: *ParseDiag, value: []const u8) Error!u32 {
-    const mode = parseOctalMode(value) catch 0;
-    if (mode != 0o600 and mode != 0o640 and mode != 0o660) {
-        return d.fail(error.InvalidMode, "use 0o600, 0o640, or 0o660", .{});
-    }
-    return mode;
+    return parseMode(d, value, 0o600, 0o775, "needs owner rw (0o600), no world-write, and no setuid/setgid/sticky bit");
 }
 
-/// Only 0o2700, 0o2750, or 0o2770: setgid, never world bits.
+/// Owner rwx so the daemon can use the directory, never world-writable.
+/// Setgid is allowed (and the default) so new subdirectories keep the
+/// partner tree's group.
 fn parseMkdirMode(d: *ParseDiag, value: []const u8) Error!u32 {
-    const mode = parseOctalMode(value) catch 0;
-    if (mode != 0o2700 and mode != 0o2750 and mode != 0o2770) {
-        return d.fail(error.InvalidMode, "use 0o2700, 0o2750, or 0o2770", .{});
-    }
-    return mode;
+    return parseMode(d, value, 0o700, 0o2775, "needs owner rwx (0o700) and no world-write; setgid is the only special bit allowed");
 }
 
-/// `0o660`, `0660`, and `660` are all octal, as with chmod.
-fn parseOctalMode(value: []const u8) !u32 {
-    const slice = if (std.mem.startsWith(u8, value, "0o") or std.mem.startsWith(u8, value, "0O"))
-        value[2..]
-    else
-        value;
-    return parseDigits(u32, slice, 8) orelse error.InvalidMode;
+/// An octal mode (`0o660`, `0660`, or `660`, as with chmod) that has
+/// every `required` bit and nothing outside `allowed`.
+fn parseMode(d: *ParseDiag, value: []const u8, required: u32, allowed: u32, comptime hint: []const u8) Error!u32 {
+    const digits = if (std.mem.startsWith(u8, value, "0o") or std.mem.startsWith(u8, value, "0O")) value[2..] else value;
+    const mode = parseDigits(u32, digits, 8) orelse return d.fail(error.InvalidMode, "not an octal mode", .{});
+    if (mode & required != required or mode & ~allowed != 0) return d.fail(error.InvalidMode, hint, .{});
+    return mode;
 }
 
 fn parseUserProperty(
@@ -1400,27 +1396,31 @@ test "publish-mode: defaults to 0o660 when not specified" {
     try std.testing.expectEqual(@as(u32, 0o660), cfg.server.publish_mode);
 }
 
-test "publish-mode: accepts 0o600, 0o640, 0o660 — rejects everything else" {
+test "publish-mode: owner rw, no world-write, no special bits" {
     const cases = .{
         .{ "0o600", @as(?u32, 0o600) },
         .{ "0o640", @as(?u32, 0o640) },
         .{ "0o660", @as(?u32, 0o660) },
         .{ "660", @as(?u32, 0o660) }, // bare-octal also accepted
         .{ "0660", @as(?u32, 0o660) }, // leading-zero octal also accepted
-        // World-anything is rejected — protects against accidentally
-        // shipping world-readable or world-writable partner data.
+        // Readable by a downstream processor running as another user.
+        .{ "0o644", @as(?u32, 0o644) },
+        .{ "0o664", @as(?u32, 0o664) },
+        // World-writable partner data is never allowed.
         .{ "0o666", @as(?u32, null) },
-        .{ "0o644", @as(?u32, null) },
-        // Execute bits are rejected — partner data files shouldn't
-        // ever be executable.
-        .{ "0o770", @as(?u32, null) },
-        // Special bits (setuid/setgid/sticky) on regular files are
-        // suspect; not in the allowed set.
+        .{ "0o602", @as(?u32, null) },
+        // Special bits (setuid/setgid/sticky) on regular files.
         .{ "0o2660", @as(?u32, null) },
-        // Owner-less is nonsensical for a file the daemon writes.
+        .{ "0o4600", @as(?u32, null) },
+        .{ "0o1600", @as(?u32, null) },
+        // The daemon writes the file, so the owner needs rw.
         .{ "0o060", @as(?u32, null) },
-        // Decimal nonsense.
+        .{ "0o400", @as(?u32, null) },
+        .{ "0o200", @as(?u32, null) },
         .{ "abc", @as(?u32, null) },
+        .{ "0o", @as(?u32, null) },
+        .{ "0o680", @as(?u32, null) },
+        .{ "0o10600", @as(?u32, null) },
     };
     inline for (cases) |case| {
         const text =
@@ -1445,19 +1445,23 @@ test "mkdir-mode: defaults to 0o2770 when not specified" {
     try std.testing.expectEqual(@as(u32, 0o2770), cfg.server.mkdir_mode);
 }
 
-test "mkdir-mode: accepts 0o2700, 0o2750, 0o2770 — rejects everything else" {
+test "mkdir-mode: owner rwx, no world-write, setgid the only special bit" {
     const cases = .{
         .{ "0o2700", @as(?u32, 0o2700) },
         .{ "0o2750", @as(?u32, 0o2750) },
         .{ "0o2770", @as(?u32, 0o2770) },
         .{ "2770", @as(?u32, 0o2770) },
-        // No setgid (the leading 2) → rejected. Setgid is what makes
-        // child files inherit `group=zift`; without it the
-        // operator-group story breaks.
-        .{ "0o770", @as(?u32, null) },
-        // World-readable/traversable → rejected.
-        .{ "0o2775", @as(?u32, null) },
-        // Decimal nonsense.
+        // Without setgid, or world-traversable: the operator's choice.
+        .{ "0o770", @as(?u32, 0o770) },
+        .{ "0o2775", @as(?u32, 0o2775) },
+        .{ "0o755", @as(?u32, 0o755) },
+        // World-writable, setuid, or sticky: never.
+        .{ "0o2777", @as(?u32, null) },
+        .{ "0o4770", @as(?u32, null) },
+        .{ "0o1770", @as(?u32, null) },
+        // The daemon uses the directory, so the owner needs rwx.
+        .{ "0o2600", @as(?u32, null) },
+        .{ "0o2070", @as(?u32, null) },
         .{ "xyz", @as(?u32, null) },
     };
     inline for (cases) |case| {
@@ -1967,7 +1971,7 @@ test "ParseDiag: line, section, user, key, and reason" {
     try expectDiag("  listen :2222\n", "line 1: 'listen': PropertyOutsideSection");
     try expectDiag("server\n  listen\n", "line 2: [server] 'listen': MissingValue");
     try expectDiag("server\n  reload-interval 5\n", "line 2: [server] 'reload-interval': InvalidDuration: use a number with a unit (ms, s, m, h, d), or 0");
-    try expectDiag("server\n  publish-mode 0o644\n", "line 2: [server] 'publish-mode': InvalidMode: use 0o600, 0o640, or 0o660");
+    try expectDiag("server\n  publish-mode 0o666\n", "line 2: [server] 'publish-mode': InvalidMode: needs owner rw (0o600), no world-write, and no setuid/setgid/sticky bit");
     try expectDiag(srv ++ "user bob\n  root bob\n", "line 5: [user bob] 'root': RelativePath: must be an absolute path");
     try expectDiag("server\n  listing-mode real\n", "line 2: [server] 'listing-mode': InvalidListingMode: use 'virtual' or 'reality'");
     try expectDiag("server\n  max-connections many\n", "line 2: [server] 'max-connections': InvalidNumber: expected a whole number");
