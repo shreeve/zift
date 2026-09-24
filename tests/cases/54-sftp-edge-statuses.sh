@@ -2,7 +2,8 @@
 # Test: status codes and audit lines at the edges of the SFTP handlers
 # Oracle: a partner who may not stat never learns whether a path or its
 #         parent exists from MKDIR/REMOVE/RMDIR/RENAME; one who may stat
-#         gets NO_SUCH_FILE for a missing entry
+#         gets NO_SUCH_FILE for a missing entry; OPEN of a FIFO fails at
+#         once instead of blocking the session
 
 source "$(dirname "$0")/../lib/common.sh"
 
@@ -17,6 +18,7 @@ hash=$(make_password_hash secret)
 for d in drop box; do
     mkdir -p "$TEST_TMP/jail/$d/existing"
     echo x > "$TEST_TMP/jail/$d/file.txt"
+    mkfifo "$TEST_TMP/jail/$d/fifo"
 done
 
 write_config <<EOF
@@ -51,6 +53,8 @@ def expect(label, want, fn, *args):
     try:
         fn(*args)
         got = "ok"
+    except socket.timeout:
+        got = "timeout"
     except PermissionError:
         got = "denied"
     except FileNotFoundError:
@@ -71,6 +75,13 @@ for root, gone, there in (("/drop", "denied", "denied"), ("/box", "missing", "fa
     expect(f"rmdir of a missing dir in {root}", gone, sftp.rmdir, f"{root}/nope")
     expect(f"rename of a missing source in {root}", gone, sftp.rename, f"{root}/nope.txt", f"{root}/new.txt")
     expect(f"rename into a missing parent in {root}", gone, sftp.rename, f"{root}/file.txt", f"{root}/nope/new.txt")
+
+# A FIFO would block open(2) until a writer (or reader) appeared.
+sftp.get_channel().settimeout(5)
+expect("open of a FIFO for reading in /box", "failure", sftp.open, "/box/fifo", "r")
+expect("open of a FIFO for writing in /box", "failure", sftp.open, "/box/fifo", "r+")
+expect("open of a FIFO for writing in /drop", "denied", sftp.open, "/drop/fifo", "w")
+expect("session still answers after the FIFO opens", "ok", sftp.listdir, "/box")
 
 sftp.close()
 t.close()

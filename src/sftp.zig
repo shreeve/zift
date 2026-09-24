@@ -606,19 +606,15 @@ const SftpState = struct {
         // present one.
         const may_stat = policy.check(self.user, .stat, path) == .allow;
 
-        // O_NOFOLLOW: a symlink as the final component is always refused.
-        const file = parent.parent.openFile(self.io, parent.base, .{
-            .mode = if (!want_write) .read_only else if (want_read) .read_write else .write_only,
-            .follow_symlinks = false,
-            .allow_directory = false,
-        }) catch |err| switch (err) {
+        const mode: std.Io.Dir.OpenFileOptions.Mode = if (!want_write) .read_only else if (want_read) .read_write else .write_only;
+        const file = openRegular(parent.parent, parent.base, mode, want_append) catch |err| switch (err) {
             error.FileNotFound => {
                 if (want_creat) return self.openStaged(request_id, op, path, want_read, want_append, want_excl);
                 return self.hide(request_id, may_stat, c.SSH_FX_NO_SUCH_FILE, op, path);
             },
             error.SymLinkLoop => return self.deny(request_id, op, path),
-            // A directory where a file was asked for.
-            error.IsDir => return self.hide(request_id, may_stat, c.SSH_FX_FAILURE, op, path),
+            // A directory, FIFO, or device where a file was asked for.
+            error.IsDir, error.NotRegularFile => return self.hide(request_id, may_stat, c.SSH_FX_FAILURE, op, path),
             else => return self.reject(request_id, c.SSH_FX_FAILURE, op, path, @errorName(err)),
         };
         var owned: ?std.Io.File = file;
@@ -642,9 +638,6 @@ const SftpState = struct {
         if (!handleIdAvailable(self.next_handle)) {
             return self.reject(request_id, c.SSH_FX_FAILURE, op, path, "handle id exhausted");
         }
-        if (want_append) setFdAppend(file.handle) catch {
-            return self.reject(request_id, c.SSH_FX_FAILURE, op, path, "append flag failed");
-        };
         if (want_trunc) file.setLength(self.io, 0) catch {
             return self.reject(request_id, c.SSH_FX_FAILURE, op, path, "truncate failed");
         };
@@ -700,7 +693,7 @@ const SftpState = struct {
         };
         const setup_failure: ?[]const u8 = blk: {
             file.setPermissions(self.io, permissions) catch break :blk "staging chmod failed";
-            if (want_append) setFdAppend(file.handle) catch break :blk "append flag failed";
+            if (want_append) setFdFlags(file.handle, true) catch break :blk "append flag failed";
             break :blk null;
         };
         if (setup_failure) |detail| {
@@ -1362,24 +1355,69 @@ fn sweepUnlinksStagingFile(live: bool, age_secs: i64, min_age_secs: i64) bool {
     return age_secs >= min_age_secs;
 }
 
-/// Zig 0.16 OpenFileOptions has no append bit, and pwrite ignores
-/// O_APPEND. F_SETFL is what makes WRITE atomic across sessions.
-fn setFdAppend(fd: std.posix.fd_t) error{AppendFlagFailed}!void {
+/// Open an existing regular file under `dir`; a final symlink is refused
+/// (O_NOFOLLOW). O_NONBLOCK keeps a FIFO or device, which only an
+/// operator can create, from blocking the session in open(2); anything
+/// but a regular file is then refused, and the flag cleared.
+fn openRegular(dir: std.Io.Dir, name: []const u8, mode: std.Io.Dir.OpenFileOptions.Mode, append: bool) !std.Io.File {
+    var name_buf: [wire.max_name_bytes + 1]u8 = undefined;
+    if (name.len >= name_buf.len) return error.NameTooLong;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+    var flags: std.c.O = .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true, .NOCTTY = true };
+    flags.ACCMODE = switch (mode) {
+        .read_only => .RDONLY,
+        .write_only => .WRONLY,
+        .read_write => .RDWR,
+    };
+    const fd: std.posix.fd_t = while (true) {
+        const rc = std.c.openat(dir.handle, @ptrCast(&name_buf), flags, @as(std.c.mode_t, 0));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break rc,
+            .INTR => continue,
+            .NOENT, .NOTDIR => return error.FileNotFound,
+            .LOOP => return error.SymLinkLoop,
+            .ISDIR => return error.IsDir,
+            // A FIFO opened for writing with no reader.
+            .NXIO => return error.NotRegularFile,
+            .ACCES, .PERM => return error.AccessDenied,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            else => return error.Unexpected,
+        }
+    };
+    errdefer _ = std.c.close(fd);
+    const info = try listing.statFd(fd);
+    switch (info.mode & listing.S_IFMT) {
+        listing.S_IFREG => {},
+        listing.S_IFDIR => return error.IsDir,
+        else => return error.NotRegularFile,
+    }
+    try setFdFlags(fd, append);
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
+/// Clear O_NONBLOCK and, if asked, set O_APPEND. Zig 0.16
+/// OpenFileOptions has no append bit, and pwrite ignores O_APPEND, so
+/// F_SETFL is what makes an append WRITE atomic across sessions.
+fn setFdFlags(fd: std.posix.fd_t, append: bool) error{FcntlFailed}!void {
     const append_bit: c_int = @intCast(@as(u32, 1) << @bitOffsetOf(std.c.O, "APPEND"));
+    const nonblock_bit: c_int = @intCast(@as(u32, 1) << @bitOffsetOf(std.c.O, "NONBLOCK"));
     const current: c_int = getfl: while (true) {
         const rc = std.c.fcntl(fd, @as(c_int, std.c.F.GETFL), @as(c_int, 0));
         switch (std.posix.errno(rc)) {
             .SUCCESS => break :getfl rc,
             .INTR => continue,
-            else => return error.AppendFlagFailed,
+            else => return error.FcntlFailed,
         }
     };
+    const wanted = (current & ~nonblock_bit) | (if (append) append_bit else 0);
     while (true) {
-        const rc = std.c.fcntl(fd, @as(c_int, std.c.F.SETFL), current | append_bit);
+        const rc = std.c.fcntl(fd, @as(c_int, std.c.F.SETFL), wanted);
         switch (std.posix.errno(rc)) {
             .SUCCESS => return,
             .INTR => continue,
-            else => return error.AppendFlagFailed,
+            else => return error.FcntlFailed,
         }
     }
 }
