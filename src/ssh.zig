@@ -20,7 +20,12 @@ pub fn authenticate(
     cfg: config.Config,
     session: c.ssh_session,
     ip_str: []const u8,
+    deadline_ms: i64,
 ) !*const config.UserConfig {
+    errdefer |err| if (err == error.LoginGraceExpired) {
+        audit.log(io, null, "auth.rejected", null, .denied, "login grace expired", ip_str);
+    };
+
     // Two ceilings.
     //
     // HARD failures are real credential rejections: a wrong or unknown-
@@ -31,9 +36,9 @@ pub fn authenticate(
     // SOFT operations are `none`, non-auth messages, and public-key
     // probes (offers, unconfigured keys, a public-key `from` miss). A
     // stock client sends one per agent key before trying a password, so
-    // they get no backoff and no abuse credit, only a loop bound: each
-    // message restarts libssh's idle deadline. A public-key `from` miss
-    // is soft so that it cannot be told apart from an unknown user.
+    // they get no backoff and no abuse credit, only a count bound; the
+    // login grace bounds the time. A public-key `from` miss is soft so
+    // that it cannot be told apart from an unknown user.
     const max_hard_failures: u32 = 6;
     const max_soft_ops: u32 = 64;
     var hard_failures: u32 = 0;
@@ -45,7 +50,9 @@ pub fn authenticate(
             return error.LibsshFailure;
         }
 
-        const msg = c.ssh_message_get(session) orelse return error.LibsshFailure;
+        try boundRead(session, cfg.server.idle_timeout_ms, deadline_ms);
+        const msg = c.ssh_message_get(session) orelse
+            return if (sys.monotonicMs() >= deadline_ms) error.LoginGraceExpired else error.LibsshFailure;
         defer c.ssh_message_free(msg);
 
         if (c.ssh_message_type(msg) != c.SSH_REQUEST_AUTH) {
@@ -144,6 +151,33 @@ pub fn authenticate(
         _ = c.ssh_message_auth_set_methods(msg, methodsForUser(cfg, username_for_methods));
         _ = c.ssh_message_reply_default(msg);
     }
+}
+
+/// From accept to successful authentication, key exchange included.
+/// Fixed, like OpenSSH's LoginGraceTime: libssh restarts the idle timer
+/// on every message, so idle alone lets a client hold a pre-auth slot
+/// for hours.
+pub const login_grace_ms: i64 = 120 * 1000;
+
+/// Bound libssh's next blocking read by the idle timeout (0 = none) and
+/// the login deadline.
+pub fn boundRead(session: c.ssh_session, idle_ms: u64, deadline_ms: i64) error{LoginGraceExpired}!void {
+    setReadTimeout(session, try readTimeoutMs(idle_ms, deadline_ms, sys.monotonicMs()));
+}
+
+fn readTimeoutMs(idle_ms: u64, deadline_ms: i64, now_ms: i64) error{LoginGraceExpired}!u64 {
+    if (now_ms >= deadline_ms) return error.LoginGraceExpired;
+    const left: u64 = @intCast(deadline_ms - now_ms);
+    return if (idle_ms == 0) left else @min(idle_ms, left);
+}
+
+/// libssh's timeout for each blocking read; 0 waits forever. libssh
+/// rounds a total under 1 ms to 0, so callers pass whole milliseconds.
+pub fn setReadTimeout(session: c.ssh_session, ms: u64) void {
+    const seconds: c_long = @intCast(ms / 1000);
+    const usec: c_long = @intCast((ms % 1000) * 1000);
+    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT, &seconds);
+    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT_USEC, &usec);
 }
 
 fn verifyPassword(
@@ -351,6 +385,15 @@ test "verifyPassword accepts only the right password" {
     const user = testUser(hash);
     try std.testing.expect(verifyPassword(std.testing.io, std.testing.allocator, &user, "correct horse"));
     try std.testing.expect(!verifyPassword(std.testing.io, std.testing.allocator, &user, "wrong horse"));
+}
+
+test "readTimeoutMs: the login deadline caps the idle timeout" {
+    try std.testing.expectEqual(@as(u64, 300_000), try readTimeoutMs(300_000, 1_000_000, 0));
+    try std.testing.expectEqual(@as(u64, 5_000), try readTimeoutMs(300_000, 10_000, 5_000));
+    // Idle 0 means no idle limit, not no limit at all.
+    try std.testing.expectEqual(@as(u64, 1), try readTimeoutMs(0, 10_000, 9_999));
+    try std.testing.expectError(error.LoginGraceExpired, readTimeoutMs(0, 10_000, 10_000));
+    try std.testing.expectError(error.LoginGraceExpired, readTimeoutMs(300_000, 10_000, 20_000));
 }
 
 test "verifyPassword returns false when user has no password" {

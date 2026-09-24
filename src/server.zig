@@ -209,6 +209,7 @@ pub fn run(
             .config_ref = ref,
             .session = session,
             .session_fd = session_fd,
+            .login_deadline_ms = sys.monotonicMs() + ssh.login_grace_ms,
             .ip_buf = ip_buf,
             .ip_len = @intCast(peer_ip.len),
         };
@@ -506,6 +507,8 @@ const SessionArgs = struct {
     session: c.ssh_session,
     /// Already registered with `signals`.
     session_fd: c_int,
+    /// Monotonic ms by which authentication must succeed.
+    login_deadline_ms: i64,
     /// Peer address captured at accept; "" when unknown.
     ip_buf: [64]u8,
     ip_len: u8,
@@ -517,6 +520,7 @@ fn sessionThread(args: *SessionArgs) void {
     const ref = args.config_ref;
     const session = args.session;
     const session_fd = args.session_fd;
+    const deadline_ms = args.login_deadline_ms;
     const ip_buf = args.ip_buf;
     const peer_ip = ip_buf[0..args.ip_len];
     allocator.destroy(args);
@@ -525,7 +529,7 @@ fn sessionThread(args: *SessionArgs) void {
 
     // Set by `handleSession` when it releases the pre-auth slot at auth.
     var auth_completed = false;
-    const ok = if (handleSession(io, allocator, ref.config, session, peer_ip, &auth_completed)) true else |err| blk: {
+    const ok = if (handleSession(io, allocator, ref.config, session, peer_ip, deadline_ms, &auth_completed)) true else |err| blk: {
         // The error text lives in the session, so read it before ssh_free.
         logLibsshError(io, @errorName(err), session, .skip) catch {};
         break :blk false;
@@ -674,37 +678,30 @@ fn handleSession(
     cfg: config.Config,
     session: c.ssh_session,
     peer_ip: []const u8,
+    login_deadline_ms: i64,
     auth_completed: *bool,
 ) !void {
-    // Before the handshake, or a silent TCP client pins a worker forever.
-    setSessionTimeout(session, cfg.server.idle_timeout_ms);
+    // Before the handshake, or a silent TCP client pins a worker.
+    try ssh.boundRead(session, cfg.server.idle_timeout_ms, login_deadline_ms);
 
     if (c.ssh_handle_key_exchange(session) != c.SSH_OK) {
         audit.log(io, null, "handshake.failed", null, .failed, "", peer_ip);
         return error.LibsshFailure;
     }
 
-    const user = try ssh.authenticate(io, allocator, cfg, session, peer_ip);
+    const user = try ssh.authenticate(io, allocator, cfg, session, peer_ip, login_deadline_ms);
 
-    // Release the pre-auth slot now; the flag tells sessionThread's
-    // defer not to release it again.
+    // Release the pre-auth slot now; the flag tells sessionThread not
+    // to release it again.
     auth_completed.* = true;
     _ = unauth_sessions.fetchSub(1, .acq_rel);
 
+    // Plain idle from here (the SFTP loop enforces idle itself).
+    ssh.setReadTimeout(session, cfg.server.idle_timeout_ms);
     const channel = try sftp.acceptSftpSubsystem(session);
 
     // The session owns the channel; freeing it here would double-free.
     try sftp.runSftp(io, allocator, channel, user, cfg.server, peer_ip);
-}
-
-/// Timeout for every blocking libssh read before SFTP starts (the SFTP
-/// loop enforces idle itself). 0 leaves libssh's default.
-fn setSessionTimeout(session: c.ssh_session, idle_timeout_ms: u64) void {
-    if (idle_timeout_ms == 0) return;
-    const seconds: c_long = @intCast(idle_timeout_ms / 1000);
-    const usec: c_long = @intCast((idle_timeout_ms % 1000) * 1000);
-    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT, &seconds);
-    _ = c.ssh_options_set(session, c.SSH_OPTIONS_TIMEOUT_USEC, &usec);
 }
 
 /// Best-effort socket options. TCP_NODELAY: SFTP is request/response,
