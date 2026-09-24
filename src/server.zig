@@ -195,6 +195,17 @@ pub fn run(
     try setBindOption(bind, c.SSH_BIND_OPTIONS_BINDADDR, listen.host.ptr);
     try setBindOption(bind, c.SSH_BIND_OPTIONS_BINDPORT_STR, listen.port.ptr);
     try setBindOption(bind, c.SSH_BIND_OPTIONS_HOSTKEY, host_key.ptr);
+    // The config file is the only config: without this, ssh_bind_listen
+    // also reads /etc/ssh/libssh_server_config, which can add host keys
+    // and change the algorithms.
+    const process_config = false;
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_PROCESS_CONFIG, &process_config);
+    // libssh verifies SHA-1 `ssh-rsa` user signatures unless the accepted
+    // list excludes it; RSA is allowed with SHA-2 only, and at 2048 bits.
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_PUBKEY_ACCEPTED_KEY_TYPES, signature_algorithms);
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_HOSTKEY_ALGORITHMS, signature_algorithms);
+    const rsa_min_bits: c_int = 2048;
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_RSA_MIN_SIZE, &rsa_min_bits);
 
     if (c.ssh_bind_listen(bind) != c.SSH_OK) {
         logLibsshError(io, "ssh_bind_listen", bind, .note);
@@ -802,7 +813,12 @@ fn parseListen(allocator: std.mem.Allocator, listen: []const u8) !Listen {
     };
 }
 
-fn setBindOption(bind: c.ssh_bind, option: c.enum_ssh_bind_options_e, value: [*:0]const u8) !void {
+/// User-key and host-key signature algorithms: the key types the config
+/// accepts, with RSA limited to its SHA-2 signatures.
+const signature_algorithms = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521," ++
+    "rsa-sha2-512,rsa-sha2-256";
+
+fn setBindOption(bind: c.ssh_bind, option: c.enum_ssh_bind_options_e, value: *const anyopaque) !void {
     if (c.ssh_bind_options_set(bind, option, value) != c.SSH_OK) return error.LibsshFailure;
 }
 
