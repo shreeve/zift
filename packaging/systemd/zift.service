@@ -68,8 +68,8 @@ RemoveIPC=true
 # What RestrictSUIDSGID would defend against -- this process creating a
 # setuid/setgid binary for later escalation -- is already covered:
 # NoNewPrivileges=true stops this process gaining privileges, and
-# NoExecPaths=/home/zift means nothing in the only writable tree can be
-# executed in the first place.
+# NoExecPaths=/home/zift means this service cannot execute anything in
+# its only writable tree.
 
 # Filesystem visibility.
 # `PrivateDevices=true` exposes only /dev/null, /dev/zero, /dev/full,
@@ -116,13 +116,19 @@ RestrictAddressFamilies=AF_INET AF_INET6
 
 # System-call surface. `@system-service` is systemd's curated baseline
 # for ordinary daemons; the additional `~@privileged ~@resources`
-# subtractions block setuid/setgid/setpgid/sched_setaffinity/etc.
-# that Zift never invokes. `SystemCallArchitectures=native` blocks
-# the 32-bit syscall ABI on x86_64 hosts (a frequent confused-deputy
-# vector).
+# subtractions block setuid/setgid/sched_setaffinity/etc. One of them
+# Zift can reach: at startup it calls setrlimit (prlimit64 on musl) to
+# raise RLIMIT_NOFILE when the soft limit is below what max-connections
+# needs. LimitNOFILE below covers the defaults, so that call is skipped;
+# with a larger max-connections, SystemCallErrorNumber=EPERM makes the
+# blocked call fail (and Zift print its fd-budget warning) instead of
+# the default SIGSYS killing the daemon at startup.
+# `SystemCallArchitectures=native` blocks the 32-bit syscall ABI on
+# x86_64 hosts (a frequent confused-deputy vector).
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 SystemCallFilter=~@resources
+SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
 # Kernel keyring. Zift does not use the keyring; isolate it.
@@ -131,20 +137,30 @@ KeyringMode=private
 # The single deploy tree under /home/zift contains the config, host
 # key, partner roots (each user's `root` lives at /home/zift/<user>/),
 # and the audit log. ProtectSystem=strict makes the rest of the
-# filesystem read-only.
+# filesystem read-only. A different layout (say /etc/zift, /srv/sftp,
+# /var/log/zift) needs matching edits here: every partner root and the
+# audit log's directory in ReadWritePaths= and NoExecPaths=, and the
+# config path in ExecStart= and ExecReload=. Otherwise uploads and the
+# audit log fail with EROFS.
 ReadWritePaths=/home/zift
 # Partners upload arbitrary bytes into /home/zift. MemoryDenyWriteExecute
-# blocks W^X inside this process, but does not stop something else on the
-# host from execve()ing an uploaded file. Mark the whole writable tree
-# non-executable so an uploaded payload cannot be run from here.
+# blocks W^X inside this process only. NoExecPaths= keeps this service
+# from execve()ing anything under the writable tree. It applies only in
+# this unit's mount namespace: other processes on the host can still
+# execute uploaded files unless the filesystem is mounted noexec.
 NoExecPaths=/home/zift
 
-# Resource limits: bound Argon2id memory pressure from auth storms.
-# passhash credentials use fixed argon2id params (64 MiB per verification).
-# With MemoryMax=4G the host can safely run many concurrent verifies;
-# still pair with `max-connections` / `max-unauth-connections` so a
-# handshake storm cannot pin every worker on KDF work.
-LimitNOFILE=4096
+# File descriptors: each session may hold up to 256 SFTP handles plus
+# its socket and libssh's own fds, so the default max-connections 128
+# needs 128 x (256 + 8) + 64 = 33,856. 65536 covers that with room;
+# raise it with max-connections (Zift warns at startup when short).
+LimitNOFILE=65536
+# Memory: every password verification is Argon2id at 64 MiB, and Zift
+# runs at most 8 at once, so KDF work peaks at 8 x 64 MiB = 512 MiB.
+# Without that cap, 128 unauthenticated connections verifying together
+# would need 8 GiB. Sessions add roughly 256 KiB of packet buffer each
+# (32 MiB at 128). 4G leaves ample headroom; the cgroup OOM-kills the
+# whole daemon, and every live session with it, if it is ever reached.
 MemoryMax=4G
 
 UMask=0027
