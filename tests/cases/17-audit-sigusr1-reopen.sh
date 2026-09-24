@@ -44,10 +44,8 @@ sleep 1
 mv "$AUDIT_PATH" "$AUDIT_PATH.1"
 : > "$AUDIT_PATH"
 
-# Send SIGUSR1 to the running zift binary (NOT the wrapper shell).
-ZIFT_BINARY_PID=$(pgrep -x zift | head -1)
-[[ -n "$ZIFT_BINARY_PID" ]] || fail "could not find running zift binary pid"
-kill -USR1 "$ZIFT_BINARY_PID"
+# $ZIFT_PID is this case's server; pgrep could pick another run's.
+kill -USR1 "$ZIFT_PID"
 sleep 1
 
 # Round 2: produce another audit line. With SIGUSR1 honored, this lands

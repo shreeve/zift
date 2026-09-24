@@ -102,15 +102,13 @@ grep -q 'config reloaded' "$TEST_TMP/disabled.log" \
 ok "reload-interval=0 suppresses mtime-driven reload"
 
 # SIGHUP must still trigger a reload even with interval=0.
-DISABLED_BIN_PID=$(pgrep -x zift | head -1)
-[[ -n "$DISABLED_BIN_PID" ]] || fail "could not find disabled zift binary pid"
-kill -HUP "$DISABLED_BIN_PID"
+kill -HUP "$DISABLED_PID"
 sleep 2
 grep -q 'config reloaded' "$TEST_TMP/disabled.log" \
     || fail "SIGHUP should reload even when interval=0, log:\n$(cat "$TEST_TMP/disabled.log")"
 ok "SIGHUP still forces reload when reload-interval=0"
 
-kill -TERM "$DISABLED_BIN_PID" 2>/dev/null || true
+kill -TERM "$DISABLED_PID" 2>/dev/null || true
 wait "$DISABLED_PID" 2>/dev/null || true
 
 # ---------- (e) reload rejects a config with an unreadable host-key ----------
