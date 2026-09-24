@@ -13,6 +13,7 @@
 source "$(dirname "$0")/../lib/common.sh"
 
 make_host_key
+mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it
 hash=$(make_password_hash secret)
 late_hash=$(make_password_hash later-secret)
 
@@ -29,7 +30,7 @@ server
 
 user ally
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
@@ -48,7 +49,7 @@ server
 
 user ally
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read lsit
 EOF
 touch "$TEST_TMP/zift.conf"

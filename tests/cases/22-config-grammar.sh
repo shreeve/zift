@@ -8,6 +8,7 @@
 source "$(dirname "$0")/../lib/common.sh"
 
 make_host_key
+mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it
 hash=$(make_password_hash secret)
 
 # Helper: write config to $TEST_TMP/<name>.conf, run validate, capture
@@ -28,7 +29,7 @@ server
 
 user alice
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   bogus-key something
   allow / read list
 EOF
@@ -56,7 +57,7 @@ server
 
 user bob
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
@@ -81,7 +82,7 @@ server
 # Comment between sections
 user carol
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
@@ -102,7 +103,7 @@ server
 
 user dan
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
@@ -132,7 +133,7 @@ server
 
 user erin
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
@@ -154,7 +155,7 @@ server
 
 user fred
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 

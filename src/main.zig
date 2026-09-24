@@ -81,7 +81,7 @@ fn validate(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
     defer gpa.free(contents);
 
     var diag: config.LoadDiag = .{};
-    var cfg = config.load(io, gpa, contents, &diag) catch {
+    var cfg = config.loadPath(io, gpa, path, contents, &diag) catch {
         if (diag.parse_err != null) try sys.note(io, "zift validate: {s}: {f}\n", .{ path, diag });
         return 1;
     };
@@ -124,7 +124,7 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     defer gpa.free(contents);
 
     var diag: config.LoadDiag = .{};
-    const cfg = config.load(io, gpa, contents, &diag) catch |err| {
+    const cfg = config.loadPath(io, gpa, args[2], contents, &diag) catch |err| {
         if (diag.parse_err != null) try sys.note(io, "zift: {s}: {f}\n", .{ args[2], diag });
         return err;
     };

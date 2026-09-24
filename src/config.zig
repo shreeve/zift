@@ -21,6 +21,7 @@ pub const SemanticError = error{
     UserRootMissing,
     UserRootNotDirectory,
     OverlappingRoots,
+    PrivateFileInsideRoot,
     AuthKeyFileUnreadable,
     AuthKeyFileTooLarge,
     AuthKeyFileMalformed,
@@ -136,14 +137,17 @@ pub const Config = struct {
 };
 
 /// Check a parsed config against the live filesystem: the host key, the
-/// log path, user roots (exist, are directories, do not overlap), and key
-/// files. Used by `zift validate`, `zift serve`, and reload, so each
-/// rejection prints the same `zift: ...` line on stderr wherever it
-/// happens; it is also kept in `diag`.
+/// log path, user roots (exist, are directories, do not overlap), key
+/// files, and that no daemon-private file sits inside a partner root.
+/// Used by `zift validate`, `zift serve`, and reload, so each rejection
+/// prints the same `zift: ...` line on stderr wherever it happens; it is
+/// also kept in `diag`. `config_path`, when known, is kept out of the
+/// roots too.
 pub fn validateSemantic(
     io: std.Io,
     gpa: std.mem.Allocator,
     cfg: *Config,
+    config_path: ?[]const u8,
     diag: *LoadDiag,
 ) SemanticError!void {
     const ck: Checker = .{ .io = io, .diag = diag };
@@ -186,6 +190,19 @@ pub fn validateSemantic(
 
     // 4. Load every `auth /path` key file.
     try resolveAuthKeyFiles(ck, gpa, cfg);
+
+    // 5. No daemon-private file inside a root. A partner who can write
+    // there could replace a key file and log in as another partner, or
+    // read the host key or the audit log.
+    try checkOutsideRoots(ck, roots, cfg.users, "host-key", cfg.server.host_key);
+    switch (cfg.server.log) {
+        .stderr => {},
+        .file => |path| try checkOutsideRoots(ck, roots, cfg.users, "log", path),
+    }
+    if (config_path) |path| try checkOutsideRoots(ck, roots, cfg.users, "config file", path);
+    for (cfg.users) |user| {
+        for (user.key_files) |path| try checkOutsideRoots(ck, roots, cfg.users, "auth key file", path);
+    }
 }
 
 /// Reports a semantic failure: `zift: <message>` on stderr, and the
@@ -271,6 +288,42 @@ fn checkLogPath(ck: Checker, path: []const u8) SemanticError!void {
         else => return ck.fail(error.LogPathUnusable, "log unreadable: {s}", .{path}),
     };
     if (st.kind != .file) return ck.fail(error.LogPathUnusable, "log is not a regular file (symlinks are refused): {s}", .{path});
+}
+
+/// Fail if `path`, as named (its directory resolved) or as it resolves,
+/// is inside any user root: a symlink or a not-yet-created log inside a
+/// root is caught too. `roots` are canonical and parallel to `users`.
+fn checkOutsideRoots(
+    ck: Checker,
+    roots: []const [:0]const u8,
+    users: []const UserConfig,
+    what: []const u8,
+    path: []const u8,
+) SemanticError!void {
+    var named_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = std.Io.Dir.cwd();
+    const named: ?[]const u8 = named: {
+        const n = cwd.realPathFile(ck.io, std.fs.path.dirname(path) orelse ".", &named_buf) catch break :named null;
+        const sep: usize = if (n == 1) 0 else 1; // the directory is `/`
+        const base = std.fs.path.basename(path);
+        if (n + sep + base.len > named_buf.len) break :named null;
+        named_buf[n] = '/';
+        @memcpy(named_buf[n + sep ..][0..base.len], base);
+        break :named named_buf[0 .. n + sep + base.len];
+    };
+    const real: ?[]const u8 = if (cwd.realPathFile(ck.io, path, &real_buf)) |n| real_buf[0..n] else |_| null;
+    for (roots, users) |root, user| {
+        for ([_]?[]const u8{ named, real }) |candidate| {
+            const p = candidate orelse continue;
+            // `isInsideRoot` wants a `/` after the root, so `/` is special.
+            if (std.mem.eql(u8, root, "/") or vfs.isInsideRoot(root, p)) {
+                return ck.fail(error.PrivateFileInsideRoot, "{s} {s} is inside user '{s}' root {s}; move it out of every partner root", .{
+                    what, path, user.name, root,
+                });
+            }
+        }
+    }
 }
 
 /// Parse every user's key files into `keys` (strings in the config
@@ -575,13 +628,25 @@ pub const LoadDiag = struct {
 /// Parse and validate config text: the one path from a file's contents to
 /// a config that may serve (validate, startup, and reload). Reading is
 /// separate because reload records the file's stamps between the two.
+/// Prefer `loadPath`, which also keeps the config file out of every root.
 pub fn load(io: std.Io, gpa: std.mem.Allocator, contents: []const u8, diag: *LoadDiag) (Error || SemanticError)!Config {
+    return loadPath(io, gpa, null, contents, diag);
+}
+
+/// `load` for the config read from `path`.
+pub fn loadPath(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    path: ?[]const u8,
+    contents: []const u8,
+    diag: *LoadDiag,
+) (Error || SemanticError)!Config {
     var cfg = parseWithDiag(gpa, contents, &diag.parse) catch |err| {
         diag.parse_err = err;
         return err;
     };
     errdefer cfg.deinit();
-    try validateSemantic(io, gpa, &cfg, diag);
+    try validateSemantic(io, gpa, &cfg, path, diag);
     return cfg;
 }
 
@@ -2049,29 +2114,34 @@ const TestTree = struct {
         try self.tmp.dir.setFilePermissions(std.testing.io, sub, .fromMode(@intCast(mode)), .{});
     }
 
-    /// Parse `text` with `@` expanded, then run validateSemantic.
-    fn check(self: *TestTree, text: []const u8) !void {
+    /// Parse `text` with `@` expanded, then run validateSemantic with the
+    /// config path `@/<config_sub>` when given.
+    fn check(self: *TestTree, text: []const u8, config_sub: ?[]const u8) !void {
         const alloc = std.testing.allocator;
         const expanded = try std.mem.replaceOwned(u8, alloc, text, "@", self.path);
         defer alloc.free(expanded);
         var cfg = try parse(alloc, expanded);
         defer cfg.deinit();
+        const config_path = if (config_sub) |sub| try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.path, sub }) else null;
+        defer if (config_path) |p| alloc.free(p);
         var diag: LoadDiag = .{};
-        try validateSemantic(std.testing.io, alloc, &cfg, &diag);
+        try validateSemantic(std.testing.io, alloc, &cfg, config_path, &diag);
     }
 
     /// `check` with `from` in the base config replaced by `to`.
     fn checkWith(self: *TestTree, from: []const u8, to: []const u8) !void {
         const text = try std.mem.replaceOwned(u8, std.testing.allocator, config, from, to);
         defer std.testing.allocator.free(text);
-        return self.check(text);
+        return self.check(text, null);
     }
 };
 
-test "validateSemantic: a well-formed tree passes" {
+test "validateSemantic: a well-formed tree passes, and the config file is checked too" {
     var tree = try TestTree.init();
     defer tree.deinit();
-    try tree.check(TestTree.config);
+    try tree.check(TestTree.config, null);
+    try tree.check(TestTree.config, "etc/zift.conf");
+    try std.testing.expectError(error.PrivateFileInsideRoot, tree.check(TestTree.config, "r/zift.conf"));
 }
 
 test "validateSemantic: host key mode, type, and content" {
@@ -2079,11 +2149,11 @@ test "validateSemantic: host key mode, type, and content" {
     defer tree.deinit();
     for ([_]u32{ 0o600, 0o400, 0o640 }) |mode| {
         try tree.chmod("etc/host", mode);
-        try tree.check(TestTree.config);
+        try tree.check(TestTree.config, null);
     }
     for ([_]u32{ 0o644, 0o660, 0o604, 0o610, 0o777 }) |mode| {
         try tree.chmod("etc/host", mode);
-        try std.testing.expectError(error.HostKeyUnreadable, tree.check(TestTree.config));
+        try std.testing.expectError(error.HostKeyUnreadable, tree.check(TestTree.config, null));
     }
     try tree.chmod("etc/host", 0o600);
 
@@ -2106,13 +2176,13 @@ test "validateSemantic: host key and key file symlinks are followed, and the tar
     try tree.tmp.dir.symLink(io, "host", "etc/host-link", .{});
     try tree.tmp.dir.symLink(io, "u.pub", "etc/u-link.pub", .{});
     const linked = "server\n  listen :2222\n  host-key @/etc/host-link\nuser u\n  auth @/etc/u-link.pub\n  root @/r\n";
-    try tree.check(linked);
+    try tree.check(linked, null);
 
     try tree.chmod("etc/host", 0o644);
-    try std.testing.expectError(error.HostKeyUnreadable, tree.check(linked));
+    try std.testing.expectError(error.HostKeyUnreadable, tree.check(linked, null));
     try tree.chmod("etc/host", 0o600);
     try tree.chmod("etc/u.pub", 0o664);
-    try std.testing.expectError(error.AuthKeyFileWritableByOthers, tree.check(linked));
+    try std.testing.expectError(error.AuthKeyFileWritableByOthers, tree.check(linked, null));
 }
 
 test "validateSemantic: the log directory must exist and a log must be a regular file" {
@@ -2124,7 +2194,33 @@ test "validateSemantic: the log directory must exist and a log must be a regular
     try tree.tmp.dir.symLink(std.testing.io, "../etc/u.pub", "log/link.log", .{});
     try std.testing.expectError(error.LogPathUnusable, tree.checkWith("@/log/audit.log", "@/log/link.log"));
     try tree.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "log/audit.log", .data = "" });
-    try tree.check(TestTree.config);
+    try tree.check(TestTree.config, null);
+}
+
+test "validateSemantic: no daemon-private file inside a partner root" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const io = std.testing.io;
+    try tree.tmp.dir.createDir(io, "r/keys", .default_dir);
+    try tree.hostKey("r/keys/host", null);
+    try tree.tmp.dir.writeFile(io, .{ .sub_path = "r/keys/u.pub", .data = "ssh-ed25519 " ++ valid_ed25519_blob ++ "\n" });
+    try tree.chmod("r/keys/u.pub", 0o644);
+
+    try std.testing.expectError(error.PrivateFileInsideRoot, tree.checkWith("@/etc/host", "@/r/keys/host"));
+    try std.testing.expectError(error.PrivateFileInsideRoot, tree.checkWith("@/etc/u.pub", "@/r/keys/u.pub"));
+    try std.testing.expectError(error.PrivateFileInsideRoot, tree.checkWith("@/log/audit.log", "@/r/audit.log"));
+
+    // A symlink outside that points in, and one inside that points out.
+    try tree.tmp.dir.symLink(io, "../r/keys/u.pub", "etc/in.pub", .{});
+    try std.testing.expectError(error.PrivateFileInsideRoot, tree.checkWith("@/etc/u.pub", "@/etc/in.pub"));
+    try tree.tmp.dir.symLink(io, "../../etc/u.pub", "r/keys/out.pub", .{});
+    try std.testing.expectError(error.PrivateFileInsideRoot, tree.checkWith("@/etc/u.pub", "@/r/keys/out.pub"));
+
+    // A partner whose name matches the key directory under partner-root.
+    try std.testing.expectError(error.PrivateFileInsideRoot, tree.check(
+        "server\n  listen :2222\n  host-key @/r/../etc/host\n  partner-root @\nuser etc\n  auth @/log/../etc/u.pub\n",
+        null,
+    ));
 }
 
 /// Parse `text`, which must fail, and compare the rendered diagnostic.
