@@ -39,6 +39,17 @@ runs the `zift` service, otherwise to `~/.local/bin`. Setting up the
 service is [`docs/operate.md`](docs/operate.md). To build from source,
 see [`docs/develop.md`](docs/develop.md).
 
+With Homebrew, on macOS or on a Linux workstation:
+
+```sh
+brew install shreeve/tap/zift
+```
+
+On macOS, `brew services start zift` then runs it from
+`$(brew --prefix)/etc/zift/zift.conf`. Install a Linux server with
+`install.sh`, not Homebrew: the systemd unit runs `/usr/local/bin/zift`,
+and only `install.sh` checks the service's config before an upgrade.
+
 ## Quickstart
 
 Serve a partner `foo` with password `bar`, who may browse, upload new

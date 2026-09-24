@@ -150,15 +150,22 @@ The runner reads:
    and the licenses (`scripts/package-release.sh`);
 5. writes the archives' checksums and signs them with cosign keyless
    through GitHub's OIDC identity;
-6. publishes a GitHub release, marked prerelease if the tag has a `-`.
+6. publishes a GitHub release, marked prerelease if the tag has a `-`;
+7. for a final release, opens a pull request on `shreeve/homebrew-tap`
+   that moves `Formula/zift.rb` to the new archives and checksums
+   (`scripts/bump-homebrew-formula.py`). It needs the repository secret
+   `HOMEBREW_TAP_TOKEN`, a token that can push a branch and open a pull
+   request there; without it the job warns and the release still ships.
 
 Artifacts: `zift-vX.Y.Z-{linux-amd64,linux-arm64,osx-arm64,osx-amd64}.tar.gz`,
 `zift-vX.Y.Z-checksums.txt` and `zift-vX.Y.Z-checksums.txt.bundle`.
 
 ### The installer
 
-`install.sh` is shared with janus and harbor: the three copies differ
-only in `REPO` and `NAME`, so change all three together. It picks the
+janus and harbor publish the same archives and install in the same two
+steps, but their `install.sh` copies still carry project-specific code
+(janus: setcap, code signing; harbor: libduckdb), so zift's is not yet
+a drop-in for them. It picks the
 platform and version, checks the archive against the checksums file and
 runs the archive's own `install.sh` (`scripts/release-install.sh`),
 passing `--uninstall` through. Everything zift-specific, such as where

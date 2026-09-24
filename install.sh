@@ -10,11 +10,12 @@
 #   curl -fsSL .../install.sh | bash -s v1.2.3
 #   curl -fsSL .../install.sh | bash -s -- --uninstall
 #
-# This script is shared, unchanged but for REPO and NAME, by janus, zift
-# and harbor; change it in all three. It downloads the release archive for
-# this platform, checks its sha256 against the release's checksums, and
-# runs the archive's own install.sh (with --uninstall to uninstall), which
-# knows where the project goes. Every release publishes:
+# janus and harbor publish the same archives and install in the same two
+# steps, but their copies of this script still carry project-specific
+# code, so it is not yet a drop-in for them. It downloads the release archive for this platform, checks its sha256
+# against the release's checksums, and runs the archive's own install.sh
+# (with --uninstall to uninstall), which knows where the project goes.
+# Every release publishes:
 #
 #   NAME-vX.Y.Z-<plat>.tar.gz     unpacks to NAME-vX.Y.Z-<plat>/install.sh ...
 #   NAME-vX.Y.Z-checksums.txt     sha256sum output over the archives
