@@ -178,7 +178,7 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // After validation, before any worker thread.
-    try audit.initGlobal(gpa, cfg.server.log);
+    try audit.initGlobal(io, gpa, cfg.server.log);
     defer audit.deinitGlobal(gpa);
 
     try stderr.writeStreamingAll(io, "zift: libssh initialized\n");

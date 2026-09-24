@@ -12,6 +12,7 @@ const audit = @import("audit.zig");
 const auth = @import("auth.zig");
 const config = @import("config.zig");
 const netmatch = @import("netmatch.zig");
+const sys = @import("sys.zig");
 
 pub fn authenticate(
     io: std.Io,
@@ -41,7 +42,7 @@ pub fn authenticate(
 
     while (true) {
         // Suppression by another session applies here too.
-        if (abuse.isSuppressed(io, ip_str, audit.nowMonotonicMs())) {
+        if (abuse.isSuppressed(io, ip_str, sys.monotonicMs())) {
             audit.log(io, null, "auth.rejected", null, .denied, "source suppressed", ip_str);
             return error.LibsshFailure;
         }
@@ -121,7 +122,7 @@ pub fn authenticate(
 
         if (is_hard) {
             hard_failures += 1;
-            const now_ms = audit.nowMonotonicMs();
+            const now_ms = sys.monotonicMs();
             abuse.recordFailure(io, ip_str, now_ms);
             // Tripping suppression ends this session now.
             if (abuse.isSuppressed(io, ip_str, now_ms)) {

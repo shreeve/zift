@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const sys = @import("sys.zig");
 
 /// The stat fields SFTP needs. std's Stat lacks uid/gid, hence our own.
 pub const EntryInfo = struct {
@@ -359,26 +360,28 @@ fn formatSize(out: []u8, mode: u32, size: u64) []const u8 {
 /// `Mon DD HH:MM` within ~6 months of now, else `Mon DD  YYYY` (the
 /// double space keeps the column width), all in UTC.
 fn formatMtime(out: []u8, mtime_secs: i64, now_secs: i64) []const u8 {
-    const broken = breakTime(mtime_secs);
+    const t = sys.civil(mtime_secs);
     const six_months_secs: i64 = 6 * 30 * 24 * 60 * 60;
     // i128: a junk mtime (e.g. i64 min) must not overflow.
     const diff: i128 = @as(i128, now_secs) - @as(i128, mtime_secs);
     const recent = diff < @as(i128, six_months_secs) and
         diff > -@as(i128, six_months_secs / 2);
 
-    const month = month_abbrev[@min(broken.month, 11)];
+    const month = month_abbrev[t.month - 1];
+    // Clamped so a junk year prints a bounded number.
+    const year: i32 = @intCast(std.math.clamp(t.year, std.math.minInt(i32), std.math.maxInt(i32)));
 
     if (recent) {
         return std.fmt.bufPrint(
             out,
             "{s} {d:>2} {d:0>2}:{d:0>2}",
-            .{ month, broken.day, broken.hour, broken.minute },
+            .{ month, t.day, t.hour, t.minute },
         ) catch out[0..0];
     }
     return std.fmt.bufPrint(
         out,
         "{s} {d:>2}  {d}",
-        .{ month, broken.day, broken.year },
+        .{ month, t.day, year },
     ) catch out[0..0];
 }
 
@@ -386,46 +389,6 @@ const month_abbrev = [_][]const u8{
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 };
-
-const BrokenTime = struct {
-    /// Clamped to i32: a junk mtime must never panic the session.
-    year: i32,
-    month: u4, // 0-11
-    day: u8, // 1-31
-    hour: u8, // 0-23
-    minute: u8, // 0-59
-};
-
-/// UTC `gmtime` via Howard Hinnant's `civil_from_days`
-/// (https://howardhinnant.github.io/date_algorithms.html): O(1) and
-/// panic-free for any i64.
-fn breakTime(secs: i64) BrokenTime {
-    const seconds_per_day: i64 = 86400;
-    const day = @divFloor(secs, seconds_per_day);
-    // `@mod`, not `secs - day * 86400`, which overflows near i64 min.
-    const seconds_in_day: i64 = @mod(secs, seconds_per_day); // [0, 86399]
-
-    // Days since 0000-03-01, the algorithm's origin.
-    const z: i64 = day + 719468;
-    const era: i64 = if (z >= 0) @divFloor(z, 146097) else @divFloor(z - 146096, 146097);
-    const doe: u32 = @intCast(z - era * 146097); // [0, 146096]
-    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    const civil_year: i64 = @as(i64, yoe) + era * 400;
-    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    const mp: u32 = (5 * doy + 2) / 153; // [0, 11], March-based
-    const day_of_month: u8 = @intCast(doy - (153 * mp + 2) / 5 + 1); // [1, 31]
-    // mp counts from March, so Jan and Feb belong to the next year.
-    const month_jan_based: u8 = if (mp < 10) @intCast(mp + 3) else @intCast(mp - 9);
-    const calendar_year: i64 = if (month_jan_based <= 2) civil_year + 1 else civil_year;
-
-    return .{
-        .year = @intCast(std.math.clamp(calendar_year, std.math.minInt(i32), std.math.maxInt(i32))),
-        .month = @intCast(month_jan_based - 1),
-        .day = day_of_month,
-        .hour = @intCast(@divFloor(seconds_in_day, 3600)),
-        .minute = @intCast(@divFloor(@mod(seconds_in_day, 3600), 60)),
-    };
-}
 
 // POSIX file-type bits, as u32 to match `EntryInfo.mode`.
 pub const S_IFMT: u32 = 0o170000;
@@ -487,89 +450,6 @@ test "formatSize: K threshold" {
 test "formatSize: fractional below 10x unit" {
     var buf: [12]u8 = undefined;
     try std.testing.expectEqualStrings("1.5K", formatSize(&buf, S_IFREG | 0o644, 1536));
-}
-
-test "breakTime: known epoch -> 1970-01-01 00:00" {
-    const b = breakTime(0);
-    try std.testing.expectEqual(@as(i32, 1970), b.year);
-    try std.testing.expectEqual(@as(u4, 0), b.month);
-    try std.testing.expectEqual(@as(u8, 1), b.day);
-    try std.testing.expectEqual(@as(u8, 0), b.hour);
-    try std.testing.expectEqual(@as(u8, 0), b.minute);
-}
-
-test "breakTime: 2026-04-27 14:35 UTC" {
-    // 2026-04-27T14:35:00Z = 1777300500.
-    const b = breakTime(1777300500);
-    try std.testing.expectEqual(@as(i32, 2026), b.year);
-    try std.testing.expectEqual(@as(u4, 3), b.month); // April (0-indexed)
-    try std.testing.expectEqual(@as(u8, 27), b.day);
-    try std.testing.expectEqual(@as(u8, 14), b.hour);
-    try std.testing.expectEqual(@as(u8, 35), b.minute);
-}
-
-test "breakTime: pre-1970 timestamps render correctly" {
-    // 1969-12-31 23:59:59 UTC = -1
-    const b = breakTime(-1);
-    try std.testing.expectEqual(@as(i32, 1969), b.year);
-    try std.testing.expectEqual(@as(u4, 11), b.month); // December
-    try std.testing.expectEqual(@as(u8, 31), b.day);
-    try std.testing.expectEqual(@as(u8, 23), b.hour);
-    try std.testing.expectEqual(@as(u8, 59), b.minute);
-}
-
-test "breakTime: 1900-01-01 (pre-Unix-epoch by 70 years)" {
-    // 1900-01-01 00:00:00 UTC = -2208988800 (well before Unix epoch)
-    const b = breakTime(-2208988800);
-    try std.testing.expectEqual(@as(i32, 1900), b.year);
-    try std.testing.expectEqual(@as(u4, 0), b.month); // January
-    try std.testing.expectEqual(@as(u8, 1), b.day);
-}
-
-test "breakTime: extreme negative timestamp does not panic" {
-    const b = breakTime(std.math.minInt(i64) + 1);
-    _ = b;
-}
-
-test "breakTime: extreme positive timestamp does not panic" {
-    const b = breakTime(std.math.maxInt(i64) - 1);
-    _ = b;
-}
-
-test "breakTime: i32 year saturation" {
-    const b = breakTime(std.math.maxInt(i64));
-    try std.testing.expect(b.year == std.math.maxInt(i32) or b.year > 0);
-}
-
-test "breakTime: leap-year handling (2000-02-29)" {
-    // 2000-02-29 12:00:00 UTC = 951825600
-    const b = breakTime(951825600);
-    try std.testing.expectEqual(@as(i32, 2000), b.year);
-    try std.testing.expectEqual(@as(u4, 1), b.month); // February
-    try std.testing.expectEqual(@as(u8, 29), b.day);
-}
-
-test "breakTime: non-leap century (1900 is NOT a leap year)" {
-    // 1900-02-28 23:59:59 UTC = -2203891201
-    const b = breakTime(-2203891201);
-    try std.testing.expectEqual(@as(i32, 1900), b.year);
-    try std.testing.expectEqual(@as(u4, 1), b.month);
-    try std.testing.expectEqual(@as(u8, 28), b.day);
-
-    // 1900-03-01 00:00:00 UTC = -2203891200
-    const c = breakTime(-2203891200);
-    try std.testing.expectEqual(@as(i32, 1900), c.year);
-    try std.testing.expectEqual(@as(u4, 2), c.month);
-    try std.testing.expectEqual(@as(u8, 1), c.day);
-}
-
-test "breakTime: 400-year leap (2000 IS a leap year)" {
-    // 2000-02-29 → 2000-03-01 transition
-    // 2000-03-01 00:00:00 UTC = 951868800
-    const b = breakTime(951868800);
-    try std.testing.expectEqual(@as(i32, 2000), b.year);
-    try std.testing.expectEqual(@as(u4, 2), b.month);
-    try std.testing.expectEqual(@as(u8, 1), b.day);
 }
 
 test "formatMtime: recent uses HH:MM" {

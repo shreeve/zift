@@ -11,9 +11,9 @@
 //! file is refused; mode 0640 is set only on a file this process created.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const config = @import("config.zig");
 const signals = @import("signals.zig");
+const sys = @import("sys.zig");
 
 pub const Result = enum { ok, denied, failed };
 
@@ -46,6 +46,7 @@ pub const Sink = struct {
     last_reopen_warn_ms: i64 = 0,
 
     pub fn initFromConfig(
+        io: std.Io,
         allocator: std.mem.Allocator,
         target: config.LogTarget,
     ) !Sink {
@@ -54,7 +55,7 @@ pub const Sink = struct {
             .file => |path| {
                 const owned = try allocator.dupe(u8, path);
                 errdefer allocator.free(owned);
-                const fd = try openLogFile(owned);
+                const fd = try openLogFile(io, owned);
                 return .{
                     .target = .{ .file = owned },
                     .fd = .init(fd),
@@ -78,7 +79,7 @@ pub const Sink = struct {
         const signaled = signals.log_reopen_requested.load(.acquire);
         const retry_at = self.reopen_retry_at_ms.load(.acquire);
         if (!signaled) {
-            if (retry_at == 0 or nowMonotonicMs() < retry_at) return;
+            if (retry_at == 0 or sys.monotonicMs() < retry_at) return;
         }
 
         const path = switch (self.target) {
@@ -94,15 +95,15 @@ pub const Sink = struct {
         // Consume the signal under the mutex so two writers cannot both
         // open; a signal arriving during the open is honored next line.
         const signaled_now = signals.log_reopen_requested.swap(false, .acq_rel);
-        const now = nowMonotonicMs();
+        const now = sys.monotonicMs();
         const retry_at_now = self.reopen_retry_at_ms.load(.acquire);
         if (!signaled_now and (retry_at_now == 0 or now < retry_at_now)) {
             self.mutex.unlock(io);
             return;
         }
 
-        const new_fd = openLogFile(path) catch |err| {
-            const failed_at = nowMonotonicMs();
+        const new_fd = openLogFile(io, path) catch |err| {
+            const failed_at = sys.monotonicMs();
             self.reopen_retry_at_ms.store(failed_at + warn_min_interval_ms, .release);
             const warn = self.last_reopen_warn_ms == 0 or
                 failed_at - self.last_reopen_warn_ms >= warn_min_interval_ms;
@@ -170,7 +171,7 @@ const warn_min_interval_ms: i64 = 5_000;
 var last_warn_ms: std.atomic.Value(i64) = .init(0);
 
 fn warnWriteFailure(name: []const u8) void {
-    const now = nowMonotonicMs();
+    const now = sys.monotonicMs();
     const last = last_warn_ms.load(.acquire);
     if (now - last < warn_min_interval_ms and last != 0) return;
     last_warn_ms.store(now, .release);
@@ -180,18 +181,11 @@ fn warnWriteFailure(name: []const u8) void {
     writeStderrRaw("\n");
 }
 
-/// CLOCK_MONOTONIC milliseconds (immune to wall-clock changes).
-pub fn nowMonotonicMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
-}
-
 fn writeStderrRaw(text: []const u8) void {
     _ = std.c.write(2, text.ptr, text.len);
 }
 
-fn openLogFile(path: []const u8) !c_int {
+fn openLogFile(io: std.Io, path: []const u8) !c_int {
     var path_z: [4096]u8 = undefined;
     if (path.len >= path_z.len) return error.PathTooLong;
     @memcpy(path_z[0..path.len], path);
@@ -211,7 +205,7 @@ fn openLogFile(path: []const u8) !c_int {
         .NOFOLLOW = true,
     }, mode);
     if (created >= 0) {
-        if (!fdIsRegularFile(created) or std.c.fchmod(created, mode) != 0) {
+        if (!isRegularFile(io, created) or std.c.fchmod(created, mode) != 0) {
             _ = std.c.close(created);
             return error.OpenFailed;
         }
@@ -225,36 +219,20 @@ fn openLogFile(path: []const u8) !c_int {
         .CLOEXEC = true,
         .NOFOLLOW = true,
     });
-    if (fd < 0 or !fdIsRegularFile(fd)) {
+    if (fd < 0 or !isRegularFile(io, fd)) {
         if (fd >= 0) _ = std.c.close(fd);
         return error.OpenFailed;
     }
     return fd;
 }
 
-/// Mode bits of an open fd, or null when stat fails.
-fn fdFileMode(fd: c_int) ?u32 {
-    if (builtin.os.tag == .linux) {
-        var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
-        const mask: std.os.linux.STATX = .{
-            .TYPE = true,
-            .MODE = true,
-        };
-        const empty: [*:0]const u8 = "";
-        const at_empty: u32 = @intCast(std.posix.AT.EMPTY_PATH);
-        const rc = std.os.linux.statx(fd, empty, at_empty, mask, &sx);
-        if (std.os.linux.errno(rc) != .SUCCESS) return null;
-        return sx.mode;
-    } else {
-        var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
-        if (std.c.fstat(fd, &st) != 0) return null;
-        return st.mode;
-    }
+fn fdFile(fd: c_int) std.Io.File {
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
-fn fdIsRegularFile(fd: c_int) bool {
-    const mode = fdFileMode(fd) orelse return false;
-    return std.posix.S.ISREG(mode);
+fn isRegularFile(io: std.Io, fd: c_int) bool {
+    const st = fdFile(fd).stat(io) catch return false;
+    return st.kind == .file;
 }
 
 // ----- process-wide singleton ----------------------------------------------
@@ -262,10 +240,11 @@ fn fdIsRegularFile(fd: c_int) bool {
 var global_sink: Sink = .{};
 
 pub fn initGlobal(
+    io: std.Io,
     allocator: std.mem.Allocator,
     target: config.LogTarget,
 ) !void {
-    global_sink = try Sink.initFromConfig(allocator, target);
+    global_sink = try Sink.initFromConfig(io, allocator, target);
 }
 
 pub fn deinitGlobal(allocator: std.mem.Allocator) void {
@@ -441,8 +420,7 @@ const time_buf_len: usize = 24;
 /// Current wall-clock time as RFC 3339 UTC with milliseconds. A failed
 /// clock read yields the epoch rather than garbage digits.
 fn formatNowRfc3339Utc(buf: *[time_buf_len]u8) []const u8 {
-    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.c.clock_gettime(.REALTIME, &ts);
+    const ts = sys.realtime();
     return formatRfc3339Utc(buf, ts.sec, ts.nsec);
 }
 
@@ -454,26 +432,18 @@ fn formatRfc3339Utc(buf: *[time_buf_len]u8, sec: i64, nsec_in: i64) []const u8 {
     if (nsec >= std.time.ns_per_s) nsec = std.time.ns_per_s - 1;
     const ms: u32 = @intCast(@divTrunc(nsec, std.time.ns_per_ms));
 
-    const civil = civilFromUnix(sec);
-    const sec_of_day: u32 = @intCast(@mod(sec, 86400));
-    const hour: u32 = @divTrunc(sec_of_day, 3600);
-    const minute: u32 = @divTrunc(@mod(sec_of_day, 3600), 60);
-    const second: u32 = @mod(sec_of_day, 60);
-
-    const year_clamped: i32 = if (civil.year < 0) 0 else if (civil.year > 9999) 9999 else civil.year;
-    const year_u: u32 = @intCast(year_clamped);
-
-    writeFixedDigits(buf[0..4], year_u);
+    const t = sys.civil(sec);
+    writeFixedDigits(buf[0..4], @intCast(std.math.clamp(t.year, 0, 9999)));
     buf[4] = '-';
-    writeFixedDigits(buf[5..7], civil.month);
+    writeFixedDigits(buf[5..7], t.month);
     buf[7] = '-';
-    writeFixedDigits(buf[8..10], civil.day);
+    writeFixedDigits(buf[8..10], t.day);
     buf[10] = 'T';
-    writeFixedDigits(buf[11..13], hour);
+    writeFixedDigits(buf[11..13], t.hour);
     buf[13] = ':';
-    writeFixedDigits(buf[14..16], minute);
+    writeFixedDigits(buf[14..16], t.minute);
     buf[16] = ':';
-    writeFixedDigits(buf[17..19], second);
+    writeFixedDigits(buf[17..19], t.second);
     buf[19] = '.';
     writeFixedDigits(buf[20..23], ms);
     buf[23] = 'Z';
@@ -489,27 +459,6 @@ fn writeFixedDigits(dst: []u8, value_in: u32) void {
         dst[i] = @intCast('0' + (value % 10));
         value /= 10;
     }
-}
-
-const Civil = struct { year: i32, month: u8, day: u8 };
-
-/// Howard Hinnant's `civil_from_days` for Unix seconds.
-fn civilFromUnix(unix_secs: i64) Civil {
-    const z: i64 = @divFloor(unix_secs, 86400) + 719468;
-    const era: i64 = if (z >= 0) @divTrunc(z, 146097) else @divTrunc(z - 146096, 146097);
-    const doe: u32 = @intCast(z - era * 146097);
-    const yoe: u32 = (doe -% (doe / 1460) -% (doe / 36524) +% (doe / 146096)) / 365;
-    const y: i64 = @as(i64, yoe) + era * 400;
-    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const mp: u32 = (5 * doy + 2) / 153;
-    const day: u32 = doy - (153 * mp + 2) / 5 + 1;
-    const month: u32 = if (mp < 10) mp + 3 else mp - 9;
-    const year: i64 = if (month <= 2) y + 1 else y;
-    return .{
-        .year = @intCast(year),
-        .month = @intCast(month),
-        .day = @intCast(day),
-    };
 }
 
 // ----- tests ---------------------------------------------------------------
@@ -578,6 +527,9 @@ test "formatRfc3339Utc fixed-input fixtures" {
         .{ .sec = 951_782_400, .nsec = 0, .want = "2000-02-29T00:00:00.000Z" }, // leap day
         .{ .sec = 1_709_251_200, .nsec = 999_000_000, .want = "2024-03-01T00:00:00.999Z" },
         .{ .sec = 4_102_444_800, .nsec = 0, .want = "2100-01-01T00:00:00.000Z" }, // year 2100 not a leap
+        // March 1 outside an era's first century (was a day early).
+        .{ .sec = 5_097_600, .nsec = 0, .want = "1970-03-01T00:00:00.000Z" },
+        .{ .sec = 4_107_542_400, .nsec = 0, .want = "2100-03-01T00:00:00.000Z" },
         .{ .sec = -1, .nsec = 0, .want = "1969-12-31T23:59:59.000Z" },
         // Year-clamp edge: a wildly distant timestamp lands at 9999.
         .{ .sec = 253_402_300_799, .nsec = 0, .want = "9999-12-31T23:59:59.000Z" },
@@ -586,24 +538,6 @@ test "formatRfc3339Utc fixed-input fixtures" {
     for (fixtures) |f| {
         const got = formatRfc3339Utc(&buf, f.sec, f.nsec);
         try std.testing.expectEqualStrings(f.want, got);
-    }
-}
-
-test "civilFromUnix matches Howard Hinnant fixtures" {
-    const Fixture = struct { unix: i64, year: i32, month: u8, day: u8 };
-    const fixtures = [_]Fixture{
-        .{ .unix = 0, .year = 1970, .month = 1, .day = 1 },
-        .{ .unix = 951782400, .year = 2000, .month = 2, .day = 29 }, // leap day
-        .{ .unix = 1456704000, .year = 2016, .month = 2, .day = 29 }, // leap day
-        .{ .unix = 1709251200, .year = 2024, .month = 3, .day = 1 },
-        .{ .unix = 4102444800, .year = 2100, .month = 1, .day = 1 }, // not a leap year
-        .{ .unix = -86400, .year = 1969, .month = 12, .day = 31 },
-    };
-    for (fixtures) |f| {
-        const civil = civilFromUnix(f.unix);
-        try std.testing.expectEqual(f.year, civil.year);
-        try std.testing.expectEqual(f.month, civil.month);
-        try std.testing.expectEqual(f.day, civil.day);
     }
 }
 
@@ -633,25 +567,14 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
     const Probe = struct {
         extern "c" fn mkfifo(path: [*:0]const u8, mode: std.posix.mode_t) c_int;
 
-        fn perm(path: [*:0]const u8) !u32 {
-            if (builtin.os.tag == .linux) {
-                var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
-                const mask: std.os.linux.STATX = .{ .TYPE = true, .MODE = true };
-                const flags: u32 = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
-                const rc = std.os.linux.statx(std.posix.AT.FDCWD, path, flags, mask, &sx);
-                if (std.os.linux.errno(rc) != .SUCCESS) return error.TestUnexpectedResult;
-                return @as(u32, sx.mode) & 0o777;
-            } else {
-                var st: std.c.Stat = std.mem.zeroes(std.c.Stat);
-                const flags: u32 = @intCast(std.posix.AT.SYMLINK_NOFOLLOW);
-                if (std.c.fstatat(std.posix.AT.FDCWD, path, &st, flags) != 0) return error.TestUnexpectedResult;
-                return @as(u32, st.mode) & 0o777;
-            }
+        fn perm(path: [:0]const u8) !u32 {
+            const st = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{ .follow_symlinks = false });
+            return @as(u32, @intCast(st.permissions.toMode())) & 0o777;
         }
 
         fn fdPerm(fd: c_int) !u32 {
-            const mode = fdFileMode(fd) orelse return error.TestUnexpectedResult;
-            return mode & 0o777;
+            const st = try fdFile(fd).stat(std.testing.io);
+            return @as(u32, @intCast(st.permissions.toMode())) & 0o777;
         }
     };
 
@@ -668,7 +591,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
         // Under umask 077 only the fchmod yields 0640.
         const old_mask = std.c.umask(0o077);
         defer _ = std.c.umask(old_mask);
-        const fd = try openLogFile(path);
+        const fd = try openLogFile(io, path);
         defer _ = std.c.close(fd);
         try std.testing.expectEqual(@as(u32, 0o640), try Probe.fdPerm(fd));
         try std.testing.expectEqual(@as(isize, 3), std.c.write(fd, "new", 3));
@@ -677,7 +600,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const path = testJoin(&buf, dir, "created.log");
         try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(path, 0o604));
-        const fd = try openLogFile(path);
+        const fd = try openLogFile(io, path);
         defer _ = std.c.close(fd);
         // Pre-existing file: append, keep its mode.
         try std.testing.expectEqual(@as(u32, 0o604), try Probe.fdPerm(fd));
@@ -703,7 +626,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
         try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(raw, 0o600));
         try std.testing.expectEqual(@as(isize, 3), std.c.write(raw, "old", 3));
         _ = std.c.close(raw);
-        const fd = try openLogFile(path);
+        const fd = try openLogFile(io, path);
         defer _ = std.c.close(fd);
         try std.testing.expectEqual(@as(u32, 0o600), try Probe.fdPerm(fd));
         try std.testing.expectEqual(@as(isize, 3), std.c.write(fd, "NEW", 3));
@@ -732,7 +655,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
         var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const link = testJoin(&link_buf, dir, "link.log");
         try tmp.dir.symLink(io, target, "d/link.log", .{});
-        try std.testing.expectError(error.OpenFailed, openLogFile(link));
+        try std.testing.expectError(error.OpenFailed, openLogFile(io, link));
         try std.testing.expectEqual(@as(u32, 0o600), try Probe.perm(target));
         var got: [16]u8 = undefined;
         const body = try tmp.dir.readFile(io, "d/target.log", &got);
@@ -743,11 +666,11 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
     {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const path = testJoin(&buf, dir, "subdir");
-        try std.testing.expectError(error.OpenFailed, openLogFile(path));
+        try std.testing.expectError(error.OpenFailed, openLogFile(io, path));
     }
 
     const devnull_before = try Probe.perm("/dev/null");
-    try std.testing.expectError(error.OpenFailed, openLogFile("/dev/null"));
+    try std.testing.expectError(error.OpenFailed, openLogFile(io, "/dev/null"));
     try std.testing.expectEqual(devnull_before, try Probe.perm("/dev/null"));
 
     {
@@ -767,7 +690,7 @@ test "openLogFile refuses symlinks and non-regular files and pins 0640 only on c
         const thr = try std.Thread.spawn(.{}, Reader.run, .{path});
         defer thr.join();
         // The open unblocks the reader; fstat then rejects the fifo.
-        try std.testing.expectError(error.OpenFailed, openLogFile(path));
+        try std.testing.expectError(error.OpenFailed, openLogFile(io, path));
         try std.testing.expectEqual(@as(u32, 0o612), try Probe.perm(path));
     }
 }
@@ -792,7 +715,7 @@ test "failed audit reopen retries on a deadline without a stderr storm" {
     var other_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const other_path = testJoin(&other_buf, dir, "other.jsonl");
 
-    var sink = try Sink.initFromConfig(std.testing.allocator, .{ .file = audit_path });
+    var sink = try Sink.initFromConfig(io, std.testing.allocator, .{ .file = audit_path });
     defer sink.deinit(std.testing.allocator);
     const original_fd = sink.fd.load(.acquire);
     try std.testing.expectEqual(@as(c_int, 0), std.c.link(audit_path, kept_path));
@@ -800,7 +723,7 @@ test "failed audit reopen retries on a deadline without a stderr storm" {
     sink.log(io, "u", "before-fail", null, .ok, "", "203.0.113.9");
     try tmp.dir.deleteFile(io, "d/audit.jsonl");
     {
-        const other_fd = try openLogFile(other_path);
+        const other_fd = try openLogFile(io, other_path);
         _ = std.c.close(other_fd);
     }
     try tmp.dir.symLink(io, other_path, "d/audit.jsonl", .{});
@@ -811,7 +734,7 @@ test "failed audit reopen retries on a deadline without a stderr storm" {
     try std.testing.expect(sink.last_reopen_warn_ms != 0);
     const warned_at = sink.last_reopen_warn_ms;
     const retry_at = sink.reopen_retry_at_ms.load(.acquire);
-    try std.testing.expect(retry_at >= nowMonotonicMs());
+    try std.testing.expect(retry_at >= sys.monotonicMs());
     try std.testing.expect(!signals.log_reopen_requested.load(.acquire));
 
     // Deadline still ahead and no new signal: leave the fd alone.
@@ -821,7 +744,7 @@ test "failed audit reopen retries on a deadline without a stderr storm" {
     try std.testing.expectEqual(original_fd, sink.fd.load(.acquire));
 
     // A fresh SIGUSR1 retries immediately but must not warn again.
-    const sentinel = nowMonotonicMs() + 1_000_000;
+    const sentinel = sys.monotonicMs() + 1_000_000;
     sink.reopen_retry_at_ms.store(sentinel, .release);
     signals.log_reopen_requested.store(true, .release);
     sink.maybeReopen(io);
@@ -831,10 +754,10 @@ test "failed audit reopen retries on a deadline without a stderr storm" {
     try std.testing.expectEqual(original_fd, sink.fd.load(.acquire));
 
     // Deadline alone retries, still inside the warn window.
-    sink.reopen_retry_at_ms.store(nowMonotonicMs() - 1, .release);
+    sink.reopen_retry_at_ms.store(sys.monotonicMs() - 1, .release);
     sink.maybeReopen(io);
     const after_deadline = sink.reopen_retry_at_ms.load(.acquire);
-    const now = nowMonotonicMs();
+    const now = sys.monotonicMs();
     try std.testing.expect(after_deadline >= now);
     try std.testing.expect(after_deadline <= now + warn_min_interval_ms);
     try std.testing.expectEqual(warned_at, sink.last_reopen_warn_ms);
@@ -849,7 +772,7 @@ test "failed audit reopen retries on a deadline without a stderr storm" {
     try std.testing.expect(std.mem.indexOf(u8, other_body, "during-fail") == null);
 
     try tmp.dir.deleteFile(io, "d/audit.jsonl");
-    sink.reopen_retry_at_ms.store(nowMonotonicMs() - 1, .release);
+    sink.reopen_retry_at_ms.store(sys.monotonicMs() - 1, .release);
     signals.log_reopen_requested.store(false, .release);
     sink.log(io, "u", "after-ok", null, .ok, "", "203.0.113.9");
 

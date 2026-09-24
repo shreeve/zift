@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const listing = @import("listing.zig");
 
 pub const Operation = enum {
     open_read,
@@ -37,8 +38,8 @@ pub fn policyDerivedMode(
     vpath: []const u8,
     kind_bits: u32,
 ) u32 {
-    const file_type = kind_bits & 0o170000;
-    const is_dir = file_type == 0o040000;
+    const file_type = kind_bits & listing.S_IFMT;
+    const is_dir = file_type == listing.S_IFDIR;
 
     var owner: u32 = 0;
 

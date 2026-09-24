@@ -209,8 +209,7 @@ fn openOrCreateNamespaceDir(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
             // lstat, then NOFOLLOW open and fstat the fd, so a swap
             // between the two cannot redirect the namespace.
             const info = try listing.statAt(root.handle, namespace_dir_name);
-            const file_type = info.mode & 0o170000;
-            if (file_type != 0o040000) return error.NamespaceDirCorrupt;
+            if ((info.mode & listing.S_IFMT) != listing.S_IFDIR) return error.NamespaceDirCorrupt;
             if ((info.mode & 0o027) != 0) return error.NamespaceDirUnsafe;
             var dir = try root.openDir(io, namespace_dir_name, .{ .iterate = true, .follow_symlinks = false });
             errdefer dir.close(io);
@@ -233,8 +232,7 @@ fn openOrCreateStagingSubdir(io: std.Io, ns_dir: std.Io.Dir) !std.Io.Dir {
     } else |err| switch (err) {
         error.PathAlreadyExists => {
             const info = try listing.statAt(ns_dir.handle, staging_subdir_name);
-            const file_type = info.mode & 0o170000;
-            if (file_type != 0o040000) return error.StagingDirCorrupt;
+            if ((info.mode & listing.S_IFMT) != listing.S_IFDIR) return error.StagingDirCorrupt;
             if ((info.mode & 0o077) != 0) return error.StagingDirUnsafe;
             var dir = try ns_dir.openDir(io, staging_subdir_name, .{ .iterate = true, .follow_symlinks = false });
             errdefer dir.close(io);
@@ -253,8 +251,7 @@ fn assertOpenedDirMode(
     unsafe: anyerror,
 ) !void {
     const info = try listing.statFd(dir.handle);
-    const file_type = info.mode & 0o170000;
-    if (file_type != 0o040000) return corrupt;
+    if ((info.mode & listing.S_IFMT) != listing.S_IFDIR) return corrupt;
     if ((info.mode & forbidden_mask) != 0) return unsafe;
 }
 

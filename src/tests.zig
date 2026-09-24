@@ -12,5 +12,6 @@ comptime {
     _ = @import("vfs.zig");
     _ = @import("wire.zig");
     _ = @import("sftp.zig");
+    _ = @import("sys.zig");
     _ = @import("fuzz.zig");
 }

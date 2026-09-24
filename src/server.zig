@@ -14,6 +14,7 @@ const config = @import("config.zig");
 const sftp = @import("sftp.zig");
 const signals = @import("signals.zig");
 const ssh = @import("ssh.zig");
+const sys = @import("sys.zig");
 
 /// In-flight session threads; enforces `max-connections` and drain.
 pub var active_sessions: std.atomic.Value(u32) = .init(0);
@@ -128,7 +129,7 @@ pub fn run(
     try status.writeStreamingAll(io, "\n");
 
     // mtime polling every `reload-interval`; 0 leaves only SIGHUP.
-    var next_reload_ms: i64 = audit.nowMonotonicMs() +
+    var next_reload_ms: i64 = sys.monotonicMs() +
         @as(i64, @intCast(active.current.config.server.reload_interval_ms));
 
     accept_loop: while (true) {
@@ -137,15 +138,15 @@ pub fn run(
         // SIGHUP reloads regardless of mtime.
         if (signals.reload_requested.swap(false, .acq_rel)) {
             active.forceReload(config_path, &config_mtime, &key_stamps);
-            next_reload_ms = audit.nowMonotonicMs() +
+            next_reload_ms = sys.monotonicMs() +
                 @as(i64, @intCast(active.current.config.server.reload_interval_ms));
         }
 
         // Also stats the running config's authorized-key files.
         const reload_interval = active.current.config.server.reload_interval_ms;
-        if (reload_interval > 0 and audit.nowMonotonicMs() >= next_reload_ms) {
+        if (reload_interval > 0 and sys.monotonicMs() >= next_reload_ms) {
             active.reloadIfChanged(config_path, &config_mtime, &key_stamps);
-            next_reload_ms = audit.nowMonotonicMs() +
+            next_reload_ms = sys.monotonicMs() +
                 @as(i64, @intCast(active.current.config.server.reload_interval_ms));
         }
 
@@ -163,7 +164,7 @@ pub fn run(
         var ip_buf: [64]u8 = undefined;
         const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
 
-        if (abuse.isSuppressed(io, peer_ip, audit.nowMonotonicMs())) {
+        if (abuse.isSuppressed(io, peer_ip, sys.monotonicMs())) {
             audit.log(io, null, "accept.rejected", null, .denied, "source suppressed", peer_ip);
             c.ssh_disconnect(session);
             c.ssh_free(session);
@@ -233,8 +234,8 @@ pub fn run(
     c.ssh_bind_set_fd(bind, @as(@TypeOf(bind_fd), -1));
 
     const grace_ms: i64 = @intCast(active.current.config.server.shutdown_grace_ms);
-    const drain_deadline = audit.nowMonotonicMs() + grace_ms;
-    while (active_sessions.load(.acquire) != 0 and audit.nowMonotonicMs() < drain_deadline) {
+    const drain_deadline = sys.monotonicMs() + grace_ms;
+    while (active_sessions.load(.acquire) != 0 and sys.monotonicMs() < drain_deadline) {
         std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
     }
 
@@ -251,8 +252,8 @@ pub fn run(
         try stderr.writeStreamingAll(io, line);
 
         // Reads on a shut-down socket return at once; 500 ms is ample.
-        const final_deadline = audit.nowMonotonicMs() + 500;
-        while (active_sessions.load(.acquire) != 0 and audit.nowMonotonicMs() < final_deadline) {
+        const final_deadline = sys.monotonicMs() + 500;
+        while (active_sessions.load(.acquire) != 0 and sys.monotonicMs() < final_deadline) {
             std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
         }
 

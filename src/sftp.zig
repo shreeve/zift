@@ -12,6 +12,7 @@ const c = @import("libssh");
 const audit = @import("audit.zig");
 const config = @import("config.zig");
 const listing = @import("listing.zig");
+const sys = @import("sys.zig");
 const policy = @import("policy.zig");
 const vfs_mod = @import("vfs.zig");
 const wire = @import("wire.zig");
@@ -52,12 +53,6 @@ extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c
 
 /// Maximum simultaneously-open file/dir handles per SFTP session.
 pub const max_handles_per_session: usize = 256;
-
-fn nowUnixSecs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return @as(i64, ts.sec);
-}
 
 fn appendVirtualChild(
     allocator: std.mem.Allocator,
@@ -135,7 +130,7 @@ pub fn runSftp(
     var jail = try vfs_mod.Vfs.init(io, allocator, user.root);
     defer jail.deinit(allocator);
 
-    const start_ms = audit.nowMonotonicMs();
+    const start_ms = sys.monotonicMs();
     var state = SftpState{
         .io = io,
         .allocator = allocator,
@@ -168,7 +163,7 @@ pub fn runSftp(
     };
     try acceptInitPayload(first_payload);
     try wire.writeVersion(channel);
-    state.last_activity_ms = audit.nowMonotonicMs();
+    state.last_activity_ms = sys.monotonicMs();
 
     while (true) {
         const payload = readPacketTimed(&state, payload_buf) catch |err| switch (err) {
@@ -209,11 +204,11 @@ pub fn runSftp(
                 return;
             },
         };
-        state.last_activity_ms = audit.nowMonotonicMs();
+        state.last_activity_ms = sys.monotonicMs();
         if (payload.len < 5) return error.LibsshFailure;
 
         const msg_type = payload[0];
-        const request_id = wire.readU32(payload[1..5]);
+        const request_id = std.mem.readInt(u32, payload[1..5], .big);
         switch (msg_type) {
             c.SSH_FXP_REALPATH => try state.handleRealpath(request_id, payload[5..]),
             c.SSH_FXP_STAT, c.SSH_FXP_LSTAT => try state.handleStat(request_id, payload[5..]),
@@ -319,7 +314,7 @@ const SftpState = struct {
     ) void {
         var buf: [320]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        const duration_ms: i64 = audit.nowMonotonicMs() - self.session_started_ms;
+        const duration_ms: i64 = sys.monotonicMs() - self.session_started_ms;
         w.writeAll(reason) catch {};
         w.print(" (duration_ms={d}", .{duration_ms}) catch {};
         if (self.spurious_eof_count != 0) {
@@ -356,8 +351,8 @@ const SftpState = struct {
                 if (vpath) |p| {
                     v.mode = policy.policyDerivedMode(self.user, p, real.mode);
                 } else {
-                    const file_type = real.mode & 0o170000;
-                    const is_dir = file_type == 0o040000;
+                    const file_type = real.mode & listing.S_IFMT;
+                    const is_dir = file_type == listing.S_IFDIR;
                     const owner: u32 = if (is_dir) 0o7 else 0o6;
                     v.mode = file_type | (owner << 6) | (owner << 3);
                 }
@@ -407,7 +402,7 @@ const SftpState = struct {
             switch (handle.kind) {
                 .file => {
                     // No path: the handle's own access is the truth.
-                    const file_type = info.mode & 0o170000;
+                    const file_type = info.mode & listing.S_IFMT;
                     var owner: u32 = 0;
                     if (handle.can_read) owner |= 0o4;
                     if (handle.can_write) owner |= 0o2;
@@ -501,7 +496,7 @@ const SftpState = struct {
 
         const dir_fd = handle.dir.?.handle;
         // One reference time per batch for "recent" vs "old" dates.
-        const now_secs: i64 = nowUnixSecs();
+        const now_secs: i64 = sys.realtime().sec;
 
         // `addDirHandle` always sets it.
         const dir_vpath = handle.dir_vpath orelse {
@@ -595,7 +590,7 @@ const SftpState = struct {
         var vbuf: [vfs_mod.max_virtual_path_bytes + 2]u8 = undefined;
         path.value = (try self.normalizedPath(request_id, path.value, &vbuf)) orelse return;
         if (cursor.len < 4) return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad flags");
-        const flags = wire.readU32(cursor[0..4]);
+        const flags = std.mem.readInt(u32, cursor[0..4], .big);
 
         // WRITE/APPEND/CREAT/TRUNC all imply write access.
         const want_write = (flags & @as(u32, @intCast(
@@ -674,7 +669,7 @@ const SftpState = struct {
                 };
 
                 var staging_name_buf: [32]u8 = undefined;
-                generateStagingName(&staging_name_buf) catch {
+                generateStagingName(self.io, &staging_name_buf) catch {
                     // Never fall back to a predictable name.
                     defer self.auditFailed(op_label, path.value, "no entropy for staging name");
                     return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "open failed");
@@ -819,8 +814,8 @@ const SftpState = struct {
         const id = wire.parseHandleId(cursor) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
         cursor = cursor[8..];
         if (cursor.len < 12) return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad read");
-        const offset = wire.readU64(cursor[0..8]);
-        const len = @min(wire.readU32(cursor[8..12]), 32 * 1024);
+        const offset = std.mem.readInt(u64, cursor[0..8], .big);
+        const len = @min(std.mem.readInt(u32, cursor[8..12], .big), 32 * 1024);
         const handle = self.findHandle(id, .file) orelse return wire.replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
 
         // Above i64 max, std's pread path would panic in a safe build.
@@ -850,7 +845,7 @@ const SftpState = struct {
         const id = wire.parseHandleId(cursor) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad handle");
         cursor = cursor[8..];
         if (cursor.len < 8) return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad write");
-        const client_offset = wire.readU64(cursor[0..8]);
+        const client_offset = std.mem.readInt(u64, cursor[0..8], .big);
         const data = wire.parseString(cursor[8..]) catch return wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad data");
         const handle = self.findHandle(id, .file) orelse return wire.replyStatus(self.channel, request_id, c.SSH_FX_INVALID_HANDLE, "bad handle");
 
@@ -1388,7 +1383,7 @@ const SftpState = struct {
         defer dir.close(self.io);
 
         const age_floor_ms: i64 = @max(@as(i64, @intCast(self.idle_timeout_ms)), staging_orphan_min_age_ms);
-        const now_secs = nowUnixSecs();
+        const now_secs = sys.realtime().sec;
         const min_age_secs: i64 = @divTrunc(age_floor_ms + 999, 1000);
 
         var it = dir.iterate();
@@ -1496,63 +1491,10 @@ const SftpState = struct {
 
     /// 32 hex chars from 16 CSPRNG bytes; collisions are negligible.
     /// Fails rather than ever produce a predictable name.
-    fn generateStagingName(out: *[32]u8) !void {
+    fn generateStagingName(io: std.Io, out: *[32]u8) !void {
         var raw: [16]u8 = undefined;
-        try fillRandomBytes(&raw);
-        const hex = "0123456789abcdef";
-        for (raw, 0..) |b, i| {
-            out[i * 2 + 0] = hex[(b >> 4) & 0xF];
-            out[i * 2 + 1] = hex[b & 0xF];
-        }
-    }
-
-    fn fillRandomBytes(buf: []u8) !void {
-        if (builtin.os.tag == .linux) {
-            var filled: usize = 0;
-            while (filled < buf.len) {
-                const rc = std.os.linux.getrandom(
-                    buf.ptr + filled,
-                    buf.len - filled,
-                    0,
-                );
-                switch (std.os.linux.errno(rc)) {
-                    .SUCCESS => {
-                        if (rc == 0) return error.RandomFailed;
-                        filled += @intCast(rc);
-                    },
-                    .INTR => continue,
-                    .NOSYS => return readFromUrandom(buf[filled..]),
-                    else => return error.RandomFailed,
-                }
-            }
-        } else {
-            std.c.arc4random_buf(buf.ptr, buf.len);
-        }
-    }
-
-    fn readFromUrandom(buf: []u8) !void {
-        const linux = std.os.linux;
-        const path: [*:0]const u8 = "/dev/urandom";
-        const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
-        switch (linux.errno(fd_rc)) {
-            .SUCCESS => {},
-            else => return error.RandomFailed,
-        }
-        const fd: i32 = @intCast(fd_rc);
-        defer _ = linux.close(fd);
-
-        var filled: usize = 0;
-        while (filled < buf.len) {
-            const rc = linux.read(fd, buf.ptr + filled, buf.len - filled);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {
-                    if (rc == 0) return error.RandomFailed;
-                    filled += @intCast(rc);
-                },
-                .INTR => continue,
-                else => return error.RandomFailed,
-            }
-        }
+        try io.randomSecure(&raw);
+        out.* = std.fmt.bytesToHex(raw, .lower);
     }
 
     fn nextHandleId(self: *SftpState) !u32 {
@@ -1596,14 +1538,14 @@ const SftpState = struct {
 fn readPacketTimed(state: *SftpState, payload_buf: []u8) ![]u8 {
     var len_buf: [4]u8 = undefined;
     try readExactTimed(state, &len_buf);
-    const len = wire.readU32(&len_buf);
+    const len = std.mem.readInt(u32, &len_buf, .big);
 
     // Oversized: reply BAD_MESSAGE to the request, then end the session,
     // since resyncing would mean draining attacker-sized input.
     if (len > payload_buf.len) {
         var head: [5]u8 = undefined;
         readExactTimed(state, &head) catch return error.LibsshFailure;
-        const request_id = wire.readU32(head[1..5]);
+        const request_id = std.mem.readInt(u32, head[1..5], .big);
         wire.replyStatus(state.channel, request_id, c.SSH_FX_BAD_MESSAGE, "packet too large") catch {};
         return error.LibsshFailure;
     }
@@ -1665,7 +1607,7 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
                     return error.LibsshFailure;
                 }
                 if (state.idle_timeout_ms != 0) {
-                    const elapsed: i64 = audit.nowMonotonicMs() - state.last_activity_ms;
+                    const elapsed: i64 = sys.monotonicMs() - state.last_activity_ms;
                     if (elapsed >= @as(i64, @intCast(state.idle_timeout_ms))) {
                         return error.IdleTimeout;
                     }
@@ -1676,7 +1618,7 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
         }
         if (n == c.SSH_AGAIN) {
             if (state.idle_timeout_ms != 0) {
-                const elapsed: i64 = audit.nowMonotonicMs() - state.last_activity_ms;
+                const elapsed: i64 = sys.monotonicMs() - state.last_activity_ms;
                 if (elapsed >= @as(i64, @intCast(state.idle_timeout_ms))) {
                     return error.IdleTimeout;
                 }
@@ -1691,7 +1633,7 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
 
 fn acceptInitPayload(payload: []const u8) error{LibsshFailure}!void {
     if (payload.len < 5 or payload[0] != c.SSH_FXP_INIT) return error.LibsshFailure;
-    if (wire.readU32(payload[1..5]) < 3) return error.LibsshFailure;
+    if (std.mem.readInt(u32, payload[1..5], .big) < 3) return error.LibsshFailure;
 }
 
 fn handleIdAvailable(next_handle: u32) bool {

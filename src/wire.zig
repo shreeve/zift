@@ -32,9 +32,9 @@ pub fn parentErrorStatus(err: anyerror) c_int {
 
 pub fn writeVersion(channel: c.ssh_channel) !void {
     var buf: [9]u8 = undefined;
-    writeU32(buf[0..4], 5);
+    std.mem.writeInt(u32, buf[0..4], 5, .big);
     buf[4] = @intCast(c.SSH_FXP_VERSION);
-    writeU32(buf[5..9], 3);
+    std.mem.writeInt(u32, buf[5..9], 3, .big);
     try writeAll(channel, &buf);
 }
 
@@ -68,7 +68,7 @@ pub fn replyNames(channel: c.ssh_channel, request_id: u32, entries: []const DirE
 
 pub fn replyHandle(channel: c.ssh_channel, request_id: u32, id: u32) !void {
     var handle_bytes: [4]u8 = undefined;
-    writeU32(&handle_bytes, id);
+    std.mem.writeInt(u32, &handle_bytes, id, .big);
 
     var buf: [64]u8 = undefined;
     var w: PacketWriter = .{ .buf = &buf };
@@ -90,11 +90,11 @@ pub fn replyFullAttrs(channel: c.ssh_channel, request_id: u32, info: listing.Ent
 pub fn replyData(channel: c.ssh_channel, request_id: u32, data: []const u8) !void {
     var header_payload: [9]u8 = undefined;
     header_payload[0] = @intCast(c.SSH_FXP_DATA);
-    writeU32(header_payload[1..5], request_id);
-    writeU32(header_payload[5..9], @intCast(data.len));
+    std.mem.writeInt(u32, header_payload[1..5], request_id, .big);
+    std.mem.writeInt(u32, header_payload[5..9], @intCast(data.len), .big);
 
     var header: [4]u8 = undefined;
-    writeU32(&header, @intCast(header_payload.len + data.len));
+    std.mem.writeInt(u32, &header, @intCast(header_payload.len + data.len), .big);
     try writeAll(channel, &header);
     try writeAll(channel, &header_payload);
     try writeAll(channel, data);
@@ -115,7 +115,7 @@ pub fn replyStatus(channel: c.ssh_channel, request_id: u32, status: c_int, messa
 fn writeDirAttrs(w: *PacketWriter) !void {
     try w.putU32(@intCast(c.SSH_FILEXFER_ATTR_SIZE | c.SSH_FILEXFER_ATTR_PERMISSIONS));
     try w.putU64(0);
-    try w.putU32(@intCast(c.SSH_S_IFDIR | 0o755));
+    try w.putU32(listing.S_IFDIR | 0o755);
 }
 
 /// SIZE, UIDGID, PERMISSIONS (with file-type bits), and ACMODTIME.
@@ -140,7 +140,7 @@ pub fn writeFullAttrs(w: *PacketWriter, info: listing.EntryInfo) !void {
 
 pub fn writePayload(channel: c.ssh_channel, payload: []const u8) !void {
     var header: [4]u8 = undefined;
-    writeU32(&header, @intCast(payload.len));
+    std.mem.writeInt(u32, &header, @intCast(payload.len), .big);
     try writeAll(channel, &header);
     try writeAll(channel, payload);
 }
@@ -170,20 +170,13 @@ pub const PacketWriter = struct {
 
     fn putU32(self: *PacketWriter, value: u32) !void {
         if (self.index + 4 > self.buf.len) return error.LibsshFailure;
-        writeU32(self.buf[self.index .. self.index + 4], value);
+        std.mem.writeInt(u32, self.buf[self.index..][0..4], value, .big);
         self.index += 4;
     }
 
     fn putU64(self: *PacketWriter, value: u64) !void {
         if (self.index + 8 > self.buf.len) return error.LibsshFailure;
-        self.buf[self.index] = @intCast((value >> 56) & 0xff);
-        self.buf[self.index + 1] = @intCast((value >> 48) & 0xff);
-        self.buf[self.index + 2] = @intCast((value >> 40) & 0xff);
-        self.buf[self.index + 3] = @intCast((value >> 32) & 0xff);
-        self.buf[self.index + 4] = @intCast((value >> 24) & 0xff);
-        self.buf[self.index + 5] = @intCast((value >> 16) & 0xff);
-        self.buf[self.index + 6] = @intCast((value >> 8) & 0xff);
-        self.buf[self.index + 7] = @intCast(value & 0xff);
+        std.mem.writeInt(u64, self.buf[self.index..][0..8], value, .big);
         self.index += 8;
     }
 
@@ -195,24 +188,6 @@ pub const PacketWriter = struct {
     }
 };
 
-pub fn readU32(bytes: []const u8) u32 {
-    return (@as(u32, bytes[0]) << 24) |
-        (@as(u32, bytes[1]) << 16) |
-        (@as(u32, bytes[2]) << 8) |
-        @as(u32, bytes[3]);
-}
-
-pub fn readU64(bytes: []const u8) u64 {
-    return (@as(u64, bytes[0]) << 56) |
-        (@as(u64, bytes[1]) << 48) |
-        (@as(u64, bytes[2]) << 40) |
-        (@as(u64, bytes[3]) << 32) |
-        (@as(u64, bytes[4]) << 24) |
-        (@as(u64, bytes[5]) << 16) |
-        (@as(u64, bytes[6]) << 8) |
-        @as(u64, bytes[7]);
-}
-
 pub const ParsedString = struct {
     value: []const u8,
     rest: []const u8,
@@ -221,7 +196,7 @@ pub const ParsedString = struct {
 pub fn parseString(payload: []const u8) !ParsedString {
     if (payload.len < 4) return error.LibsshFailure;
     // Widen before adding: `4 + len` in u32 overflows for a hostile len.
-    const len: usize = readU32(payload[0..4]);
+    const len: usize = std.mem.readInt(u32, payload[0..4], .big);
     const end = 4 + len;
     if (payload.len < end) return error.LibsshFailure;
     return .{
@@ -233,14 +208,7 @@ pub fn parseString(payload: []const u8) !ParsedString {
 pub fn parseHandleId(payload: []const u8) !u32 {
     const parsed = try parseString(payload);
     if (parsed.value.len != 4) return error.LibsshFailure;
-    return readU32(parsed.value);
-}
-
-pub fn writeU32(out: []u8, value: u32) void {
-    out[0] = @intCast((value >> 24) & 0xff);
-    out[1] = @intCast((value >> 16) & 0xff);
-    out[2] = @intCast((value >> 8) & 0xff);
-    out[3] = @intCast(value & 0xff);
+    return std.mem.readInt(u32, parsed.value[0..4], .big);
 }
 
 const testing = std.testing;
@@ -266,7 +234,7 @@ test "parseString: max-u32 length does not overflow (regression)" {
     // In u32, `4 + len` overflows here and a safe build panics.
     inline for ([_]u32{ 0xFFFF_FFFF, 0xFFFF_FFFE, 0xFFFF_FFFD, 0xFFFF_FFFC, 0x8000_0000 }) |big| {
         var payload: [8]u8 = undefined;
-        writeU32(payload[0..4], big);
+        std.mem.writeInt(u32, payload[0..4], big, .big);
         payload[4] = 1;
         payload[5] = 2;
         payload[6] = 3;
@@ -283,6 +251,6 @@ test "parseHandleId: requires exactly 4 payload bytes" {
     try testing.expectError(error.LibsshFailure, parseHandleId(&wrong_len));
 
     var overflow: [8]u8 = undefined;
-    writeU32(overflow[0..4], 0xFFFF_FFFF);
+    std.mem.writeInt(u32, overflow[0..4], 0xFFFF_FFFF, .big);
     try testing.expectError(error.LibsshFailure, parseHandleId(&overflow));
 }
