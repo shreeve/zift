@@ -23,25 +23,18 @@ pub var active_sessions: std.atomic.Value(u32) = .init(0);
 pub var unauth_sessions: std.atomic.Value(u32) = .init(0);
 
 /// The peer address (no port, no brackets) formatted into `buf`, or null.
-fn capturePeerIp(session: c.ssh_session, buf: []u8) ?[]const u8 {
-    const fd = c.ssh_get_fd(session);
-    if (fd < 0) return null;
-
-    var ss: std.posix.sockaddr.storage align(8) = undefined;
-    var ss_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    std.posix.getpeername(fd, @ptrCast(@alignCast(&ss)), &ss_len) catch return null;
-
-    const family = @as(*const std.posix.sockaddr, @ptrCast(@alignCast(&ss))).family;
+fn formatPeer(ss: *const std.posix.sockaddr.storage, buf: []u8) ?[]const u8 {
+    const family = @as(*const std.posix.sockaddr, @ptrCast(ss)).family;
     switch (family) {
         std.posix.AF.INET => {
-            const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&ss));
+            const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(ss));
             const bytes: [4]u8 = @bitCast(sa.addr);
             return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
                 bytes[0], bytes[1], bytes[2], bytes[3],
             }) catch null;
         },
         std.posix.AF.INET6 => {
-            const sa: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&ss));
+            const sa: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(ss));
             return formatIPv6(&sa.addr, buf);
         },
         else => return null,
@@ -60,6 +53,83 @@ fn formatIPv6(addr: *const [16]u8, buf: []u8) ?[]const u8 {
         std.mem.readInt(u16, addr[12..14], .big),
         std.mem.readInt(u16, addr[14..16], .big),
     }) catch null;
+}
+
+/// Why a new connection from `peer_ip` is refused, or null to admit it.
+fn refusal(io: std.Io, cfg: config.ServerConfig, peer_ip: []const u8) ?[]const u8 {
+    if (abuse.isSuppressed(io, peer_ip, sys.monotonicMs())) return "source suppressed";
+    if (active_sessions.load(.acquire) >= cfg.max_connections) return "max-connections reached";
+    // 0 = no separate pre-auth cap.
+    if (cfg.max_unauth_connections != 0 and
+        unauth_sessions.load(.acquire) >= cfg.max_unauth_connections)
+    {
+        return "max-unauth-connections reached";
+    }
+    return null;
+}
+
+/// Hand an accepted connection to a detached worker. On error `fd` is
+/// closed and every reservation released.
+fn startSession(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    active: *ActiveConfig,
+    bind: c.ssh_bind,
+    fd: c_int,
+    ip_buf: [64]u8,
+    ip_len: u8,
+) !void {
+    const session = c.ssh_new() orelse {
+        _ = std.c.close(fd);
+        return error.OutOfMemory;
+    };
+    if (c.ssh_bind_accept_fd(bind, session, fd) != c.SSH_OK) {
+        // Out of memory only. By now libssh may or may not own `fd`, and
+        // may have left the session's socket half-built, so close the fd
+        // and leak the session rather than risk a double close or free.
+        logLibsshError(io, "ssh_bind_accept_fd", bind, .note);
+        _ = std.c.close(fd);
+        return error.LibsshFailure;
+    }
+    errdefer c.ssh_free(session); // closes fd
+
+    // Registered here, not in the worker, so a drain that starts before
+    // the worker runs still force-closes it.
+    try signals.registerSessionFd(io, allocator, fd);
+    errdefer signals.unregisterSessionFd(io, fd);
+
+    const args = try allocator.create(SessionArgs);
+    errdefer allocator.destroy(args);
+    const ref = active.acquire();
+    errdefer ref.release(allocator);
+    args.* = .{
+        .io = io,
+        .allocator = allocator,
+        .config_ref = ref,
+        .session = session,
+        .session_fd = fd,
+        .login_deadline_ms = sys.monotonicMs() + ssh.login_grace_ms,
+        .ip_buf = ip_buf,
+        .ip_len = ip_len,
+    };
+
+    // Reserve both slots before spawn so the next accept sees them. The
+    // worker releases the pre-auth slot at auth (or exit) and the total
+    // slot at exit.
+    _ = active_sessions.fetchAdd(1, .acq_rel);
+    errdefer _ = active_sessions.fetchSub(1, .acq_rel);
+    _ = unauth_sessions.fetchAdd(1, .acq_rel);
+    errdefer _ = unauth_sessions.fetchSub(1, .acq_rel);
+
+    const thread = try std.Thread.spawn(.{}, sessionThread, .{args});
+    thread.detach();
+}
+
+fn setNonblocking(fd: c_int, on: bool) void {
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL);
+    if (flags < 0) return;
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.c.fcntl(fd, std.posix.F.SETFL, if (on) flags | nonblock else flags & ~nonblock);
 }
 
 pub fn run(
@@ -109,14 +179,16 @@ pub fn run(
     try setBindOption(bind, c.SSH_BIND_OPTIONS_HOSTKEY, host_key.ptr);
 
     if (c.ssh_bind_listen(bind) != c.SSH_OK) {
-        try logLibsshError(io, "ssh_bind_listen", bind, .note);
+        logLibsshError(io, "ssh_bind_listen", bind, .note);
         return error.LibsshFailure;
     }
 
-    // Poll libssh's listening fd so signals are seen within a second
-    // instead of waiting behind a blocking ssh_bind_accept.
-    c.ssh_bind_set_blocking(bind, 0);
+    // Zift polls and accepts on libssh's listening fd itself: signals
+    // are seen within a second, the peer address comes with the accept,
+    // and a refused connection is just closed. Non-blocking, so a
+    // connection reset between poll and accept cannot stall the loop.
     const bind_fd = c.ssh_bind_get_fd(bind);
+    setNonblocking(bind_fd, true);
     var pfd = [1]std.posix.pollfd{.{
         .fd = bind_fd,
         .events = std.posix.POLL.IN,
@@ -128,6 +200,7 @@ pub fn run(
     // mtime polling every `reload-interval`; 0 leaves only SIGHUP.
     var next_reload_ms: i64 = sys.monotonicMs() +
         @as(i64, @intCast(active.current.config.server.reload_interval_ms));
+    var accept_backoff_ms: i64 = 0;
 
     accept_loop: while (true) {
         if (signals.shutdown_requested.load(.acquire)) break :accept_loop;
@@ -150,131 +223,79 @@ pub fn run(
         const ready = std.posix.poll(&pfd, 1000) catch continue :accept_loop;
         if (ready == 0) continue :accept_loop;
 
-        const session = c.ssh_new() orelse return error.LibsshFailure;
-        const accept_rc = c.ssh_bind_accept(bind, session);
-        if (accept_rc != c.SSH_OK) {
-            try logLibsshError(io, "ssh_bind_accept", bind, .note);
-            c.ssh_free(session);
+        var ss: std.posix.sockaddr.storage align(8) = undefined;
+        var ss_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        const fd = std.c.accept(bind_fd, @ptrCast(&ss), &ss_len);
+        if (fd < 0) {
+            switch (std.posix.errno(fd)) {
+                .AGAIN, .INTR, .CONNABORTED => {},
+                else => |e| {
+                    // EMFILE and the like leave the connection queued, so
+                    // poll fires again at once: back off instead of spinning.
+                    accept_backoff_ms = std.math.clamp(accept_backoff_ms * 2, 10, 1000);
+                    sys.note(io, "zift: accept failed: E{s}\n", .{@tagName(e)}) catch {};
+                    std.Io.sleep(io, .fromMilliseconds(accept_backoff_ms), .awake) catch {};
+                },
+            }
             continue :accept_loop;
         }
+        accept_backoff_ms = 0;
+        // BSD sockets inherit O_NONBLOCK from the listener; libssh wants blocking.
+        setNonblocking(fd, false);
 
         var ip_buf: [64]u8 = undefined;
-        const peer_ip = capturePeerIp(session, &ip_buf) orelse "";
-
-        if (abuse.isSuppressed(io, peer_ip, sys.monotonicMs())) {
-            audit.log(io, null, "accept.rejected", null, .denied, "source suppressed", peer_ip);
-            c.ssh_disconnect(session);
-            c.ssh_free(session);
+        const peer_ip = formatPeer(&ss, &ip_buf) orelse "";
+        if (refusal(io, active.current.config.server, peer_ip)) |reason| {
+            audit.log(io, null, "accept.rejected", null, .denied, reason, peer_ip);
+            _ = std.c.close(fd);
             continue :accept_loop;
         }
-
-        const max = active.current.config.server.max_connections;
-        if (active_sessions.load(.acquire) >= max) {
-            audit.log(io, null, "accept.rejected", null, .denied, "max-connections reached", peer_ip);
-            c.ssh_disconnect(session);
-            c.ssh_free(session);
-            continue :accept_loop;
-        }
-
-        // 0 = no separate pre-auth cap.
-        const max_unauth_cfg = active.current.config.server.max_unauth_connections;
-        if (max_unauth_cfg != 0 and
-            unauth_sessions.load(.acquire) >= max_unauth_cfg)
-        {
-            audit.log(io, null, "accept.rejected", null, .denied, "max-unauth-connections reached", peer_ip);
-            c.ssh_disconnect(session);
-            c.ssh_free(session);
-            continue :accept_loop;
-        }
-
-        // Registered here, not in the worker, so a drain that starts
-        // before the worker runs still force-closes it.
-        const session_fd = c.ssh_get_fd(session);
-        signals.registerSessionFd(io, allocator, session_fd) catch |err| {
-            sys.note(io, "zift: cannot track session: {s}\n", .{@errorName(err)}) catch {};
-            c.ssh_free(session);
-            continue :accept_loop;
+        startSession(io, allocator, &active, bind, fd, ip_buf, @intCast(peer_ip.len)) catch |err| {
+            sys.note(io, "zift: cannot start session: {s}\n", .{@errorName(err)}) catch {};
         };
-
-        const ref = active.acquire();
-        const args = allocator.create(SessionArgs) catch |err| {
-            ref.release(allocator);
-            signals.unregisterSessionFd(io, session_fd);
-            c.ssh_free(session);
-            return err;
-        };
-        args.* = .{
-            .io = io,
-            .allocator = allocator,
-            .config_ref = ref,
-            .session = session,
-            .session_fd = session_fd,
-            .login_deadline_ms = sys.monotonicMs() + ssh.login_grace_ms,
-            .ip_buf = ip_buf,
-            .ip_len = @intCast(peer_ip.len),
-        };
-
-        // Reserve both slots before spawn so the next accept sees them.
-        // The worker releases the pre-auth slot at auth (or exit) and
-        // the total slot at exit.
-        _ = active_sessions.fetchAdd(1, .acq_rel);
-        _ = unauth_sessions.fetchAdd(1, .acq_rel);
-
-        const thread = std.Thread.spawn(.{}, sessionThread, .{args}) catch |err| {
-            _ = active_sessions.fetchSub(1, .acq_rel);
-            _ = unauth_sessions.fetchSub(1, .acq_rel);
-            // Before ssh_free: ssh_get_error reads the session.
-            try logLibsshError(io, @errorName(err), session, .note);
-            ref.release(allocator);
-            signals.unregisterSessionFd(io, session_fd);
-            c.ssh_free(session);
-            allocator.destroy(args);
-            continue :accept_loop;
-        };
-        thread.detach();
     }
-
-    // Graceful drain: wait up to `shutdown_grace_ms`, then shutdown(2)
-    // every remaining session socket so workers unblock and clean up.
-    try sys.note(io, "zift: shutdown signal received, draining sessions\n", .{});
 
     // Unbind now so no connection lands during the grace window. Then
     // clear libssh's copy of the fd: ssh_bind_free would close it again,
     // possibly hitting a descriptor a worker has since reused.
     _ = std.c.close(bind_fd);
     c.ssh_bind_set_fd(bind, @as(@TypeOf(bind_fd), -1));
+    drain(io, active.current.config.server.shutdown_grace_ms);
+    signals.deinitSessionRegistry(io, allocator);
+}
 
-    const grace_ms: i64 = @intCast(active.current.config.server.shutdown_grace_ms);
-    const drain_deadline = sys.monotonicMs() + grace_ms;
-    while (active_sessions.load(.acquire) != 0 and sys.monotonicMs() < drain_deadline) {
-        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+/// Wait up to `grace_ms` for sessions to end, then shutdown(2) every
+/// remaining session socket so workers unblock and clean up. Status
+/// lines are best effort: a failed stderr write must not skip the drain.
+fn drain(io: std.Io, grace_ms: u64) void {
+    sys.note(io, "zift: shutdown signal received, draining sessions\n", .{}) catch {};
+    if (waitForSessions(io, @intCast(grace_ms), 100)) {
+        sys.note(io, "zift: all sessions drained, exiting\n", .{}) catch {};
+        return;
     }
 
-    if (active_sessions.load(.acquire) == 0) {
-        try sys.note(io, "zift: all sessions drained, exiting\n", .{});
-    } else {
-        const closed = signals.forceCloseAll(io);
-        try sys.note(io, "zift: grace period expired, force-closing {d} session(s)\n", .{closed});
-
-        // Reads on a shut-down socket return at once; 500 ms is ample.
-        const final_deadline = sys.monotonicMs() + 500;
-        while (active_sessions.load(.acquire) != 0 and sys.monotonicMs() < final_deadline) {
-            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
-        }
-
-        const stragglers = active_sessions.load(.acquire);
-        if (stragglers == 0) {
-            try sys.note(io, "zift: all sessions drained after force-close, exiting\n", .{});
-        } else {
-            try sys.note(io, "zift: {d} session(s) still alive after force-close; exiting anyway\n", .{stragglers});
-        }
+    const closed = signals.forceCloseAll(io);
+    sys.note(io, "zift: grace period expired, force-closing {d} session(s)\n", .{closed}) catch {};
+    // Reads on a shut-down socket return at once; 500 ms is ample.
+    if (waitForSessions(io, 500, 20)) {
+        sys.note(io, "zift: all sessions drained after force-close, exiting\n", .{}) catch {};
+        return;
     }
 
-    // A straggler still calls `unregisterSessionFd`, so free the registry
-    // only when none remain; otherwise leak it to process exit.
-    if (active_sessions.load(.acquire) == 0) {
-        signals.deinitSessionRegistry(io, allocator);
+    // Returning would let main free the audit sink and finalize libssh
+    // under the stragglers' feet; end the process here instead.
+    sys.note(io, "zift: {d} session(s) still alive after force-close; exiting anyway\n", .{active_sessions.load(.acquire)}) catch {};
+    std.process.exit(0);
+}
+
+/// True once no session is active; false if `timeout_ms` passes first.
+fn waitForSessions(io: std.Io, timeout_ms: i64, step_ms: i64) bool {
+    const deadline = sys.monotonicMs() + timeout_ms;
+    while (active_sessions.load(.acquire) != 0) {
+        if (sys.monotonicMs() >= deadline) return false;
+        std.Io.sleep(io, .fromMilliseconds(step_ms), .awake) catch {};
     }
+    return true;
 }
 
 /// "stderr" or the file path, for the restart-only comparison.
@@ -531,7 +552,7 @@ fn sessionThread(args: *SessionArgs) void {
     var auth_completed = false;
     const ok = if (handleSession(io, allocator, ref.config, session, peer_ip, deadline_ms, &auth_completed)) true else |err| blk: {
         // The error text lives in the session, so read it before ssh_free.
-        logLibsshError(io, @errorName(err), session, .skip) catch {};
+        logLibsshError(io, @errorName(err), session, .skip);
         break :blk false;
     };
 
@@ -774,11 +795,12 @@ const NoDetail = enum {
     skip,
 };
 
-fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail: NoDetail) !void {
+/// Best effort: a failed stderr write is not worth failing a caller over.
+fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail: NoDetail) void {
     // Usually a non-null pointer to an empty string.
     const raw = c.ssh_get_error(handle);
     const detail: []const u8 = if (raw != null) std.mem.span(raw) else "";
     if (detail.len == 0 and no_detail == .skip) return;
 
-    try sys.note(io, "zift: {s}: {s}\n", .{ where, if (detail.len > 0) detail else "no detail from libssh" });
+    sys.note(io, "zift: {s}: {s}\n", .{ where, if (detail.len > 0) detail else "no detail from libssh" }) catch {};
 }
