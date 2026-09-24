@@ -85,121 +85,96 @@ fn statError(errno: anytype) StatError {
     };
 }
 
-/// Per-session uid/gid name cache, inline and allocation-free. Hosts have
-/// few owners, so a full cache just stops caching; nothing is evicted.
+/// Per-session uid/gid name cache for `listing-mode reality`, inline and
+/// allocation-free. Hosts have few owners, so a full cache stops caching
+/// and renders further ids as numbers; a name longer than
+/// `max_name_len` or a failed lookup renders as a number too.
 pub const NameResolver = struct {
     pub const max_entries: usize = 64;
     pub const max_name_len: usize = 32;
 
-    const Entry = struct {
-        id: u32,
-        len: u8,
-        valid: bool,
-        name: [max_name_len]u8,
-    };
-
-    user_count: u8 = 0,
-    user_entries: [max_entries]Entry = std.mem.zeroes([max_entries]Entry),
-    group_count: u8 = 0,
-    group_entries: [max_entries]Entry = std.mem.zeroes([max_entries]Entry),
+    users: Cache = .{},
+    groups: Cache = .{},
 
     /// The user name, or the number rendered into `numeric_buf`.
     pub fn user(self: *NameResolver, uid: u32, numeric_buf: []u8) []const u8 {
-        // Index, don't iterate by value: the returned slice must point
-        // into the cache, not a loop-local copy.
-        var i: usize = 0;
-        while (i < self.user_count) : (i += 1) {
-            if (self.user_entries[i].id == uid) {
-                if (!self.user_entries[i].valid) {
-                    return std.fmt.bufPrint(numeric_buf, "{d}", .{uid}) catch numeric_buf[0..0];
-                }
-                return self.user_entries[i].name[0..self.user_entries[i].len];
-            }
-        }
-        const name = lookupUid(uid);
-        if (self.user_count < self.user_entries.len) {
-            const slot_index = self.user_count;
-            self.user_count += 1;
-            const slot = &self.user_entries[slot_index];
-            slot.id = uid;
-            slot.valid = name != null;
-            if (name) |n| {
-                const copy = @min(n.len, max_name_len);
-                @memcpy(slot.name[0..copy], n[0..copy]);
-                slot.len = @intCast(copy);
-                return self.user_entries[slot_index].name[0..self.user_entries[slot_index].len];
-            }
-        } else if (name) |n| {
-            return copyToBuf(numeric_buf, n);
-        }
-        return std.fmt.bufPrint(numeric_buf, "{d}", .{uid}) catch numeric_buf[0..0];
+        return self.users.name(uid, numeric_buf, lookupUser);
     }
 
     pub fn group(self: *NameResolver, gid: u32, numeric_buf: []u8) []const u8 {
-        var i: usize = 0;
-        while (i < self.group_count) : (i += 1) {
-            if (self.group_entries[i].id == gid) {
-                if (!self.group_entries[i].valid) {
-                    return std.fmt.bufPrint(numeric_buf, "{d}", .{gid}) catch numeric_buf[0..0];
-                }
-                return self.group_entries[i].name[0..self.group_entries[i].len];
-            }
-        }
-        const name = lookupGid(gid);
-        if (self.group_count < self.group_entries.len) {
-            const slot_index = self.group_count;
-            self.group_count += 1;
-            const slot = &self.group_entries[slot_index];
-            slot.id = gid;
-            slot.valid = name != null;
-            if (name) |n| {
-                const copy = @min(n.len, max_name_len);
-                @memcpy(slot.name[0..copy], n[0..copy]);
-                slot.len = @intCast(copy);
-                return self.group_entries[slot_index].name[0..self.group_entries[slot_index].len];
-            }
-        } else if (name) |n| {
-            return copyToBuf(numeric_buf, n);
-        }
-        return std.fmt.bufPrint(numeric_buf, "{d}", .{gid}) catch numeric_buf[0..0];
+        return self.groups.name(gid, numeric_buf, lookupGroup);
     }
+
+    const Cache = struct {
+        count: usize = 0,
+        entries: [max_entries]Entry = undefined,
+
+        const Entry = struct {
+            id: u32,
+            /// 0 when the lookup failed.
+            len: u8,
+            name: [max_name_len]u8,
+        };
+
+        fn name(
+            self: *Cache,
+            id: u32,
+            numeric_buf: []u8,
+            comptime lookup: fn (u32, *[max_name_len]u8) ?[]const u8,
+        ) []const u8 {
+            const entry = for (self.entries[0..self.count]) |*e| {
+                if (e.id == id) break e;
+            } else blk: {
+                if (self.count == max_entries) break :blk null;
+                const e = &self.entries[self.count];
+                self.count += 1;
+                e.id = id;
+                e.len = if (lookup(id, &e.name)) |found| @intCast(found.len) else 0;
+                break :blk e;
+            };
+            if (entry) |e| if (e.len > 0) return e.name[0..e.len];
+            return std.fmt.bufPrint(numeric_buf, "{d}", .{id}) catch numeric_buf[0..0];
+        }
+    };
 };
 
-fn copyToBuf(buf: []u8, src: []const u8) []const u8 {
-    const n = @min(buf.len, src.len);
-    @memcpy(buf[0..n], src[0..n]);
-    return buf[0..n];
+fn lookupUser(uid: u32, out: *[NameResolver.max_name_len]u8) ?[]const u8 {
+    return lookupName(std.c.passwd, std.c.getpwuid_r, uid, out, 4096);
 }
 
-/// `getpwuid_r` into thread-local buffers; null on any failure.
-fn lookupUid(uid: u32) ?[]const u8 {
-    const S = struct {
-        threadlocal var pwd: std.c.passwd = undefined;
-        threadlocal var buf: [1024]u8 = undefined;
-        threadlocal var name: [NameResolver.max_name_len]u8 = undefined;
-    };
-    var result: ?*std.c.passwd = null;
-    if (std.c.getpwuid_r(uid, &S.pwd, &S.buf, S.buf.len, &result) != 0) return null;
-    const r = result orelse return null;
-    const pw_name = std.mem.span(@as([*:0]const u8, @ptrCast(r.name)));
-    if (pw_name.len == 0 or pw_name.len > S.name.len) return null;
-    @memcpy(S.name[0..pw_name.len], pw_name);
-    return S.name[0..pw_name.len];
+fn lookupGroup(gid: u32, out: *[NameResolver.max_name_len]u8) ?[]const u8 {
+    return lookupName(std.c.group, std.c.getgrgid_r, gid, out, 4096);
 }
 
-fn lookupGid(gid: u32) ?[]const u8 {
-    const S = struct {
-        threadlocal var grp: std.c.group = undefined;
-        threadlocal var buf: [1024]u8 = undefined;
-        threadlocal var name: [NameResolver.max_name_len]u8 = undefined;
-    };
-    var result: ?*std.c.group = null;
-    if (std.c.getgrgid_r(gid, &S.grp, &S.buf, S.buf.len, &result) != 0) return null;
-    const r = result orelse return null;
-    const gr_name = std.mem.span(@as([*:0]const u8, @ptrCast(r.name)));
-    if (gr_name.len == 0 or gr_name.len > S.name.len) return null;
-    @memcpy(S.name[0..gr_name.len], gr_name);
-    return S.name[0..gr_name.len];
+/// `getpwuid_r`/`getgrgid_r` into `out`. A record that overflows the
+/// scratch buffer (a group with many members) retries with a larger
+/// heap buffer, up to 1 MiB. Null on any failure.
+fn lookupName(
+    comptime Record: type,
+    comptime getById: anytype,
+    id: u32,
+    out: *[NameResolver.max_name_len]u8,
+    comptime initial_len: usize,
+) ?[]const u8 {
+    var stack_buf: [initial_len]u8 = undefined;
+    var buf: []u8 = &stack_buf;
+    defer if (buf.len > initial_len) std.heap.page_allocator.free(buf);
+    while (true) {
+        var record: Record = undefined;
+        var result: ?*Record = null;
+        const rc = getById(id, &record, buf.ptr, buf.len, &result);
+        if (rc == @intFromEnum(std.posix.E.RANGE) and buf.len < 1 << 20) {
+            const bigger = std.heap.page_allocator.alloc(u8, buf.len * 4) catch return null;
+            if (buf.len > initial_len) std.heap.page_allocator.free(buf);
+            buf = bigger;
+            continue;
+        }
+        if (rc != 0) return null;
+        const name = std.mem.span((result orelse return null).name orelse return null);
+        if (name.len == 0 or name.len > out.len) return null;
+        @memcpy(out[0..name.len], name);
+        return out[0..name.len];
+    }
 }
 
 /// A GNU `ls -l` style line (see the module doc) into `out`, which
@@ -479,4 +454,28 @@ test "statAt and statFd report the same entry, and map errors" {
     try std.testing.expectError(error.NotFound, statAt(tmp.dir.handle, "f/under-a-file"));
     try std.testing.expectError(error.NameTooLong, statAt(tmp.dir.handle, "n" ** (max_name_bytes + 1)));
     try std.testing.expectError(error.NotFound, statAt(tmp.dir.handle, "n" ** max_name_bytes));
+}
+
+test "NameResolver: names, numbers, and a scratch buffer too small to start" {
+    var resolver: NameResolver = .{};
+    var numeric: [16]u8 = undefined;
+    const uid = std.c.getuid();
+    var expected_buf: [NameResolver.max_name_len]u8 = undefined;
+    const expected = lookupUser(uid, &expected_buf) orelse return error.SkipZigTest;
+
+    try std.testing.expectEqualStrings(expected, resolver.user(uid, &numeric));
+    // Cached: the same bytes come back without a lookup.
+    try std.testing.expectEqual(resolver.user(uid, &numeric).ptr, resolver.user(uid, &numeric).ptr);
+    // No such id: rendered as a number, and remembered as such.
+    try std.testing.expectEqualStrings("4000000000", resolver.group(4_000_000_000, &numeric));
+    try std.testing.expectEqualStrings("4000000000", resolver.group(4_000_000_000, &numeric));
+
+    // ERANGE from an 8-byte scratch buffer retries with a larger one.
+    var small_buf: [NameResolver.max_name_len]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, lookupName(std.c.passwd, std.c.getpwuid_r, uid, &small_buf, 8).?);
+    var group_buf: [NameResolver.max_name_len]u8 = undefined;
+    var group_small: [NameResolver.max_name_len]u8 = undefined;
+    if (lookupGroup(std.c.getgid(), &group_buf)) |group_name| {
+        try std.testing.expectEqualStrings(group_name, lookupName(std.c.group, std.c.getgrgid_r, std.c.getgid(), &group_small, 8).?);
+    }
 }
