@@ -2,25 +2,22 @@
 //! length-prefixed string parser (client-controlled, so bounds-checked).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("libssh");
 const listing = @import("listing.zig");
 
 pub const sftp_max_packet_bytes: usize = 256 * 1024;
 
-pub const DirEntry = struct {
-    name_buf: [256]u8 = undefined,
-    name_len: usize = 0,
-    longname_buf: [320]u8 = undefined,
-    longname_len: usize = 0,
-    info: listing.EntryInfo = .{
-        .mode = 0,
-        .nlink = 0,
-        .uid = 0,
-        .gid = 0,
-        .size = 0,
-        .mtime_secs = 0,
-    },
-};
+/// The longest file name READDIR can meet: NAME_MAX bytes, except that
+/// APFS counts 255 UTF-16 units, which is up to 765 bytes of UTF-8.
+pub const max_name_bytes: usize = if (builtin.os.tag.isDarwin()) 255 * 3 else std.fs.max_name_bytes;
+
+/// A READDIR longname: fixed-width `ls -l` fields (under 160 bytes even
+/// with a 64-byte user name), then the name.
+pub const max_longname_bytes: usize = 256 + max_name_bytes;
+
+/// Name, longname, and a full attribute block, each length-prefixed.
+const max_name_entry_bytes: usize = 4 + max_name_bytes + 4 + max_longname_bytes + 32;
 
 pub fn parentErrorStatus(err: anyerror) c_int {
     return switch (err) {
@@ -51,20 +48,37 @@ pub fn replyName(channel: c.ssh_channel, request_id: u32, name: []const u8) !voi
     try writePayload(channel, w.written());
 }
 
-pub fn replyNames(channel: c.ssh_channel, request_id: u32, entries: []const DirEntry) !void {
-    // Room for a READDIR batch of 16 at ~620 bytes each.
-    var buf: [32 * 1024]u8 = undefined;
-    var w: PacketWriter = .{ .buf = &buf };
-    try w.putU8(@intCast(c.SSH_FXP_NAME));
-    try w.putU32(request_id);
-    try w.putU32(@intCast(entries.len));
-    for (entries) |entry| {
-        try w.string(entry.name_buf[0..@min(entry.name_len, entry.name_buf.len)]);
-        try w.string(entry.longname_buf[0..@min(entry.longname_len, entry.longname_buf.len)]);
-        try writeFullAttrs(&w, entry.info);
+/// A READDIR reply built in place: `begin`, `add` entries while
+/// `hasRoom`, then `send`.
+pub const NameBatch = struct {
+    w: PacketWriter,
+    count: u32 = 0,
+
+    pub fn begin(buf: []u8, request_id: u32) !NameBatch {
+        var w: PacketWriter = .{ .buf = buf };
+        try w.putU8(@intCast(c.SSH_FXP_NAME));
+        try w.putU32(request_id);
+        try w.putU32(0);
+        return .{ .w = w };
     }
-    try writePayload(channel, w.written());
-}
+
+    /// Room for one more entry of the largest possible size.
+    pub fn hasRoom(self: *const NameBatch) bool {
+        return self.w.buf.len - self.w.index >= max_name_entry_bytes;
+    }
+
+    pub fn add(self: *NameBatch, name: []const u8, longname: []const u8, info: listing.EntryInfo) !void {
+        try self.w.string(name);
+        try self.w.string(longname);
+        try writeFullAttrs(&self.w, info);
+        self.count += 1;
+    }
+
+    pub fn send(self: *NameBatch, channel: c.ssh_channel) !void {
+        std.mem.writeInt(u32, self.w.buf[5..9], self.count, .big);
+        try writePayload(channel, self.w.written());
+    }
+};
 
 pub fn replyHandle(channel: c.ssh_channel, request_id: u32, id: u32) !void {
     var handle_bytes: [4]u8 = undefined;

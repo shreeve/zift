@@ -128,9 +128,8 @@ pub fn runSftp(
     var jail = try vfs_mod.Vfs.init(io, allocator, user.root);
     defer jail.deinit(allocator);
 
-    // On the heap: 256 KiB is too much for a worker stack.
-    const payload_buf = try allocator.alloc(u8, wire.sftp_max_packet_bytes);
-    defer allocator.free(payload_buf);
+    const buf = try allocator.alloc(u8, wire.sftp_max_packet_bytes);
+    defer allocator.free(buf);
 
     const start_ms = sys.monotonicMs();
     var state = SftpState{
@@ -147,12 +146,13 @@ pub fn runSftp(
         .mkdir_mode = server_cfg.mkdir_mode,
         .last_activity_ms = start_ms,
         .session_started_ms = start_ms,
+        .buf = buf,
     };
     defer state.deinit();
 
     state.sweepStagingOrphans();
 
-    const first_payload = readPacketTimed(&state, payload_buf) catch |err| switch (err) {
+    const first_payload = readPacketTimed(&state) catch |err| switch (err) {
         error.IdleTimeout => {
             audit.log(io, user.name, "idle.timeout", null, .ok, "", peer_ip);
             return;
@@ -164,7 +164,7 @@ pub fn runSftp(
     state.last_activity_ms = sys.monotonicMs();
 
     while (true) {
-        const payload = readPacketTimed(&state, payload_buf) catch |err| switch (err) {
+        const payload = readPacketTimed(&state) catch |err| switch (err) {
             error.IdleTimeout => {
                 state.emitSessionEnded("idle timeout", .ok);
                 return;
@@ -294,6 +294,9 @@ const SftpState = struct {
     mkdir_mode: u32 = 0o2770,
     /// `<root>/.zift/staging/`, opened on the first staged upload.
     staging_dir: ?std.Io.Dir = null,
+    /// Holds each request, then any large reply built after the request
+    /// is parsed. Heap: 256 KiB is too much for a worker stack.
+    buf: []u8,
 
     fn deinit(self: *SftpState) void {
         // Unlinks staging files whose CLOSE never came. Crash orphans are
@@ -508,14 +511,14 @@ const SftpState = struct {
         if (handle.failed) return self.status(request_id, c.SSH_FX_FAILURE);
         if (handle.done) return self.status(request_id, c.SSH_FX_EOF);
 
-        // 16 entries of at most ~620 bytes fit wire.replyNames' 32 KiB.
-        var entries: [16]wire.DirEntry = undefined;
-        var count: usize = 0;
+        // The request is parsed, so its buffer can hold the reply.
+        var batch = try wire.NameBatch.begin(self.buf, request_id);
         // One reference time per batch for "recent" vs "old" dates.
         const now_secs: i64 = sys.realtime().sec;
-        var vpath_buf: [std.posix.PATH_MAX]u8 = undefined;
+        var vpath_buf: PathBuf = undefined;
+        @memcpy(vpath_buf[0..handle.vpath.len], handle.vpath);
 
-        while (count < entries.len) {
+        while (batch.count < 16 and batch.hasRoom()) {
             const entry = handle.iter.next(self.io) catch {
                 // Send what we have; the next READDIR reports the failure.
                 handle.failed = true;
@@ -527,70 +530,35 @@ const SftpState = struct {
 
             // Paths through `.zift` are already refused; hide the entry too.
             if (vfs_mod.isReservedComponent(entry.name)) continue;
-
+            // Hide a name the partner could not send back in a request,
+            // and anything STAT would refuse: a listing shows the name,
+            // size, and date that STAT withholds.
+            vfs_mod.Vfs.validateVirtualPath(entry.name) catch continue;
+            const vpath = childPath(&vpath_buf, handle.vpath.len, entry.name) orelse continue;
+            if (policy.check(self.user, .stat, vpath) == .deny) continue;
             // lstat under the jailed dir fd. An entry that vanished since
             // readdir is simply skipped.
             const info = listing.statAt(handle.dir.handle, entry.name) catch continue;
 
-            entries[count].name_len = entry.name.len;
-            const name_copy_len = @min(entry.name.len, entries[count].name_buf.len);
-            @memcpy(entries[count].name_buf[0..name_copy_len], entry.name[0..name_copy_len]);
-
-            var display_info = info;
+            const display = self.applyListingMode(info, vpath);
             var numeric_user: [16]u8 = undefined;
             var numeric_group: [16]u8 = undefined;
-            var user_name: []const u8 = undefined;
-            var group_name: []const u8 = undefined;
-
-            switch (self.listing_mode) {
-                .virtual => {
-                    // Mode from the policy at the entry's full, untruncated
-                    // path, so `ls -la` matches what the partner can do.
-                    const sep: []const u8 = if (std.mem.endsWith(u8, handle.vpath, "/")) "" else "/";
-                    const stacked = std.fmt.bufPrint(&vpath_buf, "{s}{s}{s}", .{
-                        handle.vpath, sep, entry.name,
-                    });
-                    var heap_vpath: ?[]u8 = null;
-                    defer if (heap_vpath) |p| self.allocator.free(p);
-                    const vpath: []const u8 = stacked catch blk: {
-                        heap_vpath = std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
-                            handle.vpath, sep, entry.name,
-                        }) catch break :blk handle.vpath;
-                        break :blk heap_vpath.?;
-                    };
-                    display_info.mode = policy.policyDerivedMode(self.user, vpath, info.mode);
-                    display_info.uid = 0;
-                    display_info.gid = 0;
-                    user_name = self.user.name;
-                    group_name = "sftp";
+            const owner: []const u8, const group: []const u8 = switch (self.listing_mode) {
+                .virtual => .{ self.user.name, "sftp" },
+                .reality => .{
+                    self.name_resolver.user(info.uid, &numeric_user),
+                    self.name_resolver.group(info.gid, &numeric_group),
                 },
-                .reality => {
-                    user_name = self.name_resolver.user(info.uid, &numeric_user);
-                    group_name = self.name_resolver.group(info.gid, &numeric_group);
-                },
-            }
-
-            entries[count].info = display_info;
-
-            const longname = listing.formatLongname(
-                &entries[count].longname_buf,
-                display_info,
-                user_name,
-                group_name,
-                entry.name[0..name_copy_len],
-                now_secs,
-            );
-            entries[count].longname_len = longname.len;
-
-            count += 1;
+            };
+            var longname_buf: [wire.max_longname_bytes]u8 = undefined;
+            const longname = listing.formatLongname(&longname_buf, display, owner, group, entry.name, now_secs);
+            try batch.add(entry.name, longname, display);
         }
 
-        switch (readdirFollowup(count, handle.failed)) {
-            .send_batch => {},
-            .eof => return self.status(request_id, c.SSH_FX_EOF),
-            .fail => return self.status(request_id, c.SSH_FX_FAILURE),
+        if (batch.count == 0) {
+            return self.status(request_id, if (handle.failed) c.SSH_FX_FAILURE else c.SSH_FX_EOF);
         }
-        try wire.replyNames(self.channel, request_id, entries[0..count]);
+        try batch.send(self.channel);
     }
 
     fn handleOpen(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1105,8 +1073,8 @@ const RenameScan = struct {
             vfs_mod.Vfs.validateVirtualPath(entry.name) catch return error.RenameDenied;
             if (vfs_mod.isReservedComponent(entry.name)) return error.RenameDenied;
 
-            const old = try appendChild(&scan.old, old_len, entry.name);
-            const new = try appendChild(&scan.new, new_len, entry.name);
+            const old = childPath(&scan.old, old_len, entry.name) orelse return error.RenameDenied;
+            const new = childPath(&scan.new, new_len, entry.name) orelse return error.RenameDenied;
             const info = try listing.statAt(dir.handle, entry.name);
             if (policy.checkRename(user, old, new) == .deny or gainsCapability(user, info.mode, old, new)) {
                 return error.RenameDenied;
@@ -1118,15 +1086,6 @@ const RenameScan = struct {
                 try scan.walk(child, old.len, new.len, depth + 1);
             }
         }
-    }
-
-    /// `buf[0..len] ++ "/" ++ name`, refused past the virtual path limit.
-    fn appendChild(buf: *PathBuf, len: usize, name: []const u8) ![]const u8 {
-        const end = len + 1 + name.len;
-        if (end > vfs_mod.max_virtual_path_bytes) return error.RenameDenied;
-        buf[len] = '/';
-        @memcpy(buf[len + 1 .. end], name);
-        return buf[0..end];
     }
 };
 
@@ -1196,19 +1155,31 @@ fn generateStagingName(io: std.Io, out: *[32]u8) !void {
     out.* = std.fmt.bytesToHex(raw, .lower);
 }
 
+/// Extend `buf[0..len]`, a directory's virtual path, by `/name`; null
+/// past the virtual path limit.
+fn childPath(buf: *PathBuf, len: usize, name: []const u8) ?[]const u8 {
+    // The root is "/", so its children need no separator of their own.
+    const base = if (len == 1) 0 else len;
+    const end = base + 1 + name.len;
+    if (end > vfs_mod.max_virtual_path_bytes) return null;
+    buf[base] = '/';
+    @memcpy(buf[base + 1 .. end], name);
+    return buf[0..end];
+}
+
 fn hasFlag(flags: u32, bit: c_int) bool {
     return flags & @as(u32, @intCast(bit)) != 0;
 }
 
 /// Read one length-prefixed packet, or `error.IdleTimeout`.
-fn readPacketTimed(state: *SftpState, payload_buf: []u8) ![]u8 {
+fn readPacketTimed(state: *SftpState) ![]u8 {
     var len_buf: [4]u8 = undefined;
     try readExactTimed(state, &len_buf);
     const len = std.mem.readInt(u32, &len_buf, .big);
 
     // Oversized: reply BAD_MESSAGE to the request, then end the session,
     // since resyncing would mean draining attacker-sized input.
-    if (len > payload_buf.len) {
+    if (len > state.buf.len) {
         var head: [5]u8 = undefined;
         readExactTimed(state, &head) catch return error.LibsshFailure;
         const request_id = std.mem.readInt(u32, head[1..5], .big);
@@ -1216,7 +1187,7 @@ fn readPacketTimed(state: *SftpState, payload_buf: []u8) ![]u8 {
         return error.LibsshFailure;
     }
 
-    const payload = payload_buf[0..len];
+    const payload = state.buf[0..len];
     try readExactTimed(state, payload);
     return payload;
 }
@@ -1306,14 +1277,6 @@ fn handleIdAvailable(next_handle: u32) bool {
 fn concealed(may_stat: bool, code: c_int) c_int {
     if (!may_stat and code == c.SSH_FX_NO_SUCH_FILE) return c.SSH_FX_PERMISSION_DENIED;
     return code;
-}
-
-const ReaddirFollowup = enum { send_batch, eof, fail };
-
-fn readdirFollowup(copied: usize, failed: bool) ReaddirFollowup {
-    if (copied != 0) return .send_batch;
-    if (failed) return .fail;
-    return .eof;
 }
 
 fn sweepUnlinksStagingFile(live: bool, age_secs: i64, min_age_secs: i64) bool {
@@ -1409,13 +1372,6 @@ test "a caller who cannot stat never learns a path is missing" {
     try std.testing.expectEqual(denied, concealed(true, denied));
 }
 
-test "readdir keeps a partial batch and fails the empty one" {
-    try std.testing.expectEqual(ReaddirFollowup.send_batch, readdirFollowup(3, true));
-    try std.testing.expectEqual(ReaddirFollowup.fail, readdirFollowup(0, true));
-    try std.testing.expectEqual(ReaddirFollowup.eof, readdirFollowup(0, false));
-    try std.testing.expectEqual(ReaddirFollowup.send_batch, readdirFollowup(16, false));
-}
-
 test "staging sweep skips live names and young orphans" {
     try std.testing.expect(!sweepUnlinksStagingFile(true, 10_000, 60));
     try std.testing.expect(!sweepUnlinksStagingFile(true, 0, 60));
@@ -1430,11 +1386,13 @@ test "pre-subsystem ignore cap is 64" {
     try std.testing.expectError(error.LibsshFailure, noteIgnoredPreSubsystem(&count));
 }
 
-test "rename scan paths stop at the virtual path limit" {
+test "child paths join under the root and stop at the virtual path limit" {
     var buf: PathBuf = undefined;
+    buf[0] = '/';
+    try std.testing.expectEqualStrings("/b", childPath(&buf, 1, "b").?);
     @memcpy(buf[0..2], "/a");
-    try std.testing.expectEqualStrings("/a/b", try RenameScan.appendChild(&buf, 2, "b"));
+    try std.testing.expectEqualStrings("/a/b", childPath(&buf, 2, "b").?);
     const long = [_]u8{'x'} ** (vfs_mod.max_virtual_path_bytes - 3);
-    try std.testing.expectEqual(vfs_mod.max_virtual_path_bytes, (try RenameScan.appendChild(&buf, 2, &long)).len);
-    try std.testing.expectError(error.RenameDenied, RenameScan.appendChild(&buf, 2, long ++ "y"));
+    try std.testing.expectEqual(vfs_mod.max_virtual_path_bytes, childPath(&buf, 2, &long).?.len);
+    try std.testing.expectEqual(null, childPath(&buf, 2, long ++ "y"));
 }
