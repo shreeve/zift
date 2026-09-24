@@ -182,7 +182,7 @@ pub fn validateSemantic(
     // 3. No root may equal or contain another.
     for (roots, 0..) |a, i| {
         for (roots[i + 1 ..], i + 1..) |b, j| {
-            if (insideRoot(a, b) or insideRoot(b, a)) {
+            if (vfs.isInsideRoot(a, b) or vfs.isInsideRoot(b, a)) {
                 return ck.fail(error.OverlappingRoots, "overlapping roots for users '{s}' and '{s}': {s} vs {s}", .{
                     cfg.users[i].name, cfg.users[j].name, a, b,
                 });
@@ -205,12 +205,6 @@ pub fn validateSemantic(
     for (cfg.users) |user| {
         for (user.key_files) |path| try checkOutsideRoots(ck, roots, cfg.users, "auth key file", path);
     }
-}
-
-/// `path` is `root` or below it. `vfs.isInsideRoot` wants a `/` after
-/// the root, so it misses everything under a root of `/` itself.
-fn insideRoot(root: []const u8, path: []const u8) bool {
-    return std.mem.eql(u8, root, "/") or vfs.isInsideRoot(root, path);
 }
 
 /// Reports a semantic failure: `zift: <message>` on stderr, and the
@@ -329,7 +323,7 @@ fn checkOutsideRoots(
     for (roots, users) |root, user| {
         for ([_]?[]const u8{ named, real }) |candidate| {
             const p = candidate orelse continue;
-            if (insideRoot(root, p)) {
+            if (vfs.isInsideRoot(root, p)) {
                 return ck.fail(error.PrivateFileInsideRoot, "{s} {s} is inside user '{s}' root {s}; move it out of every partner root", .{
                     what, path, user.name, root,
                 });

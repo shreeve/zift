@@ -159,7 +159,11 @@ pub fn run(
     var active = ActiveConfig{
         .io = io,
         .allocator = allocator,
-        .current = try ConfigRef.create(allocator, initial_config),
+        .current = ConfigRef.create(allocator, initial_config) catch |err| {
+            var cfg = initial_config;
+            cfg.deinit();
+            return err;
+        },
     };
     defer active.releaseActive();
 
@@ -182,14 +186,17 @@ pub fn run(
 
     active.stamp = try configStamp(io, config_path, active.current.config);
 
-    const listen = try parseListen(allocator, active.current.config.server.listen);
-    defer listen.deinit(allocator);
+    const listen = try config.parseListen(active.current.config.server.listen);
+    const listen_host = try allocator.dupeZ(u8, listen.host);
+    defer allocator.free(listen_host);
+    var port_buf: [8]u8 = undefined;
+    const listen_port = try std.fmt.bufPrintZ(&port_buf, "{d}", .{listen.port});
 
     const host_key = try allocator.dupeZ(u8, active.current.config.server.host_key);
     defer allocator.free(host_key);
 
-    try setBindOption(bind, c.SSH_BIND_OPTIONS_BINDADDR, listen.host.ptr);
-    try setBindOption(bind, c.SSH_BIND_OPTIONS_BINDPORT_STR, listen.port.ptr);
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_BINDADDR, listen_host.ptr);
+    try setBindOption(bind, c.SSH_BIND_OPTIONS_BINDPORT_STR, listen_port.ptr);
     try setBindOption(bind, c.SSH_BIND_OPTIONS_HOSTKEY, host_key.ptr);
     // The config file is the only config: without this, ssh_bind_listen
     // also reads /etc/ssh/libssh_server_config, which can add host keys
@@ -451,12 +458,7 @@ const ActiveConfig = struct {
         self.stamp = stamp;
 
         var diag: config.LoadDiag = .{};
-        var next_config = config.load(self.io, self.allocator, contents, &diag) catch {
-            if (diag.parse_err == null) {
-                // validateSemantic already printed the specific diagnostic.
-                self.noteReloadRejected(path, "semantic validation failed (see preceding diagnostic)");
-                return;
-            }
+        var next_config = config.loadPath(self.io, self.allocator, path, contents, &diag) catch {
             var msg_buf: [512]u8 = undefined;
             var w = std.Io.Writer.fixed(&msg_buf);
             w.print("{f}", .{diag}) catch {};
@@ -646,33 +648,6 @@ fn setIntOption(fd: c_int, level: i32, option: u32, value: c_int) void {
     _ = std.c.setsockopt(fd, level, option, @ptrCast(&value), @sizeOf(c_int));
 }
 
-const Listen = struct {
-    host: [:0]u8,
-    port: [:0]u8,
-
-    fn deinit(self: Listen, allocator: std.mem.Allocator) void {
-        allocator.free(self.host);
-        allocator.free(self.port);
-    }
-};
-
-/// `host:port`, `[v6]:port`, bare-v6 `::1:port`, or `:port` (all IPv4).
-fn parseListen(allocator: std.mem.Allocator, listen: []const u8) !Listen {
-    const colon = std.mem.lastIndexOfScalar(u8, listen, ':') orelse return error.InvalidListenAddress;
-    var raw_host = listen[0..colon];
-    const raw_port = listen[colon + 1 ..];
-    if (raw_port.len == 0) return error.InvalidListenAddress;
-    // libssh resolves the host as given, and "[::1]" does not resolve.
-    if (raw_host.len >= 2 and raw_host[0] == '[' and raw_host[raw_host.len - 1] == ']') {
-        raw_host = raw_host[1 .. raw_host.len - 1];
-    }
-    const host = if (raw_host.len == 0) "0.0.0.0" else raw_host;
-    return .{
-        .host = try allocator.dupeZ(u8, host),
-        .port = try allocator.dupeZ(u8, raw_port),
-    };
-}
-
 /// User-key and host-key signature algorithms: the key types the config
 /// accepts, with RSA limited to its SHA-2 signatures.
 const signature_algorithms = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521," ++
@@ -700,25 +675,6 @@ fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail:
     if (detail.len == 0 and no_detail == .skip) return;
 
     sys.note(io, "zift: {s}: {s}\n", .{ where, if (detail.len > 0) detail else "no detail from libssh" }) catch {};
-}
-
-test "parseListen: IPv4, bracketed and bare IPv6, empty host" {
-    const alloc = std.testing.allocator;
-    const cases = [_][3][]const u8{
-        .{ "127.0.0.1:2222", "127.0.0.1", "2222" },
-        .{ "[::1]:2222", "::1", "2222" },
-        .{ "[::]:22", "::", "22" },
-        .{ "::1:2222", "::1", "2222" },
-        .{ ":2222", "0.0.0.0", "2222" },
-    };
-    for (cases) |case| {
-        const l = try parseListen(alloc, case[0]);
-        defer l.deinit(alloc);
-        try std.testing.expectEqualStrings(case[1], l.host);
-        try std.testing.expectEqualStrings(case[2], l.port);
-    }
-    try std.testing.expectError(error.InvalidListenAddress, parseListen(alloc, "127.0.0.1"));
-    try std.testing.expectError(error.InvalidListenAddress, parseListen(alloc, "[::1]:"));
 }
 
 test "configStamp changes on any change to the config or a key file" {
