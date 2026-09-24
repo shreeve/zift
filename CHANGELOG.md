@@ -95,7 +95,9 @@ the line and the reason.
 - `validate` checks what `serve` opens. The host key must load as an
   unencrypted private key, the log's directory must exist, an existing
   log must be a regular file, FIFO or character device (never a
-  symlink), and each public-key blob must match its algorithm name.
+  symlink), and each public-key blob must match its algorithm name,
+  carry a sane RSA exponent and modulus or an uncompressed ECDSA point,
+  and load in libssh as login would load it.
   Migration: fix what `validate` names.
 - Error names changed. `InvalidConfig` became `MissingValue`,
   `InvalidNumber`, `InvalidMode`, `RelativePath` or

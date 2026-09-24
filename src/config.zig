@@ -395,11 +395,29 @@ fn resolveOneKeyFile(
                 else => "malformed public-key line",
             });
         };
+        // What login does with the line: a key libssh cannot import
+        // would pass validation and then never match.
+        if (!try libsshImports(gpa, pubkey)) {
+            return keyFileFail(ck, error.AuthKeyFileMalformed, user_name, path, line_no, "malformed public-key line: libssh cannot load this key");
+        }
         try combined.append(arena_alloc, pubkey);
         parsed += 1;
     }
 
     if (parsed == 0) return keyFileFail(ck, error.AuthKeyFileEmpty, user_name, path, 0, "no public-key lines found");
+}
+
+/// True when libssh imports `key` as login does (ssh.zig `findKey`).
+fn libsshImports(gpa: std.mem.Allocator, key: PublicKey) error{OutOfMemory}!bool {
+    const algorithm_z = try gpa.dupeZ(u8, key.algorithm);
+    defer gpa.free(algorithm_z);
+    const blob_z = try gpa.dupeZ(u8, key.blob);
+    defer gpa.free(blob_z);
+    var parsed: c.ssh_key = null;
+    const rc = c.ssh_pki_import_pubkey_base64(blob_z.ptr, c.ssh_key_type_from_name(algorithm_z.ptr), &parsed);
+    if (rc != c.SSH_OK or parsed == null) return false;
+    c.ssh_key_free(parsed);
+    return true;
 }
 
 /// `user '<name>': auth key file '<path>'[ line N]: <reason>`; `line_no`
@@ -983,26 +1001,40 @@ const min_rsa_bits = 2048;
 const max_rsa_bits = 8192;
 
 /// Check the SSH wire form (RFC 4253 §6.6, RFC 5656 §3.1): the embedded
-/// algorithm name, the ECDSA curve, the key length or RSA modulus size,
-/// and nothing trailing.
+/// algorithm name, the ECDSA curve and uncompressed point, the key
+/// length, the RSA exponent and modulus, and nothing trailing.
 fn checkKeyBlob(algorithm: []const u8, key_len: usize, raw: []const u8) Error!void {
     var rest = raw;
     const name = sshString(&rest) orelse return error.InvalidKeyLine;
     if (!std.mem.eql(u8, name, algorithm)) return error.KeyAlgorithmMismatch;
     if (key_len == 0) {
-        _ = sshString(&rest) orelse return error.InvalidKeyLine; // e
-        const n = std.mem.trimStart(u8, sshString(&rest) orelse return error.InvalidKeyLine, "\x00");
+        // e: odd, at least 3, and at most 32 bits (OpenSSH makes 65537).
+        const e = positiveMpint(sshString(&rest) orelse return error.InvalidKeyLine) orelse return error.InvalidKeyLine;
+        if (e.len == 0 or e.len > 4 or e[e.len - 1] & 1 == 0 or (e.len == 1 and e[0] < 3)) return error.InvalidKeyLine;
+        // n: odd (a product of odd primes), 2048 to 8192 bits.
+        const n = positiveMpint(sshString(&rest) orelse return error.InvalidKeyLine) orelse return error.InvalidKeyLine;
         const bits = if (n.len == 0) 0 else n.len * 8 - @clz(n[0]);
         if (bits < min_rsa_bits or bits > max_rsa_bits) return error.InvalidRsaKeySize;
+        if (n[n.len - 1] & 1 == 0) return error.InvalidKeyLine;
     } else {
-        if (std.mem.startsWith(u8, algorithm, "ecdsa-sha2-")) {
+        const ecdsa = std.mem.startsWith(u8, algorithm, "ecdsa-sha2-");
+        if (ecdsa) {
             const curve = sshString(&rest) orelse return error.InvalidKeyLine;
             if (!std.mem.eql(u8, curve, algorithm["ecdsa-sha2-".len..])) return error.KeyAlgorithmMismatch;
         }
         const key = sshString(&rest) orelse return error.InvalidKeyLine;
         if (key.len != key_len) return error.InvalidKeyLine;
+        // SSH carries ECDSA points uncompressed: 0x04, then x and y.
+        if (ecdsa and key[0] != 0x04) return error.InvalidKeyLine;
     }
     if (rest.len != 0) return error.InvalidKeyLine;
+}
+
+/// The magnitude of a non-negative SSH mpint (RFC 4251 §5) without
+/// leading zero bytes, or null if its sign bit is set.
+fn positiveMpint(raw: []const u8) ?[]const u8 {
+    if (raw.len != 0 and raw[0] & 0x80 != 0) return null;
+    return std.mem.trimStart(u8, raw, "\x00");
 }
 
 /// Take one u32-length-prefixed string off the front of `rest`.
@@ -1584,6 +1616,72 @@ test "parsePublicKeyLine: blob must match its algorithm and be well formed" {
     }
 }
 
+/// The modulus of `rsa2048_blob` as its mpint: a 0x00 pad, then 256 bytes.
+fn rsa2048Modulus() [257]u8 {
+    var raw: [rsa2048_blob.len]u8 = undefined;
+    const len = std.base64.standard.Decoder.calcSizeForSlice(rsa2048_blob) catch unreachable;
+    std.base64.standard.Decoder.decode(raw[0..len], rsa2048_blob) catch unreachable;
+    return raw[4 + "ssh-rsa".len + 4 + 3 + 4 ..][0..257].*;
+}
+
+/// `ssh-rsa` key line with the given exponent and modulus (raw mpints).
+fn rsaTestLine(alloc: std.mem.Allocator, e: []const u8, n: []const u8) ![]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    for ([_][]const u8{ "ssh-rsa", e, n }) |part| {
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(part.len), .big);
+        try raw.appendSlice(alloc, &len);
+        try raw.appendSlice(alloc, part);
+    }
+    const encoder = std.base64.standard.Encoder;
+    const line = try alloc.alloc(u8, "ssh-rsa ".len + encoder.calcSize(raw.items.len));
+    @memcpy(line[0.."ssh-rsa ".len], "ssh-rsa ");
+    _ = encoder.encode(line["ssh-rsa ".len..], raw.items);
+    return line;
+}
+
+test "parsePublicKeyLine: RSA exponent and modulus, and the ECDSA point form" {
+    const alloc = std.testing.allocator;
+    const n = rsa2048Modulus();
+    var even_n = n;
+    even_n[256] &= 0xfe;
+
+    const cases = [_]struct { []const u8, []const u8, ?Error }{
+        .{ "\x01\x00\x01", &n, null }, // e = 65537: the real key
+        .{ "\x03", &n, null },
+        .{ "", &n, error.InvalidKeyLine }, // no exponent
+        .{ "\x01", &n, error.InvalidKeyLine }, // e = 1
+        .{ "\x01\x00\x00", &n, error.InvalidKeyLine }, // even
+        .{ "\x01\x00\x00\x00\x01", &n, error.InvalidKeyLine }, // over 32 bits
+        .{ "\x81", &n, error.InvalidKeyLine }, // negative
+        .{ "\x01\x00\x01", n[1..], error.InvalidKeyLine }, // sign bit set: negative
+        .{ "\x01\x00\x01", &even_n, error.InvalidKeyLine },
+    };
+    for (cases) |case| {
+        const e, const modulus, const want = case;
+        const line = try rsaTestLine(alloc, e, modulus);
+        defer alloc.free(line);
+        if (want) |err| {
+            try std.testing.expectError(err, parsePublicKeyLine(alloc, line));
+        } else {
+            const pk = try parsePublicKeyLine(alloc, line);
+            alloc.free(pk.algorithm);
+            alloc.free(pk.blob);
+        }
+    }
+
+    // A P-256 blob whose point starts 0x02 (compressed) instead of 0x04.
+    var ec: [p256_blob.len]u8 = undefined;
+    const ec_len = try std.base64.standard.Decoder.calcSizeForSlice(p256_blob);
+    try std.base64.standard.Decoder.decode(ec[0..ec_len], p256_blob);
+    ec[ec_len - 65] = 0x02;
+    var text: [p256_blob.len]u8 = undefined;
+    var buf: [256]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "ecdsa-sha2-nistp256 {s}", .{std.base64.standard.Encoder.encode(&text, ec[0..ec_len])});
+    try std.testing.expectError(error.InvalidKeyLine, parsePublicKeyLine(alloc, line));
+}
+
 test "user with no auth lines rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
@@ -2000,6 +2098,33 @@ test "validateSemantic: key files hold keys, comments, and blank lines" {
     try std.testing.expectError(error.AuthKeyFileTooLarge, tree.check(TestTree.config, null));
     try std.testing.expectError(error.AuthKeyFileNotRegular, tree.checkWith("@/etc/u.pub", "@/etc"));
     try std.testing.expectError(error.AuthKeyFileUnreadable, tree.checkWith("@/etc/u.pub", "@/etc/none.pub"));
+}
+
+test "libsshImports: login's import refuses what the wire checks refuse" {
+    const alloc = std.testing.allocator;
+    for ([_]PublicKey{
+        .{ .algorithm = "ssh-ed25519", .blob = valid_ed25519_blob },
+        .{ .algorithm = "ecdsa-sha2-nistp256", .blob = p256_blob },
+        .{ .algorithm = "ecdsa-sha2-nistp384", .blob = p384_blob },
+        .{ .algorithm = "ecdsa-sha2-nistp521", .blob = p521_blob },
+        .{ .algorithm = "ssh-rsa", .blob = rsa2048_blob },
+    }) |key| try std.testing.expect(try libsshImports(alloc, key));
+
+    // An even RSA modulus: mbedTLS refuses it, so login never matches.
+    var even_n = rsa2048Modulus();
+    even_n[256] &= 0xfe;
+    const line = try rsaTestLine(alloc, "\x01\x00\x01", &even_n);
+    defer alloc.free(line);
+    try std.testing.expect(!try libsshImports(alloc, .{ .algorithm = "ssh-rsa", .blob = line["ssh-rsa ".len..] }));
+    try std.testing.expectError(error.InvalidKeyLine, parsePublicKeyLine(alloc, line));
+
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const file = try std.fmt.allocPrint(alloc, "{s}\n", .{line});
+    defer alloc.free(file);
+    try tree.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "etc/u.pub", .data = file });
+    try tree.chmod("etc/u.pub", 0o644);
+    try std.testing.expectError(error.AuthKeyFileMalformed, tree.check(TestTree.config, null));
 }
 
 test "validateSemantic: the log directory must exist and a log must be a regular file" {

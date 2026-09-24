@@ -156,7 +156,8 @@ are not allowed. Accepted algorithms: `ssh-ed25519`,
 rejected. The file must be a regular file (a symlink is followed and its
 target checked, so Kubernetes Secrets and systemd credentials work),
 owned by root or the daemon's user, not group- or world-writable, and
-contain at least one key.
+contain at least one key. Each key must be well formed and load in
+libssh exactly as it would at login.
 
 ### `from`
 

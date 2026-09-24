@@ -79,10 +79,11 @@ does not reveal which users exist or how they authenticate.
 ### Public keys
 
 Keys live in operator-managed files (rules in
-[`configure.md`](configure.md#auth)). Ed25519 and ECDSA P-256, P-384 and
-P-521 keys are accepted, and RSA keys of 2048 to 8192 bits, which must
-sign with `rsa-sha2-256` or `rsa-sha2-512`. SHA-1 RSA signatures and
-DSA are refused, for user and host keys alike.
+[`configure.md`](configure.md#auth)). User keys may be Ed25519, ECDSA
+P-256, P-384 or P-521, or RSA of 2048 to 8192 bits, which must sign with
+`rsa-sha2-256` or `rsa-sha2-512`; SHA-1 RSA signatures and DSA are
+refused. The host key may be any unencrypted key libssh loads, smaller
+RSA included, and never signs with SHA-1.
 
 A public-key probe for an unknown user and for a known user outside
 `from` look the same to the client; only the audit detail differs.
