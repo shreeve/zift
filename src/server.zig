@@ -23,22 +23,29 @@ pub var active_sessions: std.atomic.Value(u32) = .init(0);
 pub var unauth_sessions: std.atomic.Value(u32) = .init(0);
 
 /// The peer address (no port, no brackets) formatted into `buf`, or null.
+/// An IPv4-mapped IPv6 address prints as IPv4: a dual-stack listener
+/// then logs and rate-limits IPv4 clients per address, not all as one
+/// IPv6 /64.
 fn formatPeer(ss: *const std.posix.sockaddr.storage, buf: []u8) ?[]const u8 {
     const family = @as(*const std.posix.sockaddr, @ptrCast(ss)).family;
     switch (family) {
         std.posix.AF.INET => {
             const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(ss));
             const bytes: [4]u8 = @bitCast(sa.addr);
-            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            }) catch null;
+            return formatIPv4(bytes, buf);
         },
         std.posix.AF.INET6 => {
             const sa: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(ss));
+            const v4_mapped_prefix = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff };
+            if (std.mem.eql(u8, sa.addr[0..12], &v4_mapped_prefix)) return formatIPv4(sa.addr[12..16].*, buf);
             return formatIPv6(&sa.addr, buf);
         },
         else => return null,
     }
+}
+
+fn formatIPv4(bytes: [4]u8, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch null;
 }
 
 /// Colon-hex IPv6 without `::` compression (netmatch accepts this form).
@@ -803,4 +810,19 @@ fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail:
     if (detail.len == 0 and no_detail == .skip) return;
 
     sys.note(io, "zift: {s}: {s}\n", .{ where, if (detail.len > 0) detail else "no detail from libssh" }) catch {};
+}
+
+fn expectPeer(expected: []const u8, sa: anytype) !void {
+    var ss: std.posix.sockaddr.storage align(8) = undefined;
+    @as(*@TypeOf(sa), @ptrCast(@alignCast(&ss))).* = sa;
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, formatPeer(&ss, &buf).?);
+}
+
+test "formatPeer: IPv4, IPv6 uncompressed, IPv4-mapped as IPv4" {
+    try expectPeer("192.0.2.7", std.posix.sockaddr.in{ .port = 0, .addr = @bitCast([4]u8{ 192, 0, 2, 7 }) });
+    const v6 = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try expectPeer("2001:db8:0:0:0:0:0:1", std.posix.sockaddr.in6{ .port = 0, .flowinfo = 0, .addr = v6, .scope_id = 0 });
+    const mapped = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 198, 51, 100, 9 };
+    try expectPeer("198.51.100.9", std.posix.sockaddr.in6{ .port = 0, .flowinfo = 0, .addr = mapped, .scope_id = 0 });
 }

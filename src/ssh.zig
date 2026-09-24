@@ -90,7 +90,6 @@ pub fn authenticate(
                 if (try verifyPassword(io, allocator, if (allowed) user.?.password_hash else null, password, deadline_ms)) {
                     _ = c.ssh_message_auth_reply_success(msg, 0);
                     audit.log(io, username, "auth.password", null, .ok, "", ip_str);
-                    abuse.recordSuccess(io, ip_str);
                     return user.?;
                 }
                 const detail = if (user == null) "unknown user" else if (!allowed) "source not allowed" else "bad password";
@@ -100,10 +99,7 @@ pub fn authenticate(
         } else if (subtype == c.SSH_AUTH_METHOD_PUBLICKEY) {
             const decision = handlePublicKeyMessage(io, allocator, cfg, msg, ip_str);
             switch (decision) {
-                .accepted => |user| {
-                    abuse.recordSuccess(io, ip_str);
-                    return user;
-                },
+                .accepted => |user| return user,
                 .offered => {
                     // `pk_ok` was sent; wait for the signed follow-up.
                     soft_ops += 1;

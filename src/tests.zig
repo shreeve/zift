@@ -10,7 +10,9 @@ comptime {
     _ = @import("listing.zig");
     _ = @import("vfs.zig");
     _ = @import("wire.zig");
+    _ = @import("server.zig");
     _ = @import("sftp.zig");
+    _ = @import("signals.zig");
     _ = @import("ssh.zig");
     _ = @import("sys.zig");
     _ = @import("fuzz.zig");
