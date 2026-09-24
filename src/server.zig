@@ -625,37 +625,25 @@ fn handleSession(
 }
 
 /// Best-effort socket options. TCP_NODELAY: SFTP is request/response,
-/// and Nagle adds delayed-ACK latency. SO_KEEPALIVE drops dead peers; on
-/// Linux the probes start after 60s idle and give up after 6 × 10s.
-/// Option numbers differ by OS (Darwin's 4 is TCP_NOPUSH, not
-/// KEEPIDLE), so they come from `std.posix` and the timing knobs are
-/// Linux-only.
+/// and Nagle adds delayed-ACK latency. Keepalive drops dead peers (which
+/// matters with `idle-timeout 0`): probes start after 60 s idle and give
+/// up after 6 × 10 s. Darwin names the idle knob TCP_KEEPALIVE.
 fn configureSocket(fd: c_int) void {
-    if (fd < 0) return;
-    const enable: c_int = 1;
-    _ = std.c.setsockopt(
-        fd,
-        std.posix.IPPROTO.TCP,
-        std.posix.TCP.NODELAY,
-        @ptrCast(&enable),
-        @sizeOf(c_int),
-    );
-    _ = std.c.setsockopt(
-        fd,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.KEEPALIVE,
-        @ptrCast(&enable),
-        @sizeOf(c_int),
-    );
+    const tcp = std.posix.IPPROTO.TCP;
+    setIntOption(fd, tcp, std.posix.TCP.NODELAY, 1);
+    setIntOption(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, 1);
+    const keep_idle = switch (builtin.os.tag) {
+        .linux => std.posix.TCP.KEEPIDLE,
+        .macos => std.posix.TCP.KEEPALIVE,
+        else => return,
+    };
+    setIntOption(fd, tcp, keep_idle, 60);
+    setIntOption(fd, tcp, std.posix.TCP.KEEPINTVL, 10);
+    setIntOption(fd, tcp, std.posix.TCP.KEEPCNT, 6);
+}
 
-    if (builtin.os.tag == .linux) {
-        const idle_seconds: c_int = 60;
-        const intvl_seconds: c_int = 10;
-        const probe_count: c_int = 6;
-        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPIDLE, @ptrCast(&idle_seconds), @sizeOf(c_int));
-        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPINTVL, @ptrCast(&intvl_seconds), @sizeOf(c_int));
-        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT, @ptrCast(&probe_count), @sizeOf(c_int));
-    }
+fn setIntOption(fd: c_int, level: i32, option: u32, value: c_int) void {
+    _ = std.c.setsockopt(fd, level, option, @ptrCast(&value), @sizeOf(c_int));
 }
 
 const Listen = struct {
@@ -668,11 +656,16 @@ const Listen = struct {
     }
 };
 
+/// `host:port`, `[v6]:port`, bare-v6 `::1:port`, or `:port` (all IPv4).
 fn parseListen(allocator: std.mem.Allocator, listen: []const u8) !Listen {
     const colon = std.mem.lastIndexOfScalar(u8, listen, ':') orelse return error.InvalidListenAddress;
-    const raw_host = listen[0..colon];
+    var raw_host = listen[0..colon];
     const raw_port = listen[colon + 1 ..];
     if (raw_port.len == 0) return error.InvalidListenAddress;
+    // libssh resolves the host as given, and "[::1]" does not resolve.
+    if (raw_host.len >= 2 and raw_host[0] == '[' and raw_host[raw_host.len - 1] == ']') {
+        raw_host = raw_host[1 .. raw_host.len - 1];
+    }
     const host = if (raw_host.len == 0) "0.0.0.0" else raw_host;
     return .{
         .host = try allocator.dupeZ(u8, host),
@@ -707,6 +700,25 @@ fn logLibsshError(io: std.Io, where: []const u8, handle: ?*anyopaque, no_detail:
     if (detail.len == 0 and no_detail == .skip) return;
 
     sys.note(io, "zift: {s}: {s}\n", .{ where, if (detail.len > 0) detail else "no detail from libssh" }) catch {};
+}
+
+test "parseListen: IPv4, bracketed and bare IPv6, empty host" {
+    const alloc = std.testing.allocator;
+    const cases = [_][3][]const u8{
+        .{ "127.0.0.1:2222", "127.0.0.1", "2222" },
+        .{ "[::1]:2222", "::1", "2222" },
+        .{ "[::]:22", "::", "22" },
+        .{ "::1:2222", "::1", "2222" },
+        .{ ":2222", "0.0.0.0", "2222" },
+    };
+    for (cases) |case| {
+        const l = try parseListen(alloc, case[0]);
+        defer l.deinit(alloc);
+        try std.testing.expectEqualStrings(case[1], l.host);
+        try std.testing.expectEqualStrings(case[2], l.port);
+    }
+    try std.testing.expectError(error.InvalidListenAddress, parseListen(alloc, "127.0.0.1"));
+    try std.testing.expectError(error.InvalidListenAddress, parseListen(alloc, "[::1]:"));
 }
 
 test "configStamp changes on any change to the config or a key file" {
