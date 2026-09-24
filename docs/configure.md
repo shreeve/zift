@@ -31,7 +31,9 @@ zift validate /home/zift/zift.conf
 zift serve /home/zift/zift.conf
 ```
 
-`validate` runs every check `serve` runs before it listens:
+`validate` runs the checks `serve` runs on a config at startup and on
+every reload. It does not open the log, bind the port, or check that
+the service may bind it:
 
 - the file parses (errors name the line, section, directive and reason);
 - the host key loads as an unencrypted private key and passes the file
@@ -53,6 +55,8 @@ ownership is checked against the user running it.
 - Directives are indented under a section, one per line: `name value`.
 - Blank lines are ignored. `#` starts a comment at the start of a line
   or after a space or tab; a `#` inside a token is literal.
+- A value runs to the end of the line or comment and may contain
+  spaces: `root /srv/sp ace #2` is `/srv/sp ace`.
 - User names use ASCII letters, digits, `_`, `-` and `.`, are at most 64
   bytes, and may not start with `.`.
 - Durations need a unit: `ms`, `s`, `m`, `h` or `d` (`30s`, `5m`). A bare
@@ -325,9 +329,10 @@ deny **/.git/**
 Zift checks the config file and every `auth` key file each
 `reload-interval`, and reloads when any of their size, mtime, ctime or
 inode changes. `SIGHUP` reloads at once, changed or not. A valid config
-applies to new sessions; sessions already open keep the config they
-logged in with until they end. An invalid one is rejected and the
-previous config keeps serving (see [`operate.md`](operate.md#reload)).
+applies to new connections; each connection keeps the config that was
+current when it was accepted until it ends. An invalid one is rejected
+and the previous config keeps serving (see
+[`operate.md`](operate.md#reload)).
 
 Directories are not watched: after creating a partner root or fixing its
 mode, reload by hand. Write config changes atomically (write a
@@ -336,7 +341,9 @@ written file.
 
 `listen`, `host-key` and `log` are bound at startup. A reload that
 changes one logs a warning and keeps the old value; restart to apply
-it. Everything else applies to new sessions.
+it. `max-connections`, `max-unauth-connections`, `reload-interval` and
+`shutdown-grace` apply at once; everything else applies to new
+connections.
 
 ## SFTP Surface
 

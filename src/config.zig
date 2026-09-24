@@ -2300,6 +2300,10 @@ test "comments: whole-line, or '#' after a blank; a '#' inside a token is litera
     try std.testing.expectEqualStrings("/a#b", u.rules[0].pattern);
     try std.testing.expectEqualStrings("/c", u.rules[1].pattern);
     try std.testing.expectEqualStrings("/#in", u.rules[2].pattern);
+    // A value runs to the comment and may contain blanks.
+    var spaced = try parse(std.testing.allocator, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /srv/sp ace #2\n");
+    defer spaced.deinit();
+    try std.testing.expectEqualStrings("/srv/sp ace", spaced.users[0].root);
     // `read#write` is one token: not a verb.
     try std.testing.expectError(error.InvalidPermission, parse(std.testing.allocator, text ++ "  allow /x read#write\n"));
 }
