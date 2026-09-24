@@ -1,489 +1,248 @@
 # Security Model
 
-Zift is an SFTP server on a remote trust boundary. Its security posture
-comes from narrow scope, default-deny policy, explicit filesystem roots,
-and avoiding runtime features that add state or code execution inside
-the daemon.
-
-This document describes what Zift is designed to protect, what it does
-not protect, and which caveats operators should understand before
-exposing it to partners.
+Zift is an SFTP server on a trust boundary. Its posture comes from
+narrow scope, default-deny policy, explicit filesystem roots, and no
+runtime features that add state or run code inside the daemon. This
+page says what Zift protects, what it does not, and the caveats to
+understand before exposing it to partners.
 
 ## Threat Model
 
-Zift is primarily concerned with:
+Zift defends against:
 
-- An authenticated partner trying to read or write outside their virtual
-  root.
-- An authenticated partner trying to exceed their configured
-  permissions.
-- An authenticated partner trying to destroy, overwrite, or replace data
-  they were only allowed to create or read.
-- An authenticated partner trying to exploit symlinks, `..`, malformed
-  paths, or SFTP protocol edge cases.
-- An unauthenticated network client trying to consume connection slots,
-  enumerate users, or abuse authentication.
-- A local unprivileged user trying to observe partner data or in-flight
-  uploads through host filesystem permissions.
+- an authenticated partner reaching outside their root, exceeding their
+  permissions, or destroying or replacing data they could only create
+  or read;
+- an authenticated partner using symlinks, `..`, malformed paths or SFTP
+  protocol edge cases to do any of that;
+- an unauthenticated client consuming connection slots or memory,
+  enumerating users, or guessing credentials;
+- a local unprivileged user reading partner data or in-flight uploads
+  through host permissions.
 
-Zift does not protect against:
+It does not defend against root compromise of the host, a malicious
+operator, kernel, filesystem-driver, libssh or crypto-library bugs, disk
+exhaustion by allowed uploads, downstream processors that mishandle
+files, or a stolen partner credential.
 
-- root compromise of the host
-- a malicious operator
-- kernel vulnerabilities
-- filesystem drivers that lie about canonical fd paths
-- libssh or crypto-library vulnerabilities
-- disk exhaustion by allowed uploads
-- downstream processors that mishandle files after Zift writes them
-- partner credential compromise
+Run Zift as a dedicated unprivileged user. That is mandatory, not
+cosmetic: virtual users have no UID, shell or home directory, and every
+filesystem operation runs as the daemon's user.
 
-Run Zift as a dedicated unprivileged OS user. Treat that as mandatory,
-not cosmetic.
-
-## Security Boundary
-
-The boundary is:
+## Request Path
 
 ```text
 remote SFTP client
-  -> SSH transport via libssh
-  -> Zift auth
-  -> Zift path normalization
-  -> Zift policy check
-  -> verified filesystem operation under user's root
+  -> SSH transport (libssh)
+  -> Zift authentication
+  -> path normalization
+  -> policy check
+  -> filesystem operation, resolved inside the user's root
 ```
 
-Every virtual user has:
+Policy is default-deny and any matching `deny` wins
+([`configure.md`](configure.md#permissions)). `write` alone never
+destroys: replacing an existing file needs `update`.
 
-- a name
-- one password hash and/or one or more public keys
-- one real filesystem root
-- allow/deny rules
+## Paths And The Jail
 
-Virtual users are not OS users. They have no shell, no UID, no home
-directory in `/etc/passwd`, and no independent host permissions. Zift
-itself performs filesystem operations as the single OS user running the
-daemon.
+Every client path is validated before policy or audit: at most 4096
+bytes, valid UTF-8, no control bytes or DEL, `.` and `..` resolved but
+never above the root, and no `.zift` (or legacy `.zift-staging`)
+component anywhere, in any letter case. Policy sees the normalized
+virtual path, never a host path.
 
-## Default Deny
-
-Authorization starts from deny.
-
-A user with valid credentials but no `allow` rules can authenticate but
-cannot browse, download, upload, rename, or delete useful paths.
-
-`allow` grants specific verbs on matching virtual paths. `deny`
-overrides `allow`.
-
-This is the central policy invariant:
-
-```zift
-user ally
-  auth a…
-  from 203.0.113.40
-  allow /pending read write
-  deny **.exe
-```
-
-The user may create new non-`.exe` files under `/pending`, but may not
-delete or overwrite existing files because neither `delete` nor `update`
-was granted.
-
-## Path Validation
-
-Zift validates client-supplied virtual paths before policy or audit:
-
-- maximum 4096 bytes
-- valid UTF-8
-- no NUL byte
-- no ASCII control characters
-- no DEL byte
-- no traversal above virtual root
-- normalized `.` and `..`
-- reserved `.zift` path component rejected (and legacy `.zift-staging` for upgrade safety)
-
-Policy is checked against the normalized virtual path, not against the
-host filesystem path.
-
-## Jail Enforcement
-
-Zift does not rely on string-prefix checks alone. It walks from the
-partner root one directory component at a time with descriptor-relative
-`NOFOLLOW` opens. Directory symlinks are visible as entries but cannot
-be traversed, so an allowed symlink spelling cannot alias a denied path
-or the reserved `.zift` namespace.
-
-Mutation operations use parent-directory file descriptors where
-possible:
-
-- open each parent component without following symlinks
-- verify the parent fd is inside the user's root
-- perform the operation relative to that fd
-
-MKDIR opens the new directory with symlink-follow disabled and pins
-`mkdir-mode` on that directory fd.
-
-This is designed to block common symlink and time-of-check/time-of-use
-escape patterns where a string looked safe before open but resolves
-outside the jail at operation time.
-
-## Filesystem Assumptions
-
-Zift assumes the kernel reports truthful canonical paths for file
-descriptors.
-
-On Linux this depends on `/proc/self/fd`. On macOS this depends on
-`F_GETPATH`.
-
-Do not place partner roots on unusual filesystems that synthesize or lie
-about fd paths if you depend on jail enforcement. Prefer ordinary local
-filesystems for partner roots.
+Zift then walks from the partner root one component at a time with
+descriptor-relative `NOFOLLOW` opens and acts relative to the parent
+descriptor. A symlink inside a root is listed but never traversed, and a
+final-component symlink is never opened, so no spelling can alias a
+denied path, `.zift`, or anything outside the root. Opened files are
+also checked against the root through the kernel's view of the
+descriptor path (`/proc/self/fd` on Linux, `F_GETPATH` on macOS); keep
+partner roots on ordinary local filesystems that report those honestly.
 
 ## Authentication
 
 ### Passwords
 
-Passwords are stored as Janus-identical `a…` passhashes (argon2id
-with fixed module constants; `a` + 31 base62 chars — always 32 chars):
+A password is stored as a 32-character passhash: `a` (the format
+version) and 31 base62 characters encoding an 8-byte salt and a 15-byte
+Argon2id key (64 MiB, 2 passes, 1 lane). The format and parameters are
+the same as Janus, a sibling project, so a hash minted by either
+verifies in the other. The digest comparison is constant-time.
 
-```zift
-auth a…
-```
+Every password denial costs one Argon2id: a wrong password, an unknown
+user, a key-only user and a `from` miss all run the same check against a
+dummy hash when there is nothing real to check. Response time therefore
+does not reveal which users exist or how they authenticate.
 
-Mint with `zift hash-password` (see [`configure.md`](configure.md)).
-Parameters are fixed (not stored in the blob), matching Janus:
+### Public keys
 
-- argon2id, memory 64 MiB, time 2, parallelism 1
-- 8-byte salt, 15-byte key
+Keys live in operator-managed files (rules in
+[`configure.md`](configure.md#auth)). Ed25519 and ECDSA P-256, P-384 and
+P-521 keys are accepted, and RSA keys of 2048 to 8192 bits, which must
+sign with `rsa-sha2-256` or `rsa-sha2-512`. SHA-1 RSA signatures and
+DSA are refused, for user and host keys alike.
 
-Plaintext passwords and legacy `$argon2id$…` PHC strings are rejected.
+A public-key probe for an unknown user and for a known user outside
+`from` look the same to the client; only the audit detail differs.
 
-Every password denial runs the same argon2id work — a real verify for a
-known user with a password, and the same cost against a dummy credential
-for an unknown user, a key-only user, or a user rejected by the `from`
-allowlist — so response timing does not enumerate usernames or reveal
-which auth methods a username has.
+### Method narrowing
 
-### Public Keys
+A password-only user's failure replies advertise only `password`, so
+clients stop offering every agent key first. That lets a probing client
+tell a password-only user from an unknown one. Partner names are usually
+pre-shared, so this is the right trade; if it matters, give every user
+both a password and a key.
 
-Public keys live in operator-managed files:
+## Abuse Controls
 
-```zift
-auth /home/zift/keys/ally.pub
-```
+These are built in and always on; there is nothing to install or
+enable. Their numbers are in the [Limits](configure.md#limits) table.
 
-Accepted algorithms:
+- **Login grace.** A connection must log in within a fixed time from
+  accept, key exchange included, however busy it keeps the server.
+- **Per-connection ceilings.** Hard failures (a bad password, a
+  password from outside `from`) back off a little longer each time and
+  end the connection after a few. Soft operations (key offers, `none`,
+  other SSH messages) are only counted, with a higher ceiling.
+- **Source suppression.** A burst of hard failures from one source
+  refuses that source for a while, including its connections still
+  logging in. A successful login does not clear the count. A source is
+  an IPv4 address or an IPv6 /64.
+- **Connection caps.** `max-connections` bounds all sessions,
+  `max-unauth-connections` those not yet logged in, and each source
+  gets a small share of pre-auth connections. Refusals are audited at
+  most once a minute per source.
+- **Bounded password work.** Only a few Argon2id checks run at once, so
+  a flood of bad logins cannot exhaust memory; the rest wait within
+  their login grace.
+- **No shell or forwarding.** After the SFTP subsystem starts, extra
+  channels and channel or global requests (`exec`, `pty-req`,
+  `tcpip-forward`, ...) are refused.
 
-- `ssh-ed25519`
-- `ecdsa-sha2-nistp256`
-- `ecdsa-sha2-nistp384`
-- `ecdsa-sha2-nistp521`
+Prefer `from` for partners with stable addresses. A host firewall is
+optional defense in depth; keep administrative SSH on a different port.
 
-Rejected:
+## Uploads And The Per-Partner Namespace
 
-- RSA
-- DSA
-- malformed key lines
-- key files that are not regular files
-- key files writable by group or world
+New uploads are written to `<root>/.zift/staging/` and renamed into
+place when the client closes them. Staging files are private while in
+flight, publish re-checks policy and the clobber rule, and an upload
+abandoned by a disconnect is removed. Orphans left by a crash are swept
+at that partner's next login once older than `max(idle-timeout, 15m)`;
+the sweep skips uploads still open in this process.
 
-### Auth Attempt Limits
+`<root>/.zift/` is reserved: partners cannot name it in any request or
+see it in any listing. Besides `staging/`, which only the daemon uses,
+operators may keep per-partner notes there. Zift checks both levels on
+every use, and new uploads fail with "staging dir unavailable" if
+either is wrong; logins and downloads still work.
 
-Each session has a finite authentication attempt limit. Pre-auth
-connections are also subject to `idle-timeout`.
+| Path | Must be | Created as |
+| --- | --- | --- |
+| `.zift` | a real directory owned by the daemon's user or root, with no group-write and no other access | `0750`, daemon's user |
+| `.zift/staging` | a real directory owned by the daemon's user, with no group or other access | `0700`, daemon's user |
 
-Set `max-unauth-connections` to keep unauthenticated connection churn
-from consuming all `max-connections` slots.
-
-### Auth Method Caveat
-
-SSH public-key auth is a two-phase protocol. Some response shapes can
-reveal information about whether a username/key combination is
-configured.
-
-Zift narrows failure methods for password-only known users so ordinary
-clients do not waste time offering every SSH agent key before showing a
-password prompt. That means a password-only known user can be
-distinguished from an unknown user by a probing client.
-
-For partner deployments where usernames are pre-shared, this is usually
-the right operational tradeoff. If username non-enumerability is more
-important, provision both password and key auth consistently so response
-shapes stay less distinguishable.
-
-Public-key probes for an unknown user and for a known user outside
-`from` are the same to the client: no backoff, and not a hard failure.
-The audit log still distinguishes them (`unknown user` versus
-`source not allowed`).
-
-## Permission Safety
-
-Authorization verbs and the clobber rule (`write` creates; modifying or
-replacing an existing entry also needs `update`) are defined in
-[`configure.md`](configure.md). The security-relevant invariant is the
-same: `write` alone is not destructive write access.
-
-## Atomic Uploads
-
-New uploads are written into `<root>/.zift/staging/` and published to
-the final path when the client closes the file handle. The parent
-`<root>/.zift/` is zift's reserved per-partner namespace (see
-"Per-Partner Namespace" below).
-
-Security properties:
-
-- partners cannot list `.zift` (or anything inside it)
-- partners cannot reference `.zift` through SFTP paths (the legacy
-  `.zift-staging` name from v0.5.0–v0.7.x is still reserved for
-  upgrade-safety)
-- fresh staging directories are mode `0o700`
-- staging files are private while in flight
-- disconnect cleanup removes unfinished staging files
-- publish re-checks policy and clobber authority at close time
-
-Operational caveats:
-
-- Staging happens under the partner root, not the target parent. Default
-  ACLs and setgid inheritance on subdirectories such as `/pending` do
-  not apply at staging-file create time. Use `publish-mode`, root-level
-  defaults, or downstream fixup if processors rely on exact ownership or
-  ACLs.
-- Partner root and target directory must be on the same filesystem.
-  Cross-filesystem rename returns `EXDEV`; Zift refuses the publish
-  rather than copy bytes non-atomically.
-- Crash orphans under `<root>/.zift/staging/` are swept on the next
-  login for that partner when older than `max(idle-timeout, 15m)`.
-  The sweep does not delete a staging file another live session still
-  has open. Partners never see each other's staging — each jail is
-  separate.
-
-## Per-Partner Namespace
-
-Every partner root has a reserved per-partner namespace directory at
-`<root>/.zift/`. This is zift's hidden drawer for the partner: a
-place to store both daemon-managed state and operator-managed notes
-without exposing any of it through the SFTP wire surface.
-
-Layout:
-
-```text
-<root>/.zift/                       reserved per-partner namespace
-├── staging/                        daemon-owned, mode 0700
-│                                   atomic-upload in-flight files
-└── (operator-managed)              notes.md, contracts, scripts,
-                                    audit reviews — anything the
-                                    operator wants alongside the
-                                    partner's data tree
-```
-
-Security properties:
-
-- `.zift` (and the legacy `.zift-staging` from v0.5.0–v0.7.x) is
-  rejected as a virtual-path component by the path validator
-  **anywhere in the path, not just at the partner root**. Every
-  SFTP operation (OPENDIR, STAT, OPEN, REALPATH, MKDIR, REMOVE,
-  RMDIR, RENAME, ...) on any path containing `.zift` as a component
-  returns `permission denied` to the partner. REALPATH of `.zift` and
-  of other rejected paths returns permission denied, the same as STAT
-  and OPEN. An operator
-  migrating from a non-zift SFTP service should scan partner
-  roots for pre-existing `.zift`/`.zift-staging` directories
-  before going live — see `docs/operate.md` "Upgrading to
-  v0.8.0".
-- The listing renderer also skips `.zift` (and the legacy
-  `.zift-staging`) when emitting READDIR results — partners
-  never observe the entry exists.
-- The daemon writes only to `<root>/.zift/staging/`. The namespace
-  parent and any other path inside it are operator-managed; the
-  daemon traverses them but does not read or write their contents.
-
-Recommended operator workflow for per-partner metadata:
+Zift creates both on the first upload. To keep notes there and stop the
+daemon from changing `.zift` itself, create it root-owned, and then
+create `staging` yourself, since the daemon can no longer do it:
 
 ```sh
-# Pre-create with operator ownership so the daemon can traverse
-# (group zift) but cannot modify (root-owned parent).
 sudo install -d -o root -g zift -m 0750 /home/zift/<partner>/.zift
-
-# Drop notes, contracts, anything you want hidden from the partner.
+sudo install -d -o zift -g zift -m 0700 /home/zift/<partner>/.zift/staging
 sudoedit /home/zift/<partner>/.zift/notes.md
 ```
 
-If the operator does not pre-create `.zift/`, the daemon creates it
-at mode `0o750 zift:zift` on first upload. At `0o750`, operators in
-group `zift` can read+traverse the namespace but cannot write to it
-without elevating to root (or to the `zift` user) — adding notes or
-other operator-managed files still goes through `sudo`/`sudoedit`.
-
-A pre-existing `.zift/` is enforced to be a real directory (not a
-symlink — which could redirect the staging area outside the jail)
-AND to have a sane mode: `mode & 0o027 != 0` is fatal. That means
-the daemon refuses to start a session if it finds a namespace dir
-that grants group-write (`0o770`, `0o777`) or any "other" access
-(`0o755`, `0o751`, etc.). The acceptable shapes are:
-
-```text
-0o700 zift:zift            (daemon-only)
-0o750 zift:zift            (daemon owns, operators in group zift read)
-0o750 root:zift            (root owns, operators in group zift read)
-```
-
-Reject:
-
-```text
-0o770   group-writable — a group member could race the staging entry
-0o755   world-readable — exposes operator metadata to local users
-0o777   no.
-```
-
-This namespace is forward-extensible: future per-partner state that
-zift might add (staging-orphan sweep queues, resume indexes, etc.)
-would land in `<root>/.zift/<subdir>/` without any further
-path-validator changes.
+Staging lives under the partner root, not the target directory, so
+default ACLs and setgid inheritance on `/pending` do not apply while a
+file is staged; use `publish-mode` or downstream fixups if processors
+depend on them. The partner root and the target must be on one
+filesystem: Zift refuses a cross-filesystem publish rather than copy
+bytes non-atomically.
 
 ## Audit Logging
 
-Zift emits structured JSON audit lines for auth and privileged or
-denied operations.
+Every login, open, change and refusal is audited as one JSON object per line
+([`operate.md`](operate.md#logs)). Partner-supplied fields (user name,
+path, detail) are escaped so a line is always valid JSON and cannot be
+split or forged: invalid UTF-8 becomes U+FFFD, and control characters,
+C1 controls, DEL, U+2028, U+2029 and the bidi override and isolate
+characters are written as `\uXXXX`.
 
-Every partner-influenced field (username, path, detail) is JSON-escaped,
-and invalid UTF-8 bytes in a filename are replaced with U+FFFD before
-encoding, so an audit line is always valid JSON — a partner cannot forge
-a log line or emit bytes that make `jq` or a log shipper drop the line.
+Audit favors availability. If the log cannot be opened at startup,
+`serve` exits. Once running, a failed write or reopen is reported on
+stderr and serving continues. If you need fail-closed audit, keep the
+log where partners cannot fill it, ship it off-host, and have your
+supervisor stop the service when delivery fails.
 
-Audit is designed for operational visibility, not as a fail-closed
-security control.
+## Host Posture
 
-If the audit destination fails, Zift warns on stderr and continues
-serving. Availability wins over blocking all partner traffic because a
-log sink is unavailable.
-
-If your environment requires fail-closed audit semantics, put the log
-destination on storage partners cannot influence, ship logs off-host,
-monitor stderr, and use supervisor policy to stop the service when log
-delivery fails.
-
-## Recommended Host Posture
-
-Use the shipped systemd unit as the baseline.
-
-The recommended posture:
-
-- dedicated `zift` OS user
-- no root privileges
-- empty capability bounding set
-- `NoNewPrivileges=true`
-- restricted address families
-- strict filesystem namespace
-- `/home/zift` as the only writable tree
-- root-owned config and host key, group-readable by `zift`
-- partner roots owned by `zift:zift`
-- partner directories mode `2770`
-- audit log mode `0640`
-- private staging directories mode `0700`
-
-Recommended top-level modes:
-
-```text
-/home/zift/                         0750 root:zift
-/home/zift/zift.conf                0640 root:zift
-/home/zift/host_ed25519             0640 root:zift
-/home/zift/audit.jsonl              0640 zift:zift
-/home/zift/keys/                    0750 root:zift
-/home/zift/keys/<partner>.pub       0640 root:zift
-/home/zift/<partner>/               2770 zift:zift
-/home/zift/<partner>/.zift/         0750 zift:zift  (or root:zift if operator pre-creates)
-/home/zift/<partner>/.zift/staging  0700 zift:zift
-```
-
-## Network Posture
-
-Zift listens on the configured TCP address. Built-in controls cover
-the normal Internet-facing partner case:
-
-- per-user `from` CIDR source policy (optional, recommended for B2B)
-- connection caps (`max-connections`, `max-unauth-connections`)
-- idle timeout
-- per-session auth attempt ceiling (6)
-- auth backoff after failures (up to 2s)
-- temporary source suppression after 10 failures in 10 minutes
-  (15-minute suppress window; cleared on successful auth). Suppression
-  is checked again inside authentication. A source that trips the
-  threshold is disconnected, including the session that recorded the
-  failure. New accepts from that source are refused.
-- non-auth SSH messages are capped — service requests, global
-  requests, and channel requests other than the sftp subsystem — so
-  they cannot hold a connection slot forever.
-
-Zift does not implement geo rules, threat feeds, TLS termination, or
-HTTP health endpoints. A host/cloud firewall remains optional
-defense-in-depth. Prefer `from` in the user block so source policy
-lives with credentials and path rules.
-
-## SFTP Protocol Surface
-
-Zift intentionally implements the SFTP v3 operations needed for file
-transfer and rejects metadata mutation and extension operations. Requests
-such as `SETSTAT`, `FSETSTAT`, `READLINK`, `SYMLINK`, and `EXTENDED`
-return "operation unsupported" and the session continues. Clients cannot
-set server-side mtime, chmod/chown files through SFTP, create symlinks,
-or rely on protocol extensions.
+Use the shipped systemd unit and the layout in
+[`operate.md`](operate.md): a dedicated `zift` user with no
+capabilities, config, host key and key files owned by `root:zift` and
+not writable by the daemon, partner roots `2770 zift:zift`, and the
+daemon's writable tree marked non-executable. `validate` refuses a
+config whose host key, key files, audit log or config file lie inside a
+partner root, where a partner could read or replace them.
 
 ## Supply Chain
 
-Release builds:
-
-- use Zig `0.16.0`
-- vendor libssh, mbedTLS, and zlib via `build.zig.zon`
-- produce static Linux binaries
-- produce macOS binaries with system libSystem only
-- publish SHA256 checksums
-- sign `SHA256SUMS` with cosign keyless via GitHub Actions OIDC
-
-Operators should verify `SHA256SUMS.bundle` and the downloaded binary
-hash before installing.
-
-Source builds are reproducible from the pinned dependency graph, but a
-local build does not carry the GitHub Actions OIDC identity. Use release
-artifacts when provenance matters.
+Release binaries are built by GitHub Actions with Zig 0.16.0 from
+libssh, mbedTLS and zlib pinned in `build.zig.zon`. Linux binaries are
+static; macOS binaries link only libSystem. `SHA256SUMS` covers every
+published file and is signed with cosign keyless through the release
+workflow's OIDC identity. Verify both before installing
+([`operate.md`](operate.md#by-hand)); a local build carries no such
+provenance.
 
 ## Known Caveats
 
-These are accepted limitations or follow-up hardening items, not hidden
-promises:
+- **Reload does not revoke live sessions.** A removed partner, a changed
+  password or a new `deny` applies to new sessions only. Restart to cut
+  off open sessions.
+- **Clobber protection needs a no-replace rename.** Publish and rename
+  without `update` use `renameat2(RENAME_NOREPLACE)` on Linux or
+  `renameatx_np(RENAME_EXCL)` on macOS. On NFS, SMB and some FUSE
+  mounts that lack it, they fail rather than risk replacing a file.
+- **Overwrites are not atomic.** Only new uploads are staged. A partner
+  with `update` who overwrites a file writes it in place, so a reader
+  can see it half-written.
+- **Bad key signatures are not counted.** libssh drops a public-key
+  request with an invalid signature before Zift sees it, so those do not
+  count toward the auth ceiling; the login grace still bounds them.
+- **Case and Unicode on macOS.** Matching is byte-exact and
+  case-sensitive, but APFS and HFS+ are case-insensitive and treat
+  Unicode normalization forms as the same name. There, `deny **.exe`
+  misses `TOOL.EXE`, and a deny of an NFC name misses its NFD spelling.
+  `.zift` is matched case-insensitively and is ASCII, so it is not
+  affected, and Linux filesystems are not affected. Prefer
+  case-sensitive filesystems for partner roots.
+- **Unreachable names.** Names that are not valid UTF-8, contain control
+  bytes, or (on macOS) exceed 255 bytes cannot be named over SFTP and
+  are left out of listings.
+- **Shared addresses share a counter.** Partners behind one NAT, or in
+  one IPv6 /64, share suppression and the per-source pre-auth cap. One
+  of them guessing badly can lock the others out until the suppression
+  expires.
+- **One daemon per partner root.** Two Zift processes serving the same
+  root can sweep each other's in-flight uploads.
+- **Public-key timing is close, not identical.** Password denials cost
+  exactly one Argon2id; public-key denials differ by microseconds of key
+  parsing.
+- **No quotas.** Disk space and full disks are the operating system's
+  business.
 
-- Glob matching supports `**`, which is useful but recursive. Patterns
-  are operator-controlled, not remote-client-controlled. Matching is
-  bounded by a per-evaluation step budget: a pathological pattern
-  against a long client path fails closed (the operation is denied)
-  rather than consuming unbounded CPU.
-- Glob matching is byte-exact and case-sensitive. On a case-insensitive
-  filesystem (macOS APFS/HFS+), `deny **.exe` matches `tool.exe` but not
-  `TOOL.EXE` even though they are the same file. Prefer case-sensitive
-  local filesystems for partner roots, or write deny patterns that do
-  not depend on case. The reserved `.zift` namespace is folded to be
-  case-insensitive regardless, so partners cannot reach it via a case
-  variant. APFS also equates Unicode normalization forms, so a
-  byte-exact deny of an NFC name does not match the NFD spelling.
-  `.zift` is ASCII and is not affected. Linux partner roots are not
-  affected. Zift does not fold normalization.
-- Audit is not fail-closed.
-- Quotas and disk-full behavior are delegated to the OS.
-
-## Security Review Checklist
+## Review Checklist
 
 Before exposing a deployment:
 
-- `zift validate /path/to/zift.conf` succeeds as the service user.
-- Zift runs as a dedicated unprivileged OS user.
-- Config and host key are not writable by the daemon.
-- Public-key files are not writable by group or world.
-- Partner roots do not overlap.
-- Partner roots are not on FUSE or unusual network filesystems.
-- Partner roots that receive staged uploads are on a single filesystem.
-- `max-connections`, `max-unauth-connections`, and systemd `MemoryMax`
-  are consistent with Argon2id memory settings.
-- Partner users with stable egress use `from` CIDRs when possible.
-- Auth throttling / source suppression remain enabled (built-in;
-  no external ban daemon required).
-- Audit logs go to stderr (preferred) or a monitored file.
-- Rollback binary and config backup are available.
+- `zift validate` succeeds as the service user.
+- Zift runs as a dedicated unprivileged user under the shipped unit.
+- The config, host key and key files are not writable by the daemon.
+- Partner roots are on local filesystems that support no-replace
+  rename, one filesystem per root.
+- Partners with stable egress addresses have `from` lines.
+- Audit logs go to the journal or a monitored file, and someone watches
+  for `config.reload` failures.
+- The previous binary and a config backup are at hand.

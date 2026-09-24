@@ -118,15 +118,14 @@ Zift provides:
 
 - SFTP version 3 service over SSH.
 - Virtual users defined in a text config file.
-- Password auth using compact versioned passhashes (`a…`, argon2id; shared with Janus).
-- Public-key auth using operator-managed key files.
-- Per-user filesystem roots.
-- Optional `partner-root` shorthand for `/home/zift/<user>` style
-  layouts.
-- Path-scoped allow/deny rules.
-- A small permission vocabulary: `read`, `write`, `update`, `delete`,
-  `full`, plus granular `list`, `mkdir`, and `rename`.
-- Default-deny authorization.
+- Password auth with Argon2id hashes, and public-key auth (Ed25519,
+  ECDSA, RSA) from operator-managed key files.
+- Per-user roots that symlinks cannot escape.
+- Default-deny, path-scoped allow/deny rules with a small vocabulary:
+  `read`, `write`, `update`, `delete`, `full`, plus `list`, `mkdir` and
+  `rename`.
+- Optional per-user source addresses, and built-in auth backoff,
+  source suppression and connection caps.
 - Structured JSON audit logs.
 - Hot config reload for new sessions.
 - Graceful shutdown and forced close after a configured grace period.
@@ -153,13 +152,10 @@ Zift does not contain:
 - Automatic updates.
 - Telemetry.
 
-The intended model is self-contained for the normal case: one binary,
-one config, built-in connection caps, auth backoff, temporary source
-suppression, and optional per-user `from` CIDRs. Use a process
-supervisor (systemd) if you want autostart. Pipe JSON audit logs
-wherever you already ship logs. Filesystem snapshots cover backups;
-external watchers handle post-upload processing. Zift does not require
-fail2ban, CrowdSec, or a separate ban daemon.
+The normal case is one binary and one config. A supervisor such as
+systemd starts it, your log shipper takes the JSON audit lines,
+filesystem snapshots cover backups, and external watchers handle
+post-upload processing. No fail2ban, CrowdSec or ban daemon is needed.
 
 ## Why The Narrowness Is A Feature
 
@@ -185,26 +181,15 @@ chooses to do.
 
 ## Current Maturity
 
-The implementation is a compact Zig codebase using libssh for the SSH
-transport. Release builds vendor libssh, mbedTLS, and zlib through the
-Zig package graph.
+Zift is a compact Zig codebase on libssh, with unit tests, fuzzing, and
+an integration suite that drives real OpenSSH and Paramiko clients
+against the same static release binary users run. Releases are signed
+with cosign.
 
-The repository includes:
-
-- unit tests via `zig build test`
-- integration tests using OpenSSH clients, shell scripts, Expect, and
-  Paramiko probes
-- CI that builds a static Linux release-style binary and runs the
-  integration suite against it
-- a release workflow that builds Linux and macOS artifacts, emits
-  `SHA256SUMS`, signs the manifest with cosign keyless, and publishes a
-  deploy bundle
-- a security guide that covers the threat model, invariants, deployment
-  hardening, and known caveats
-
-Remaining known caveats are documented in [`security.md`](security.md).
-The most important are filesystem edge cases around no-replace rename
-semantics and cross-filesystem atomic uploads.
+Read the [known caveats](security.md#known-caveats) before deciding. The
+ones most likely to matter: partner roots need a filesystem with
+no-replace rename (not NFS or SMB), a reload does not cut off a partner
+who is already connected, and overwrites are not atomic.
 
 ## The Evaluation Test
 

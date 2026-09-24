@@ -2,8 +2,9 @@
 
 Zift links statically against the following open-source libraries.
 Release binaries include compiled object code from each. Source for each
-pinned version is fetched at build time via `build.zig.zon`; the URLs and
-commit hashes there are the authoritative pointers to the exact sources
+pinned version is fetched at build time via `build.zig.zon`; the URLs,
+commits and content hashes there (and, for zlib, in the wrapper's own
+`build.zig.zon`) are the authoritative pointers to the exact sources
 that produced the shipped binary.
 
 ## libssh
@@ -36,7 +37,10 @@ License text: <https://www.apache.org/licenses/LICENSE-2.0.txt>
 
 - Project: <https://zlib.net/>
 - Version: 1.3.2
-- Source: <https://github.com/madler/zlib>
+- Source: <https://github.com/madler/zlib/archive/refs/tags/v1.3.2.tar.gz>,
+  fetched and built through the Zig package wrapper
+  <https://github.com/allyourcodebase/zlib>, which `build.zig.zon` pins
+  by commit
 - License: zlib license
 
 The zlib license is permissive and notice-only. The full text is short:

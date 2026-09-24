@@ -1,371 +1,175 @@
 # Develop Zift
 
-This guide is for contributors and maintainers.
-
-Zift is a Zig project. It builds one SFTP server binary and a small set
-of companion test/fuzz targets. The runtime depends on libssh for SSH,
-mbedTLS for crypto, and zlib for SSH compression. Release builds vendor
-those dependencies through `build.zig.zon`.
+This guide is for contributors and maintainers. Zift is one Zig binary
+built with libssh (SSH), mbedTLS (crypto) and zlib (compression), all
+compiled from source pinned in `build.zig.zon`. No system packages are
+needed.
 
 ## Toolchain
 
-Required:
-
 - Zig `0.16.0`
-- a POSIX-like host for development
-- Python 3 for integration probes
-- OpenSSH client tools for integration tests
-- `expect` for password-driven SFTP tests
-
-On Linux integration-test hosts:
+- a Linux or macOS host
+- for integration tests: Python 3 with Paramiko, the OpenSSH client,
+  `expect` and `lsof`
 
 ```sh
-sudo apt-get update
-sudo apt-get install -y expect openssh-client python3-venv lsof
+sudo apt-get install -y expect openssh-client python3-venv lsof   # Linux; macOS has these
+python3 -m venv tests/.venv
+tests/.venv/bin/pip install paramiko
 ```
 
 ## Source Layout
 
 ```text
 src/
-├── main.zig              # CLI: serve, validate, hash-password, version
-├── server.zig            # accept loop, reload, session threads, bind
-├── ssh.zig               # SSH userauth (password / public key)
-├── sftp.zig              # SFTP v3 state and request handlers
-├── wire.zig              # SFTP packet codec
-├── config.zig            # config parser, semantic validation, key-file loading
-├── policy.zig            # allow/deny engine and glob matching
-├── vfs.zig               # virtual path normalization and jail verification
-├── auth.zig              # password verify (wraps passhash)
-├── passhash.zig          # versioned password credential codec (a…)
-├── abuse.zig             # auth backoff + temporary source suppression
-├── netmatch.zig          # IP/CIDR matching for per-user `from`
-├── audit.zig             # JSON audit sink (+ shared monotonic clock)
-├── listing.zig           # virtual/reality directory listing renderer
-├── signals.zig           # signal flags, session fd registry, forced close
-├── tests.zig             # unit-test root
-├── fuzz.zig              # fuzz harnesses
-└── ext/
-    └── libssh_root.h     # translate-c tip for @import("libssh")
-```
-
-Other important paths:
-
-```text
-build.zig                           # build graph, vendored C dependency build
-build.zig.zon                       # pinned dependency graph
-tools/verify.zig                    # release-artifact dep-surface verifier
-packaging/systemd/zift.service      # optional systemd unit
-tests/run.sh                        # integration-test runner
-tests/cases/*.sh                    # integration cases
-tests/lib/*.py                      # Paramiko/raw protocol probes
-.github/workflows/ci.yml            # CI
-.github/workflows/release.yml
+├── main.zig        CLI: serve, validate, hash-password, version
+├── server.zig      accept loop, admission, reload, drain, session threads
+├── ssh.zig         SSH authentication: password, public key, KDF slots, login grace
+├── abuse.zig       per-source failure counts, suppression, pre-auth cap
+├── netmatch.zig    IP/CIDR matching for `from`
+├── passhash.zig    the `a…` password hash format
+├── config.zig      config parser and filesystem validation
+├── policy.zig      allow/deny evaluation and glob matching
+├── sftp.zig        SFTP v3 request handlers, staging and publish
+├── vfs.zig         path normalization and the NOFOLLOW jail walk
+├── wire.zig        SFTP packet encoding and parsing
+├── listing.zig     directory listing rendering and stat helpers
+├── audit.zig       JSON audit sink
+├── signals.zig     signal flags and the session socket registry
+├── sys.zig         clocks, civil time, one-write stderr helper
+├── tests.zig       unit-test root
+├── fuzz.zig        fuzz harnesses
+└── ext/            libssh translate-c header
+tools/verify.zig    checks a release binary's dynamic dependencies
+packaging/systemd/zift.service
+tests/run.sh, tests/cases/*.sh, tests/lib/
 ```
 
 ## Build
 
-Debug-style local build:
-
 ```sh
-zig build
-bin/zift version
-```
-
-ReleaseSafe local build:
-
-```sh
+zig build                              # Debug, PIE, to bin/zift
 zig build -Doptimize=ReleaseSafe
 bin/zift version
 ```
 
-The normal development binary lands at `bin/zift`.
-
-## Unit Tests
-
-```sh
-zig build test
-```
-
-Unit tests cover parser behavior, policy matching, auth validation,
-path normalization, listing formatting, audit serialization, and other
-pure or mostly-pure logic.
-
-## Integration Tests
-
-Run all integration tests:
+A release binary is ReleaseSafe, stripped, and checked by
+`tools/verify.zig` (no dynamic dependencies on Linux, only libSystem on
+macOS). It lands in `release/zift-<version>-<arch>-<os>`:
 
 ```sh
-tests/run.sh
+zig build release -Dtarget=x86_64-linux-musl
+zig build release -Dtarget=aarch64-linux-musl
+zig build release -Dtarget=x86_64-macos
+zig build release -Dtarget=aarch64-macos
 ```
 
-List cases:
-
-```sh
-tests/run.sh --list
-```
-
-Run selected cases:
-
-```sh
-tests/run.sh 00-smoke 34-clobber 35-atomic-upload
-```
-
-Keep a passing case's scratch directory:
-
-```sh
-tests/run.sh --keep 00-smoke
-```
-
-Each case gets:
-
-- an isolated temp directory
-- a unique TCP port
-- a fresh config
-- access to `ZIFT_BIN`
-
-Cases cover smoke behavior, idle timeouts, connection caps, reloads,
-graceful shutdown, handle access modes, symlink escapes, semantic
-validation, audit file targets, signal-driven log reopen, unsupported
-SFTP operations, path limits, auth hardening, config grammar, append
-semantics, unauthenticated DoS pressure, reload stress, log sink
-failure, readdir edge cases, virtual listings, clobber protection,
-atomic uploads, staging hardening, publish/mkdir modes, and v0.7 auth
-migrations.
-
-## Fuzzing
-
-Fuzz harnesses live in `src/fuzz.zig` and are imported into the
-test build.
-
-They cover:
-
-- config parser
-- virtual path normalization (both the allocating and the
-  allocation-free `normalizeVirtualInto` used on the hot request path)
-- policy glob matching
-- passhash credential validation via parser paths
-- public-key line validation
-- the SFTP wire codec (`parseString` / `parseHandleId`) — the one
-  parser a remote authenticated partner drives byte-by-byte
-
-The harnesses compile and run once during ordinary `zig build test`.
-
-CI's `fuzz-short` job runs `zig build test -Doptimize=ReleaseSafe --fuzz`
-for 60s. ReleaseSafe avoids a Zig 0.16.0 Debug `--fuzz` StackTrace type
-mismatch; switch back to Debug fuzz when a patched Zig is pinned.
-
-## Local Release Builds
-
-Build one release artifact:
-
-```sh
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.11.0-dev
-```
-
-Supported release targets:
-
-```sh
-zig build release -Dtarget=x86_64-linux-musl  -Dversion=0.11.0-dev
-zig build release -Dtarget=aarch64-linux-musl -Dversion=0.11.0-dev
-zig build release -Dtarget=x86_64-macos       -Dversion=0.11.0-dev
-zig build release -Dtarget=aarch64-macos      -Dversion=0.11.0-dev
-```
-
-Output lands under `release/`.
-
-Linux release targets must use `*-linux-musl`, not plain `*-linux`, so
-the binary is fully static and does not depend on the build host's
-glibc.
-
-## Vendored C Dependencies
-
-`build.zig.zon` pins:
-
-- libssh `0.11.5`
-- mbedTLS `3.6.7`
-- zlib `1.3.2`
-
-`build.zig` compiles libssh as a static library configured for the
-server-side SFTP surface Zift needs. It disables unused libssh features
-and wires libssh to the vendored mbedTLS and zlib builds.
-
-This is intentionally in the Zig build graph rather than a shell script
-that downloads tarballs at build time. A release tag pins the exact
-source revisions used for the shipped binary.
-
-## CI
-
-`.github/workflows/ci.yml` runs on pushes and pull requests to `main`.
-
-Jobs:
-
-- `unit-tests`: install Zig and run `zig build test`.
-- `build-release-safe`: build the static `x86_64-linux-musl`
-  ReleaseSafe binary, assert zero ELF `DT_NEEDED` entries, verify the
-  systemd unit, and run smoke commands.
-- `integration-tests`: run `tests/run.sh` against the binary built by
-  the ReleaseSafe job.
-- `fuzz-short`: `zig build test -Doptimize=ReleaseSafe --fuzz` for 60s.
-
-The important CI design choice is that integration tests run against
-the same static-musl shape users run in production, not a dynamic glibc
-binary that only exists in CI.
-
-## Release Workflow
-
-`.github/workflows/release.yml` triggers on tags matching:
-
-```text
-vX.Y.Z
-vX.Y.Z-rc.1
-```
-
-Prerelease suffixes may contain ASCII letters, digits, and dots.
-
-The workflow:
-
-1. Validates the tag shape.
-2. Extracts `X.Y.Z` and passes it as `-Dversion`.
-3. Builds four targets:
-   - `x86_64-linux-musl`
-   - `aarch64-linux-musl`
-   - `x86_64-macos`
-   - `aarch64-macos`
-4. Bundles the optional `packaging/systemd/zift.service` unit.
-5. Aggregates checksums into `SHA256SUMS`.
-6. Signs `SHA256SUMS` with cosign keyless using GitHub Actions OIDC.
-7. Publishes a GitHub Release.
-
-Release artifacts are named for end users:
-
-```text
-zift-X.Y.Z-x86_64-linux
-zift-X.Y.Z-aarch64-linux
-zift-X.Y.Z-x86_64-macos
-zift-X.Y.Z-aarch64-macos
-zift-deploy-X.Y.Z.tar.gz
-SHA256SUMS
-SHA256SUMS.bundle
-```
+Linux targets must be `-linux-musl`; a glibc target fails at once and
+names the musl target to use. The step works from any directory and
+with `--prefix`, and prints the artifact's sha256.
 
 ## Versioning
 
-`build.zig` contains `default_version` for local builds.
+The version lives only in `build.zig.zon` (`.version`). Every build
+uses it unless `-Dversion=…` overrides it, which the release workflow
+does with the tag minus its leading `v`. To release:
 
-Release CI overrides it with:
+1. Set `.version` in `build.zig.zon`.
+2. Rename `## Unreleased` in `CHANGELOG.md` to `## X.Y.Z — <date>`.
+3. Run the unit and integration tests.
+4. Tag and push: `git tag -a vX.Y.Z -m "Zift X.Y.Z" && git push origin
+   vX.Y.Z`.
 
-```sh
--Dversion="${GITHUB_REF_NAME#v}"
-```
-
-Before tagging a release:
-
-1. Update `default_version` if the source-tree fallback should move.
-2. Ensure docs mention the same current version.
-3. Run unit and integration tests.
-4. Push an annotated tag.
-
-Example:
+## Unit Tests And Fuzzing
 
 ```sh
-git tag -a v0.11.0 -m "Zift 0.11.0"
-git push origin v0.11.0
-```
-
-## Coding Principles
-
-Zift is intentionally conservative.
-
-Prefer:
-
-- explicit invariants over permissive fallback behavior
-- small config surface over convenience knobs
-- built-in abuse floor over external ban daemons
-- supervisor + stderr logs over a Zift logging platform
-- structured errors that tell operators what to fix
-- tests that discriminate the bug, not just cover the happy path
-- release artifacts that match what CI tested
-
-Avoid:
-
-- new runtime state locations (databases, Redis, ban DBs on disk)
-- background coordination
-- embedded scripting
-- HTTP control planes
-- plugin interfaces
-- CrowdSec/fail2ban/threat-feed integrations as product surface
-- unbounded parsing
-- accepting malformed config with warnings
-- hidden compatibility shims for unreleased branch behavior
-
-## Adding Features
-
-Most feature requests should be solved outside Zift — unless they are
-the boring necessities that make “launch and relax” true (source
-policy, connection caps, auth backoff, temporary suppress).
-
-Before adding anything to the daemon, ask:
-
-1. Does this make “I need an SFTP server” easier without becoming an
-   MFT platform?
-2. Can this be done with a wrapper, cron, log shipper, filesystem ACL,
-   inotify/fswatch, or downstream processor instead?
-3. Does this require new persistent state?
-4. Does this add a new config concept?
-5. Does this broaden the remote attack surface?
-6. Does this make failure modes harder to explain with `ls`, `ss`,
-   `tail`, and `jq`?
-
-If the answer points outside Zift, keep it outside Zift.
-
-## Maintenance Backlog
-
-No known P0 or P1 items are open. Current follow-ups are polish:
-
-- Add a reload lifetime stress test with many active sessions while the
-  config is reloaded repeatedly.
-- Add a Linux-only regression test for raw-syscall errno handling around
-  missing files.
-- Consider per-session parsed public-key handle caching, but only if the
-  configured-key and dummy-key auth paths keep matching timing behavior.
-
-## Documentation Maintenance
-
-Current docs are:
-
-- `README.md`
-- `docs/evaluate.md`
-- `docs/operate.md`
-- `docs/configure.md`
-- `docs/security.md`
-- `docs/develop.md`
-
-When changing config grammar, release behavior, deployment posture,
-security invariants, or SFTP protocol behavior, update docs in the same
-change as the code.
-
-## Useful Commands
-
-```sh
-# build
-zig build
-
-# version
-bin/zift version
-
-# unit tests
 zig build test
-
-# integration tests
-tests/run.sh
-
-# list integration tests
-tests/run.sh --list
-
-# local release artifact
-zig build release -Dtarget=x86_64-linux-musl -Dversion=0.11.0-dev
-
-# inspect release output
-ls -la release/
+zig build test -Dtarget=x86_64-linux-musl          # the libc that ships
+zig build test -Doptimize=ReleaseSafe --fuzz=200K
 ```
+
+`src/fuzz.zig` fuzzes the config parser, glob matching (against a
+reference matcher), passhash validation, public-key lines, the SFTP
+string parser and path normalization. A plain `zig build test` runs each
+harness once. Fuzz in ReleaseSafe: Zig 0.16.0's Debug `--fuzz` fails to
+build.
+
+## Integration Tests
+
+```sh
+tests/run.sh                     # every case
+tests/run.sh --list              # case names and descriptions
+tests/run.sh 00-smoke 34-clobber # selected cases
+tests/run.sh --keep 00-smoke     # keep a passing case's scratch dir
+```
+
+Each case is a bash script in `tests/cases/` that sources
+`tests/lib/common.sh` and gets its own `TEST_TMP` directory, a
+`TEST_PORT`, its `TEST_NAME`, and `ZIFT_BIN`. It exits 0 to pass, and
+calls `skip <reason>`, which exits 77, when a prerequisite is missing.
+The first `# Test:` line is its description in `--list`.
+
+The runner reads:
+
+| Variable | Effect |
+| --- | --- |
+| `ZIFT_BIN` | test this binary instead of building one |
+| `ZIFT_TEST_PORT_BASE` | ports start here, one per case (default 22200) |
+| `ZIFT_REQUIRE_ALL=1` | a skipped case fails the run, except slow cases |
+| `ZIFT_TEST_SLOW=1` | also run slow cases, such as the 120 s login grace |
+| `ZIFT_TEST_TIMEOUT` | per-case timeout |
+
+## CI
+
+`.github/workflows/ci.yml` runs on pushes and pull requests to `main`:
+
+- **Unit tests** on Linux and macOS; on Linux also `zig fmt --check` and
+  the unit tests built for `x86_64-linux-musl`.
+- **Release build** of `x86_64-linux-musl` and `aarch64-macos` with
+  `zig build release`, exactly as a release does. On Linux it also runs
+  `systemd-analyze verify` on the unit and fails on any output. Then
+  `version` and `validate` smoke tests.
+- **Integration tests** on Linux and macOS against that release
+  artifact, with `ZIFT_REQUIRE_ALL=1`, and a check that the binary under
+  test was not replaced.
+- **Fuzz** with `--fuzz=200K` in ReleaseSafe; anything but a clean exit
+  fails.
+
+## Release Workflow
+
+`.github/workflows/release.yml` runs on a pushed tag matching
+`vX.Y.Z` or `vX.Y.Z-<prerelease>` (letters, digits and dots). It:
+
+1. rejects any other tag shape;
+2. strips the leading `v` and passes the rest as `-Dversion`;
+3. runs the unit tests, then builds the four release targets;
+4. packs the systemd unit into `zift-deploy-X.Y.Z.tar.gz`;
+5. writes `SHA256SUMS` over exactly the files it publishes and signs it
+   with cosign keyless through GitHub's OIDC identity;
+6. publishes a GitHub release, marked prerelease if the tag has a `-`.
+
+Artifacts: `zift-X.Y.Z-{x86_64,aarch64}-{linux,macos}`,
+`zift-deploy-X.Y.Z.tar.gz`, `SHA256SUMS`, `SHA256SUMS.bundle`.
+
+## Principles
+
+Zift is deliberately conservative. Prefer explicit invariants over
+permissive fallbacks, a small config surface over knobs, a built-in
+abuse floor over external ban daemons, supervisor-owned logs over a
+logging platform, errors that tell the operator what to fix, tests that
+fail without the fix, and release artifacts that are exactly what CI
+tested.
+
+Avoid new runtime state (databases, ban lists on disk), background
+coordination, embedded scripting, HTTP control planes, plugins,
+unbounded parsing, and accepting a malformed config with a warning.
+
+Most feature requests belong outside Zift. Before adding one, ask:
+does it keep Zift an SFTP server rather than an MFT platform? Could a
+wrapper, cron job, log shipper, filesystem ACL or downstream processor
+do it instead? Does it add persistent state, a config concept, or
+remote attack surface? Does it make failures harder to explain with
+`ls`, `ss`, `tail` and `jq`? If the answers point outside, keep it
+outside.
+
+Update the docs and `CHANGELOG.md` in the same change as the code.
