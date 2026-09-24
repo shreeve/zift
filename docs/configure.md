@@ -66,8 +66,8 @@ The grammar is intentionally small:
 - User names are limited to 64 bytes.
 - Virtual paths are UTF-8 and limited to 4096 bytes.
 
-Durations require a suffix: `ms`, `s`, `m`, or `h`. Bare `0` is allowed
-for settings where zero disables a behavior.
+Durations require a suffix: `ms`, `s`, `m`, `h`, or `d`. Bare `0` is
+allowed for settings where zero disables a behavior.
 
 ## Server Directives
 
