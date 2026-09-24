@@ -22,16 +22,10 @@ and can write only inside partner roots. For another layout, see
 
 ## Install
 
-Install `cosign` first (`apt install cosign`, `dnf install cosign` or
-`brew install cosign`); the installer will not install without it. Then:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/shreeve/zift/main/install.sh | bash
-```
-
-It downloads the latest release for this platform, checks the cosign
-signature on `SHA256SUMS` against the exact release workflow and tag,
-checks the binary against `SHA256SUMS`, and installs the binary only.
+Install `cosign` and run the installer as in the
+[README](../README.md#install). It checks the cosign signature on
+`SHA256SUMS` against the exact release workflow and tag, checks the
+binary against `SHA256SUMS`, and installs the binary only.
 
 - On a host with a `zift.service` unit it installs to `/usr/local/bin`,
   the path the unit runs, and uses `sudo` for that one write, saying so
@@ -62,7 +56,7 @@ cosign verify-blob \
   --certificate-identity "https://github.com/shreeve/zift/.github/workflows/release.yml@refs/tags/v${ZIFT_VERSION}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing    # macOS: shasum -a 256 -c
+sha256sum -c SHA256SUMS --ignore-missing    # macOS: shasum -a 256 -c --ignore-missing
 
 sudo install -m 0755 "zift-${ZIFT_VERSION}-${ARCH}-linux" /usr/local/bin/zift
 zift version
@@ -173,12 +167,15 @@ instead, the daemon cannot create files in `/home/zift`, so create it
 first: `sudo install -o zift -g zift -m 0640 /dev/null
 /home/zift/audit.jsonl`.
 
-**6. systemd unit.** The repository and each release's
-`zift-deploy-X.Y.Z.tar.gz` ship `packaging/systemd/zift.service`, set up
-for `/home/zift`:
+**6. systemd unit.** The unit, set up for `/home/zift`, is
+`packaging/systemd/zift.service` in the repository and
+`zift-deploy-X.Y.Z/zift.service` in each release's
+`zift-deploy-X.Y.Z.tar.gz`:
 
 ```sh
-sudo install -m 0644 packaging/systemd/zift.service /etc/systemd/system/zift.service
+curl -fsSLO "https://github.com/shreeve/zift/releases/download/v${ZIFT_VERSION}/zift-deploy-${ZIFT_VERSION}.tar.gz"
+tar -xzf "zift-deploy-${ZIFT_VERSION}.tar.gz"
+sudo install -m 0644 "zift-deploy-${ZIFT_VERSION}/zift.service" /etc/systemd/system/zift.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now zift
 systemctl status zift
@@ -190,6 +187,15 @@ anything under `/home/zift`, allows only IPv4 and IPv6 sockets, filters
 system calls, and sets `MemoryMax=4G`, `LimitNOFILE=65536` and
 `TasksMax=512`. `systemctl status` and `is-active` need no `sudo`;
 `start`, `stop`, `restart` and `reload` do.
+
+To serve on a port below 1024, such as 22, grant the one capability
+that needs (`sudo systemctl edit zift`):
+
+```ini
+[Service]
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+```
 
 ### Sizing
 
@@ -290,8 +296,9 @@ root comes first.
 
 ## Remove A Partner
 
-Delete the `user` block the same way and reload. New logins for that
-user fail at once, but sessions already open continue until they end.
+Delete the `user` block the same way and reload. New connections for
+that user fail at once, but connections accepted before the reload
+keep the old config until they end.
 To cut a partner off immediately, restart the service; that drops every
 session.
 
@@ -312,11 +319,11 @@ when empty; `ip` is always present.
 | `accept.rejected` | connection refused at accept; detail `max-connections reached`, `max-unauth-connections reached`, `source suppressed` or `too many pre-auth connections from source` (at most one line per source per minute) |
 | `handshake.failed` | key exchange failed |
 | `auth.password` | password login; denied detail `unknown user`, `source not allowed` or `bad password` |
-| `auth.publickey` | key login; ok detail is the key algorithm; denied detail `unknown user`, `source not allowed`, `no keys configured` or `key not configured` |
-| `auth.rejected` | login ended: `source suppressed` or `login grace expired` |
+| `auth.publickey` | key login; ok detail is the key algorithm; denied detail `unknown user`, `source not allowed`, `no keys configured`, `key not configured`, `no key in message` or `signature invalid`; failed detail `pk_ok reply failed` |
+| `auth.rejected` | login ended: `source suppressed`, or `login grace expired` after key exchange (during it, the expiry is a `handshake.failed`) |
 | `auth.too_many_attempts` | six hard failures, or detail `probes` after 64 soft operations |
 | `config.reload` | reload rejected (`failed`, reason in detail) or recovered (`ok`) |
-| `idle.timeout` | session closed for idleness |
+| `idle.timeout` | session closed for idleness before the client sent SFTP INIT; later, `session.ended` with detail `idle timeout` |
 | `session.ended` | session over; detail is the reason and `duration_ms`; `failed` when it ended on an error |
 | `opendir`, `open_read`, `open_write` | directory or file opened; a new upload's `open_write` has detail `staged` |
 | `publish` | upload renamed into place at close |
@@ -364,9 +371,10 @@ Zift has no HTTP endpoint. For liveness, probe the TCP port:
 nc -z -w2 127.0.0.1 2222
 ```
 
-A probe that goes further, such as an `ssh` login attempt, writes audit
-lines every time, and a failed password counts toward source
-suppression. `from` does not exempt a source. A monitor that must log in
+Each probe is a connection: it holds a pre-auth slot for a moment and
+writes a `handshake.failed` audit line. A probe that goes further, such
+as an `ssh` login attempt, writes more audit lines, and a failed
+password counts toward source suppression. `from` does not exempt a source. A monitor that must log in
 needs a real user with real credentials.
 
 ## Backup
@@ -387,6 +395,7 @@ ss -ltnp | grep 2222
 | Symptom | Likely cause |
 | --- | --- |
 | startup fails | invalid config, host key rejected, missing root, audit log cannot be opened, port in use |
+| `ssh_bind_listen` fails with permission denied | a port below 1024 without `CAP_NET_BIND_SERVICE`; see the [unit drop-in](#set-up-the-host) |
 | `config reload rejected` | the edited config is invalid and the previous one is serving; fix the file (it applies itself) or run `systemctl reload` to see the error |
 | login denied | wrong credential, `from` mismatch, source suppressed, or the partner's key is not in their key file |
 | every new upload fails with `staging dir unavailable` | the partner root or its `.zift` is not writable or owned as required (see [`security.md`](security.md#uploads-and-the-per-partner-namespace)) |

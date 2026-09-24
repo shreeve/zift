@@ -29,6 +29,7 @@ pub const SemanticError = error{
     AuthKeyFileNotRegular,
     AuthKeyFileWritableByOthers,
     AuthKeyFileUntrustedOwner,
+    AuthKeyFileHardLinked,
     OutOfMemory,
 };
 
@@ -81,9 +82,9 @@ pub const ServerConfig = struct {
     /// `virtual` shows the partner's own name, group `sftp`, and
     /// policy-derived rwx; `reality` passes the inode's owner and mode.
     listing_mode: ListingMode = .virtual,
-    /// Mode of a published upload: owner rw, never world-writable, no
-    /// special bits. In-flight uploads are protected by the 0700 staging
-    /// dir, not by this mode.
+    /// Mode of a published upload: read and write bits only (at most
+    /// 0o664), owner rw. In-flight uploads are protected by the 0700
+    /// staging dir, not by this mode.
     publish_mode: u32 = 0o660,
     /// Mode of an SFTP MKDIR: owner rwx, never world-writable. Setgid
     /// (on by default) keeps the partner tree's group on new subdirectories.
@@ -222,24 +223,29 @@ const Checker = struct {
     }
 };
 
-const TrustError = error{ Unreadable, NotRegular, BadMode, BadOwner };
+const TrustError = error{ Unreadable, NotRegular, HardLinked, BadMode, BadOwner };
 
 /// Open a file the daemon trusts (host key, key file). Symlinks are
 /// followed (Kubernetes Secrets and systemd credentials are symlinks);
-/// the file itself must be regular, owned by root or the daemon's user
-/// (another local user could rewrite it), with no `forbidden_mode` bits.
-/// The checks run on the open fd, so the inode checked is the inode read.
-fn openTrusted(io: std.Io, path: []const u8, forbidden_mode: u32) TrustError!std.Io.File {
-    // Opening a FIFO would block, so refuse anything else first.
-    const pre = std.Io.Dir.cwd().statFile(io, path, .{}) catch return error.Unreadable;
-    if (pre.kind != .file) return error.NotRegular;
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.Unreadable;
-    errdefer file.close(io);
-    const st = listing.statFd(file.handle) catch return error.Unreadable;
+/// the file itself must be regular, with no second hard link (one inside
+/// a partner root would evade `checkOutsideRoots`), owned by root or the
+/// daemon's user (another local user could rewrite it), with no
+/// `forbidden_mode` bits. The open is O_NONBLOCK, so a FIFO swapped in at
+/// the path cannot hang validate or a reload, and every check runs on the
+/// open fd, so the inode checked is the inode read. (O_NONBLOCK does not
+/// change reads of a regular file.)
+fn openTrusted(path: []const u8, forbidden_mode: u32) TrustError!std.Io.File {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.Unreadable;
+    const path_z = std.posix.toPosixPath(path) catch return error.Unreadable;
+    const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .NOCTTY = true, .CLOEXEC = true });
+    if (fd < 0) return error.Unreadable;
+    errdefer _ = std.c.close(fd);
+    const st = listing.statFd(fd) catch return error.Unreadable;
     if (st.mode & listing.S_IFMT != listing.S_IFREG) return error.NotRegular;
+    if (st.nlink > 1) return error.HardLinked;
     if (st.mode & forbidden_mode != 0) return error.BadMode;
     if (st.uid != 0 and st.uid != std.c.geteuid()) return error.BadOwner;
-    return file;
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
 /// Room for any private key file (an 8192-bit RSA PEM is about 6 KiB).
@@ -249,9 +255,10 @@ const max_host_key_bytes = 64 * 1024;
 /// in a trusted file with no group-write, group-exec, or other bits, so
 /// 0600, 0400, and 0640 root:zift pass. Key bytes never reach a diagnostic.
 fn checkHostKey(ck: Checker, gpa: std.mem.Allocator, path: []const u8) SemanticError!void {
-    var file = openTrusted(ck.io, path, 0o037) catch |err| return switch (err) {
+    var file = openTrusted(path, 0o037) catch |err| return switch (err) {
         error.Unreadable => ck.fail(error.HostKeyUnreadable, "host-key unreadable: {s}", .{path}),
         error.NotRegular => ck.fail(error.HostKeyUnreadable, "host-key not a regular file: {s}", .{path}),
+        error.HardLinked => ck.fail(error.HostKeyUnreadable, "host-key has more than one hard link: {s}", .{path}),
         error.BadMode => ck.fail(error.HostKeyUnreadable, "host-key mode allows group-write, group-exec, or other access: {s}", .{path}),
         error.BadOwner => ck.fail(error.HostKeyUnreadable, "host-key owned by neither root nor the daemon's user: {s}", .{path}),
     };
@@ -358,9 +365,10 @@ fn resolveOneKeyFile(
     user_name: []const u8,
     path: []const u8,
 ) SemanticError!void {
-    var file = openTrusted(ck.io, path, 0o022) catch |err| return switch (err) {
+    var file = openTrusted(path, 0o022) catch |err| return switch (err) {
         error.Unreadable => keyFileFail(ck, error.AuthKeyFileUnreadable, user_name, path, 0, "unreadable"),
         error.NotRegular => keyFileFail(ck, error.AuthKeyFileNotRegular, user_name, path, 0, "not a regular file"),
+        error.HardLinked => keyFileFail(ck, error.AuthKeyFileHardLinked, user_name, path, 0, "has more than one hard link"),
         error.BadMode => keyFileFail(ck, error.AuthKeyFileWritableByOthers, user_name, path, 0, "writable by group/world (mode)"),
         error.BadOwner => keyFileFail(ck, error.AuthKeyFileUntrustedOwner, user_name, path, 0, "owned by neither root nor the daemon's user"),
     };
@@ -395,11 +403,29 @@ fn resolveOneKeyFile(
                 else => "malformed public-key line",
             });
         };
+        // What login does with the line: a key libssh cannot import
+        // would pass validation and then never match.
+        if (!try libsshImports(gpa, pubkey)) {
+            return keyFileFail(ck, error.AuthKeyFileMalformed, user_name, path, line_no, "malformed public-key line: libssh cannot load this key");
+        }
         try combined.append(arena_alloc, pubkey);
         parsed += 1;
     }
 
     if (parsed == 0) return keyFileFail(ck, error.AuthKeyFileEmpty, user_name, path, 0, "no public-key lines found");
+}
+
+/// True when libssh imports `key` as login does (ssh.zig `findKey`).
+fn libsshImports(gpa: std.mem.Allocator, key: PublicKey) error{OutOfMemory}!bool {
+    const algorithm_z = try gpa.dupeZ(u8, key.algorithm);
+    defer gpa.free(algorithm_z);
+    const blob_z = try gpa.dupeZ(u8, key.blob);
+    defer gpa.free(blob_z);
+    var parsed: c.ssh_key = null;
+    const rc = c.ssh_pki_import_pubkey_base64(blob_z.ptr, c.ssh_key_type_from_name(algorithm_z.ptr), &parsed);
+    if (rc != c.SSH_OK or parsed == null) return false;
+    c.ssh_key_free(parsed);
+    return true;
 }
 
 /// `user '<name>': auth key file '<path>'[ line N]: <reason>`; `line_no`
@@ -804,11 +830,13 @@ fn parseServerProperty(
     try firstSetting(d, server.lines.getPtr(which), line);
     switch (which) {
         .listen => {
-            _ = parseListen(value) catch
+            _ = parseListen(value) catch {
+                if (std.mem.startsWith(u8, value, "*:")) return d.fail(error.InvalidListen, "write :port to listen on every IPv4 address", .{});
                 return d.fail(error.InvalidListen, "use host:port, :port, or [ipv6]:port with a port from 1 to 65535", .{});
+            };
             server.cfg.listen = try allocator.dupe(u8, value);
         },
-        .@"host-key" => server.cfg.host_key = try allocator.dupe(u8, value),
+        .@"host-key" => server.cfg.host_key = try dupeAbsolute(allocator, d, value),
         // Floors: a shorter poll re-stats every key file on each accept-loop
         // wake-up, and a shorter idle timeout fails every handshake.
         .@"reload-interval" => server.cfg.reload_interval_ms = try parseDurationAtLeast(d, value, 100, "100ms"),
@@ -849,9 +877,11 @@ fn firstSetting(d: *ParseDiag, seen_line: *u32, line: u32) Error!void {
     seen_line.* = line;
 }
 
-/// Paths must be absolute: a relative one would depend on the daemon's
-/// cwd, and `realPathFileAbsoluteAlloc` in validateSemantic asserts it
-/// (a bad reload must not reach that assert).
+/// Paths must be absolute: a relative one would depend on the cwd, so
+/// `validate` run elsewhere would check another file than `serve` under
+/// systemd (cwd `/`) opens, and `realPathFileAbsoluteAlloc` in
+/// validateSemantic asserts it for roots (a bad reload must not reach
+/// that assert).
 fn dupeAbsolute(allocator: std.mem.Allocator, d: *ParseDiag, value: []const u8) Error![]const u8 {
     if (value[0] != '/') return d.fail(error.RelativePath, "must be an absolute path", .{});
     return allocator.dupe(u8, value);
@@ -874,9 +904,10 @@ fn parseDigits(comptime T: type, text: []const u8, base: u8) ?T {
 }
 
 /// The daemon must be able to write what it publishes, and partner data
-/// is never world-writable. No setuid, setgid, or sticky bit on files.
+/// is never world-writable. Only read and write bits: an upload is never
+/// published executable, and never setuid, setgid or sticky.
 fn parsePublishMode(d: *ParseDiag, value: []const u8) Error!u32 {
-    return parseMode(d, value, 0o600, 0o775, "needs owner rw (0o600), no world-write, and no setuid/setgid/sticky bit");
+    return parseMode(d, value, 0o600, 0o664, "needs owner rw (0o600) and only read/write bits, no world-write: at most 0o664");
 }
 
 /// Owner rwx so the daemon can use the directory, never world-writable.
@@ -909,7 +940,7 @@ fn parseUserProperty(
         try firstSetting(d, &user.root_line, line);
         user.root = try dupeAbsolute(allocator, d, value);
     } else if (std.mem.eql(u8, key, "from")) {
-        try parseFrom(allocator, user, value);
+        try parseFrom(allocator, d, user, value);
     } else if (std.mem.eql(u8, key, "allow")) {
         try parseAllowRule(allocator, d, user, value);
     } else if (std.mem.eql(u8, key, "deny")) {
@@ -980,26 +1011,40 @@ const min_rsa_bits = 2048;
 const max_rsa_bits = 8192;
 
 /// Check the SSH wire form (RFC 4253 §6.6, RFC 5656 §3.1): the embedded
-/// algorithm name, the ECDSA curve, the key length or RSA modulus size,
-/// and nothing trailing.
+/// algorithm name, the ECDSA curve and uncompressed point, the key
+/// length, the RSA exponent and modulus, and nothing trailing.
 fn checkKeyBlob(algorithm: []const u8, key_len: usize, raw: []const u8) Error!void {
     var rest = raw;
     const name = sshString(&rest) orelse return error.InvalidKeyLine;
     if (!std.mem.eql(u8, name, algorithm)) return error.KeyAlgorithmMismatch;
     if (key_len == 0) {
-        _ = sshString(&rest) orelse return error.InvalidKeyLine; // e
-        const n = std.mem.trimStart(u8, sshString(&rest) orelse return error.InvalidKeyLine, "\x00");
+        // e: odd, at least 3, and at most 32 bits (OpenSSH makes 65537).
+        const e = positiveMpint(sshString(&rest) orelse return error.InvalidKeyLine) orelse return error.InvalidKeyLine;
+        if (e.len == 0 or e.len > 4 or e[e.len - 1] & 1 == 0 or (e.len == 1 and e[0] < 3)) return error.InvalidKeyLine;
+        // n: odd (a product of odd primes), 2048 to 8192 bits.
+        const n = positiveMpint(sshString(&rest) orelse return error.InvalidKeyLine) orelse return error.InvalidKeyLine;
         const bits = if (n.len == 0) 0 else n.len * 8 - @clz(n[0]);
         if (bits < min_rsa_bits or bits > max_rsa_bits) return error.InvalidRsaKeySize;
+        if (n[n.len - 1] & 1 == 0) return error.InvalidKeyLine;
     } else {
-        if (std.mem.startsWith(u8, algorithm, "ecdsa-sha2-")) {
+        const ecdsa = std.mem.startsWith(u8, algorithm, "ecdsa-sha2-");
+        if (ecdsa) {
             const curve = sshString(&rest) orelse return error.InvalidKeyLine;
             if (!std.mem.eql(u8, curve, algorithm["ecdsa-sha2-".len..])) return error.KeyAlgorithmMismatch;
         }
         const key = sshString(&rest) orelse return error.InvalidKeyLine;
         if (key.len != key_len) return error.InvalidKeyLine;
+        // SSH carries ECDSA points uncompressed: 0x04, then x and y.
+        if (ecdsa and key[0] != 0x04) return error.InvalidKeyLine;
     }
     if (rest.len != 0) return error.InvalidKeyLine;
+}
+
+/// The magnitude of a non-negative SSH mpint (RFC 4251 §5) without
+/// leading zero bytes, or null if its sign bit is set.
+fn positiveMpint(raw: []const u8) ?[]const u8 {
+    if (raw.len != 0 and raw[0] & 0x80 != 0) return null;
+    return std.mem.trimStart(u8, raw, "\x00");
 }
 
 /// Take one u32-length-prefixed string off the front of `rest`.
@@ -1013,17 +1058,37 @@ fn sshString(rest: *[]const u8) ?[]const u8 {
 }
 
 /// One IP or CIDR per `from` line; lines accumulate.
-fn parseFrom(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
-    if (std.mem.indexOfAny(u8, value, " \t") != null) return error.InvalidFrom;
-    const cidr = netmatch.parseCidr(value) catch return error.InvalidFrom;
+fn parseFrom(allocator: std.mem.Allocator, d: *ParseDiag, user: *UserBuilder, value: []const u8) Error!void {
+    if (std.mem.indexOfAny(u8, value, " \t") != null) return d.fail(error.InvalidFrom, "one address or CIDR per 'from' line", .{});
+    const cidr = netmatch.parseCidr(value) catch |err| switch (err) {
+        error.CoversAllIpv4 => {
+            // Fail closed with the spelling the operator likely meant.
+            const slash = std.mem.indexOfScalar(u8, value, '/').?;
+            const probe = netmatch.parseCidr(value[0..slash]) catch unreachable;
+            if (netmatch.isMapped(probe)) {
+                const v4 = probe.addr[12..16];
+                return d.fail(error.InvalidFrom, "an IPv6 prefix counts 128 bits, so this matches every IPv4 peer; write {d}.{d}.{d}.{d}{s}", .{
+                    v4[0], v4[1], v4[2], v4[3], value[slash..],
+                });
+            }
+            return d.fail(error.InvalidFrom, "this matches every IPv4 peer; use a prefix of /96 or longer, or ::/0 for any source", .{});
+        },
+        else => return d.fail(error.InvalidFrom, "use an IPv4 or IPv6 address, optionally /prefix", .{}),
+    };
     try user.from.append(allocator, cidr);
 }
 
 /// Reject a pattern that can never match. Policy matches the normalized
-/// virtual path, which starts with `/` and has no empty, `.`, `..`, or
-/// trailing components; a dead `deny` would silently fail open.
+/// virtual path, which starts with `/` and has no empty, `.`, `..`,
+/// trailing or reserved components; a dead `deny` would silently fail
+/// open.
 fn checkPattern(d: *ParseDiag, pattern: []const u8) Error!void {
     if (pattern[0] != '/' and !std.mem.startsWith(u8, pattern, "**")) {
+        // `*/a` does match, but only `/a`: `*` never crosses `/`, and
+        // every path starts with one. The author likely meant `**/a`.
+        if (std.mem.trimStart(u8, pattern, "*").len != 0 and std.mem.trimStart(u8, pattern, "*")[0] == '/') {
+            return d.fail(error.InvalidPattern, "'{s}' matches only at the top level, as if it began with '/': start it with '/' (top level) or '**/' (any depth)", .{pattern});
+        }
         return d.fail(error.InvalidPattern, "'{s}' never matches: start it with '/' (top level) or '**/' (any depth)", .{pattern});
     }
     if (pattern.len > 1 and pattern[pattern.len - 1] == '/') {
@@ -1037,6 +1102,9 @@ fn checkPattern(d: *ParseDiag, pattern: []const u8) Error!void {
         }
         if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) {
             return d.fail(error.InvalidPattern, "'{s}' never matches: paths are matched without '.' or '..' components", .{pattern});
+        }
+        if (vfs.isReservedComponent(part)) {
+            return d.fail(error.InvalidPattern, "'{s}' never matches: '{s}' is reserved, and every request naming it is refused", .{ pattern, part });
         }
     }
 }
@@ -1106,7 +1174,8 @@ pub const ListenAddress = struct {
 /// Split a `listen` value into what to bind: `host:port`, `:port` (every
 /// IPv4 address), or `[ipv6]:port`. The parser uses it so `zift validate`
 /// rejects what `serve` could not bind (`listen` is not applied on
-/// reload). A hostname is left to libssh to resolve.
+/// reload). A hostname is left to libssh, which binds the first address
+/// it resolves to. IPv6 zones (`%lo0`) are not supported.
 pub fn parseListen(value: []const u8) error{InvalidListen}!ListenAddress {
     const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidListen;
     const port = parseDigits(u16, value[colon + 1 ..], 10) orelse return error.InvalidListen;
@@ -1116,9 +1185,13 @@ pub fn parseListen(value: []const u8) error{InvalidListen}!ListenAddress {
         if (!std.mem.endsWith(u8, host, "]")) return error.InvalidListen;
         host = host[1 .. host.len - 1];
         _ = std.Io.net.Ip6Address.parse(host, 0) catch return error.InvalidListen;
-    } else if (std.mem.indexOfScalar(u8, host, ':') != null) {
-        // `::1:2222` is ambiguous; IPv6 hosts must be bracketed.
-        return error.InvalidListen;
+    } else {
+        // An IPv4 literal or a DNS name. This refuses `::1:2222`, which
+        // is ambiguous (IPv6 hosts must be bracketed), and `*`, blanks
+        // and `%` zones, which no resolver takes.
+        for (host) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and ch != '.' and ch != '-' and ch != '_') return error.InvalidListen;
+        }
     }
     // Longer than any DNS name.
     if (host.len > 255) return error.InvalidListen;
@@ -1241,6 +1314,12 @@ test "parse: listen is validated at parse time" {
         "[::1]2222", // no ':' after the bracket
         "[localhost]:2222", // brackets hold an IPv6 literal
         "[]:2222",
+        "*:2222", // `:2222` is every IPv4 address
+        "local host:2222", // blanks inside the host
+        "127.0.0.1\t:2222",
+        "[fe80::1%lo0]:2222", // zones are not supported
+        "fe80::1%lo0:2222",
+        "host%lo0:2222",
     };
     for (bad) |listen| {
         var buf: [256]u8 = undefined;
@@ -1374,6 +1453,13 @@ test "publish-mode: owner rw, no world-write, no special bits" {
         // World-writable partner data is never allowed.
         .{ "0o666", @as(?u32, null) },
         .{ "0o602", @as(?u32, null) },
+        // Nor is an executable upload.
+        .{ "0o700", @as(?u32, null) },
+        .{ "0o755", @as(?u32, null) },
+        .{ "0o770", @as(?u32, null) },
+        .{ "0o670", @as(?u32, null) },
+        .{ "0o610", @as(?u32, null) },
+        .{ "0o601", @as(?u32, null) },
         // Special bits (setuid/setgid/sticky) on regular files.
         .{ "0o2660", @as(?u32, null) },
         .{ "0o4600", @as(?u32, null) },
@@ -1551,6 +1637,72 @@ test "parsePublicKeyLine: blob must match its algorithm and be well formed" {
     }
 }
 
+/// The modulus of `rsa2048_blob` as its mpint: a 0x00 pad, then 256 bytes.
+fn rsa2048Modulus() [257]u8 {
+    var raw: [rsa2048_blob.len]u8 = undefined;
+    const len = std.base64.standard.Decoder.calcSizeForSlice(rsa2048_blob) catch unreachable;
+    std.base64.standard.Decoder.decode(raw[0..len], rsa2048_blob) catch unreachable;
+    return raw[4 + "ssh-rsa".len + 4 + 3 + 4 ..][0..257].*;
+}
+
+/// `ssh-rsa` key line with the given exponent and modulus (raw mpints).
+fn rsaTestLine(alloc: std.mem.Allocator, e: []const u8, n: []const u8) ![]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    for ([_][]const u8{ "ssh-rsa", e, n }) |part| {
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(part.len), .big);
+        try raw.appendSlice(alloc, &len);
+        try raw.appendSlice(alloc, part);
+    }
+    const encoder = std.base64.standard.Encoder;
+    const line = try alloc.alloc(u8, "ssh-rsa ".len + encoder.calcSize(raw.items.len));
+    @memcpy(line[0.."ssh-rsa ".len], "ssh-rsa ");
+    _ = encoder.encode(line["ssh-rsa ".len..], raw.items);
+    return line;
+}
+
+test "parsePublicKeyLine: RSA exponent and modulus, and the ECDSA point form" {
+    const alloc = std.testing.allocator;
+    const n = rsa2048Modulus();
+    var even_n = n;
+    even_n[256] &= 0xfe;
+
+    const cases = [_]struct { []const u8, []const u8, ?Error }{
+        .{ "\x01\x00\x01", &n, null }, // e = 65537: the real key
+        .{ "\x03", &n, null },
+        .{ "", &n, error.InvalidKeyLine }, // no exponent
+        .{ "\x01", &n, error.InvalidKeyLine }, // e = 1
+        .{ "\x01\x00\x00", &n, error.InvalidKeyLine }, // even
+        .{ "\x01\x00\x00\x00\x01", &n, error.InvalidKeyLine }, // over 32 bits
+        .{ "\x81", &n, error.InvalidKeyLine }, // negative
+        .{ "\x01\x00\x01", n[1..], error.InvalidKeyLine }, // sign bit set: negative
+        .{ "\x01\x00\x01", &even_n, error.InvalidKeyLine },
+    };
+    for (cases) |case| {
+        const e, const modulus, const want = case;
+        const line = try rsaTestLine(alloc, e, modulus);
+        defer alloc.free(line);
+        if (want) |err| {
+            try std.testing.expectError(err, parsePublicKeyLine(alloc, line));
+        } else {
+            const pk = try parsePublicKeyLine(alloc, line);
+            alloc.free(pk.algorithm);
+            alloc.free(pk.blob);
+        }
+    }
+
+    // A P-256 blob whose point starts 0x02 (compressed) instead of 0x04.
+    var ec: [p256_blob.len]u8 = undefined;
+    const ec_len = try std.base64.standard.Decoder.calcSizeForSlice(p256_blob);
+    try std.base64.standard.Decoder.decode(ec[0..ec_len], p256_blob);
+    ec[ec_len - 65] = 0x02;
+    var text: [p256_blob.len]u8 = undefined;
+    var buf: [256]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "ecdsa-sha2-nistp256 {s}", .{std.base64.standard.Encoder.encode(&text, ec[0..ec_len])});
+    try std.testing.expectError(error.InvalidKeyLine, parsePublicKeyLine(alloc, line));
+}
+
 test "user with no auth lines rejected" {
     const text =
         "server\n  listen 127.0.0.1:2222\n  host-key /tmp/key\n\n" ++
@@ -1582,6 +1734,15 @@ test "from rejects malformed cidr" {
         "  from 10.0.0.0/99\n" ++
         "  root /tmp/a\n";
     try std.testing.expectError(error.InvalidFrom, parse(std.testing.allocator, text));
+}
+
+test "from: an IPv6 prefix that covers all of IPv4 is rejected with a hint" {
+    const srv = "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n";
+    try expectDiag(srv ++ "  from ::ffff:203.0.113.0/24\n", "line 7: [user u] 'from': InvalidFrom: an IPv6 prefix counts 128 bits, so this matches every IPv4 peer; write 203.0.113.0/24");
+    try expectDiag(srv ++ "  from ::/80\n", "line 7: [user u] 'from': InvalidFrom: this matches every IPv4 peer; use a prefix of /96 or longer, or ::/0 for any source");
+    var cfg = try parse(std.testing.allocator, srv ++ "  from ::/0\n  from ::ffff:203.0.113.0/120\n");
+    defer cfg.deinit();
+    try std.testing.expect(netmatch.allowed(cfg.users[0].from, "8.8.8.8"));
 }
 
 test "two passhash auth lines for one user are rejected" {
@@ -1926,6 +2087,30 @@ test "validateSemantic: host key and key file symlinks are followed, and the tar
     try std.testing.expectError(error.AuthKeyFileWritableByOthers, tree.check(linked, null));
 }
 
+test "validateSemantic: trusted files may not be hard-linked, and a FIFO never blocks" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const io = std.testing.io;
+    // A second link, say inside a partner root, would evade the check
+    // that keeps private files out of every root.
+    try tree.tmp.dir.hardLink("etc/host", tree.tmp.dir, "r/host", io, .{});
+    try std.testing.expectError(error.HostKeyUnreadable, tree.check(TestTree.config, null));
+    try tree.tmp.dir.deleteFile(io, "r/host");
+    try tree.check(TestTree.config, null);
+    try tree.tmp.dir.hardLink("etc/u.pub", tree.tmp.dir, "r/u.pub", io, .{});
+    try std.testing.expectError(error.AuthKeyFileHardLinked, tree.check(TestTree.config, null));
+    try tree.tmp.dir.deleteFile(io, "r/u.pub");
+
+    // A FIFO with no writer: a blocking open would hang here.
+    const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/etc/fifo", .{tree.path}, 0);
+    defer std.testing.allocator.free(fifo);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo, 0o600));
+    try std.testing.expectError(error.HostKeyUnreadable, tree.checkWith("@/etc/host", "@/etc/fifo"));
+    try std.testing.expectError(error.AuthKeyFileNotRegular, tree.checkWith("@/etc/u.pub", "@/etc/fifo"));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.posix.mode_t) c_int;
+
 test "validateSemantic: key files hold keys, comments, and blank lines" {
     var tree = try TestTree.init();
     defer tree.deinit();
@@ -1958,6 +2143,33 @@ test "validateSemantic: key files hold keys, comments, and blank lines" {
     try std.testing.expectError(error.AuthKeyFileTooLarge, tree.check(TestTree.config, null));
     try std.testing.expectError(error.AuthKeyFileNotRegular, tree.checkWith("@/etc/u.pub", "@/etc"));
     try std.testing.expectError(error.AuthKeyFileUnreadable, tree.checkWith("@/etc/u.pub", "@/etc/none.pub"));
+}
+
+test "libsshImports: login's import refuses what the wire checks refuse" {
+    const alloc = std.testing.allocator;
+    for ([_]PublicKey{
+        .{ .algorithm = "ssh-ed25519", .blob = valid_ed25519_blob },
+        .{ .algorithm = "ecdsa-sha2-nistp256", .blob = p256_blob },
+        .{ .algorithm = "ecdsa-sha2-nistp384", .blob = p384_blob },
+        .{ .algorithm = "ecdsa-sha2-nistp521", .blob = p521_blob },
+        .{ .algorithm = "ssh-rsa", .blob = rsa2048_blob },
+    }) |key| try std.testing.expect(try libsshImports(alloc, key));
+
+    // An even RSA modulus: mbedTLS refuses it, so login never matches.
+    var even_n = rsa2048Modulus();
+    even_n[256] &= 0xfe;
+    const line = try rsaTestLine(alloc, "\x01\x00\x01", &even_n);
+    defer alloc.free(line);
+    try std.testing.expect(!try libsshImports(alloc, .{ .algorithm = "ssh-rsa", .blob = line["ssh-rsa ".len..] }));
+    try std.testing.expectError(error.InvalidKeyLine, parsePublicKeyLine(alloc, line));
+
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const file = try std.fmt.allocPrint(alloc, "{s}\n", .{line});
+    defer alloc.free(file);
+    try tree.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "etc/u.pub", .data = file });
+    try tree.chmod("etc/u.pub", 0o644);
+    try std.testing.expectError(error.AuthKeyFileMalformed, tree.check(TestTree.config, null));
 }
 
 test "validateSemantic: the log directory must exist and a log must be a regular file" {
@@ -2030,10 +2242,12 @@ test "ParseDiag: line, section, user, key, and reason" {
     try expectDiag("  listen :2222\n", "line 1: 'listen': PropertyOutsideSection");
     try expectDiag("server\n  listen\n", "line 2: [server] 'listen': MissingValue");
     try expectDiag("server\n  reload-interval 5\n", "line 2: [server] 'reload-interval': InvalidDuration: use a number with a unit (ms, s, m, h, d), or 0");
-    try expectDiag("server\n  publish-mode 0o666\n", "line 2: [server] 'publish-mode': InvalidMode: needs owner rw (0o600), no world-write, and no setuid/setgid/sticky bit");
+    try expectDiag("server\n  publish-mode 0o666\n", "line 2: [server] 'publish-mode': InvalidMode: needs owner rw (0o600) and only read/write bits, no world-write: at most 0o664");
     try expectDiag(srv ++ "user bob\n  root bob\n", "line 5: [user bob] 'root': RelativePath: must be an absolute path");
+    try expectDiag("server\n  listen :2222\n  host-key host_ed25519\n", "line 3: [server] 'host-key': RelativePath: must be an absolute path");
     try expectDiag("server\n  listing-mode real\n", "line 2: [server] 'listing-mode': InvalidListingMode: use 'virtual' or 'reality'");
     try expectDiag("server\n  max-connections many\n", "line 2: [server] 'max-connections': InvalidNumber: expected a whole number");
+    try expectDiag("server\n  listen *:22\n", "line 2: [server] 'listen': InvalidListen: write :port to listen on every IPv4 address");
     try expectDiag("server\nserver\n", "line 2: DuplicateServerSection");
 }
 
@@ -2086,6 +2300,10 @@ test "comments: whole-line, or '#' after a blank; a '#' inside a token is litera
     try std.testing.expectEqualStrings("/a#b", u.rules[0].pattern);
     try std.testing.expectEqualStrings("/c", u.rules[1].pattern);
     try std.testing.expectEqualStrings("/#in", u.rules[2].pattern);
+    // A value runs to the comment and may contain blanks.
+    var spaced = try parse(std.testing.allocator, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /srv/sp ace #2\n");
+    defer spaced.deinit();
+    try std.testing.expectEqualStrings("/srv/sp ace", spaced.users[0].root);
     // `read#write` is one token: not a verb.
     try std.testing.expectError(error.InvalidPermission, parse(std.testing.allocator, text ++ "  allow /x read#write\n"));
 }
@@ -2120,13 +2338,16 @@ test "the same key file twice for one user is rejected" {
 }
 
 test "rule patterns that can never match are rejected" {
-    // Each of these is a silent no-op in policy.check: as a `deny` it
-    // would fail open. `*` never crosses `/`, and every path starts with it.
+    // Each of these is a silent no-op in policy.check (as a `deny` it
+    // would fail open), or matches far less than it reads. `*` never
+    // crosses `/`, and every path starts with it.
     const dead = [_][]const u8{
         "*", "*.exe", "secret", "?x", "pending/*", // no leading `/` or `**`
         "/secret/", "/in/*/", "**/", // trailing `/`
         "//x", "/a//b", // empty component
         "/a/./b", "/a/..", "/../etc", "**/..", "/.", // `.` / `..` component
+        "/.zift", "/pending/.zift/**", "**/.Zift", "/.ZIFT-staging", "/a/.zift-staging/b", // reserved
+        "*/a", "*/**", // match only as `/a` and `/**`: ambiguous, so rejected
     };
     for (dead) |pattern| {
         var buf: [256]u8 = undefined;
@@ -2137,7 +2358,7 @@ test "rule patterns that can never match are rejected" {
         try std.testing.expectError(error.InvalidPattern, parse(std.testing.allocator, allow));
     }
 
-    const live = [_][]const u8{ "/", "/secret", "/*.exe", "**", "**.exe", "***.exe", "**/secret", "/in/**", "/a/**/b", "/a.b/..c", "/#x", "/a#" };
+    const live = [_][]const u8{ "/", "/secret", "/*.exe", "**", "**.exe", "***.exe", "**/secret", "/in/**", "/a/**/b", "/a.b/..c", "/#x", "/a#", "**.zift", "/a.zift", "/.zift2", "/.zift*" };
     for (live) |pattern| {
         var buf: [256]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n  deny {s}\n", .{pattern});
@@ -2147,4 +2368,6 @@ test "rule patterns that can never match are rejected" {
     }
 
     try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  deny *.exe\n", "line 5: [user u] 'deny': InvalidPattern: '*.exe' never matches: start it with '/' (top level) or '**/' (any depth)");
+    try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  deny */a\n", "line 5: [user u] 'deny': InvalidPattern: '*/a' matches only at the top level, as if it began with '/': start it with '/' (top level) or '**/' (any depth)");
+    try expectDiag("server\n  listen :2222\n  host-key /k\nuser u\n  deny /in/.Zift/**\n", "line 5: [user u] 'deny': InvalidPattern: '/in/.Zift/**' never matches: '.Zift' is reserved, and every request naming it is refused");
 }

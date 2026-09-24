@@ -31,7 +31,9 @@ zift validate /home/zift/zift.conf
 zift serve /home/zift/zift.conf
 ```
 
-`validate` runs every check `serve` runs before it listens:
+`validate` runs the checks `serve` runs on a config at startup and on
+every reload. It does not open the log, bind the port, or check that
+the service may bind it:
 
 - the file parses (errors name the line, section, directive and reason);
 - the host key loads as an unencrypted private key and passes the file
@@ -53,6 +55,8 @@ ownership is checked against the user running it.
 - Directives are indented under a section, one per line: `name value`.
 - Blank lines are ignored. `#` starts a comment at the start of a line
   or after a space or tab; a `#` inside a token is literal.
+- A value runs to the end of the line or comment and may contain
+  spaces: `root /srv/sp ace #2` is `/srv/sp ace`.
 - User names use ASCII letters, digits, `_`, `-` and `.`, are at most 64
   bytes, and may not start with `.`.
 - Durations need a unit: `ms`, `s`, `m`, `h` or `d` (`30s`, `5m`). A bare
@@ -68,7 +72,7 @@ ownership is checked against the user running it.
 
 | Directive | Default | Meaning |
 | --- | --- | --- |
-| `listen` | required | `host:port`, `:port` (every IPv4 address), or `[ipv6]:port` such as `[::]:2222` |
+| `listen` | required | `host:port`, `:port` (every IPv4 address), or `[ipv6]:port` such as `[::]:2222`; a hostname binds the first address it resolves to; no zones (`%lo0`) |
 | `host-key` | required | SSH host private key |
 | `partner-root` | none | base for users without `root`: user `ally` gets `<partner-root>/ally` |
 | `reload-interval` | `2s` | how often to check the config and key files for changes; `0` (SIGHUP only) or at least `100ms` |
@@ -85,8 +89,8 @@ ownership is checked against the user running it.
 
 Generate one with `ssh-keygen -t ed25519 -f /home/zift/host_ed25519 -N
 ""`. The file must be a regular file (a symlink is followed and its
-target checked), owned by root or the daemon's user, with no
-group-write, group-exec or other bits: `0600` and `0640` pass, `0644`
+target checked) with one hard link, owned by root or the daemon's user,
+with no group-write, group-exec or other bits: `0600` and `0640` pass, `0644`
 and `0660` do not. `root:zift 0640` lets the daemon read its identity
 but not rewrite it.
 
@@ -119,10 +123,10 @@ debugging.
 
 ### `publish-mode` and `mkdir-mode`
 
-`publish-mode` needs owner `rw` and may not include other-write or any
-setuid, setgid or sticky bit. `mkdir-mode` needs owner `rwx`, may not
-include other-write, and may include setgid, which keeps new
-directories in the partner tree's group.
+`publish-mode` needs owner `rw` and takes only read and write bits,
+without other-write: at most `0o664`. `mkdir-mode` needs owner `rwx`,
+may not include other-write, setuid or sticky, and may include setgid,
+which keeps new directories in the partner tree's group.
 
 ## User Directives
 
@@ -154,9 +158,10 @@ are not allowed. Accepted algorithms: `ssh-ed25519`,
 `ssh-rsa` from 2048 to 8192 bits. RSA keys authenticate only with
 `rsa-sha2-256` or `rsa-sha2-512` signatures, never SHA-1; DSA is
 rejected. The file must be a regular file (a symlink is followed and its
-target checked, so Kubernetes Secrets and systemd credentials work),
-owned by root or the daemon's user, not group- or world-writable, and
-contain at least one key.
+target checked, so Kubernetes Secrets and systemd credentials work)
+with one hard link, owned by root or the daemon's user, not group- or world-writable, and
+contain at least one key. Each key must be well formed and load in
+libssh exactly as it would at login.
 
 ### `from`
 
@@ -169,10 +174,16 @@ from 2001:db8::/32
 ```
 
 With any `from` line, a peer that matches none of them cannot log in as
-this user. The attempt is still timed and counted like a bad password,
-so it reveals nothing. `::ffff:a.b.c.d` forms match plain IPv4 peers,
-and `::/0` matches every peer. This is the cheapest hardening there is
-when partners have stable egress addresses.
+this user. A password attempt from elsewhere is still timed and counted
+like a bad password, so it reveals nothing; a key attempt is refused
+like an unknown user's. This is the cheapest hardening there is when
+partners have stable egress addresses.
+
+IPv4 peers are matched as `::ffff:a.b.c.d`, so `::ffff:` forms match
+plain IPv4 peers. An IPv6 prefix counts all 128 bits: one shorter than
+/96 that covers that space, such as `::ffff:203.0.113.0/24` or `::/80`,
+would admit every IPv4 peer and is rejected (write `203.0.113.0/24`).
+`::/0` is allowed and deliberately matches every peer, IPv4 included.
 
 ### `root`
 
@@ -258,15 +269,17 @@ Matching is case-sensitive and byte-exact apart from `?`, which takes
 one whole UTF-8 character.
 
 Paths are normalized before matching: they start with `/` and have no
-`.`, `..`, empty or trailing components. A pattern that could never
-match such a path is rejected with `InvalidPattern`:
+`.`, `..`, empty or trailing components, and never name the reserved
+`.zift` or `.zift-staging` in any letter case. A pattern that could
+never match such a path is rejected with `InvalidPattern`:
 
 | Rejected | Write instead |
 | --- | --- |
-| `*.exe`, `secret` | `/*.exe` (top level) or `**.exe`, `**/secret` (any depth) |
+| `*.exe`, `secret`, `*/a` | `/*.exe` (top level) or `**.exe`, `**/secret` (any depth) |
 | `/dir/` | `/dir` |
 | `/a//b`, `/a/./b` | `/a/b` |
 | `/a/../b` | `/b` |
+| `/.zift`, `/in/.zift/**` | nothing: partners can never reach it |
 
 `/dir/**` matches everything below `/dir` but not `/dir` itself. So
 `deny **/.ssh/**` refuses every file under any `.ssh` directory, and
@@ -316,9 +329,10 @@ deny **/.git/**
 Zift checks the config file and every `auth` key file each
 `reload-interval`, and reloads when any of their size, mtime, ctime or
 inode changes. `SIGHUP` reloads at once, changed or not. A valid config
-applies to new sessions; sessions already open keep the config they
-logged in with until they end. An invalid one is rejected and the
-previous config keeps serving (see [`operate.md`](operate.md#reload)).
+applies to new connections; each connection keeps the config that was
+current when it was accepted until it ends. An invalid one is rejected
+and the previous config keeps serving (see
+[`operate.md`](operate.md#reload)).
 
 Directories are not watched: after creating a partner root or fixing its
 mode, reload by hand. Write config changes atomically (write a
@@ -327,7 +341,9 @@ written file.
 
 `listen`, `host-key` and `log` are bound at startup. A reload that
 changes one logs a warning and keeps the old value; restart to apply
-it. Everything else applies to new sessions.
+it. `max-connections`, `max-unauth-connections`, `reload-interval` and
+`shutdown-grace` apply at once; everything else applies to new
+connections.
 
 ## SFTP Surface
 

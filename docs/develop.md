@@ -130,8 +130,7 @@ The runner reads:
   `systemd-analyze verify` on the unit and fails on any output. Then
   `version` and `validate` smoke tests.
 - **Integration tests** on Linux and macOS against that release
-  artifact, with `ZIFT_REQUIRE_ALL=1`, and a check that the binary under
-  test was not replaced.
+  artifact (`ZIFT_BIN`), with `ZIFT_REQUIRE_ALL=1`.
 - **Fuzz** with `--fuzz=200K` in ReleaseSafe; anything but a clean exit
   fails.
 

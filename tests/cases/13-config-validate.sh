@@ -109,6 +109,8 @@ conf digitsep "$alice" "max-connections 1_000"
 validate_err "$T/digitsep.conf" "InvalidNumber"
 conf worldpublish "$alice" "publish-mode 0o666"
 validate_err "$T/worldpublish.conf" "no world-write"
+conf execpublish "$alice" "publish-mode 0o755"
+validate_err "$T/execpublish.conf" "'publish-mode': InvalidMode: needs owner rw (0o600) and only read/write bits"
 conf user65 "$(user "$(printf 'a%.0s' {1..65})" "root $T/root_a" "allow / read list")"
 validate_err "$T/user65.conf" "UsernameTooLong"
 conf dotdot "$(user ..)" "partner-root $T/partners"
@@ -120,7 +122,8 @@ for rule in "deny *.exe|'deny': InvalidPattern: '*.exe' never matches" \
             "deny secret|'secret' never matches" \
             "allow /pending/ read|drop the trailing '/'" \
             "deny /a//b|empty component" \
-            "deny /inbox/../etc|'.' or '..'"; do
+            "deny /inbox/../etc|'.' or '..'" \
+            "deny /pending/.zift/**|'.zift' is reserved"; do
     conf rule "$(user runner "root $T/root_a" "allow / full" "${rule%%|*}")"
     validate_err "$T/rule.conf" "${rule#*|}"
 done
@@ -162,6 +165,9 @@ validate_err "$T/not_dir.conf" "is not a directory"
 conf no_host_key "$alice"
 sed -i.bak "s|host-key .*|host-key $T/no_such_host_key|" "$T/no_host_key.conf"
 validate_err "$T/no_host_key.conf" "host-key unreadable"
+# Relative, it would name one file here and another under systemd (cwd /).
+(cd "$(dirname "$HOST_KEY")" && sed "s|host-key .*|host-key $(basename "$HOST_KEY")|" "$T/happy.conf" > "$T/rel_host_key.conf")
+validate_err "$T/rel_host_key.conf" "'host-key': RelativePath"
 conf overlap "$(user outer "root $T/shared" "allow / read list")
 $(user inner "root $T/shared/sub" "allow / read list")"
 validate_err "$T/overlap.conf" "overlapping roots"

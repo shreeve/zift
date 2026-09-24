@@ -2,6 +2,7 @@
 //! diagnostic lines.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// CLOCK_MONOTONIC milliseconds. libc rather than `std.Io.Clock.awake`,
 /// which on macOS is CLOCK_UPTIME_RAW and stops while the host sleeps.
@@ -20,7 +21,11 @@ pub fn realtime() std.c.timespec {
 
 /// Format one stderr line and write it in one go (lines longer than the
 /// buffer drain in chunks), so concurrent lines do not interleave.
+/// Silent in unit tests: the diagnostics they provoke are expected, and
+/// any stderr output makes `zig build test` print a "failed command"
+/// header over a passing run. Test failures report through the runner.
 pub fn note(io: std.Io, comptime fmt: []const u8, args: anytype) std.Io.File.Writer.Error!void {
+    if (builtin.is_test) return;
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writerStreaming(io, &buf);
     w.interface.print(fmt, args) catch return w.err.?;

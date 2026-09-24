@@ -5,9 +5,10 @@ Versions marked "untagged" were released from a commit, not a git tag.
 
 ## Unreleased
 
-To upgrade, run `zift validate` on your config with the new binary
-before you restart. It catches every breaking change below and names
-the line and the reason.
+To upgrade, run `zift validate` on your config with the new binary, as
+the service user (`sudo -u zift zift validate …`), before you restart.
+It catches every breaking change below and names the line and the
+reason.
 
 ### Security
 
@@ -20,7 +21,8 @@ the line and the reason.
   40-login flood now peaks near 520 MiB.
 - Pre-auth connections are bounded:
   - a fixed 120 s login grace runs from accept to successful auth, key
-    exchange included, and audits `auth.rejected` "login grace expired";
+    exchange included, and audits `auth.rejected` "login grace expired"
+    (`handshake.failed` when it expires during key exchange);
   - each source may hold at most 8 pre-auth connections; extras are
     refused with `accept.rejected` "too many pre-auth connections from
     source";
@@ -39,9 +41,10 @@ the line and the reason.
 - Abuse tracking keys IPv6 sources by /64 (IPv4 by address).
 - A public-key probe for a real user outside `from` looks the same to
   the client as one for an unknown user.
-- Rule patterns that can never match were accepted, so `deny *.exe`
-  silently protected nothing. They are now rejected (see Breaking
-  changes).
+- Configs that failed open or checked the wrong file are now rejected:
+  dead rule patterns, IPv6 `from` prefixes that match every IPv4 peer,
+  loose or hard-linked host and key files, and a relative `host-key`.
+  Each is under Breaking changes.
 - READDIR listed the name, size and date of entries that STAT refused.
   It now hides every entry STAT of the same path would refuse, and names
   with control bytes or invalid UTF-8.
@@ -53,9 +56,8 @@ the line and the reason.
   by the daemon's user. The partner root is opened NOFOLLOW everywhere.
 - Opening an existing FIFO, device or socket over SFTP fails at once
   instead of hanging the session. Only regular files open.
-- The host key and `auth` key files must be owned by root or the
-  daemon's user, and the host key may not grant group-write, group-exec
-  or other access (see Breaking changes).
+- The host key and key files are opened non-blocking, so a FIFO put in
+  their place cannot hang a reload.
 - `validate` refuses daemon-private files (host key, key files, audit
   log, the config itself) inside any partner root, including through a
   symlink.
@@ -71,11 +73,12 @@ the line and the reason.
 
 ### Breaking changes
 
-- Patterns must be anchored. A pattern that does not start with `/` or
-  `**`, ends in `/` (other than `/` itself), or contains `//`, `.` or
-  `..` is `InvalidPattern`. Migration: `deny *.exe` becomes `deny
-  /*.exe` (top level) or `deny **.exe` (any depth); `/dir/` becomes
-  `/dir`.
+- Patterns must be able to match: `deny *.exe` used to protect nothing.
+  A pattern that does not start with `/` or `**`, ends in `/` (other
+  than `/` itself), or contains `//`, `.`, `..` or a reserved
+  `.zift`/`.zift-staging` component is `InvalidPattern`. Migration:
+  `deny *.exe` becomes `deny /*.exe` (top level) or `deny **.exe` (any
+  depth); `/dir/` becomes `/dir`.
 - A single-valued directive given twice (`listen`, `host-key`, `root`,
   `log`, `partner-root`, `publish-mode`, `mkdir-mode`, durations and
   counts) is `DuplicateDirective`; the same `auth /path` twice for one
@@ -84,42 +87,57 @@ the line and the reason.
   `reload-interval` under 100ms, and `_` digit separators are rejected.
   Migration: use `max-connections 1` or more, `0` to disable a timer,
   and plain digits.
-- An unbracketed IPv6 `listen` (`::1:2222`) is rejected. Migration:
-  write `[::1]:2222`. Bracketed forms now bind; before, they passed
-  validate and failed at serve.
-- `validate` checks what `serve` opens. The host key must load as an
-  unencrypted private key, the log's directory must exist, an existing
-  log must be a regular file, FIFO or character device (never a
-  symlink), and each public-key blob must match its algorithm name.
-  Migration: fix what `validate` names.
+- An unbracketed IPv6 `listen` (`::1:2222`), and a host with `*`, a
+  blank or a `%` zone, is rejected. Migration: write `[::1]:2222`, or
+  `:2222` for every IPv4 address. Bracketed forms now bind; before,
+  they passed validate and failed at serve.
+- `validate` checks more of what `serve` opens. The host key must load
+  as an unencrypted private key, the log's directory must exist, an
+  existing log must be a regular file, FIFO or character device (never
+  a symlink), and each public-key blob must match its algorithm name,
+  carry a sane RSA exponent and modulus or an uncompressed ECDSA point,
+  and load in libssh as login would load it. Migration: fix what
+  `validate` names.
 - Error names changed. `InvalidConfig` became `MissingValue`,
   `InvalidNumber`, `InvalidMode`, `RelativePath` or
-  `InvalidListingMode`; `InlineComment` is gone; an over-long `auth
-  /path` is `InvalidAuth`. Migration: update any script that matches
+  `InvalidListingMode`; `MissingRulePattern` became `MissingValue`;
+  `InlineComment` and `InvalidIndent` are gone; an over-long `auth
+  /path` is `InvalidAuth`; `UnauthCapExceedsTotal` is a parse
+  diagnostic naming its line. Migration: update any script that matches
   on the old names. Diagnostics now end with `: <reason>` and name the
   right line and user.
-- A relative `root` is rejected at parse time. Before, it aborted the
-  daemon. Migration: use an absolute path.
+- A relative `root` or `host-key` is rejected at parse time. Before, a
+  relative root aborted the daemon, and a relative host key was read
+  from the cwd, so `validate` could check another file than `serve`
+  under systemd (cwd `/`) loads. Migration: use an absolute path.
+- An IPv6 `from` prefix under /96 that covers `::ffff:0:0/96` matched
+  every IPv4 peer, and is now `InvalidFrom`. Migration: write
+  `::ffff:203.0.113.0/24` as `203.0.113.0/24`; `::/0` still means any
+  source.
 - An `idle-timeout` over libssh's limit (2147483647 ms, about 24.8
   days) is rejected. Migration: use `24d` or less, or `0`.
 - A host key that grants group-write, group-exec or any other access
   (`0644`, `0660`) is rejected, and so is a host key or key file owned by
-  anyone but root or the daemon's user. Migration: `chown root:zift` and
-  `chmod 0640` (or `0600`).
+  anyone but root or the daemon's user or with a second hard link.
+  Migration: `chown root:zift`, `chmod 0640` (or `0600`), and copy
+  instead of hard-linking.
 
 ### Added
 
 - Trailing comments: `<whitespace># ...` ends a line. A `#` inside a
-  token is literal.
+  token is literal, and values may contain spaces: `root /srv/sp ace
+  #2` is `/srv/sp ace`.
 - Symlinked `host-key` and `auth` key files. The target is checked
   (regular file, mode, owner), which fits Kubernetes Secrets and systemd
   credentials.
 - `ssh-rsa` keys of 2048 to 8192 bits, verified only with `rsa-sha2-256`
   or `rsa-sha2-512` signatures. SHA-1 signatures, smaller RSA keys and
-  DSA are rejected.
+  DSA are rejected. libssh leaves a bad or SHA-1 signature unanswered,
+  so such a client waits for its own timeout.
 - `log` may be a FIFO or a character device such as `/dev/null`.
-- `publish-mode` accepts any mode with owner `rw`, no other-write and no
-  special bits (for example `0o644`). `mkdir-mode` accepts any mode with
+- `publish-mode` accepts any mode with owner `rw` and only read and
+  write bits, without other-write (for example `0o644`; at most
+  `0o664`). `mkdir-mode` accepts any mode with
   owner `rwx` and no other-write; setgid is allowed.
 - SETSTAT and FSETSTAT set atime and mtime, so `put -p` and WinSCP's
   timestamp preservation work. SETSTAT needs `update`; FSETSTAT is
@@ -129,8 +147,6 @@ the line and the reason.
 - Reload also triggers when an `auth` key file changes.
 - A session that ends on an error is audited as `session.ended` with
   result `failed`.
-- `root /` works, and the overlap check treats it as containing every
-  other root.
 - `tests/run.sh` honors `ZIFT_TEST_PORT_BASE` (default 22200).
 
 ### Changed
@@ -190,20 +206,15 @@ the line and the reason.
 - install.sh validates the tag, shows cosign's own error, replaces the
   binary with an atomic rename, and `--uninstall` also looks in
   `/usr/local/bin` and `~/.local/bin`.
-- CI tests the `zig build release` artifact on Linux and macOS with
-  `ZIFT_REQUIRE_ALL=1`, runs unit tests on x86_64-linux-musl too, checks
-  `zig fmt`, and fuzzes with `--fuzz=200K`. release.yml runs unit tests
-  before building and hashes exactly the published files.
-- Source layout: `auth.zig` was folded into `ssh.zig`; the new `sys.zig`
-  holds the clocks, the civil-time routine and the one-write stderr
-  helper.
 
 ### Fixed
 
 - The audit date routine had two sign errors: dates outside
   2000-03-01..2100-02-28 were a day off. Current timestamps were not
   affected.
-- A short write no longer leaves a partial JSON line in the audit log.
+- A short audit write is resumed, so it no longer leaves a partial JSON
+  line. A write that fails midway (ENOSPC, EPIPE) can still leave a
+  newline-terminated fragment.
 - Two sessions appending to one file could overwrite each other; append
   now uses `O_APPEND`.
 - A second login could delete an upload another session still had open
