@@ -40,10 +40,12 @@ pub const Error = error{
     WrongLength,
     KdfFailed,
     BufferTooSmall,
+    EmptyPassword,
 };
 
 /// Mint a fresh `a…` blob from a password into `out` (needs ≥32 bytes).
 pub fn mint(io: std.Io, allocator: std.mem.Allocator, password: []const u8, out: []u8) Error![]const u8 {
+    if (password.len == 0) return error.EmptyPassword;
     if (out.len < blob_len) return error.BufferTooSmall;
 
     var salt: [salt_len]u8 = undefined;
@@ -70,6 +72,10 @@ pub fn verify(io: std.Io, allocator: std.mem.Allocator, password: []const u8, bl
     var digest: [key_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &digest);
     kdf(io, allocator, password, raw[0..salt_len], &digest) catch return false;
+    // Empty passwords are never accepted, even if `blob` is a hash of
+    // "". The KDF above keeps this denial the same cost as a mismatch.
+    // A decode failure already returned above, without that work.
+    if (password.len == 0) return false;
     var expected: [key_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &expected);
     @memcpy(&expected, raw[salt_len..][0..key_len]);
@@ -179,6 +185,13 @@ test "validate rejects legacy and bad shapes" {
     try std.testing.expectError(error.WrongLength, validate("aAAAA"));
     try std.testing.expectError(error.InvalidAlphabet, validate("a" ++ "A" ** 30 ++ "_"));
     try std.testing.expectError(error.InvalidAlphabet, validate("a" ++ "A" ** 30 ++ "-"));
+}
+
+test "empty password is not mintable or acceptable" {
+    var buf: [blob_len]u8 = undefined;
+    try std.testing.expectError(error.EmptyPassword, mint(std.testing.io, std.testing.allocator, "", &buf));
+    const blob = try mint(std.testing.io, std.testing.allocator, "correct horse", &buf);
+    try std.testing.expect(!verify(std.testing.io, std.testing.allocator, "", blob));
 }
 
 test "fixed length" {
