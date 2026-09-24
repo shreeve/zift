@@ -131,7 +131,7 @@ pub fn derivedMode(granted: config.PermissionSet, kind_bits: u32) u32 {
 ///
 /// So `/inbox/**` does not match `/inbox`, and since a normalized path
 /// starts with `/`, only a pattern starting with `/`, `**`, or `*/` can
-/// match one (`*.exe` never does). A value longer than
+/// match one (`*.exe` never does); config accepts only `/` and `**`. A value longer than
 /// `vfs.max_virtual_path_bytes` matches no wildcard pattern.
 ///
 /// Time is O(len(pattern) * len(value)); space is one fixed buffer.

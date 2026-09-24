@@ -29,8 +29,9 @@ pub fn authenticate(
     // Two ceilings.
     //
     // HARD failures are real credential rejections: a wrong or unknown-
-    // user password, a password from outside `from`, or a matched key
-    // with a bad signature. They feed the abuse table and the backoff,
+    // user password, or a password from outside `from`. (libssh drops a
+    // key with a bad signature before Zift sees it, so the pubkey
+    // `hard_denied` path is defensive.) They feed the abuse table and the backoff,
     // and 6 (OpenSSH's MaxAuthTries) end the session.
     //
     // SOFT operations are `none`, non-auth messages, and public-key
@@ -240,7 +241,8 @@ const PublicKeyDecision = union(enum) {
     accepted: *const config.UserConfig,
     /// Acceptable key offered and `pk_ok` sent; await the signed request.
     offered,
-    /// A configured key with a bad signature.
+    /// A configured key with a bad signature. libssh 0.11 rejects those
+    /// itself; kept so a libssh that passes them on still counts them.
     hard_denied,
     /// Unknown user, `from` miss, no keys, unconfigured or malformed
     /// offer. Same class as unknown user so it confirms nothing.

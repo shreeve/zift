@@ -54,9 +54,9 @@ RemoveIPC=true
 
 # RestrictSUIDSGID is deliberately NOT set, and must not be re-added.
 #
-# It blocks the setgid bit, and every value `mkdir-mode` accepts
-# (0o2700, 0o2750, 0o2770) carries setgid. With it enabled, MKDIR fails
-# for every partner under every policy -- the audit log shows
+# It blocks the setgid bit, which the default `mkdir-mode` (0o2770) and
+# any mode an operator gives setgid carry. With it enabled, such a MKDIR
+# fails for every partner under every policy -- the audit log shows
 # `"operation":"mkdir","result":"failed","detail":"createDir failed"`,
 # i.e. the policy check passed and the syscall was refused. Verified by
 # running the same mkdir as `zift` with and without the restriction.

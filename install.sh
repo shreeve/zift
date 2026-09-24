@@ -34,8 +34,8 @@
 # This installs the BINARY ONLY. Standing up the daemon — service user,
 # host key, config, jail tree, hardened systemd unit — is deliberately out
 # of scope: those steps must be idempotent and must never clobber a config
-# that carries partner credentials, which is a job for the host-zift
-# runbook or docs/operate.md, not for a script piped from the internet.
+# that carries partner credentials, which is a job for docs/operate.md,
+# not for a script piped from the internet.
 #
 # Uninstall the same way — the binary goes; your config, host key, partner
 # trees, and service unit stay:
