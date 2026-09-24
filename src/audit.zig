@@ -326,41 +326,38 @@ fn formatLine(
     detail: []const u8,
     ip: []const u8,
 ) []const u8 {
-    // Full line first; then drop detail, then path, then user.
-    {
+    // The full line; else clip detail to fit; else also drop path; else
+    // also drop user.
+    const Try = struct { user: bool, path: bool, truncated: bool };
+    const tries = [_]Try{
+        .{ .user = true, .path = true, .truncated = false },
+        .{ .user = true, .path = true, .truncated = true },
+        .{ .user = true, .path = false, .truncated = true },
+        .{ .user = false, .path = false, .truncated = true },
+    };
+    for (tries) |t| {
         var w = std.Io.Writer.fixed(buf);
-        if (formatLineImpl(&w, user, operation, path, result, detail, ip, false)) |_| {
-            return w.buffered();
-        } else |_| {}
+        formatLineImpl(
+            &w,
+            if (t.user) user else null,
+            operation,
+            if (t.path) path else null,
+            result,
+            detail,
+            ip,
+            t.truncated,
+        ) catch continue;
+        return w.buffered();
     }
 
-    {
-        var w = std.Io.Writer.fixed(buf);
-        if (formatLineImpl(&w, user, operation, path, result, "[truncated]", ip, true)) |_| {
-            return w.buffered();
-        } else |_| {}
-    }
-
-    {
-        var w = std.Io.Writer.fixed(buf);
-        if (formatLineImpl(&w, user, operation, null, result, "", ip, true)) |_| {
-            return w.buffered();
-        } else |_| {}
-    }
-
-    {
-        var w = std.Io.Writer.fixed(buf);
-        if (formatLineImpl(&w, null, operation, null, result, "", ip, true)) |_| {
-            return w.buffered();
-        } else |_| {}
-    }
-
-    // Only a huge `operation` gets here. Still valid JSON.
+    // Only a huge `operation` or `ip` gets here. Still valid JSON.
     const fallback = "{\"event\":\"zift.audit\",\"operation\":\"?\",\"result\":\"failed\",\"ip\":\"\",\"truncated\":true}\n";
     const len = @min(fallback.len, buf.len);
     @memcpy(buf[0..len], fallback[0..len]);
     return buf[0..len];
 }
+
+const truncated_tail = ",\"truncated\":true}\n";
 
 fn formatLineImpl(
     w: *std.Io.Writer,
@@ -380,88 +377,105 @@ fn formatLineImpl(
     try w.writeAll("\",\"event\":\"zift.audit\"");
     if (user) |value| {
         try w.writeAll(",\"user\":");
-        try writeJsonStringLossy(w, value);
+        try writeJsonString(w, value, null);
     }
     try w.writeAll(",\"operation\":");
-    try writeJsonStringLossy(w, operation);
+    try writeJsonString(w, operation, null);
     try w.writeAll(",\"result\":\"");
     try w.writeAll(@tagName(result));
     try w.writeAll("\"");
     if (path) |value| {
         try w.writeAll(",\"path\":");
-        try writeJsonStringLossy(w, value);
+        try writeJsonString(w, value, null);
     }
+    const ip_key = ",\"ip\":";
     if (detail.len != 0) {
-        try w.writeAll(",\"detail\":");
-        try writeJsonStringLossy(w, detail);
+        const detail_key = ",\"detail\":";
+        if (!truncated) {
+            try w.writeAll(detail_key);
+            try writeJsonString(w, detail, null);
+        } else {
+            // Keep as much of the detail as fits in front of the fixed
+            // tail, rather than losing all of it to a few bytes over.
+            const tail = ip_key.len + jsonStringLen(ip) + truncated_tail.len;
+            const room = w.buffer.len -| (w.end + detail_key.len + tail);
+            if (room > 2) {
+                try w.writeAll(detail_key);
+                try writeJsonString(w, detail, room);
+            }
+        }
     }
-    try w.writeAll(",\"ip\":");
-    try writeJsonStringLossy(w, ip);
-    if (truncated) try w.writeAll(",\"truncated\":true");
-    try w.writeAll("}\n");
+    try w.writeAll(ip_key);
+    try writeJsonString(w, ip, null);
+    try w.writeAll(if (truncated) truncated_tail else "}\n");
 }
 
 /// Emit `s` as a JSON string, replacing invalid UTF-8 with U+FFFD.
+/// With a `limit`, the string (quotes included) is cut at a character
+/// boundary to fit in that many bytes.
 ///
-/// Usernames and some audited strings are raw bytes. std's encoder
+/// Usernames and paths are raw partner-supplied bytes. std's encoder
 /// passes invalid UTF-8 through (making the line invalid JSON, which jq
 /// and strict shippers drop, hiding the event) or panics with
 /// `escape_unicode`, so we sanitize while encoding.
-fn writeJsonStringLossy(w: *std.Io.Writer, s: []const u8) !void {
-    const replacement = "\u{FFFD}"; // 3 bytes: EF BF BD
+fn writeJsonString(w: *std.Io.Writer, s: []const u8, limit: ?usize) !void {
     try w.writeByte('"');
+    var used: usize = 2;
     var i: usize = 0;
     while (i < s.len) {
-        const b = s[i];
-        if (b < 0x80) {
-            switch (b) {
-                '"' => try w.writeAll("\\\""),
-                '\\' => try w.writeAll("\\\\"),
-                0x08 => try w.writeAll("\\b"),
-                0x0C => try w.writeAll("\\f"),
-                '\n' => try w.writeAll("\\n"),
-                '\r' => try w.writeAll("\\r"),
-                '\t' => try w.writeAll("\\t"),
-                else => {
-                    if (b < 0x20) {
-                        try w.print("\\u{x:0>4}", .{b});
-                    } else {
-                        try w.writeByte(b);
-                    }
-                },
-            }
-            i += 1;
-            continue;
+        var scratch: [6]u8 = undefined;
+        const encoded, const consumed = encodeChar(s, i, &scratch);
+        if (limit) |max| {
+            if (used + encoded.len > max) break;
+            used += encoded.len;
         }
-        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch {
-            try w.writeAll(replacement);
-            i += 1;
-            continue;
-        };
-        if (i + seq_len > s.len or !std.unicode.utf8ValidateSlice(s[i..][0..seq_len])) {
-            try w.writeAll(replacement);
-            i += 1;
-            continue;
-        }
-        try w.writeAll(s[i..][0..seq_len]);
-        i += seq_len;
+        try w.writeAll(encoded);
+        i += consumed;
     }
     try w.writeByte('"');
 }
 
-test "audit line stays valid JSON for invalid-UTF-8 path" {
-    var buf: [max_line_bytes]u8 = undefined;
-    // A filename with a lone 0xFF byte (invalid UTF-8) plus an embedded
-    // quote and newline to exercise escaping.
-    const nasty = "/pending/\xff\x22\x0aevil";
-    const line = formatLine(&buf, "foo", "open_write", nasty, .denied, "", "127.0.0.1");
-    // No raw control bytes or lone high bytes leaked; must be parseable.
-    for (line[0 .. line.len - 1]) |ch| {
-        try std.testing.expect(ch != '\n' or false);
+fn jsonStringLen(s: []const u8) usize {
+    var counter = std.Io.Writer.Discarding.init(&.{});
+    writeJsonString(&counter.writer, s, null) catch unreachable;
+    return @intCast(counter.fullCount());
+}
+
+/// The character of `s` at `i` as it appears inside a JSON string, and
+/// the number of input bytes it consumes.
+fn encodeChar(s: []const u8, i: usize, scratch: *[6]u8) struct { []const u8, usize } {
+    const replacement = "\u{FFFD}";
+    const b = s[i];
+    if (b < 0x80) {
+        const escaped: []const u8 = switch (b) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            0x08 => "\\b",
+            0x0C => "\\f",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            0x00...0x07, 0x0B, 0x0E...0x1F, 0x7F => unicodeEscape(scratch, b),
+            else => s[i..][0..1],
+        };
+        return .{ escaped, 1 };
     }
-    try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
-    try std.testing.expect(std.unicode.utf8ValidateSlice(line));
-    try std.testing.expect(std.mem.indexOf(u8, line, "\u{FFFD}") != null);
+    const len = std.unicode.utf8ByteSequenceLength(b) catch return .{ replacement, 1 };
+    if (i + len > s.len) return .{ replacement, 1 };
+    const cp = std.unicode.utf8Decode(s[i..][0..len]) catch return .{ replacement, 1 };
+    return switch (cp) {
+        // Valid JSON raw, but they break lines or reorder text for the
+        // tools that read audit logs: C1 controls (U+0085 NEL splits
+        // lines in Python, U+009B is a terminal CSI), the JavaScript
+        // line separators, and bidi overrides that let a filename
+        // visually rearrange the path shown by `tail -F`.
+        0x80...0x9F, 0x2028, 0x2029, 0x202A...0x202E, 0x2066...0x2069 => .{ unicodeEscape(scratch, cp), len },
+        else => .{ s[i..][0..len], len },
+    };
+}
+
+fn unicodeEscape(scratch: *[6]u8, cp: u21) []const u8 {
+    return std.fmt.bufPrint(scratch, "\\u{x:0>4}", .{cp}) catch unreachable;
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
@@ -531,12 +545,33 @@ fn expectField(line: []const u8, key: []const u8, want: []const u8) !void {
     try std.testing.expectEqualStrings(want, got.string);
 }
 
+test "audit line stays valid JSON for invalid-UTF-8 path" {
+    var buf: [max_line_bytes]u8 = undefined;
+    // A filename with a lone 0xFF byte (invalid UTF-8) plus an embedded
+    // quote and newline to exercise escaping.
+    const nasty = "/pending/\xff\x22\x0aevil";
+    const line = formatLine(&buf, "foo", "open_write", nasty, .denied, "", "127.0.0.1");
+    try expectWellFormedLine(line);
+    try expectField(line, "path", "/pending/\u{FFFD}\"\nevil");
+}
+
+test "audit line escapes characters that split or reorder lines" {
+    var buf: [max_line_bytes]u8 = undefined;
+    // NEL (C1), LINE SEPARATOR, RIGHT-TO-LEFT OVERRIDE, DEL, and an
+    // ordinary non-ASCII letter that must pass through untouched.
+    const name = "/in/a\u{85}b\u{2028}c\u{202E}d\x7fé";
+    const line = formatLine(&buf, "ally", "write", name, .ok, "", "");
+    try expectWellFormedLine(line);
+    try std.testing.expect(std.mem.indexOf(u8, line, "a\\u0085b\\u2028c\\u202ed\\u007fé") != null);
+    try expectField(line, "path", name);
+}
+
 test "audit line escapes special characters" {
     var buf: [256]u8 = undefined;
     const line = formatLine(&buf, "ally", "open_write", "/pending/\"weird\"\nfile", .ok, "size=11", "10.0.0.1");
     try std.testing.expect(std.mem.indexOf(u8, line, "\\\"weird\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\\n") != null);
-    try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
+    try expectWellFormedLine(line);
 }
 
 test "audit line always includes ip" {
@@ -609,15 +644,60 @@ test "formatRfc3339Utc fixed-input fixtures" {
     }
 }
 
-test "audit line truncates detail when over the line cap" {
+test "audit line clips detail to fit the line cap" {
     var buf: [max_line_bytes]u8 = undefined;
     var huge: [max_line_bytes]u8 = undefined;
     @memset(&huge, 'x');
     const line = formatLine(&buf, "ally", "write", "/tmp/foo", .ok, &huge, "10.0.0.1");
-    try std.testing.expect(line.len <= max_line_bytes);
+    try expectWellFormedLine(line);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"truncated\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "\"ip\":\"10.0.0.1\"") != null);
-    try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
+    try expectField(line, "ip", "10.0.0.1");
+    try expectField(line, "path", "/tmp/foo");
+    // Clipped, not replaced: nearly the whole line budget is detail.
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"detail\":\"xxxx") != null);
+    try std.testing.expect(line.len > max_line_bytes - 8);
+}
+
+test "audit detail clipping never splits a character or an escape" {
+    var buf: [max_line_bytes]u8 = undefined;
+    // Each unit is a 3-byte character or a 6-byte escape, so the cut
+    // lands mid-unit for some offset in this range.
+    var detail: [max_line_bytes]u8 = undefined;
+    var i: usize = 0;
+    while (i + 3 <= detail.len) : (i += 3) @memcpy(detail[i..][0..3], "\u{20AC}");
+    for (0..8) |pad| {
+        const user = "u" ** 8;
+        const line = formatLine(&buf, user[0..pad], "write", null, .ok, detail[0..i], "10.0.0.1");
+        try expectWellFormedLine(line);
+    }
+    @memset(&detail, 0x01);
+    for (0..8) |pad| {
+        const user = "u" ** 8;
+        const line = formatLine(&buf, user[0..pad], "write", null, .ok, &detail, "10.0.0.1");
+        try expectWellFormedLine(line);
+    }
+}
+
+test "fuzz audit line" {
+    return std.testing.fuzz({}, fuzzAuditLine, .{ .corpus = &.{
+        "ally\x00write\x00/in/\xff\"\n\x00size=1\xc2\x85\x00203.0.113.7",
+        "\x00\x00\xe2\x80\xa8\x00\xe2\x80\xae\x00",
+    } });
+}
+
+// Input is `user\x00operation\x00path\x00detail\x00ip`; a missing field
+// is null (user, path) or empty.
+fn fuzzAuditLine(_: void, smith: *std.testing.Smith) !void {
+    var input: [2 * max_line_bytes]u8 = undefined;
+    const len = smith.sliceWithHash(&input, 0xA0D17106);
+    var fields = std.mem.splitScalar(u8, input[0..len], 0);
+    const user = fields.next();
+    const operation = fields.next() orelse "";
+    const path = fields.next();
+    const detail = fields.next() orelse "";
+    const ip = fields.rest();
+    var buf: [max_line_bytes]u8 = undefined;
+    try expectWellFormedLine(formatLine(&buf, user, operation, path, .ok, detail, ip));
 }
 
 test "writeLine resumes after a short write and ends a failed line" {
