@@ -1,7 +1,7 @@
 //! Command-line entry point: `serve`, `validate`, `hash-password`, `version`.
 //!
 //! Operational status goes to stderr; stdout carries only what scripts
-//! consume (the passhash and the version).
+//! consume (the passhash, the version, and validate's ok line).
 
 const std = @import("std");
 const c = @import("libssh");
@@ -18,40 +18,22 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    if (args.len < 2) {
+    const cmd = if (args.len >= 2) args[1] else "";
+    const code: u8 = if (std.mem.eql(u8, cmd, "serve") and args.len == 3)
+        serve(io, init.gpa, args[2])
+    else if (std.mem.eql(u8, cmd, "validate") and args.len == 3)
+        try validate(io, init.gpa, args[2])
+    else if (std.mem.eql(u8, cmd, "hash-password"))
+        try hashPassword(io, init.gpa)
+    else if (std.mem.eql(u8, cmd, "version"))
+        try version(io)
+    else
         try usage(io);
-        std.process.exit(1);
-    }
-
-    const cmd = args[1];
-
-    if (std.mem.eql(u8, cmd, "serve")) {
-        try serve(io, init.gpa, args);
-        return;
-    }
-
-    if (std.mem.eql(u8, cmd, "hash-password")) {
-        try hashPassword(io, init.gpa);
-        return;
-    }
-
-    if (std.mem.eql(u8, cmd, "validate")) {
-        const code = try validate(io, init.gpa, args);
-        std.process.exit(code);
-    }
-
-    if (std.mem.eql(u8, cmd, "version")) {
-        try version(io);
-        return;
-    }
-
-    try usage(io);
-    std.process.exit(1);
+    std.process.exit(code);
 }
 
-fn usage(io: std.Io) !void {
-    const stderr = std.Io.File.stderr();
-    try stderr.writeStreamingAll(io,
+fn usage(io: std.Io) !u8 {
+    try std.Io.File.stderr().writeStreamingAll(io,
         \\usage:
         \\  zift serve <config>
         \\  zift validate <config>
@@ -59,52 +41,59 @@ fn usage(io: std.Io) !void {
         \\  zift version
         \\
     );
+    return 1;
 }
 
-fn version(io: std.Io) !void {
+fn version(io: std.Io) !u8 {
     try std.Io.File.stdout().writeStreamingAll(io, "zift " ++ build_options.version ++ "\n" ++
         "build: " ++ build_options.target ++ " " ++ build_options.optimize ++ "\n");
+    return 0;
 }
 
-fn validate(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
-    if (args.len != 3) {
-        try sys.note(io, "usage: zift validate <config>\n", .{});
-        return 1;
-    }
-
-    const path = args[2];
-
+/// Read, parse, and validate `path`, reporting any failure as
+/// `<prefix>: ...` on stderr. A semantic failure prints its own line.
+fn loadConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8, prefix: []const u8) ?config.Config {
     const contents = config.readFile(io, gpa, path) catch |err| {
-        try sys.note(io, "zift validate: cannot read {s}: {s}\n", .{ path, @errorName(err) });
-        return 1;
+        sys.note(io, "{s}: cannot read {s}: {s}\n", .{ prefix, path, @errorName(err) }) catch {};
+        return null;
     };
     defer gpa.free(contents);
 
     var diag: config.LoadDiag = .{};
-    var cfg = config.loadPath(io, gpa, path, contents, &diag) catch {
-        if (diag.parse_err != null) try sys.note(io, "zift validate: {s}: {f}\n", .{ path, diag });
-        return 1;
+    return config.loadPath(io, gpa, path, contents, &diag) catch {
+        if (diag.parse_err != null) sys.note(io, "{s}: {s}: {f}\n", .{ prefix, path, diag }) catch {};
+        return null;
     };
+}
+
+fn validate(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !u8 {
+    var cfg = loadConfig(io, gpa, path, "zift validate") orelse return 1;
     defer cfg.deinit();
 
-    const stdout = std.Io.File.stdout();
-    var buf: [4096]u8 = undefined;
-    const summary = std.fmt.bufPrint(&buf, "ok: {s} ({d} user{s}, listen {s})\n", .{
+    var buf: [256]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
+    try stdout.interface.print("ok: {s} ({d} user{s}, listen {s})\n", .{
         path,
         cfg.users.len,
         if (cfg.users.len == 1) "" else "s",
         cfg.server.listen,
-    }) catch unreachable;
-    try stdout.writeStreamingAll(io, summary);
+    });
+    try stdout.interface.flush();
     return 0;
 }
 
-fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len != 3) {
-        try usage(io);
-        return;
-    }
+/// Run the server until shutdown. Every failure is reported here as one
+/// line, after the resources taken so far are released.
+fn serve(io: std.Io, gpa: std.mem.Allocator, path: []const u8) u8 {
+    runServer(io, gpa, path) catch |err| {
+        // A rejected config has already said why.
+        if (err != error.ConfigRejected) sys.note(io, "zift: serve failed: {s}\n", .{@errorName(err)}) catch {};
+        return 1;
+    };
+    return 0;
+}
 
+fn runServer(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
     const rc = c.ssh_init();
     if (rc != c.SSH_OK) return error.LibsshInitFailed;
     defer _ = c.ssh_finalize();
@@ -112,23 +101,25 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
     // Before any worker thread exists.
     signals.install();
 
-    const stderr = std.Io.File.stderr();
-
     // Announce the running version before reading the config. After an
     // upgrade `zift version` reports the file on disk, not this process;
     // this line is the journal's record, even when startup then fails.
-    try stderr.writeStreamingAll(io, "zift: starting zift " ++ build_options.version ++
+    try std.Io.File.stderr().writeStreamingAll(io, "zift: starting zift " ++ build_options.version ++
         " (" ++ build_options.target ++ " " ++ build_options.optimize ++ ")\n");
 
-    const contents = try config.readFile(io, gpa, args[2]);
-    defer gpa.free(contents);
-
-    var diag: config.LoadDiag = .{};
-    const cfg = config.loadPath(io, gpa, args[2], contents, &diag) catch |err| {
-        if (diag.parse_err != null) try sys.note(io, "zift: {s}: {f}\n", .{ args[2], diag });
+    var cfg = loadConfig(io, gpa, path, "zift") orelse return error.ConfigRejected;
+    // `server.run` owns `cfg` once called; free it on any failure before.
+    startup(io, gpa, path, &cfg) catch |err| {
+        cfg.deinit();
         return err;
     };
+    defer audit.deinitGlobal(gpa);
+    try server.run(io, gpa, path, cfg);
+}
 
+/// What runs between a valid config and the server: warnings, the audit
+/// sink (after validation, before any worker thread), and the banner.
+fn startup(io: std.Io, gpa: std.mem.Allocator, path: []const u8, cfg: *const config.Config) !void {
     // Informational: the legacy staging dir is never used any more.
     for (cfg.users) |*user| {
         if (vfs.legacyStagingDirExists(io, user.root)) {
@@ -137,35 +128,40 @@ fn serve(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    // After validation, before any worker thread.
     try audit.initGlobal(io, gpa, cfg.server.log);
-    defer audit.deinitGlobal(gpa);
+    errdefer audit.deinitGlobal(gpa);
 
     try sys.note(io, "zift: libssh initialized\nzift: config path: {s}\nzift: listen: {s}\n", .{
-        args[2], cfg.server.listen,
+        path, cfg.server.listen,
     });
-    try server.run(io, gpa, args[2], cfg);
 }
 
-fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !void {
-    // Password on stdin, passhash on stdout, no prompt:
-    // `printf '%s\n' "$pw" | zift hash-password`.
-    const stdin = std.Io.File.stdin();
-    const stdout = std.Io.File.stdout();
-
-    var reader_buffer: [256]u8 = undefined;
-    var reader = stdin.readerStreaming(io, &reader_buffer);
-    const input = try reader.interface.allocRemaining(gpa, .limited(4096));
-    defer gpa.free(input);
-
-    const password = std.mem.trimEnd(u8, input, "\r\n");
+/// Password on stdin, passhash on stdout, no prompt:
+/// `printf '%s\n' "$pw" | zift hash-password`. Only the first line is
+/// the password, less its line ending, exactly as Janus's `passhash`
+/// reads piped input; anything after it is ignored.
+fn hashPassword(io: std.Io, gpa: std.mem.Allocator) !u8 {
+    var reader_buffer: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &reader_buffer);
+    var reader = std.Io.File.stdin().readerStreaming(io, &reader_buffer);
+    const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+        error.StreamTooLong => {
+            try sys.note(io, "zift: password line longer than {d} bytes\n", .{reader_buffer.len});
+            return 1;
+        },
+        error.ReadFailed => return reader.err.?,
+    };
+    const password = std.mem.trimEnd(u8, line orelse "", "\r\n");
     if (password.len == 0) {
-        const stderr = std.Io.File.stderr();
-        try stderr.writeStreamingAll(io, "zift: password must not be empty\n");
-        std.process.exit(1);
+        try sys.note(io, "zift: password must not be empty\n", .{});
+        return 1;
     }
-    var hash_buffer: [128]u8 = undefined;
+
+    var hash_buffer: [passhash.blob_len]u8 = undefined;
     const hash = try passhash.mint(io, gpa, password, &hash_buffer);
-    var line: [passhash.blob_len + 1]u8 = undefined;
-    try stdout.writeStreamingAll(io, std.fmt.bufPrint(&line, "{s}\n", .{hash}) catch unreachable);
+    var out_buffer: [passhash.blob_len + 1]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &out_buffer);
+    try stdout.interface.print("{s}\n", .{hash});
+    try stdout.interface.flush();
+    return 0;
 }
