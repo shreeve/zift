@@ -7,7 +7,7 @@ Versions marked "untagged" were released from a commit, not a git tag.
 
 - Homebrew: `brew install shreeve/tap/zift` on macOS or Linux, and
   `brew services start zift` on macOS. Linux servers still install with
-  `install.sh`. Each release opens a pull request that bumps the formula.
+  `install.sh`.
 
 ## 0.12.1 — 2026-09-24
 

@@ -82,6 +82,13 @@ does with the tag minus its leading `v`. To release:
    to pass: the release workflow runs unit tests only.
 4. Tag and push: `git tag -a vX.Y.Z -m "Zift X.Y.Z" && git push origin
    vX.Y.Z`.
+5. For a final release, once it is published, bump the Homebrew formula
+   in a clone of `shreeve/homebrew-tap` and open a pull request there:
+
+   ```sh
+   gh release download vX.Y.Z -p 'zift-vX.Y.Z-checksums.txt'
+   scripts/bump-homebrew-formula.py ../homebrew-tap/Formula/zift.rb X.Y.Z zift-vX.Y.Z-checksums.txt
+   ```
 
 ## Unit Tests And Fuzzing
 
@@ -150,12 +157,7 @@ The runner reads:
    and the licenses (`scripts/package-release.sh`);
 5. writes the archives' checksums and signs them with cosign keyless
    through GitHub's OIDC identity;
-6. publishes a GitHub release, marked prerelease if the tag has a `-`;
-7. for a final release, opens a pull request on `shreeve/homebrew-tap`
-   that moves `Formula/zift.rb` to the new archives and checksums
-   (`scripts/bump-homebrew-formula.py`). It needs the repository secret
-   `HOMEBREW_TAP_TOKEN`, a token that can push a branch and open a pull
-   request there; without it the job warns and the release still ships.
+6. publishes a GitHub release, marked prerelease if the tag has a `-`.
 
 Artifacts: `zift-vX.Y.Z-{linux-amd64,linux-arm64,osx-arm64,osx-amd64}.tar.gz`,
 `zift-vX.Y.Z-checksums.txt` and `zift-vX.Y.Z-checksums.txt.bundle`.
