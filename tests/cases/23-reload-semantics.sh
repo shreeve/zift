@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test: PLAN §7.3 reload semantics — interval cadence, forward-only mtime,
+# Test: PLAN §7.3 reload semantics — interval cadence, any-change stamp,
 #       stat-failure warnings, host-key check on reload
 # Covers: PLAN §7.3 (auto-reload semantics)
 # TODOS: P1 reload semantics cluster (4 items)
@@ -36,14 +36,21 @@ grep -q 'config reloaded' "$ZIFT_LOG" \
     || fail "expected forward-mtime change to trigger reload, log:\n$(cat "$ZIFT_LOG")"
 ok "forward-mtime change triggered a reload within the interval"
 
-# ---------- (b) rewinding mtime does NOT trigger reload ----------
+# ---------- (b) rewinding mtime also triggers a reload ----------
+# Any change to the stamp reloads (a deploy that restores old mtimes,
+# e.g. rsync -t, must not need SIGHUP), and an unchanged file does not.
 RELOADS_BEFORE=$(grep -c 'config reloaded' "$ZIFT_LOG" || true)
 touch -t 200001010000 "$TEST_TMP/zift.conf"
 sleep 2
 RELOADS_AFTER=$(grep -c 'config reloaded' "$ZIFT_LOG" || true)
-[[ "$RELOADS_AFTER" == "$RELOADS_BEFORE" ]] \
-    || fail "rewinding mtime should not trigger reload (before=$RELOADS_BEFORE after=$RELOADS_AFTER)"
-ok "rewinding mtime did NOT trigger reload (forward-only honored)"
+[[ "$RELOADS_AFTER" -gt "$RELOADS_BEFORE" ]] \
+    || fail "rewinding mtime should trigger a reload (before=$RELOADS_BEFORE after=$RELOADS_AFTER)"
+ok "rewinding mtime triggered a reload"
+sleep 2
+RELOADS_STILL=$(grep -c 'config reloaded' "$ZIFT_LOG" || true)
+[[ "$RELOADS_STILL" == "$RELOADS_AFTER" ]] \
+    || fail "an unchanged config reloaded again (before=$RELOADS_AFTER after=$RELOADS_STILL)"
+ok "an unchanged config is not reloaded"
 
 # ---------- (c) stat failure logs once, recovery logs once ----------
 # Move the file out of the way (server can't stat it), wait for the
@@ -102,7 +109,8 @@ grep -q 'config reloaded' "$TEST_TMP/disabled.log" \
 ok "reload-interval=0 suppresses mtime-driven reload"
 
 # SIGHUP must still trigger a reload even with interval=0.
-DISABLED_BIN_PID=$(pgrep -x zift | head -1)
+# $! is zift itself; `pgrep -x zift` could pick another test run's server.
+DISABLED_BIN_PID=$DISABLED_PID
 [[ -n "$DISABLED_BIN_PID" ]] || fail "could not find disabled zift binary pid"
 kill -HUP "$DISABLED_BIN_PID"
 sleep 2
