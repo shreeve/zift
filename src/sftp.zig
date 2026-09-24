@@ -1037,13 +1037,11 @@ const SftpState = struct {
 
         var it = dir.iterate();
         while (it.next(self.io) catch null) |entry| {
-            if (entry.kind != .file) continue;
-            const live = self.stagingNameIsLive(entry.name);
-            const age_secs: i64 = if (live) 0 else blk: {
-                const info = listing.statAt(dir.handle, entry.name) catch continue;
-                break :blk now_secs - info.mtime_secs;
-            };
-            if (!sweepUnlinksStagingFile(live, age_secs, min_age_secs)) continue;
+            // Filesystems without d_type (XFS with ftype=0, some NFS)
+            // report every entry as unknown; the lstat decides.
+            if (entry.kind != .file and entry.kind != .unknown) continue;
+            const info = listing.statAt(dir.handle, entry.name) catch continue;
+            if (!isStagingOrphan(self.stagingNameIsLive(entry.name), info, now_secs - min_age_secs)) continue;
             dir.deleteFile(self.io, entry.name) catch {};
         }
     }
@@ -1371,9 +1369,10 @@ fn fsErrorStatus(err: anyerror) c_int {
     };
 }
 
-fn sweepUnlinksStagingFile(live: bool, age_secs: i64, min_age_secs: i64) bool {
-    if (live) return false;
-    return age_secs >= min_age_secs;
+/// A staging entry no live handle owns is an orphan once it is a regular
+/// file last modified at or before `cutoff_secs`.
+fn isStagingOrphan(live: bool, info: listing.EntryInfo, cutoff_secs: i64) bool {
+    return !live and info.mode & listing.S_IFMT == listing.S_IFREG and info.mtime_secs <= cutoff_secs;
 }
 
 /// Open an existing regular file under `dir`; a final symlink is refused
@@ -1518,12 +1517,15 @@ test "only a missing entry is NO_SUCH_FILE" {
     }) |err| try std.testing.expectEqual(failure, fsErrorStatus(err));
 }
 
-test "staging sweep skips live names and young orphans" {
-    try std.testing.expect(!sweepUnlinksStagingFile(true, 10_000, 60));
-    try std.testing.expect(!sweepUnlinksStagingFile(true, 0, 60));
-    try std.testing.expect(!sweepUnlinksStagingFile(false, 59, 60));
-    try std.testing.expect(sweepUnlinksStagingFile(false, 60, 60));
-    try std.testing.expect(!sweepUnlinksStagingFile(false, -1, 60));
+test "staging sweep skips live names, young files, and anything not a regular file" {
+    const file: listing.EntryInfo = .{ .mode = listing.S_IFREG | 0o600, .nlink = 1, .uid = 0, .gid = 0, .size = 0, .mtime_secs = 100 };
+    var dir = file;
+    dir.mode = listing.S_IFDIR | 0o700;
+    try std.testing.expect(isStagingOrphan(false, file, 100));
+    try std.testing.expect(isStagingOrphan(false, file, 10_000));
+    try std.testing.expect(!isStagingOrphan(true, file, 10_000));
+    try std.testing.expect(!isStagingOrphan(false, file, 99));
+    try std.testing.expect(!isStagingOrphan(false, dir, 10_000));
 }
 
 test "pre-subsystem ignore cap is 64" {
