@@ -63,8 +63,8 @@ fn formatIPv6(addr: *const [16]u8, buf: []u8) ?[]const u8 {
 }
 
 /// Why a new connection from `peer_ip` is refused, or null to admit it.
-fn refusal(io: std.Io, cfg: config.ServerConfig, peer_ip: []const u8) ?[]const u8 {
-    if (abuse.isSuppressed(io, peer_ip, sys.monotonicMs())) return "source suppressed";
+/// Admission takes one of the source's pre-auth slots.
+fn refusal(io: std.Io, cfg: config.ServerConfig, peer_ip: []const u8, now_ms: i64) ?[]const u8 {
     if (active_sessions.load(.acquire) >= cfg.max_connections) return "max-connections reached";
     // 0 = no separate pre-auth cap.
     if (cfg.max_unauth_connections != 0 and
@@ -72,7 +72,17 @@ fn refusal(io: std.Io, cfg: config.ServerConfig, peer_ip: []const u8) ?[]const u
     {
         return "max-unauth-connections reached";
     }
-    return null;
+    return switch (abuse.admit(io, peer_ip, now_ms)) {
+        .admitted => null,
+        .suppressed => "source suppressed",
+        .busy => "too many pre-auth connections from source",
+    };
+}
+
+/// Give back a session's pre-auth slots: the global one and its source's.
+fn releasePreauth(io: std.Io, peer_ip: []const u8) void {
+    _ = unauth_sessions.fetchSub(1, .acq_rel);
+    abuse.releasePreauth(io, peer_ip);
 }
 
 /// Hand an accepted connection to a detached worker. On error `fd` is
@@ -86,6 +96,7 @@ fn startSession(
     ip_buf: [64]u8,
     ip_len: u8,
 ) !void {
+    errdefer abuse.releasePreauth(io, ip_buf[0..ip_len]);
     const session = c.ssh_new() orelse {
         _ = std.c.close(fd);
         return error.OutOfMemory;
@@ -252,8 +263,11 @@ pub fn run(
 
         var ip_buf: [64]u8 = undefined;
         const peer_ip = formatPeer(&ss, &ip_buf) orelse "";
-        if (refusal(io, active.current.config.server, peer_ip)) |reason| {
-            audit.log(io, null, "accept.rejected", null, .denied, reason, peer_ip);
+        const now_ms = sys.monotonicMs();
+        if (refusal(io, active.current.config.server, peer_ip, now_ms)) |reason| {
+            if (abuse.rejectionLogDue(io, peer_ip, now_ms)) {
+                audit.log(io, null, "accept.rejected", null, .denied, reason, peer_ip);
+            }
             _ = std.c.close(fd);
             continue :accept_loop;
         }
@@ -569,7 +583,7 @@ fn sessionThread(args: *SessionArgs) void {
     if (ok) c.ssh_disconnect(session);
     c.ssh_free(session);
 
-    if (!auth_completed) _ = unauth_sessions.fetchSub(1, .acq_rel);
+    if (!auth_completed) releasePreauth(io, peer_ip);
     ref.release(allocator);
     _ = active_sessions.fetchSub(1, .acq_rel);
 }
@@ -719,10 +733,10 @@ fn handleSession(
 
     const user = try ssh.authenticate(io, allocator, cfg, session, peer_ip, login_deadline_ms);
 
-    // Release the pre-auth slot now; the flag tells sessionThread not
+    // Release the pre-auth slots now; the flag tells sessionThread not
     // to release it again.
     auth_completed.* = true;
-    _ = unauth_sessions.fetchSub(1, .acq_rel);
+    releasePreauth(io, peer_ip);
 
     // Plain idle from here (the SFTP loop enforces idle itself).
     ssh.setReadTimeout(session, cfg.server.idle_timeout_ms);

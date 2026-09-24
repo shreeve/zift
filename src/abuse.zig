@@ -1,7 +1,8 @@
 //! Built-in source abuse control, so a normal deploy needs no fail2ban.
 //!
-//! Tracks failed authentications per source in a fixed table behind one
-//! mutex; a burst of failures suppresses the source for a while. A source
+//! Per-source state in a fixed table behind one mutex: failed
+//! authentications, where a burst suppresses the source for a while, and
+//! concurrent pre-auth connections, which are capped. A source
 //! is an IPv4 address or an IPv6 /64, since one IPv6 host routinely holds
 //! a whole /64. A successful login clears nothing: one valid account must
 //! not buy fresh guesses against the others, and a partner behind the
@@ -17,6 +18,12 @@ pub const failure_threshold: u32 = 10;
 pub const window_ms: i64 = 10 * 60 * 1000;
 /// How long a source stays rejected after tripping the threshold.
 pub const suppress_ms: i64 = 15 * 60 * 1000;
+/// Concurrent pre-auth connections per source, so one host cannot fill
+/// `max-connections` with silent sockets.
+pub const max_preauth: u16 = 8;
+/// A source's refused connections are audited at most once per interval,
+/// so a reconnect loop cannot grow the audit log at connect speed.
+pub const reject_log_ms: i64 = 60 * 1000;
 /// Tracked sources. Large enough that filling the table to evict a
 /// suppressed source is expensive.
 const max_entries: usize = 4096;
@@ -29,9 +36,13 @@ const Entry = struct {
     failures: u32 = 0,
     window_start_ms: i64 = 0,
     suppressed_until_ms: i64 = 0,
-    /// Last insert or failure. Eviction picks the least-recently-active
-    /// source, not the one closest to tripping the threshold.
+    /// Last insert, admission, or failure. Eviction picks the least-
+    /// recently-active source, not the one closest to the threshold.
     last_seen_ms: i64 = 0,
+    /// Pre-auth connections in flight. An entry with any is never
+    /// evicted, so the count stays exact.
+    preauth: u16 = 0,
+    last_reject_log_ms: ?i64 = null,
 
     fn keySlice(self: *const Entry) []const u8 {
         return self.key[0..self.key_len];
@@ -66,6 +77,45 @@ pub fn isSuppressed(io: std.Io, ip: []const u8, now_ms: i64) bool {
     defer mutex.unlock(io);
     const entry = findEntry(sourceKey(ip)) orelse return false;
     return entry.suppressed_until_ms > now_ms;
+}
+
+pub const Admission = enum { admitted, suppressed, busy };
+
+/// Decide on a new connection from `ip`. `admitted` holds one of the
+/// source's pre-auth slots until `releasePreauth`.
+pub fn admit(io: std.Io, ip: []const u8, now_ms: i64) Admission {
+    if (ip.len == 0) return .admitted;
+    mutex.lockUncancelable(io);
+    defer mutex.unlock(io);
+    // A full table of busy sources admits untracked; release tolerates it.
+    const entry = findOrInsert(sourceKey(ip), now_ms) orelse return .admitted;
+    if (entry.suppressed_until_ms > now_ms) return .suppressed;
+    if (entry.preauth >= max_preauth) return .busy;
+    entry.preauth += 1;
+    entry.last_seen_ms = now_ms;
+    return .admitted;
+}
+
+/// Give back the pre-auth slot an `admitted` connection holds.
+pub fn releasePreauth(io: std.Io, ip: []const u8) void {
+    if (ip.len == 0) return;
+    mutex.lockUncancelable(io);
+    defer mutex.unlock(io);
+    const entry = findEntry(sourceKey(ip)) orelse return;
+    entry.preauth -|= 1;
+}
+
+/// Whether to audit a refused connection from `ip` (see `reject_log_ms`).
+pub fn rejectionLogDue(io: std.Io, ip: []const u8, now_ms: i64) bool {
+    if (ip.len == 0) return true;
+    mutex.lockUncancelable(io);
+    defer mutex.unlock(io);
+    const entry = findOrInsert(sourceKey(ip), now_ms) orelse return true;
+    if (entry.last_reject_log_ms) |last| {
+        if (now_ms - last < reject_log_ms) return false;
+    }
+    entry.last_reject_log_ms = now_ms;
+    return true;
 }
 
 /// Record an authentication failure for `ip`. May begin a suppress window.
@@ -113,11 +163,13 @@ fn findOrInsert(key: []const u8, now_ms: i64) ?*Entry {
     // Table full: evict the least-recently-active unsuppressed slot. If
     // every slot is suppressed, evict the one expiring soonest; losing
     // that suppression is a smaller harm than ignoring new sources.
+    // Sources with pre-auth connections in flight are never evicted.
     var lru_unsuppressed: ?*Entry = null;
     var lru_seen: i64 = std.math.maxInt(i64);
     var soonest_expiry: ?*Entry = null;
     var soonest_until: i64 = std.math.maxInt(i64);
     for (&entries) |*entry| {
+        if (entry.preauth > 0) continue;
         if (entry.suppressed_until_ms > now_ms) {
             if (entry.suppressed_until_ms < soonest_until) {
                 soonest_until = entry.suppressed_until_ms;
@@ -193,6 +245,52 @@ test "sourceKey" {
     try std.testing.expectEqualStrings("192.0.2.7", sourceKey("192.0.2.7"));
     try std.testing.expectEqualStrings("2001:db8:0:0", sourceKey("2001:db8:0:0:0:0:0:1"));
     try std.testing.expectEqualStrings("", sourceKey(""));
+}
+
+test "admit caps a source's pre-auth connections and refuses when suppressed" {
+    const io = std.testing.io;
+    resetForTest(io);
+    const ip = "192.0.2.50";
+    var i: u16 = 0;
+    while (i < max_preauth) : (i += 1) try std.testing.expectEqual(Admission.admitted, admit(io, ip, 1000));
+    try std.testing.expectEqual(Admission.busy, admit(io, ip, 1000));
+    // Another address is its own source.
+    try std.testing.expectEqual(Admission.admitted, admit(io, "192.0.2.51", 1000));
+    releasePreauth(io, ip);
+    try std.testing.expectEqual(Admission.admitted, admit(io, ip, 1000));
+
+    failTimes(io, ip, failure_threshold, 2000);
+    try std.testing.expectEqual(Admission.suppressed, admit(io, ip, 3000));
+    // Releasing more than was admitted does not wrap.
+    i = 0;
+    while (i < max_preauth + 2) : (i += 1) releasePreauth(io, ip);
+    try std.testing.expectEqual(@as(u16, 0), findEntry(ip).?.preauth);
+}
+
+test "rejectionLogDue allows one line per source per interval" {
+    const io = std.testing.io;
+    resetForTest(io);
+    try std.testing.expect(rejectionLogDue(io, "192.0.2.60", 1000));
+    try std.testing.expect(!rejectionLogDue(io, "192.0.2.60", 1000 + reject_log_ms - 1));
+    try std.testing.expect(rejectionLogDue(io, "192.0.2.61", 1001));
+    try std.testing.expect(rejectionLogDue(io, "192.0.2.60", 1000 + reject_log_ms));
+    try std.testing.expect(rejectionLogDue(io, "", 1000));
+    try std.testing.expect(rejectionLogDue(io, "", 1000));
+}
+
+test "a full table never evicts a source with pre-auth connections" {
+    const io = std.testing.io;
+    resetForTest(io);
+    defer resetForTest(io);
+    try std.testing.expectEqual(Admission.admitted, admit(io, "198.51.100.2", 1));
+    var buf: [64]u8 = undefined;
+    var i: u32 = 1;
+    while (i < max_entries) : (i += 1) {
+        recordFailure(io, try std.fmt.bufPrint(&buf, "10.1.{d}.{d}", .{ i / 256, i % 256 }), 100 + i);
+    }
+    recordFailure(io, "192.0.2.2", 100_000);
+    try std.testing.expect(findEntry("198.51.100.2") != null);
+    try std.testing.expect(findEntry("10.1.0.1") == null);
 }
 
 test "a full table evicts the least recently active unsuppressed source" {
