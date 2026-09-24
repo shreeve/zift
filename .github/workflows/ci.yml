@@ -53,9 +53,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-linux-musl
             artifact: zift-ci-x86_64-linux
+            plat: linux-amd64
           - os: macos-latest
             target: aarch64-macos
             artifact: zift-ci-aarch64-macos
+            plat: osx-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -80,6 +82,23 @@ jobs:
           mkdir -p bin
           cp "release/$ARTIFACT" bin/zift
           ls -l bin/zift
+
+      # The archive a release publishes, installed and uninstalled by the
+      # installer inside it, as install.sh runs it.
+      - name: Package, install and uninstall
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          PLAT: ${{ matrix.plat }}
+        run: |
+          set -euo pipefail
+          cp bin/zift "release/zift-0.0.0-ci-${ARTIFACT#zift-ci-}"
+          pkg="$RUNNER_TEMP/pkg" dest="$RUNNER_TEMP/bin"
+          TAG=v0.0.0-ci PLAT="$PLAT" OUT="$pkg" scripts/package-release.sh
+          tar -xzf "$pkg/zift-v0.0.0-ci-$PLAT.tar.gz" -C "$pkg"
+          BIN="$dest" bash "$pkg/zift-v0.0.0-ci-$PLAT/install.sh"
+          "$dest/zift" version
+          BIN="$dest" bash "$pkg/zift-v0.0.0-ci-$PLAT/install.sh" --uninstall
+          test ! -e "$dest/zift"
 
       - name: Verify systemd unit (catch inline-comment & directive bugs)
         if: runner.os == 'Linux'

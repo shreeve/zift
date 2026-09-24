@@ -194,10 +194,11 @@ partner root, where a partner could read or replace them.
 
 Release binaries are built by GitHub Actions with Zig 0.16.0 from
 libssh, mbedTLS and zlib pinned in `build.zig.zon`. Linux binaries are
-static; macOS binaries link only libSystem. `SHA256SUMS` covers every
-published file and is signed with cosign keyless through the release
-workflow's OIDC identity. Verify both before installing
-([`operate.md`](operate.md#by-hand)); a local build carries no such
+static; macOS binaries link only libSystem. A checksums file covers
+every release archive and is signed with cosign keyless through the release
+workflow's OIDC identity. The installer checks the checksum only; to
+verify the signature too, install by hand
+([`operate.md`](operate.md#by-hand)). A local build carries no such
 provenance.
 
 ## Known Caveats

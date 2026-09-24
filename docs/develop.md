@@ -41,6 +41,7 @@ src/
 ├── fuzz.zig        fuzz harnesses
 └── ext/            libssh translate-c header
 tools/verify.zig    checks a release binary's dynamic dependencies
+scripts/            release packaging and the installer inside each archive
 packaging/systemd/zift.service
 tests/run.sh, tests/cases/*.sh, tests/lib/
 ```
@@ -145,14 +146,25 @@ The runner reads:
 1. rejects any other tag shape;
 2. strips the leading `v` and passes the rest as `-Dversion`;
 3. runs the unit tests, then builds the four release targets;
-4. packs the systemd unit, `LICENSE` and `THIRD_PARTY_LICENSES.md` into
-   `zift-deploy-X.Y.Z.tar.gz`;
-5. writes `SHA256SUMS` over exactly the files it publishes and signs it
-   with cosign keyless through GitHub's OIDC identity;
+4. packs each binary with its installer, the systemd unit, the README
+   and the licenses (`scripts/package-release.sh`);
+5. writes the archives' checksums and signs them with cosign keyless
+   through GitHub's OIDC identity;
 6. publishes a GitHub release, marked prerelease if the tag has a `-`.
 
-Artifacts: `zift-X.Y.Z-{x86_64,aarch64}-{linux,macos}`,
-`zift-deploy-X.Y.Z.tar.gz`, `SHA256SUMS`, `SHA256SUMS.bundle`.
+Artifacts: `zift-vX.Y.Z-{linux-amd64,linux-arm64,osx-arm64,osx-amd64}.tar.gz`,
+`zift-vX.Y.Z-checksums.txt` and `zift-vX.Y.Z-checksums.txt.bundle`.
+
+### The installer
+
+`install.sh` is shared with janus and harbor: the three copies differ
+only in `REPO` and `NAME`, so change all three together. It picks the
+platform and version, checks the archive against the checksums file and
+runs the archive's own `install.sh` (`scripts/release-install.sh`),
+passing `--uninstall` through. Everything zift-specific, such as where
+the binary goes and when to use sudo, lives in that inner installer.
+CI packages the release build and runs the inner installer's install
+and uninstall on Linux and macOS.
 
 ## Principles
 
