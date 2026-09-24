@@ -17,21 +17,25 @@ pub fn authenticate(
     //
     //   HARD failures — a real credential rejection (wrong password,
     //   unknown-user password spray, a matched key whose signature is
-    //   invalid, or a known user hitting the `from` allowlist). These
-    //   feed the cross-session abuse suppressor and the escalating
+    //   invalid, or a password attempt outside the `from` allowlist).
+    //   These feed the cross-session abuse suppressor and the escalating
     //   backoff, and 6 of them (OpenSSH's MaxAuthTries default) ends the
-    //   session.
+    //   session. A public-key `from` miss is NOT hard: that class
+    //   difference against the soft unknown-user response confirms the
+    //   username.
     //
-    //   SOFT operations — method `none` and public-key *probes* (the
-    //   `SSH_PUBLICKEY_STATE_NONE` "would this key work?" offers, and
-    //   offers of keys that aren't configured). A stock client sends
-    //   `none` plus one probe per agent key BEFORE it ever tries a
-    //   password, so counting these as hard failures made a normal
-    //   5-key agent trip the 6-attempt ceiling and the legitimate
-    //   partner's own IP suppression. Soft ops get no backoff and never
-    //   touch the abuse table; they only have a generous ceiling so a
-    //   client cannot pin a session forever by looping probes (the
-    //   `.offered` path resets libssh's idle timer each round).
+    //   SOFT operations — method `none`, non-auth messages, and
+    //   public-key probes (the `SSH_PUBLICKEY_STATE_NONE` "would this
+    //   key work?" offers, offers of keys that aren't configured, and
+    //   a public-key `from` miss). A stock client sends `none` plus one
+    //   probe per agent key BEFORE it ever tries a password, so counting
+    //   these as hard failures made a normal 5-key agent trip the
+    //   6-attempt ceiling and the legitimate partner's own IP
+    //   suppression. Soft ops get no backoff and never touch the abuse
+    //   table; they only have a generous ceiling so a client cannot pin
+    //   a session forever by looping probes. `ssh_message_get` restarts
+    //   libssh's idle deadline on every message, including service and
+    //   global requests, so those count here too.
     const max_hard_failures: u32 = 6;
     const max_soft_ops: u32 = 64;
     var hard_failures: u32 = 0;
@@ -39,10 +43,24 @@ pub fn authenticate(
     const ip_str = peer_ip orelse "";
 
     while (true) {
+        // A source suppressed by another session (or by the failure
+        // just recorded) must not keep guessing inside this one.
+        // Empty IP is not suppressible; do not clear the entry here.
+        if (abuse.isSuppressed(io, ip_str, audit.nowMonotonicMs())) {
+            audit.log(io, null, "auth.rejected", null, .denied, "source suppressed", ip_str);
+            return error.LibsshFailure;
+        }
+
         const msg = c.ssh_message_get(session) orelse return error.LibsshFailure;
         defer c.ssh_message_free(msg);
 
         if (c.ssh_message_type(msg) != c.SSH_REQUEST_AUTH) {
+            // Same ceiling as method `none`: no backoff, no abuse credit.
+            soft_ops += 1;
+            if (soft_ops >= max_soft_ops) {
+                audit.log(io, null, "auth.too_many_attempts", null, .denied, "probes", ip_str);
+                return error.LibsshFailure;
+            }
             _ = c.ssh_message_reply_default(msg);
             continue;
         }
@@ -130,9 +148,9 @@ pub fn authenticate(
                     }
                     continue;
                 },
-                // A matched key with an invalid signature (or a `from`
-                // rejection) is a real failure; an unknown user / no
-                // keys / unconfigured-key offer is a soft probe.
+                // A matched key with an invalid signature is a real
+                // failure. Unknown user, public-key `from` miss, no
+                // keys, and unconfigured-key offers are soft probes.
                 .hard_denied => is_hard = true,
                 .soft_denied => {},
             }
@@ -142,7 +160,14 @@ pub fn authenticate(
             // Real credential rejection: feed the abuse suppressor,
             // apply escalating backoff, disconnect at the ceiling.
             hard_failures += 1;
-            abuse.recordFailure(io, ip_str, audit.nowMonotonicMs());
+            const now_ms = audit.nowMonotonicMs();
+            abuse.recordFailure(io, ip_str, now_ms);
+            // The failure that trips the threshold (or a source already
+            // suppressed) ends this session now, not after five more tries.
+            if (abuse.isSuppressed(io, ip_str, now_ms)) {
+                audit.log(io, null, "auth.rejected", null, .denied, "source suppressed", ip_str);
+                return error.LibsshFailure;
+            }
             const delay_ms = @min(hard_failures * 250, 2000);
             std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
             if (hard_failures >= max_hard_failures) {
@@ -150,8 +175,9 @@ pub fn authenticate(
                 return error.LibsshFailure;
             }
         } else {
-            // Soft op (`none`, unrecognized method, soft pubkey probe):
-            // no backoff, no abuse credit, just a loop bound.
+            // Soft op (`none`, unrecognized method, soft pubkey probe
+            // including a `from` miss): no backoff, no abuse credit,
+            // just a loop bound.
             soft_ops += 1;
             if (soft_ops >= max_soft_ops) {
                 audit.log(io, null, "auth.too_many_attempts", null, .denied, "probes", ip_str);
@@ -213,14 +239,16 @@ const PublicKeyDecision = union(enum) {
     /// follow-up signed message.
     offered,
     /// A real credential rejection: a key that matched a configured key
-    /// but whose signature failed to verify, or a known user rejected
-    /// by the `from` allowlist. Counts as a hard failure (abuse +
-    /// backoff).
+    /// but whose signature failed to verify. Counts as a hard failure
+    /// (abuse + backoff). A public-key `from` miss is not in this class.
     hard_denied,
-    /// A probe that reveals nothing usable: unknown user, no keys
-    /// configured, an offer of a key that isn't configured, or a
-    /// malformed offer. Does NOT count against the abuse suppressor —
-    /// stock clients enumerate agent keys this way on every login.
+    /// A probe that reveals nothing usable: unknown user, public-key
+    /// `from` miss, no keys configured, an offer of a key that isn't
+    /// configured, or a malformed offer. The `from` miss shares this
+    /// class with unknown user so hard-vs-soft cannot confirm the
+    /// username; the audit detail stays `source not allowed`. Does NOT
+    /// count against the abuse suppressor — stock clients enumerate
+    /// agent keys this way on every login.
     soft_denied,
 };
 
@@ -255,9 +283,13 @@ fn handlePublicKeyMessage(
     };
 
     if (!netmatch.allowed(user.from, ip_str)) {
+        // Soft, same as unknown user, and only after the dummy compare.
+        // Hard-vs-soft here would confirm the username. Audit detail
+        // stays distinct from `unknown user`. Password `from` misses
+        // are classified at the caller and stay hard.
         _ = matchAgainstDummyKey(allocator, presented);
         audit.log(io, username, "auth.publickey", null, .denied, "source not allowed", ip_str);
-        return .hard_denied;
+        return .soft_denied;
     }
 
     if (user.keys.len == 0) {
