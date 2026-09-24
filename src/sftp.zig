@@ -406,10 +406,20 @@ const SftpState = struct {
         return arg.value;
     }
 
+    /// Reply and audit a failed filesystem call on `vpath`. A caller who
+    /// may not stat it learns neither that it, or its parent, is missing
+    /// nor that it exists.
+    fn fsFailure(self: *SftpState, request_id: u32, op: []const u8, vpath: []const u8, err: anyerror) !void {
+        const code = fsErrorStatus(err);
+        const reveals = code == c.SSH_FX_NO_SUCH_FILE or err == error.PathAlreadyExists;
+        if (reveals and policy.check(self.user, .stat, vpath) == .deny) return self.deny(request_id, op, vpath);
+        return self.reject(request_id, code, op, vpath, @errorName(err));
+    }
+
     /// The verified parent of `vpath`, or null after replying and auditing.
     fn parentOrReply(self: *SftpState, request_id: u32, op: []const u8, vpath: []const u8) !?vfs_mod.ParentResolution {
         return self.vfs.openVerifiedParent(self.io, self.allocator, vpath) catch |err| {
-            try self.reject(request_id, wire.parentErrorStatus(err), op, vpath, @errorName(err));
+            try self.fsFailure(request_id, op, vpath, err);
             return null;
         };
     }
@@ -451,12 +461,7 @@ const SftpState = struct {
     fn handleStat(self: *SftpState, request_id: u32, payload: []const u8) !void {
         var buf: PathBuf = undefined;
         const path = (try self.authorizedPath(request_id, payload, &buf, .stat, "stat")) orelse return;
-        const info = self.lstatVirtual(path) catch |err| {
-            return self.status(request_id, switch (err) {
-                error.NotFound => c.SSH_FX_NO_SUCH_FILE,
-                else => wire.parentErrorStatus(err),
-            });
-        };
+        const info = self.lstatVirtual(path) catch |err| return self.status(request_id, fsErrorStatus(err));
         try wire.replyFullAttrs(self.channel, request_id, self.applyListingMode(info, path));
     }
 
@@ -497,7 +502,7 @@ const SftpState = struct {
         }
 
         const dir = self.vfs.openVirtualDir(self.io, self.allocator, path, true) catch |err| {
-            return self.reject(request_id, wire.parentErrorStatus(err), "opendir", path, "open dir failed");
+            return self.reject(request_id, fsErrorStatus(err), "opendir", path, @errorName(err));
         };
         const id = self.addHandle(path, .{ .dir = .{ .dir = dir, .iter = dir.iterate() } }) catch |err| {
             return self.reject(request_id, c.SSH_FX_FAILURE, "opendir", path, @errorName(err));
@@ -594,15 +599,12 @@ const SftpState = struct {
             return self.reject(request_id, c.SSH_FX_FAILURE, op, path, "handle limit reached");
         }
 
+        // From here on only the parent fd plus basename are used.
+        var parent = (try self.parentOrReply(request_id, op, path)) orelse return;
+        defer parent.deinit(self.io, self.allocator);
         // Write without read or list must not tell a missing path from a
         // present one.
         const may_stat = policy.check(self.user, .stat, path) == .allow;
-
-        // From here on only the parent fd plus basename are used.
-        var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path) catch |err| {
-            return self.reject(request_id, concealed(may_stat, wire.parentErrorStatus(err)), op, path, @errorName(err));
-        };
-        defer parent.deinit(self.io, self.allocator);
 
         // O_NOFOLLOW: a symlink as the final component is always refused.
         const file = parent.parent.openFile(self.io, parent.base, .{
@@ -826,11 +828,7 @@ const SftpState = struct {
         defer parent.deinit(self.io, self.allocator);
 
         setTimesAt(parent.parent.handle, parent.base, &times) catch |err| {
-            if (err == error.FileNotFound) {
-                const may_stat = policy.check(self.user, .stat, path) == .allow;
-                return self.hide(request_id, may_stat, c.SSH_FX_NO_SUCH_FILE, "setstat", path);
-            }
-            return self.reject(request_id, c.SSH_FX_FAILURE, "setstat", path, @errorName(err));
+            return self.fsFailure(request_id, "setstat", path, err);
         };
         defer self.auditOk("setstat", path, "");
         try self.status(request_id, c.SSH_FX_OK);
@@ -891,8 +889,8 @@ const SftpState = struct {
         defer parent.deinit(self.io, self.allocator);
 
         const permissions = std.Io.File.Permissions.fromMode(@intCast(self.mkdir_mode));
-        parent.parent.createDir(self.io, parent.base, permissions) catch {
-            return self.reject(request_id, c.SSH_FX_FAILURE, "mkdir", path, "createDir failed");
+        parent.parent.createDir(self.io, parent.base, permissions) catch |err| {
+            return self.fsFailure(request_id, "mkdir", path, err);
         };
         // umask applied to createDir, so set the mode again, rolling back
         // on failure. `iterate` keeps Zig off O_PATH, which cannot fchmod.
@@ -931,7 +929,7 @@ const SftpState = struct {
             .file => parent.parent.deleteFile(self.io, parent.base),
             .dir => parent.parent.deleteDir(self.io, parent.base),
         };
-        removed catch |err| return self.reject(request_id, c.SSH_FX_FAILURE, label, path, @errorName(err));
+        removed catch |err| return self.fsFailure(request_id, label, path, err);
         defer self.auditOk(label, path, "");
         try self.status(request_id, c.SSH_FX_OK);
     }
@@ -952,7 +950,7 @@ const SftpState = struct {
         defer to_parent.deinit(self.io, self.allocator);
 
         const source = listing.statAt(from_parent.parent.handle, from_parent.base) catch |err| {
-            return self.reject(request_id, c.SSH_FX_NO_SUCH_FILE, "rename", from, @errorName(err));
+            return self.fsFailure(request_id, "rename", from, err);
         };
         if (gainsCapability(self.user, source.mode, from, to)) return self.deny(request_id, "rename", from);
 
@@ -1348,11 +1346,15 @@ fn handleIdAvailable(next_handle: u32) bool {
     return next_handle != std.math.maxInt(u32);
 }
 
-/// A caller who may not stat a path must not learn that it, or its
-/// parent, is missing.
-fn concealed(may_stat: bool, code: c_int) c_int {
-    if (!may_stat and code == c.SSH_FX_NO_SUCH_FILE) return c.SSH_FX_PERMISSION_DENIED;
-    return code;
+/// The status for a failed path walk or filesystem call. Only a missing
+/// entry is NO_SUCH_FILE: running out of descriptors or memory, or a
+/// host permission problem, is a server-side FAILURE.
+fn fsErrorStatus(err: anyerror) c_int {
+    return switch (err) {
+        error.FileNotFound, error.NotFound, error.NameTooLong => c.SSH_FX_NO_SUCH_FILE,
+        error.PathTraversal, error.InvalidPath, error.Reserved => c.SSH_FX_PERMISSION_DENIED,
+        else => c.SSH_FX_FAILURE,
+    };
 }
 
 fn sweepUnlinksStagingFile(live: bool, age_secs: i64, min_age_secs: i64) bool {
@@ -1438,14 +1440,23 @@ test "handle ids stop before u32 wrap" {
     try std.testing.expect(!handleIdAvailable(std.math.maxInt(u32)));
 }
 
-test "a caller who cannot stat never learns a path is missing" {
+test "only a missing entry is NO_SUCH_FILE" {
     const denied: c_int = c.SSH_FX_PERMISSION_DENIED;
     const missing: c_int = c.SSH_FX_NO_SUCH_FILE;
     const failure: c_int = c.SSH_FX_FAILURE;
-    try std.testing.expectEqual(denied, concealed(false, missing));
-    try std.testing.expectEqual(missing, concealed(true, missing));
-    try std.testing.expectEqual(failure, concealed(false, failure));
-    try std.testing.expectEqual(denied, concealed(true, denied));
+    try std.testing.expectEqual(missing, fsErrorStatus(error.FileNotFound));
+    try std.testing.expectEqual(missing, fsErrorStatus(error.NotFound));
+    try std.testing.expectEqual(denied, fsErrorStatus(error.PathTraversal));
+    try std.testing.expectEqual(denied, fsErrorStatus(error.Reserved));
+    for ([_]anyerror{
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.SystemResources,
+        error.OutOfMemory,
+        error.AccessDenied,
+        error.DirNotEmpty,
+        error.PathAlreadyExists,
+    }) |err| try std.testing.expectEqual(failure, fsErrorStatus(err));
 }
 
 test "staging sweep skips live names and young orphans" {

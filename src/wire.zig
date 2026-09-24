@@ -19,14 +19,6 @@ pub const max_longname_bytes: usize = 256 + max_name_bytes;
 /// Name, longname, and a full attribute block, each length-prefixed.
 const max_name_entry_bytes: usize = 4 + max_name_bytes + 4 + max_longname_bytes + 32;
 
-pub fn parentErrorStatus(err: anyerror) c_int {
-    return switch (err) {
-        error.PathTraversal, error.InvalidPath, error.Reserved => c.SSH_FX_PERMISSION_DENIED,
-        error.OutOfMemory => c.SSH_FX_FAILURE,
-        else => c.SSH_FX_NO_SUCH_FILE,
-    };
-}
-
 /// Where a DATA reply's payload starts in its frame (length, type,
 /// request id, data length).
 pub const data_offset: usize = 13;
