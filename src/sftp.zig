@@ -57,6 +57,10 @@ extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c
 /// Maximum simultaneously-open file/dir handles per SFTP session.
 pub const max_handles_per_session: usize = 256;
 
+/// READDIR fills each reply up to this size: far fewer round trips than
+/// a fixed count of entries, and well under the packet limit.
+const readdir_reply_bytes: usize = 64 * 1024;
+
 /// A normalized virtual path, which can be one byte longer than the raw
 /// limit (a leading `/` is added).
 const PathBuf = [vfs_mod.max_virtual_path_bytes + 2]u8;
@@ -514,13 +518,13 @@ const SftpState = struct {
         if (handle.done) return self.status(request_id, c.SSH_FX_EOF);
 
         // The request is parsed, so its buffer can hold the reply.
-        var batch = try wire.NameBatch.begin(self.buf, request_id);
+        var batch = try wire.NameBatch.begin(self.buf[0..readdir_reply_bytes], request_id);
         // One reference time per batch for "recent" vs "old" dates.
         const now_secs: i64 = sys.realtime().sec;
         var vpath_buf: PathBuf = undefined;
         @memcpy(vpath_buf[0..dir_vpath.len], dir_vpath);
 
-        while (batch.count < 16 and batch.hasRoom()) {
+        while (batch.hasRoom()) {
             const entry = handle.iter.next(self.io) catch {
                 // Send what we have; the next READDIR reports the failure.
                 handle.failed = true;
@@ -719,23 +723,21 @@ const SftpState = struct {
         const id = wire.parseHandleId(payload) catch return self.status(request_id, c.SSH_FX_BAD_MESSAGE);
         if (payload.len < 20) return self.status(request_id, c.SSH_FX_BAD_MESSAGE);
         const offset = std.mem.readInt(u64, payload[8..16], .big);
-        const len = @min(std.mem.readInt(u32, payload[16..20], .big), 32 * 1024);
+        const len = @min(std.mem.readInt(u32, payload[16..20], .big), wire.max_read_bytes);
         const handle = self.findFile(id) orelse return self.status(request_id, c.SSH_FX_INVALID_HANDLE);
 
         // Above i64 max, std's pread path would panic in a safe build.
         if (offset > std.math.maxInt(i64)) return self.status(request_id, c.SSH_FX_BAD_MESSAGE);
         if (!handle.can_read) return self.deny(request_id, "read", null);
 
-        // A 0-byte read gets empty DATA, not EOF.
-        if (len == 0) return wire.replyData(self.channel, request_id, "");
-
-        const buf = try self.allocator.alloc(u8, len);
-        defer self.allocator.free(buf);
-        const n = handle.file.readPositionalAll(self.io, buf, offset) catch {
+        // The request is parsed, so its buffer can take the data and the
+        // reply around it.
+        const n = handle.file.readPositionalAll(self.io, self.buf[wire.data_offset..][0..len], offset) catch {
             return self.status(request_id, c.SSH_FX_FAILURE);
         };
-        if (n == 0) return self.status(request_id, c.SSH_FX_EOF);
-        try wire.replyData(self.channel, request_id, buf[0..n]);
+        // A 0-byte read gets empty DATA, not EOF.
+        if (n == 0 and len != 0) return self.status(request_id, c.SSH_FX_EOF);
+        try wire.replyData(self.channel, self.buf, request_id, n);
     }
 
     fn handleWrite(self: *SftpState, request_id: u32, payload: []const u8) !void {
