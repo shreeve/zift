@@ -46,8 +46,9 @@ fn usage(io: std.Io) !u8 {
 }
 
 fn version(io: std.Io) !u8 {
-    try std.Io.File.stdout().writeStreamingAll(io, "zift " ++ build_options.version ++ "\n" ++
-        "build: " ++ build_options.target ++ " " ++ build_options.optimize ++ "\n");
+    // One line, as janus and harbor print; the journal's startup line
+    // carries the target and build mode.
+    try std.Io.File.stdout().writeStreamingAll(io, "zift " ++ build_options.version ++ "\n");
     return 0;
 }
 
