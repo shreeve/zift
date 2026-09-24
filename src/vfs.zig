@@ -11,6 +11,8 @@ const listing = @import("listing.zig");
 
 pub const Error = error{
     InvalidPath,
+    /// A `.zift` component (see `isReservedComponent`).
+    Reserved,
     OutOfMemory,
     PathTooLong,
     PathTraversal,
@@ -80,10 +82,10 @@ pub const Vfs = struct {
 
     /// Length, no C0 control or DEL bytes, and valid UTF-8 (the audit
     /// line must stay valid JSON).
-    pub fn validateVirtualPath(virtual_path: []const u8) Error!void {
+    pub fn validateVirtualPath(virtual_path: []const u8) error{ PathTooLong, InvalidPath }!void {
         if (virtual_path.len > max_virtual_path_bytes) return error.PathTooLong;
         for (virtual_path) |b| {
-            if (b == 0 or b < 0x20 or b == 0x7F) return error.InvalidPath;
+            if (b < 0x20 or b == 0x7F) return error.InvalidPath;
         }
         if (!std.unicode.utf8ValidateSlice(virtual_path)) return error.InvalidPath;
     }
@@ -266,14 +268,12 @@ pub fn isReservedComponent(part: []const u8) bool {
 /// bytes, drop `.` and empty components, resolve `..` (never above the
 /// root), and refuse a reserved component anywhere. The result can be one
 /// byte longer than the input (a leading `/` is added).
-pub fn normalizeVirtualInto(virtual_path: []const u8, out: []u8) Error![]u8 {
+pub fn normalizeVirtualInto(
+    virtual_path: []const u8,
+    out: []u8,
+) error{ PathTooLong, InvalidPath, PathTraversal, Reserved }![]u8 {
     std.debug.assert(out.len >= max_virtual_path_bytes + 1);
-
-    if (virtual_path.len > max_virtual_path_bytes) return error.PathTooLong;
-    for (virtual_path) |b| {
-        if (b == 0 or b < 0x20 or b == 0x7F) return error.InvalidPath;
-    }
-    if (!std.unicode.utf8ValidateSlice(virtual_path)) return error.InvalidPath;
+    try Vfs.validateVirtualPath(virtual_path);
 
     // Offset of each depth's leading '/', so `..` is an O(1) truncate.
     var starts: [max_virtual_path_bytes / 2 + 2]usize = undefined;
@@ -289,7 +289,7 @@ pub fn normalizeVirtualInto(virtual_path: []const u8, out: []u8) Error![]u8 {
             len = starts[depth];
             continue;
         }
-        if (isReservedComponent(part)) return error.InvalidPath;
+        if (isReservedComponent(part)) return error.Reserved;
         starts[depth] = len;
         depth += 1;
         out[len] = '/';
@@ -347,32 +347,32 @@ test "normalize rejects nul byte" {
 
 test "normalize rejects /.zift namespace anywhere in path" {
     try std.testing.expectError(
-        error.InvalidPath,
+        error.Reserved,
         testNormalize("/.zift"),
     );
     try std.testing.expectError(
-        error.InvalidPath,
+        error.Reserved,
         testNormalize("/.zift/staging/abc123"),
     );
     try std.testing.expectError(
-        error.InvalidPath,
+        error.Reserved,
         testNormalize("/.zift/notes.md"),
     );
     // Mid-path too.
     try std.testing.expectError(
-        error.InvalidPath,
+        error.Reserved,
         testNormalize("/pending/.zift/something"),
     );
     try std.testing.expectError(
-        error.InvalidPath,
+        error.Reserved,
         testNormalize("/.zift-staging"),
     );
     try std.testing.expectError(
-        error.InvalidPath,
+        error.Reserved,
         testNormalize("/.zift-staging/legacy.dat"),
     );
     try std.testing.expectError(
-        error.InvalidPath,
+        error.Reserved,
         testNormalize("/pending/.zift-staging/something"),
     );
     // Non-reserved dotfiles are fine.
@@ -382,7 +382,7 @@ test "normalize rejects /.zift namespace anywhere in path" {
 
 test "reserved .zift component is case-insensitive" {
     for ([_][]const u8{ "/.ZIFT/staging/x", "/.Zift/notes", "/pending/.ZIFT-STAGING/x" }) |p| {
-        try std.testing.expectError(error.InvalidPath, testNormalize(p));
+        try std.testing.expectError(error.Reserved, testNormalize(p));
     }
     try std.testing.expect(isReservedComponent(".ZIFT"));
     try std.testing.expect(isReservedComponent(".Zift"));

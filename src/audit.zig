@@ -20,23 +20,14 @@ pub const Result = enum { ok, denied, failed };
 /// Longer lines are shortened and marked `"truncated":true`.
 const max_line_bytes: usize = 4096;
 
-/// Where audit lines go. Matches `config.LogTarget` shape but owns the
-/// fd so the sink can reopen on SIGUSR1 without disturbing the config
-/// snapshot.
-pub const Target = union(enum) {
-    stderr,
-    file: []const u8,
-};
-
 pub const Sink = struct {
-    target: Target = .stderr,
+    /// A `.file` path is an owned copy: the config may be freed on reload.
+    target: config.LogTarget = .stderr,
     /// File fd when target is `.file`; -1 otherwise. Swapped atomically
     /// on reopen.
     fd: std.atomic.Value(c_int) = .init(-1),
     /// Serializes writes and reopen.
     mutex: std.Io.Mutex = .init,
-    /// Owned copy of the file path; the config may be freed on reload.
-    owned_path: ?[]const u8 = null,
     /// Monotonic ms when a failed reopen is retried; 0 = none pending.
     /// A deadline, not a re-raised signal flag, so a broken path does
     /// not retry (and warn) on every audit line.
@@ -59,7 +50,6 @@ pub const Sink = struct {
                 return .{
                     .target = .{ .file = owned },
                     .fd = .init(fd),
-                    .owned_path = owned,
                 };
             },
         }
@@ -68,7 +58,10 @@ pub const Sink = struct {
     pub fn deinit(self: *Sink, allocator: std.mem.Allocator) void {
         const fd = self.fd.swap(-1, .acq_rel);
         if (fd >= 0) _ = std.c.close(fd);
-        if (self.owned_path) |path| allocator.free(path);
+        switch (self.target) {
+            .stderr => {},
+            .file => |path| allocator.free(path),
+        }
         self.* = .{};
     }
 

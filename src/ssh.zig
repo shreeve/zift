@@ -19,7 +19,7 @@ pub fn authenticate(
     allocator: std.mem.Allocator,
     cfg: config.Config,
     session: c.ssh_session,
-    peer_ip: ?[]const u8,
+    ip_str: []const u8,
 ) !*const config.UserConfig {
     // Two ceilings.
     //
@@ -38,8 +38,6 @@ pub fn authenticate(
     const max_soft_ops: u32 = 64;
     var hard_failures: u32 = 0;
     var soft_ops: u32 = 0;
-    const ip_str = peer_ip orelse "";
-
     while (true) {
         // Suppression by another session applies here too.
         if (abuse.isSuppressed(io, ip_str, sys.monotonicMs())) {
@@ -100,7 +98,7 @@ pub fn authenticate(
                 }
             }
         } else if (subtype == c.SSH_AUTH_METHOD_PUBLICKEY) {
-            const decision = handlePublicKeyMessage(io, allocator, cfg, msg, peer_ip);
+            const decision = handlePublicKeyMessage(io, allocator, cfg, msg, ip_str);
             switch (decision) {
                 .accepted => |user| {
                     abuse.recordSuccess(io, ip_str);
@@ -223,13 +221,11 @@ fn handlePublicKeyMessage(
     allocator: std.mem.Allocator,
     cfg: config.Config,
     msg: c.ssh_message,
-    peer_ip: ?[]const u8,
+    ip_str: []const u8,
 ) PublicKeyDecision {
     const username_ptr = c.ssh_message_auth_user(msg);
     if (username_ptr == null) return .soft_denied;
     const username = std.mem.span(username_ptr);
-
-    const ip_str = peer_ip orelse "";
 
     const presented = c.ssh_message_auth_pubkey(msg);
     if (presented == null) {

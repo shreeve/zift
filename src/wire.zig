@@ -24,7 +24,7 @@ pub const DirEntry = struct {
 
 pub fn parentErrorStatus(err: anyerror) c_int {
     return switch (err) {
-        error.PathTraversal, error.InvalidPath => c.SSH_FX_PERMISSION_DENIED,
+        error.PathTraversal, error.InvalidPath, error.Reserved => c.SSH_FX_PERMISSION_DENIED,
         error.OutOfMemory => c.SSH_FX_FAILURE,
         else => c.SSH_FX_NO_SUCH_FILE,
     };

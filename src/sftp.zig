@@ -125,7 +125,7 @@ pub fn runSftp(
     channel: c.ssh_channel,
     user: *const config.UserConfig,
     server_cfg: config.ServerConfig,
-    peer_ip: ?[]const u8,
+    peer_ip: []const u8,
 ) !void {
     var jail = try vfs_mod.Vfs.init(io, allocator, user.root);
     defer jail.deinit(allocator);
@@ -153,10 +153,9 @@ pub fn runSftp(
     const payload_buf = try allocator.alloc(u8, wire.sftp_max_packet_bytes);
     defer allocator.free(payload_buf);
 
-    const ip_str = peer_ip orelse "";
     const first_payload = readPacketTimed(&state, payload_buf) catch |err| switch (err) {
         error.IdleTimeout => {
-            audit.log(io, user.name, "idle.timeout", null, .ok, "", ip_str);
+            audit.log(io, user.name, "idle.timeout", null, .ok, "", peer_ip);
             return;
         },
         else => return err,
@@ -168,11 +167,11 @@ pub fn runSftp(
     while (true) {
         const payload = readPacketTimed(&state, payload_buf) catch |err| switch (err) {
             error.IdleTimeout => {
-                state.emitSessionEnded("idle timeout", .ok, ip_str);
+                state.emitSessionEnded("idle timeout", .ok);
                 return;
             },
             error.ChannelEof => {
-                state.emitSessionEnded("client closed channel", .ok, ip_str);
+                state.emitSessionEnded("client closed channel", .ok);
                 return;
             },
             error.LibsshFailure => {
@@ -194,13 +193,13 @@ pub fn runSftp(
                 // close) lands here. Only that code counts as a clean end.
                 if (disconnectReason(lib_msg)) |code| {
                     if (code == ssh2_disconnect_by_application) {
-                        state.emitSessionEnded("client disconnected", .ok, ip_str);
+                        state.emitSessionEnded("client disconnected", .ok);
                         return;
                     }
                 }
 
                 lw.writeAll(lib_msg) catch {};
-                state.emitSessionEnded(lw.buffered(), .failed, ip_str);
+                state.emitSessionEnded(lw.buffered(), .failed);
                 return;
             },
         };
@@ -273,8 +272,8 @@ const SftpState = struct {
     allocator: std.mem.Allocator,
     channel: c.ssh_channel,
     user: *const config.UserConfig,
-    /// Borrowed from `handleSession`, which outlives this state.
-    peer_ip: ?[]const u8 = null,
+    /// Borrowed from the session thread, which outlives this state.
+    peer_ip: []const u8 = "",
     vfs: vfs_mod.Vfs,
     /// 0 disables the idle check.
     idle_timeout_ms: u64 = 0,
@@ -310,7 +309,6 @@ const SftpState = struct {
         self: *const SftpState,
         reason: []const u8,
         result: audit.Result,
-        ip_str: []const u8,
     ) void {
         var buf: [320]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
@@ -321,7 +319,7 @@ const SftpState = struct {
             w.print(", spurious_eof={d}", .{self.spurious_eof_count}) catch {};
         }
         w.writeAll(")") catch {};
-        audit.log(self.io, self.user.name, "session.ended", null, result, w.buffered(), ip_str);
+        audit.log(self.io, self.user.name, "session.ended", null, result, w.buffered(), self.peer_ip);
     }
 
     /// Normalize a client path into `out`, or reply an error and return
@@ -329,48 +327,53 @@ const SftpState = struct {
     /// filesystem resolves, or `/pending/../secret` slips past a rule.
     /// Bad bytes or length: BAD_MESSAGE. Traversal or `.zift`: DENIED.
     fn normalizedPath(self: *SftpState, request_id: u32, raw: []const u8, out: []u8) !?[]const u8 {
-        vfs_mod.Vfs.validateVirtualPath(raw) catch {
-            try wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path");
-            return null;
-        };
-        return vfs_mod.normalizeVirtualInto(raw, out) catch {
-            try wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied");
+        return vfs_mod.normalizeVirtualInto(raw, out) catch |err| {
+            switch (err) {
+                error.PathTooLong, error.InvalidPath => try wire.replyStatus(self.channel, request_id, c.SSH_FX_BAD_MESSAGE, "bad path"),
+                error.PathTraversal, error.Reserved => try wire.replyStatus(self.channel, request_id, c.SSH_FX_PERMISSION_DENIED, "denied"),
+            }
             return null;
         };
     }
 
     /// Attrs as the partner sees them. `virtual`: uid/gid 0 and
     /// policy-derived mode at `vpath`. `reality`: the inode unchanged.
-    fn applyListingMode(self: *const SftpState, real: listing.EntryInfo, vpath: ?[]const u8) listing.EntryInfo {
+    fn applyListingMode(self: *const SftpState, real: listing.EntryInfo, vpath: []const u8) listing.EntryInfo {
         switch (self.listing_mode) {
             .reality => return real,
             .virtual => {
                 var v = real;
                 v.uid = 0;
                 v.gid = 0;
-                if (vpath) |p| {
-                    v.mode = policy.policyDerivedMode(self.user, p, real.mode);
-                } else {
-                    const file_type = real.mode & listing.S_IFMT;
-                    const is_dir = file_type == listing.S_IFDIR;
-                    const owner: u32 = if (is_dir) 0o7 else 0o6;
-                    v.mode = file_type | (owner << 6) | (owner << 3);
-                }
+                v.mode = policy.policyDerivedMode(self.user, vpath, real.mode);
                 return v;
             },
         }
     }
 
     fn auditOk(self: *SftpState, op: []const u8, vpath: ?[]const u8, detail: []const u8) void {
-        audit.log(self.io, self.user.name, op, vpath, .ok, detail, self.peer_ip orelse "");
+        audit.log(self.io, self.user.name, op, vpath, .ok, detail, self.peer_ip);
     }
 
     fn auditDenied(self: *SftpState, op: []const u8, vpath: ?[]const u8) void {
-        audit.log(self.io, self.user.name, op, vpath, .denied, "", self.peer_ip orelse "");
+        audit.log(self.io, self.user.name, op, vpath, .denied, "", self.peer_ip);
     }
 
     fn auditFailed(self: *SftpState, op: []const u8, vpath: ?[]const u8, detail: []const u8) void {
-        audit.log(self.io, self.user.name, op, vpath, .failed, detail, self.peer_ip orelse "");
+        audit.log(self.io, self.user.name, op, vpath, .failed, detail, self.peer_ip);
+    }
+
+    /// The verified parent of `vpath`, or null after replying and auditing
+    /// (denied when the walk refused the path, failed otherwise).
+    fn openParentOrReply(self: *SftpState, request_id: u32, op: []const u8, vpath: []const u8) !?vfs_mod.ParentResolution {
+        return self.vfs.openVerifiedParent(self.io, self.allocator, vpath) catch |err| {
+            const status = wire.parentErrorStatus(err);
+            defer {
+                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied(op, vpath) else self.auditFailed(op, vpath, @errorName(err));
+            }
+            try wire.replyStatus(self.channel, request_id, status, "denied or not found");
+            return null;
+        };
     }
 
     fn handleRealpath(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -397,23 +400,20 @@ const SftpState = struct {
         const info = listing.statFd(fd) catch
             return wire.replyStatus(self.channel, request_id, c.SSH_FX_FAILURE, "fstat failed");
 
-        var display = self.applyListingMode(info, null);
+        var display = info;
         if (self.listing_mode == .virtual) {
+            display.uid = 0;
+            display.gid = 0;
             switch (handle.kind) {
                 .file => {
                     // No path: the handle's own access is the truth.
-                    const file_type = info.mode & listing.S_IFMT;
                     var owner: u32 = 0;
                     if (handle.can_read) owner |= 0o4;
                     if (handle.can_write) owner |= 0o2;
-                    display.mode = file_type | (owner << 6) | (owner << 3);
+                    display.mode = (info.mode & listing.S_IFMT) | (owner << 6) | (owner << 3);
                 },
-                .dir => {
-                    if (handle.dir_vpath) |vpath| {
-                        display.mode = policy.policyDerivedMode(self.user, vpath, info.mode);
-                    }
-                    display.uid = 0;
-                    display.gid = 0;
+                .dir => if (handle.dir_vpath) |vpath| {
+                    display.mode = policy.policyDerivedMode(self.user, vpath, info.mode);
                 },
             }
         }
@@ -960,14 +960,7 @@ const SftpState = struct {
         const may_replace = !handle.staging_excl and
             policy.check(self.user, .update, target_vpath) == .allow;
 
-        if (dest_exists and !may_replace) {
-            if (handle.staging_excl) {
-                self.auditDenied("close", target_vpath);
-                return c.SSH_FX_FAILURE;
-            }
-            self.auditDenied("close", target_vpath);
-            return c.SSH_FX_PERMISSION_DENIED;
-        }
+        if (dest_exists and !may_replace) return self.denyPublish(handle, target_vpath);
 
         // Without replace rights use a no-replace rename, so a target
         // created after the lstat above still cannot be clobbered.
@@ -987,14 +980,7 @@ const SftpState = struct {
                 to_parent.base,
                 self.io,
             ) catch |err| switch (err) {
-                error.PathAlreadyExists => {
-                    if (handle.staging_excl) {
-                        self.auditDenied("close", target_vpath);
-                        return c.SSH_FX_FAILURE;
-                    }
-                    self.auditDenied("close", target_vpath);
-                    return c.SSH_FX_PERMISSION_DENIED;
-                },
+                error.PathAlreadyExists => return self.denyPublish(handle, target_vpath),
                 else => return err,
             };
         }
@@ -1004,6 +990,13 @@ const SftpState = struct {
         handle.staging_basename = null;
 
         return c.SSH_FX_OK;
+    }
+
+    /// The target exists and may not be replaced: EXCL reports FAILURE
+    /// ("file exists"), otherwise PERMISSION_DENIED.
+    fn denyPublish(self: *SftpState, handle: *const Handle, target_vpath: []const u8) c_int {
+        self.auditDenied("close", target_vpath);
+        return if (handle.staging_excl) c.SSH_FX_FAILURE else c.SSH_FX_PERMISSION_DENIED;
     }
 
     fn handleMkdir(self: *SftpState, request_id: u32, payload: []const u8) !void {
@@ -1016,13 +1009,7 @@ const SftpState = struct {
         }
         namespace_mutation_mutex.lockUncancelable(self.io);
         defer namespace_mutation_mutex.unlock(self.io);
-        var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
-            const status = wire.parentErrorStatus(err);
-            defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("mkdir", path.value) else self.auditFailed("mkdir", path.value, @errorName(err));
-            }
-            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
-        };
+        var parent = (try self.openParentOrReply(request_id, "mkdir", path.value)) orelse return;
         defer parent.deinit(self.io, self.allocator);
 
         const dir_mode = std.Io.File.Permissions.fromMode(@intCast(self.mkdir_mode));
@@ -1063,13 +1050,7 @@ const SftpState = struct {
         }
         namespace_mutation_mutex.lockUncancelable(self.io);
         defer namespace_mutation_mutex.unlock(self.io);
-        var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
-            const status = wire.parentErrorStatus(err);
-            defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("remove", path.value) else self.auditFailed("remove", path.value, @errorName(err));
-            }
-            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
-        };
+        var parent = (try self.openParentOrReply(request_id, "remove", path.value)) orelse return;
         defer parent.deinit(self.io, self.allocator);
 
         parent.parent.deleteFile(self.io, parent.base) catch {
@@ -1090,13 +1071,7 @@ const SftpState = struct {
         }
         namespace_mutation_mutex.lockUncancelable(self.io);
         defer namespace_mutation_mutex.unlock(self.io);
-        var parent = self.vfs.openVerifiedParent(self.io, self.allocator, path.value) catch |err| {
-            const status = wire.parentErrorStatus(err);
-            defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rmdir", path.value) else self.auditFailed("rmdir", path.value, @errorName(err));
-            }
-            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
-        };
+        var parent = (try self.openParentOrReply(request_id, "rmdir", path.value)) orelse return;
         defer parent.deinit(self.io, self.allocator);
 
         parent.parent.deleteDir(self.io, parent.base) catch {
@@ -1120,21 +1095,9 @@ const SftpState = struct {
         }
         namespace_mutation_mutex.lockUncancelable(self.io);
         defer namespace_mutation_mutex.unlock(self.io);
-        var from_parent = self.vfs.openVerifiedParent(self.io, self.allocator, from.value) catch |err| {
-            const status = wire.parentErrorStatus(err);
-            defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", from.value) else self.auditFailed("rename", from.value, @errorName(err));
-            }
-            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
-        };
+        var from_parent = (try self.openParentOrReply(request_id, "rename", from.value)) orelse return;
         defer from_parent.deinit(self.io, self.allocator);
-        var to_parent = self.vfs.openVerifiedParent(self.io, self.allocator, to.value) catch |err| {
-            const status = wire.parentErrorStatus(err);
-            defer {
-                if (status == c.SSH_FX_PERMISSION_DENIED) self.auditDenied("rename", to.value) else self.auditFailed("rename", to.value, @errorName(err));
-            }
-            return wire.replyStatus(self.channel, request_id, status, "denied or not found");
-        };
+        var to_parent = (try self.openParentOrReply(request_id, "rename", to.value)) orelse return;
         defer to_parent.deinit(self.io, self.allocator);
 
         const source_info = listing.statAt(from_parent.parent.handle, from_parent.base) catch |err| {
@@ -1213,43 +1176,19 @@ const SftpState = struct {
     fn verifyRenameNode(self: *SftpState, mode: u32, old_path: []const u8, new_path: []const u8) !void {
         if (policy.checkRename(self.user, old_path, new_path) == .deny) return error.RenameDenied;
 
-        const common_ops = [_]policy.Operation{ .stat, .update };
-        for (common_ops) |op| {
-            if (policy.check(self.user, op, new_path) == .allow and
-                policy.check(self.user, op, old_path) == .deny)
-            {
-                return error.RenameDenied;
-            }
-        }
-
-        switch (mode & listing.S_IFMT) {
-            listing.S_IFDIR => {
-                const dir_ops = [_]policy.Operation{ .readdir, .rmdir };
-                for (dir_ops) |op| {
-                    if (policy.check(self.user, op, new_path) == .allow and
-                        policy.check(self.user, op, old_path) == .deny)
-                    {
-                        return error.RenameDenied;
-                    }
-                }
-            },
-            listing.S_IFREG => {
-                const file_ops = [_]policy.Operation{ .open_read, .open_write, .remove };
-                for (file_ops) |op| {
-                    if (policy.check(self.user, op, new_path) == .allow and
-                        policy.check(self.user, op, old_path) == .deny)
-                    {
-                        return error.RenameDenied;
-                    }
-                }
-            },
-            else => {
-                if (policy.check(self.user, .remove, new_path) == .allow and
-                    policy.check(self.user, .remove, old_path) == .deny)
+        const kind_ops: []const policy.Operation = switch (mode & listing.S_IFMT) {
+            listing.S_IFDIR => &.{ .readdir, .rmdir },
+            listing.S_IFREG => &.{ .open_read, .open_write, .remove },
+            else => &.{.remove},
+        };
+        for ([_][]const policy.Operation{ &.{ .stat, .update }, kind_ops }) |ops| {
+            for (ops) |op| {
+                if (policy.check(self.user, op, new_path) == .allow and
+                    policy.check(self.user, op, old_path) == .deny)
                 {
                     return error.RenameDenied;
                 }
-            },
+            }
         }
     }
 
@@ -1606,29 +1545,24 @@ fn readExactTimed(state: *SftpState, out: []u8) !void {
                 if (state.spurious_eof_count >= spurious_eof_cap) {
                     return error.LibsshFailure;
                 }
-                if (state.idle_timeout_ms != 0) {
-                    const elapsed: i64 = sys.monotonicMs() - state.last_activity_ms;
-                    if (elapsed >= @as(i64, @intCast(state.idle_timeout_ms))) {
-                        return error.IdleTimeout;
-                    }
-                }
+                if (idleExpired(state)) return error.IdleTimeout;
                 continue;
             }
             return error.ChannelEof;
         }
         if (n == c.SSH_AGAIN) {
-            if (state.idle_timeout_ms != 0) {
-                const elapsed: i64 = sys.monotonicMs() - state.last_activity_ms;
-                if (elapsed >= @as(i64, @intCast(state.idle_timeout_ms))) {
-                    return error.IdleTimeout;
-                }
-            }
+            if (idleExpired(state)) return error.IdleTimeout;
             continue;
         }
         // Progress: the cap counts consecutive false EOFs only.
         state.spurious_eof_count = 0;
         offset += @intCast(n);
     }
+}
+
+fn idleExpired(state: *const SftpState) bool {
+    if (state.idle_timeout_ms == 0) return false;
+    return sys.monotonicMs() - state.last_activity_ms >= @as(i64, @intCast(state.idle_timeout_ms));
 }
 
 fn acceptInitPayload(payload: []const u8) error{LibsshFailure}!void {

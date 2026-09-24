@@ -198,6 +198,8 @@ pub fn run(
             .allocator = allocator,
             .config_ref = ref,
             .session = session,
+            .ip_buf = ip_buf,
+            .ip_len = @intCast(peer_ip.len),
         };
 
         // Reserve both slots before spawn so the next accept sees them.
@@ -490,6 +492,9 @@ const SessionArgs = struct {
     allocator: std.mem.Allocator,
     config_ref: *ConfigRef,
     session: c.ssh_session,
+    /// Peer address captured at accept; "" when unknown.
+    ip_buf: [64]u8,
+    ip_len: u8,
 };
 
 fn sessionThread(args: *SessionArgs) void {
@@ -497,6 +502,8 @@ fn sessionThread(args: *SessionArgs) void {
     const allocator = args.allocator;
     const ref = args.config_ref;
     const ssh_session = args.session;
+    const ip_buf = args.ip_buf;
+    const peer_ip = ip_buf[0..args.ip_len];
     allocator.destroy(args);
 
     // Registered so drain can force-close it; failure is not fatal.
@@ -521,7 +528,7 @@ fn sessionThread(args: *SessionArgs) void {
         ref.release(allocator);
         _ = active_sessions.fetchSub(1, .acq_rel);
     }
-    handleSession(io, allocator, ref.config, ssh_session, &auth_completed) catch |err| {
+    handleSession(io, allocator, ref.config, ssh_session, peer_ip, &auth_completed) catch |err| {
         logLibsshError(io, @errorName(err), ssh_session, .skip) catch {};
     };
 }
@@ -532,8 +539,7 @@ fn currentConfigMtime(io: std.Io, path: []const u8) !std.Io.Timestamp {
 }
 
 fn statKeyMtime(io: std.Io, path: []const u8) ?std.Io.Timestamp {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
-    return stat.mtime;
+    return currentConfigMtime(io, path) catch null;
 }
 
 /// Mtimes of the serving config's key files, advanced on every reload
@@ -658,18 +664,16 @@ fn handleSession(
     allocator: std.mem.Allocator,
     cfg: config.Config,
     session: c.ssh_session,
+    peer_ip: []const u8,
     auth_completed: *bool,
 ) !void {
     defer c.ssh_free(session);
-
-    var ip_buf: [64]u8 = undefined;
-    const peer_ip: ?[]const u8 = capturePeerIp(session, &ip_buf);
 
     // Before the handshake, or a silent TCP client pins a worker forever.
     setSessionTimeout(session, cfg.server.idle_timeout_ms);
 
     if (c.ssh_handle_key_exchange(session) != c.SSH_OK) {
-        audit.log(io, null, "handshake.failed", null, .failed, "", peer_ip orelse "");
+        audit.log(io, null, "handshake.failed", null, .failed, "", peer_ip);
         return error.LibsshFailure;
     }
 
