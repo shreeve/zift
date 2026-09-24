@@ -29,62 +29,30 @@ pub const Decision = enum {
     deny,
 };
 
-/// A mode for `listing-mode virtual` showing what the partner may do at
-/// `vpath`, not what is on disk. The file type is kept; setuid, setgid,
-/// sticky, and other bits are always off; group mirrors owner.
-///
-///   file:  r = download, w = write; never x
-///   dir:   r = stat, w = any change inside, x = list
-pub fn policyDerivedMode(
-    user: *const config.UserConfig,
-    vpath: []const u8,
-    kind_bits: u32,
-) u32 {
-    const file_type = kind_bits & listing.S_IFMT;
-    const is_dir = file_type == listing.S_IFDIR;
-
-    var owner: u32 = 0;
-
-    if (is_dir) {
-        // Browsable renders `r-x`, as on Unix.
-        if (check(user, .stat, vpath) == .allow) owner |= 0o4;
-
-        const can_mutate = (check(user, .open_write, vpath) == .allow) or
-            (check(user, .mkdir, vpath) == .allow) or
-            (check(user, .rename, vpath) == .allow) or
-            (check(user, .update, vpath) == .allow) or
-            (check(user, .remove, vpath) == .allow);
-        if (can_mutate) owner |= 0o2;
-        if (check(user, .readdir, vpath) == .allow) owner |= 0o1;
-    } else {
-        // `list` shows the name, not the bytes, so it gives no `r`.
-        if (check(user, .open_read, vpath) == .allow) owner |= 0o4;
-
-        // As on Unix, removal belongs to the parent directory's `w`.
-        if (check(user, .open_write, vpath) == .allow) owner |= 0o2;
+/// Everything the partner may do at `path`, in one pass over the rules:
+/// empty if any `deny` matches, else the union of the matching `allow`s.
+/// A path longer than `vfs.max_virtual_path_bytes` gets nothing: no
+/// client can name one, and `globMatch` is sized for that bound.
+pub fn effective(user: *const config.UserConfig, path: []const u8) config.PermissionSet {
+    var granted = config.PermissionSet.initEmpty();
+    if (path.len > vfs.max_virtual_path_bytes) return granted;
+    for (user.rules) |rule| {
+        if (!globMatch(rule.pattern, path)) continue;
+        switch (rule.effect) {
+            .deny => return config.PermissionSet.initEmpty(),
+            .allow => granted.setUnion(rule.permissions),
+        }
     }
+    return granted;
+}
 
-    return file_type | (owner << 6) | (owner << 3) | 0;
+/// Whether `granted` (from `effective`) allows `operation`.
+pub fn permits(granted: config.PermissionSet, operation: Operation) bool {
+    return granted.intersectWith(permissionsFor(operation)).count() > 0;
 }
 
 pub fn check(user: *const config.UserConfig, operation: Operation, virtual_path: []const u8) Decision {
-    const sufficient = permissionsFor(operation);
-    var allowed = false;
-    // No client can name a longer path, and `globMatch` is sized for it.
-    if (virtual_path.len > vfs.max_virtual_path_bytes) return .deny;
-
-    for (user.rules) |rule| {
-        if (!globMatch(rule.pattern, virtual_path)) continue;
-
-        switch (rule.effect) {
-            .deny => return .deny,
-            .allow => {
-                if (rule.permissions.intersectWith(sufficient).count() > 0) allowed = true;
-            },
-        }
-    }
-
-    return if (allowed) .allow else .deny;
+    return if (permits(effective(user, virtual_path), operation)) .allow else .deny;
 }
 
 pub fn checkRename(user: *const config.UserConfig, from_path: []const u8, to_path: []const u8) Decision {
@@ -97,21 +65,52 @@ pub fn checkRename(user: *const config.UserConfig, from_path: []const u8, to_pat
 /// `list` already reveals everything STAT returns, and clients such as
 /// FileZilla and WinSCP stat a directory before listing it.
 fn permissionsFor(operation: Operation) config.PermissionSet {
-    var set = config.PermissionSet.initEmpty();
-    switch (operation) {
-        .stat => {
-            set.insert(.read);
-            set.insert(.list);
+    return switch (operation) {
+        .stat => .initMany(&.{ .read, .list }),
+        .open_read => .initOne(.read),
+        .open_write => .initOne(.write),
+        .readdir => .initOne(.list),
+        .mkdir => .initOne(.mkdir),
+        .remove, .rmdir => .initOne(.delete),
+        .update => .initOne(.update),
+        .rename => .initOne(.rename),
+    };
+}
+
+/// `derivedMode` of the permissions at `vpath`.
+pub fn policyDerivedMode(
+    user: *const config.UserConfig,
+    vpath: []const u8,
+    kind_bits: u32,
+) u32 {
+    return derivedMode(effective(user, vpath), kind_bits);
+}
+
+/// A mode for `listing-mode virtual` showing what the partner may do,
+/// not what is on disk. The file type is kept; setuid, setgid, sticky,
+/// and other bits are always off; group mirrors owner.
+///
+///   dir:  r = stat, w = any change inside, x = list
+///   file: r = download, w = write; never x. Removal is the parent's
+///         `w`, as on Unix.
+pub fn derivedMode(granted: config.PermissionSet, kind_bits: u32) u32 {
+    const file_type = kind_bits & listing.S_IFMT;
+    var owner: u32 = 0;
+    switch (file_type) {
+        listing.S_IFDIR => {
+            // Browsable renders `r-x`, as on Unix.
+            if (permits(granted, .stat)) owner |= 0o4;
+            const changes: config.PermissionSet = .initMany(&.{ .write, .mkdir, .rename, .update, .delete });
+            if (granted.intersectWith(changes).count() > 0) owner |= 0o2;
+            if (granted.contains(.list)) owner |= 0o1;
         },
-        .open_read => set.insert(.read),
-        .open_write => set.insert(.write),
-        .readdir => set.insert(.list),
-        .mkdir => set.insert(.mkdir),
-        .remove, .rmdir => set.insert(.delete),
-        .update => set.insert(.update),
-        .rename => set.insert(.rename),
+        else => {
+            // `list` shows the name, not the bytes, so it gives no `r`.
+            if (granted.contains(.read)) owner |= 0o4;
+            if (granted.contains(.write)) owner |= 0o2;
+        },
     }
-    return set;
+    return file_type | (owner << 6) | (owner << 3);
 }
 
 /// Match a normalized virtual path against a rule pattern.
@@ -267,6 +266,26 @@ test "deny overrides allow" {
     const user = testUser(&.{ allow("/", full), deny("/*.exe") });
     try std.testing.expectEqual(Decision.deny, check(&user, .open_write, "/tool.exe"));
     try std.testing.expectEqual(Decision.allow, check(&user, .open_write, "/tool.txt"));
+}
+
+test "effective: deny empties the set in any rule order, allows unite" {
+    const user = testUser(&.{
+        allow("/in", &.{.list}),
+        deny("/in/*.exe"),
+        allow("/in/**", &.{ .read, .write }),
+    });
+    try std.testing.expect(effective(&user, "/in/a.exe").eql(.initEmpty()));
+    try std.testing.expect(effective(&user, "/in/a.csv").eql(.initMany(&.{ .list, .read, .write })));
+    try std.testing.expect(effective(&user, "/in").eql(.initOne(.list)));
+    try std.testing.expect(permits(effective(&user, "/in"), .stat));
+    try std.testing.expect(!permits(effective(&user, "/in"), .open_read));
+}
+
+test "effective: a path longer than any client can name gets nothing" {
+    const user = testUser(&.{allow("/", full)});
+    const long = "/" ++ "a" ** vfs.max_virtual_path_bytes;
+    try std.testing.expect(effective(&user, long).eql(.initEmpty()));
+    try std.testing.expect(effective(&user, long[0..vfs.max_virtual_path_bytes]).eql(.initFull()));
 }
 
 test "pathological patterns match correctly and in linear time" {
