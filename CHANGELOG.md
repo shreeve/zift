@@ -39,6 +39,10 @@ the line and the reason.
 - Abuse tracking keys IPv6 sources by /64 (IPv4 by address).
 - A public-key probe for a real user outside `from` looks the same to
   the client as one for an unknown user.
+- An IPv6 `from` prefix shorter than /96 that covers IPv4-mapped space
+  (`::ffff:203.0.113.0/24`, `::/80`) matched every IPv4 peer. It is now
+  `InvalidFrom`, with the IPv4 spelling as the hint; `::/0` still means
+  any source (see Breaking changes).
 - Rule patterns that can never match were accepted, so `deny *.exe`
   silently protected nothing. They are now rejected (see Breaking
   changes).
@@ -100,6 +104,9 @@ the line and the reason.
   right line and user.
 - A relative `root` is rejected at parse time. Before, it aborted the
   daemon. Migration: use an absolute path.
+- An IPv6 `from` prefix under /96 that covers `::ffff:0:0/96` is
+  `InvalidFrom`. Migration: write `::ffff:203.0.113.0/24` as
+  `203.0.113.0/24`, or use `::/0` for any source.
 - An `idle-timeout` over libssh's limit (2147483647 ms, about 24.8
   days) is rejected. Migration: use `24d` or less, or `0`.
 - A host key that grants group-write, group-exec or any other access

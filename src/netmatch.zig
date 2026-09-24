@@ -20,7 +20,19 @@ pub const Cidr = struct {
 pub const ParseError = error{
     InvalidCidr,
     InvalidPrefix,
+    /// An IPv6 prefix shorter than /96 that contains `::ffff:0:0/96`, so
+    /// it matches every IPv4 peer. `::ffff:203.0.113.0/24` reads as 24
+    /// bits of IPv6, not of IPv4. `::/0` is exempt: it means any source.
+    CoversAllIpv4,
 };
+
+/// Where IPv4 lives in the 16-byte space (`::ffff:0:0/96`).
+const mapped_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ [_]u8{0} ** 4;
+
+/// True when `cidr` is written in IPv4-mapped form (`::ffff:a.b.c.d`).
+pub fn isMapped(cidr: Cidr) bool {
+    return std.mem.eql(u8, cidr.addr[0..12], mapped_prefix[0..12]);
+}
 
 /// Parse a single IP or `IP/prefix` token into a `Cidr`.
 pub fn parseCidr(text: []const u8) ParseError!Cidr {
@@ -38,6 +50,9 @@ pub fn parseCidr(text: []const u8) ParseError!Cidr {
         for (digits) |ch| if (!std.ascii.isDigit(ch)) return error.InvalidPrefix;
         prefix = std.fmt.parseUnsigned(u8, digits, 10) catch return error.InvalidPrefix;
         if (prefix > max) return error.InvalidPrefix;
+    }
+    if (!v4 and prefix != 0 and prefix < 96 and prefixEqual(addr, mapped_prefix, prefix)) {
+        return error.CoversAllIpv4;
     }
     return .{ .addr = addr, .prefix = if (v4) prefix + 96 else prefix };
 }
@@ -119,6 +134,29 @@ test "ipv4-mapped from matches a plain ipv4 peer" {
     try std.testing.expect(matches(net, "192.0.2.77"));
     try std.testing.expect(matches(net, "::ffff:192.0.2.77"));
     try std.testing.expect(!matches(net, "192.0.3.1"));
+}
+
+test "an IPv6 prefix under /96 that covers IPv4 space is rejected" {
+    // IPv4 peers are held as ::ffff:a.b.c.d, so each of these would have
+    // matched every IPv4 peer, 8.8.8.8 included.
+    for ([_][]const u8{ "::ffff:203.0.113.0/24", "::ffff:0.0.0.0/95", "::/80", "::/1", "0:0:0:0:0:ffff:c000:200/64" }) |text| {
+        try std.testing.expectError(error.CoversAllIpv4, parseCidr(text));
+    }
+    // `::/0` deliberately means any source; /96 and longer are exact.
+    const any = try parseCidr("::/0");
+    try std.testing.expect(matches(any, "8.8.8.8"));
+    try std.testing.expect(matches(any, "2001:db8::1"));
+    const v4_all = try parseCidr("::ffff:0.0.0.0/96");
+    try std.testing.expect(matches(v4_all, "8.8.8.8"));
+    try std.testing.expect(!matches(v4_all, "2001:db8::1"));
+    const mapped = try parseCidr("::ffff:203.0.113.0/120");
+    try std.testing.expect(isMapped(mapped));
+    try std.testing.expect(!matches(mapped, "8.8.8.8"));
+    // Prefixes under /96 that do not reach ::ffff:0:0 are fine.
+    const doc = try parseCidr("2001:db8::/32");
+    try std.testing.expect(!matches(doc, "8.8.8.8"));
+    _ = try parseCidr("::/96");
+    _ = try parseCidr("fe80::/10");
 }
 
 test "allowed empty means any" {

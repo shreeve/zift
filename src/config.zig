@@ -909,7 +909,7 @@ fn parseUserProperty(
         try firstSetting(d, &user.root_line, line);
         user.root = try dupeAbsolute(allocator, d, value);
     } else if (std.mem.eql(u8, key, "from")) {
-        try parseFrom(allocator, user, value);
+        try parseFrom(allocator, d, user, value);
     } else if (std.mem.eql(u8, key, "allow")) {
         try parseAllowRule(allocator, d, user, value);
     } else if (std.mem.eql(u8, key, "deny")) {
@@ -1013,9 +1013,23 @@ fn sshString(rest: *[]const u8) ?[]const u8 {
 }
 
 /// One IP or CIDR per `from` line; lines accumulate.
-fn parseFrom(allocator: std.mem.Allocator, user: *UserBuilder, value: []const u8) Error!void {
-    if (std.mem.indexOfAny(u8, value, " \t") != null) return error.InvalidFrom;
-    const cidr = netmatch.parseCidr(value) catch return error.InvalidFrom;
+fn parseFrom(allocator: std.mem.Allocator, d: *ParseDiag, user: *UserBuilder, value: []const u8) Error!void {
+    if (std.mem.indexOfAny(u8, value, " \t") != null) return d.fail(error.InvalidFrom, "one address or CIDR per 'from' line", .{});
+    const cidr = netmatch.parseCidr(value) catch |err| switch (err) {
+        error.CoversAllIpv4 => {
+            // Fail closed with the spelling the operator likely meant.
+            const slash = std.mem.indexOfScalar(u8, value, '/').?;
+            const probe = netmatch.parseCidr(value[0..slash]) catch unreachable;
+            if (netmatch.isMapped(probe)) {
+                const v4 = probe.addr[12..16];
+                return d.fail(error.InvalidFrom, "an IPv6 prefix counts 128 bits, so this matches every IPv4 peer; write {d}.{d}.{d}.{d}{s}", .{
+                    v4[0], v4[1], v4[2], v4[3], value[slash..],
+                });
+            }
+            return d.fail(error.InvalidFrom, "this matches every IPv4 peer; use a prefix of /96 or longer, or ::/0 for any source", .{});
+        },
+        else => return d.fail(error.InvalidFrom, "use an IPv4 or IPv6 address, optionally /prefix", .{}),
+    };
     try user.from.append(allocator, cidr);
 }
 
@@ -1582,6 +1596,15 @@ test "from rejects malformed cidr" {
         "  from 10.0.0.0/99\n" ++
         "  root /tmp/a\n";
     try std.testing.expectError(error.InvalidFrom, parse(std.testing.allocator, text));
+}
+
+test "from: an IPv6 prefix that covers all of IPv4 is rejected with a hint" {
+    const srv = "server\n  listen :2222\n  host-key /k\nuser u\n  auth /u.pub\n  root /r\n";
+    try expectDiag(srv ++ "  from ::ffff:203.0.113.0/24\n", "line 7: [user u] 'from': InvalidFrom: an IPv6 prefix counts 128 bits, so this matches every IPv4 peer; write 203.0.113.0/24");
+    try expectDiag(srv ++ "  from ::/80\n", "line 7: [user u] 'from': InvalidFrom: this matches every IPv4 peer; use a prefix of /96 or longer, or ::/0 for any source");
+    var cfg = try parse(std.testing.allocator, srv ++ "  from ::/0\n  from ::ffff:203.0.113.0/120\n");
+    defer cfg.deinit();
+    try std.testing.expect(netmatch.allowed(cfg.users[0].from, "8.8.8.8"));
 }
 
 test "two passhash auth lines for one user are rejected" {

@@ -169,10 +169,16 @@ from 2001:db8::/32
 ```
 
 With any `from` line, a peer that matches none of them cannot log in as
-this user. The attempt is still timed and counted like a bad password,
-so it reveals nothing. `::ffff:a.b.c.d` forms match plain IPv4 peers,
-and `::/0` matches every peer. This is the cheapest hardening there is
-when partners have stable egress addresses.
+this user. A password attempt from elsewhere is still timed and counted
+like a bad password, so it reveals nothing; a key attempt is refused
+like an unknown user's. This is the cheapest hardening there is when
+partners have stable egress addresses.
+
+IPv4 peers are matched as `::ffff:a.b.c.d`, so `::ffff:` forms match
+plain IPv4 peers. An IPv6 prefix counts all 128 bits: one shorter than
+/96 that covers that space, such as `::ffff:203.0.113.0/24` or `::/80`,
+would admit every IPv4 peer and is rejected (write `203.0.113.0/24`).
+`::/0` is allowed and deliberately matches every peer, IPv4 included.
 
 ### `root`
 
