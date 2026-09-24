@@ -68,7 +68,7 @@ ownership is checked against the user running it.
 
 | Directive | Default | Meaning |
 | --- | --- | --- |
-| `listen` | required | `host:port`, `:port` (every IPv4 address), or `[ipv6]:port` such as `[::]:2222` |
+| `listen` | required | `host:port`, `:port` (every IPv4 address), or `[ipv6]:port` such as `[::]:2222`; a hostname binds the first address it resolves to; no zones (`%lo0`) |
 | `host-key` | required | SSH host private key |
 | `partner-root` | none | base for users without `root`: user `ally` gets `<partner-root>/ally` |
 | `reload-interval` | `2s` | how often to check the config and key files for changes; `0` (SIGHUP only) or at least `100ms` |

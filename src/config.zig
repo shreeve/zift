@@ -830,8 +830,10 @@ fn parseServerProperty(
     try firstSetting(d, server.lines.getPtr(which), line);
     switch (which) {
         .listen => {
-            _ = parseListen(value) catch
+            _ = parseListen(value) catch {
+                if (std.mem.startsWith(u8, value, "*:")) return d.fail(error.InvalidListen, "write :port to listen on every IPv4 address", .{});
                 return d.fail(error.InvalidListen, "use host:port, :port, or [ipv6]:port with a port from 1 to 65535", .{});
+            };
             server.cfg.listen = try allocator.dupe(u8, value);
         },
         .@"host-key" => server.cfg.host_key = try dupeAbsolute(allocator, d, value),
@@ -1172,7 +1174,8 @@ pub const ListenAddress = struct {
 /// Split a `listen` value into what to bind: `host:port`, `:port` (every
 /// IPv4 address), or `[ipv6]:port`. The parser uses it so `zift validate`
 /// rejects what `serve` could not bind (`listen` is not applied on
-/// reload). A hostname is left to libssh to resolve.
+/// reload). A hostname is left to libssh, which binds the first address
+/// it resolves to. IPv6 zones (`%lo0`) are not supported.
 pub fn parseListen(value: []const u8) error{InvalidListen}!ListenAddress {
     const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidListen;
     const port = parseDigits(u16, value[colon + 1 ..], 10) orelse return error.InvalidListen;
@@ -1182,9 +1185,13 @@ pub fn parseListen(value: []const u8) error{InvalidListen}!ListenAddress {
         if (!std.mem.endsWith(u8, host, "]")) return error.InvalidListen;
         host = host[1 .. host.len - 1];
         _ = std.Io.net.Ip6Address.parse(host, 0) catch return error.InvalidListen;
-    } else if (std.mem.indexOfScalar(u8, host, ':') != null) {
-        // `::1:2222` is ambiguous; IPv6 hosts must be bracketed.
-        return error.InvalidListen;
+    } else {
+        // An IPv4 literal or a DNS name. This refuses `::1:2222`, which
+        // is ambiguous (IPv6 hosts must be bracketed), and `*`, blanks
+        // and `%` zones, which no resolver takes.
+        for (host) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and ch != '.' and ch != '-' and ch != '_') return error.InvalidListen;
+        }
     }
     // Longer than any DNS name.
     if (host.len > 255) return error.InvalidListen;
@@ -1307,6 +1314,12 @@ test "parse: listen is validated at parse time" {
         "[::1]2222", // no ':' after the bracket
         "[localhost]:2222", // brackets hold an IPv6 literal
         "[]:2222",
+        "*:2222", // `:2222` is every IPv4 address
+        "local host:2222", // blanks inside the host
+        "127.0.0.1\t:2222",
+        "[fe80::1%lo0]:2222", // zones are not supported
+        "fe80::1%lo0:2222",
+        "host%lo0:2222",
     };
     for (bad) |listen| {
         var buf: [256]u8 = undefined;
@@ -2234,6 +2247,7 @@ test "ParseDiag: line, section, user, key, and reason" {
     try expectDiag("server\n  listen :2222\n  host-key host_ed25519\n", "line 3: [server] 'host-key': RelativePath: must be an absolute path");
     try expectDiag("server\n  listing-mode real\n", "line 2: [server] 'listing-mode': InvalidListingMode: use 'virtual' or 'reality'");
     try expectDiag("server\n  max-connections many\n", "line 2: [server] 'max-connections': InvalidNumber: expected a whole number");
+    try expectDiag("server\n  listen *:22\n", "line 2: [server] 'listen': InvalidListen: write :port to listen on every IPv4 address");
     try expectDiag("server\nserver\n", "line 2: DuplicateServerSection");
 }
 

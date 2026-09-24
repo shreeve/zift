@@ -92,8 +92,9 @@ the line and the reason.
   `reload-interval` under 100ms, and `_` digit separators are rejected.
   Migration: use `max-connections 1` or more, `0` to disable a timer,
   and plain digits.
-- An unbracketed IPv6 `listen` (`::1:2222`) is rejected. Migration:
-  write `[::1]:2222`. Bracketed forms now bind; before, they passed
+- An unbracketed IPv6 `listen` (`::1:2222`), and a host with `*`, a
+  blank or a `%` zone, is rejected. Migration: write `[::1]:2222`, or
+  `:2222` for every IPv4 address. Bracketed forms now bind; before, they passed
   validate and failed at serve.
 - `validate` checks what `serve` opens. The host key must load as an
   unencrypted private key, the log's directory must exist, an existing
