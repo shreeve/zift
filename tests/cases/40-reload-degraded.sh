@@ -5,13 +5,15 @@
 #       diagnostic, (c) emit a structured `config.reload result=failed`
 #       audit event, and (d) on the next good config, announce recovery
 #       with a `config.reload result=ok` audit event and apply the new
-#       rules. Reproduces the production incident (an inline `#` comment
-#       on an `allow` line) that a reload silently rejected.
+#       rules. The production incident was an inline `#` comment on an
+#       `allow` line, which is now a valid trailing comment, so the
+#       invalid config here is a mistyped verb instead.
 # Covers: 0.10.1 silent-reload hazard fix
 
 source "$(dirname "$0")/../lib/common.sh"
 
 make_host_key
+mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it
 hash=$(make_password_hash secret)
 late_hash=$(make_password_hash later-secret)
 
@@ -28,16 +30,16 @@ server
 
 user ally
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
 start_zift
 sleep 1
 
-# ---------- (b) replace it with an INVALID config (inline comment) ----------
-# This is the exact shape of the production incident: a trailing `#`
-# comment on an `allow` line, which the parser rejects (InlineComment).
+# ---------- (b) replace it with an INVALID config (mistyped verb) ----------
+# A one-word typo on an `allow` line, which the parser rejects
+# (InvalidPermission).
 cat > "$TEST_TMP/zift.conf" <<EOF
 server
   listen 127.0.0.1:$TEST_PORT
@@ -47,8 +49,8 @@ server
 
 user ally
   auth $hash
-  root $TEST_TMP
-  allow / read list  # this inline comment makes the config invalid
+  root $TEST_TMP/root
+  allow / read lsit
 EOF
 touch "$TEST_TMP/zift.conf"
 sleep 2

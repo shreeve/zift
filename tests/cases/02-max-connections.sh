@@ -6,6 +6,7 @@
 source "$(dirname "$0")/../lib/common.sh"
 
 make_host_key
+mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it
 hash=$(make_password_hash secret)
 
 write_config <<EOF
@@ -13,11 +14,13 @@ server
   listen 127.0.0.1:$TEST_PORT
   host-key $TEST_TMP/host_ed25519
   max-connections 2
+  # Off: this case is about max-connections (the default pre-auth cap is 1 here).
+  max-unauth-connections 0
   log stderr
 
 user runner
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 

@@ -16,6 +16,7 @@ if [[ ! -x "$PY" ]]; then
 fi
 
 make_host_key
+mkdir -p "$TEST_TMP/root" # partner root; host key, config and log stay outside it
 hash=$(make_password_hash secret)
 
 # ---------- config-side limits ----------
@@ -30,7 +31,7 @@ server
 
 user $NAME_64
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
@@ -41,7 +42,7 @@ server
 
 user $NAME_65
   auth $hash
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
@@ -60,11 +61,8 @@ grep -q 'UsernameTooLong' "$TEST_TMP/u65.err" \
     || fail "65-byte username: expected UsernameTooLong in stderr, got: $(cat "$TEST_TMP/u65.err")"
 ok "65-byte username rejected with UsernameTooLong"
 
-# `auth /path` value at >8192 bytes rejects with KeyLineTooLong.
-# v0.7.0 reuses the same per-line cap that v0.6.x applied to the
-# inline `key` directive: a public-key reference that doesn't fit
-# in `max_keyline_bytes` is almost certainly an attack surface or
-# a typo, regardless of whether it's the path or the key itself.
+# An `auth /path` longer than the OS path limit is rejected at parse
+# time as InvalidAuth (it is a path, not a key line).
 HUGE_PATH=/$(printf 'A%.0s' {1..8200})
 cat > "$TEST_TMP/key_huge.conf" <<EOF
 server
@@ -74,7 +72,7 @@ server
 user keyguy
   auth $hash
   auth $HUGE_PATH
-  root $TEST_TMP
+  root $TEST_TMP/root
   allow / read list
 EOF
 
@@ -83,9 +81,9 @@ set +e
 rcK=$?
 set -e
 [[ "$rcK" == "1" ]] || fail "huge auth-path line: expected exit 1, got $rcK"
-grep -q 'KeyLineTooLong' "$TEST_TMP/k.err" \
-    || fail "huge auth-path line: expected KeyLineTooLong in stderr, got: $(cat "$TEST_TMP/k.err")"
-ok "auth /<path> > 8192 B rejected with KeyLineTooLong"
+grep -q 'InvalidAuth: key file path too long' "$TEST_TMP/k.err" \
+    || fail "huge auth-path line: expected 'InvalidAuth: key file path too long' in stderr, got: $(cat "$TEST_TMP/k.err")"
+ok "auth /<path> longer than the path limit rejected with InvalidAuth"
 
 # ---------- runtime path validation ----------
 # Run a server with permissive policy; the probe sends malformed paths
