@@ -168,6 +168,8 @@ user foo
   allow /pending write read update delete
   allow /archive read
   deny **.exe
+  # **/.ssh/** does not match the .ssh directory itself, so READDIR can list names while OPEN of the key file stays denied.
+  deny **/.ssh
   deny **/.ssh/**
 ```
 
@@ -318,10 +320,13 @@ allow /workspace full
 allow / list
 ```
 
-Add these to any policy — they cost nothing and close common mistakes:
+Add these to any policy — they cost nothing and close common mistakes.
+`**/.ssh/**` does not match the directory `.ssh` itself, so READDIR of
+that directory can list names while OPEN of the key file stays denied:
 
 ```zift
 deny **.exe
+deny **/.ssh
 deny **/.ssh/**
 deny **/.git/**
 ```
@@ -381,10 +386,11 @@ status` and the journal) and the daemon is never sent the reload. Running
 `zift validate` by hand first is now belt-and-suspenders — still handy,
 because it prints the exact line and reason immediately.
 
-Reloads apply to new sessions only, and are triggered by the config file
-mtime moving forward or by `SIGHUP`. Changing anything *around* the
-config — creating a partner root, adding a key file, fixing modes —
-leaves the mtime untouched, so reload by hand after those.
+Reloads apply to new sessions only, and are triggered when the
+`zift.conf` mtime or an authorized-key file's mtime moves forward, or
+by `SIGHUP`. Creating a partner root or fixing directory modes leaves
+those mtimes untouched, so reload by hand after those. Replacing an
+authorized-key file does not need a dummy edit of `zift.conf`.
 
 ## Documentation
 

@@ -120,6 +120,9 @@ possible:
 - verify the parent fd is inside the user's root
 - perform the operation relative to that fd
 
+MKDIR opens the new directory with symlink-follow disabled and pins
+`mkdir-mode` on that directory fd.
+
 This is designed to block common symlink and time-of-check/time-of-use
 escape patterns where a string looked safe before open but resolves
 outside the jail at operation time.
@@ -208,6 +211,11 @@ the right operational tradeoff. If username non-enumerability is more
 important, provision both password and key auth consistently so response
 shapes stay less distinguishable.
 
+Public-key probes for an unknown user and for a known user outside
+`from` are the same to the client: no backoff, and not a hard failure.
+The audit log still distinguishes them (`unknown user` versus
+`source not allowed`).
+
 ## Permission Safety
 
 Authorization verbs and the clobber rule (`write` creates; modifying or
@@ -245,9 +253,9 @@ Operational caveats:
   rather than copy bytes non-atomically.
 - Crash orphans under `<root>/.zift/staging/` are swept on the next
   login for that partner when older than `max(idle-timeout, 15m)`.
-  Partners never see each other's staging — each jail is separate.
-  Concurrent sessions for the same partner are protected by the age
-  floor.
+  The sweep does not delete a staging file another live session still
+  has open. Partners never see each other's staging — each jail is
+  separate.
 
 ## Per-Partner Namespace
 
@@ -273,9 +281,11 @@ Security properties:
 - `.zift` (and the legacy `.zift-staging` from v0.5.0–v0.7.x) is
   rejected as a virtual-path component by the path validator
   **anywhere in the path, not just at the partner root**. Every
-  SFTP operation (OPENDIR, STAT, OPEN, MKDIR, REMOVE, RMDIR,
-  RENAME, ...) on any path containing `.zift` as a component
-  returns `permission denied` to the partner. An operator
+  SFTP operation (OPENDIR, STAT, OPEN, REALPATH, MKDIR, REMOVE,
+  RMDIR, RENAME, ...) on any path containing `.zift` as a component
+  returns `permission denied` to the partner. REALPATH of `.zift` and
+  of other rejected paths returns permission denied, the same as STAT
+  and OPEN. An operator
   migrating from a non-zift SFTP service should scan partner
   roots for pre-existing `.zift`/`.zift-staging` directories
   before going live — see `docs/operate.md` "Upgrading to
@@ -396,7 +406,13 @@ the normal Internet-facing partner case:
 - per-session auth attempt ceiling (6)
 - auth backoff after failures (up to 2s)
 - temporary source suppression after 10 failures in 10 minutes
-  (15-minute suppress window; cleared on successful auth)
+  (15-minute suppress window; cleared on successful auth). Suppression
+  is checked again inside authentication. A source that trips the
+  threshold is disconnected, including the session that recorded the
+  failure. New accepts from that source are refused.
+- non-auth SSH messages are capped — service requests, global
+  requests, and channel requests other than the sftp subsystem — so
+  they cannot hold a connection slot forever.
 
 Zift does not implement geo rules, threat feeds, TLS termination, or
 HTTP health endpoints. A host/cloud firewall remains optional
@@ -446,7 +462,10 @@ promises:
   local filesystems for partner roots, or write deny patterns that do
   not depend on case. The reserved `.zift` namespace is folded to be
   case-insensitive regardless, so partners cannot reach it via a case
-  variant.
+  variant. APFS also equates Unicode normalization forms, so a
+  byte-exact deny of an NFC name does not match the NFD spelling.
+  `.zift` is ASCII and is not affected. Linux partner roots are not
+  affected. Zift does not fold normalization.
 - Audit is not fail-closed.
 - Quotas and disk-full behavior are delegated to the OS.
 
